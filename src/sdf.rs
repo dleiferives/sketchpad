@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 pub const TILE_RES: u32 = 128;
 pub const TILE_SIZE: f32 = 128.0;
-pub const GRID_TILES: u32 = 4;
+pub const GRID_TILES: u32 = 8;
 pub const CANVAS_SIZE: u32 = GRID_TILES * TILE_RES;
 
 #[derive(Debug, Clone)]
