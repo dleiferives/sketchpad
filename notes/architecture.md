@@ -21,29 +21,52 @@ Vello (`vello`) sits on top of this stack and provides a complete 2D vector rend
 
 ## Conceptual Architecture
 
+Two representations, one canvas. Strokes come in as Bézier paths (vector), get stamped into sparse SDF tiles (distance field), and display as infinitely zoomable, perfectly anti-aliased SDF evaluation.
+
 ```
-┌─────────────────────────────────────┐
-│  App Layer (layers, undo, UI)       │
-├─────────────────────────────────────┤
-│  Custom Stroke Pipeline (WGSL)      │  ← we write this
-│  ┌───────────────────────────────┐  │
-│  │ Bézier → Euler spiral        │  │
-│  │ Parallel curve expansion     │  │
-│  │ Cusp / evolute handling      │  │
-│  │ Caps, joins, dashing         │  │
-│  │ Flattening to line soup      │  │
-│  │ Brush customization (width,  │  │
-│  │   texture, pressure, taper)  │  │
-│  └───────────────────────────────┘  │
-├─────────────────────────────────────┤
-│  Tile-based rasterizer (WGSL)       │
-├─────────────────────────────────────┤
-│  wgpu                               │
-├─────────────────────────────────────┤
-│  winit (window, input, stylus)      │
-├─────────────────────────────────────┤
-│  Vulkan / Metal / D3D12 / WebGPU    │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  App Layer (layers, undo, UI)        │
+│  ┌────────────────────────────────┐  │
+│  │  Document model               │  │
+│  │  Layer stack                   │  │
+│  │  Undo/redo (snapshot tiles)    │  │
+│  │  File I/O (.sketchpad format)  │  │
+│  └────────────────────────────────┘  │
+├──────────────────────────────────────┤
+│  SDF Canvas (GPU side)               │
+│  ┌────────────────────────────────┐  │
+│  │  Sparse quadtree of tiles      │  │
+│  │  Each tile: 128×128 f32 SDF    │  │
+│  │  Auto-subdivide near strokes   │  │
+│  │  Compute shader CSG operations │  │
+│  │    min(d_canvas, d_stroke)     │  │
+│  └────────────────────────────────┘  │
+│             ↕                         │
+│  ┌────────────────────────────────┐  │
+│  │  Stroke Pipeline (custom WGSL) │  │
+│  │  Bézier → Euler spiral         │  │
+│  │  Parallel curve expansion      │  │
+│  │  Cusp / evolute handling       │  │
+│  │  Caps, joins, dashing          │  │
+│  │  Brush SDF kernel generation   │  │
+│  │    (width, hardness, texture,  │  │
+│  │     pressure, taper, spacing)  │  │
+│  └────────────────────────────────┘  │
+├──────────────────────────────────────┤
+│  SDF Display (fragment shader)        │
+│  ┌────────────────────────────────┐  │
+│  │  Per-pixel SDF evaluation      │  │
+│  │  smoothstep(d) = free AA       │  │
+│  │  Zoom = scale sample coord     │  │
+│  │  Layer compositing             │  │
+│  └────────────────────────────────┘  │
+├──────────────────────────────────────┤
+│  wgpu                                │
+├──────────────────────────────────────┤
+│  winit (window, input, stylus)       │
+├──────────────────────────────────────┤
+│  Vulkan / Metal / D3D12 / WebGPU     │
+└──────────────────────────────────────┘
 ```
 
 ## The Stroke Algorithm
