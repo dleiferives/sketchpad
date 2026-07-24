@@ -172,6 +172,27 @@ This is O(tiles touched by stroke) rather than O(total canvas). A single stroke 
 
 For ergonomics, keep the last ~50 undo states in GPU memory. Older states can be serialized to CPU or disk lazily.
 
+## Color Data in the SDF Canvas
+
+SDF tiles store geometry (distance to nearest edge). To support color, each tile sample also stores **latent pigment vectors**.
+
+```
+Tile sample: (f32 sdf, vec3 latent)
+  sdf:   signed distance to nearest edge
+  latent: [c1, c2, c3] — pigment concentrations (4th implicit)
+          residual r = RGB - mix(c) is stored alongside
+```
+
+The latent representation is from Mixbox (Sochorová & Jamriška, SIGGRAPH 2021). See `notes/pigment-mixing.md` for the full treatment.
+
+When stamping a brush stroke:
+1. **Geometry**: `min(canvas_sdf, brush_sdf)` — same as before
+2. **Color**: Where brush_sdf < 0 (inside stroke), `lerp(canvas_latent, brush_latent, opacity)`
+
+When erasing, color is removed along with the SDF (erased region reverts to empty/transparent).
+
+The decode from latent → sRGB happens at display time in the fragment shader, via the Mixbox polynomial evaluator. This means layers can be composited with correct pigment mixing behavior.
+
 ## Future: Blend Modes
 
 The CSG operations extend naturally. For example, multiply blend mode would be:

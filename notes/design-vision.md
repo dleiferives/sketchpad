@@ -79,24 +79,29 @@ This is a compute shader operation. The stroke's SDF can be evaluated analytical
 ### Rendering Flow
 
 ```
-User draws → Stylus input → Bézier path capture
+User draws → Stylus input → Bézier path capture + color
   │
   ├─► GPU stroke expansion (paper algorithm)
   │     Bézier → Euler spiral → parallel curves → flatten
   │
+  ├─► Color encoding (Mixbox)
+  │     RGB brush color → latent pigment vector (GPU shader)
+  │
   └─► SDF stamping (compute shader)
         For each tile the stroke overlaps:
           Evaluate distance to stroke geometry
-          SDF[tile] = min(SDF[tile], distance)
+          SDF[tile] = min(SDF[tile], distance)     // geometry
+          latent[tile] = lerp(latent[tile], latent_brush, opacity)  // color
           If tile detail exceeds threshold → subdivide
 
 Display:
   View transform (zoom, pan) → select tile level
   Fragment shader per screen pixel:
     Sample SDF at pixel position
-    if d < 0: inside stroke → fill color
-    if |d| < 1px: edge → anti-alias
+    if d < 0: inside stroke → decode latent → sRGB (Mixbox polynomial)
+    if |d| < 1px: edge → anti-alias with decoded color
     if d > 0: outside → background / transparent
+    Composite layers with pigment-aware blending
 ```
 
 The display shader is where the SDF magic happens. Anti-aliasing is free — just smoothstep the distance to the edge. Zoom is free — just scale the sampling coordinate. Everything stays crisp.
@@ -148,6 +153,7 @@ Brush = {
     hardness: 0..1 (soft edge fall-off)
     spacing: 0..1 (how far apart sample points are)
     texture: optional image/noise for grain
+    color: RGB (encoded to Mixbox latent on GPU before stamping)
 }
 ```
 
