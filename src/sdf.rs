@@ -2,6 +2,8 @@ use std::collections::HashMap;
 
 pub const TILE_RES: u32 = 128;
 pub const TILE_SIZE: f32 = 128.0;
+pub const GRID_TILES: u32 = 4;
+pub const CANVAS_SIZE: u32 = GRID_TILES * TILE_RES;
 
 #[derive(Debug, Clone)]
 pub struct SDFTile {
@@ -56,8 +58,7 @@ impl SparseSDFGrid {
                     let wy = oy + (py as f32 + 0.5) / TILE_RES as f32 * TILE_SIZE;
                     for px in 0..TILE_RES {
                         let wx = ox + (px as f32 + 0.5) / TILE_RES as f32 * TILE_SIZE;
-                        let d =
-                            ((wx - cx).powi(2) + (wy - cy).powi(2)).sqrt() - radius;
+                        let d = ((wx - cx).powi(2) + (wy - cy).powi(2)).sqrt() - radius;
                         let idx = (py * TILE_RES + px) as usize;
                         let old = tile.data[idx];
                         tile.data[idx] = old.min(d);

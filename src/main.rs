@@ -1,39 +1,40 @@
 mod sdf;
-mod pipeline;
 
-use sdf::SparseSDFGrid;
-use pipeline::{CameraUniform, DisplayPipeline};
+use sdf::{SparseSDFGrid, CANVAS_SIZE, GRID_TILES, TILE_RES};
+use std::{iter, sync::Arc};
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
-    event_loop::{ActiveEventLoop, EventLoop},
-    keyboard::{Key, NamedKey},
-    window::WindowAttributes,
+    event::{ElementState, WindowEvent},
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{KeyCode, PhysicalKey},
+    window::Window,
 };
 
-const TILE_RES: u32 = 128;
-const GRID_TILES: u32 = 4;
-const CANVAS_SIZE: u32 = GRID_TILES * TILE_RES;
-
-struct App {
-    window: Option<Box<dyn winit::window::Window>>,
-    gpu: Option<GpuState>,
-    canvas_tex: Option<wgpu::Texture>,
-    canvas_view: Option<wgpu::TextureView>,
-    canvas_sampler: Option<wgpu::Sampler>,
-    camera_buf: Option<wgpu::Buffer>,
-    display: Option<DisplayPipeline>,
-    sdf: SparseSDFGrid,
-    offset: (f32, f32),
-    zoom: f32,
-    drawing: bool,
+struct Canvas {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    sampler: wgpu::Sampler,
+    bind_group: wgpu::BindGroup,
+    pipeline: wgpu::RenderPipeline,
 }
 
-struct GpuState {
+struct Gpu {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    canvas: Canvas,
+}
+
+struct App {
+    window: Option<Arc<Window>>,
+    gpu: Option<Gpu>,
+    configured: bool,
+    grid: SparseSDFGrid,
+    offset: (f32, f32),
+    zoom: f32,
+    drawing: bool,
+    mouse_pos: (f32, f32),
 }
 
 impl App {
@@ -41,43 +42,43 @@ impl App {
         Self {
             window: None,
             gpu: None,
-            canvas_tex: None,
-            canvas_view: None,
-            canvas_sampler: None,
-            camera_buf: None,
-            display: None,
-            sdf: SparseSDFGrid::new(),
+            configured: false,
+            grid: SparseSDFGrid::new(),
             offset: (CANVAS_SIZE as f32 / 2.0, CANVAS_SIZE as f32 / 2.0),
             zoom: 1.0,
             drawing: false,
+            mouse_pos: (0.0, 0.0),
         }
     }
 
-    fn init_gpu(window: &dyn winit::window::Window) -> GpuState {
-        let mut d = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
-        d.backends = wgpu::Backends::VULKAN | wgpu::Backends::METAL | wgpu::Backends::DX12;
-        let instance = wgpu::Instance::new(d);
-        let surface = instance.create_surface(window).unwrap();
+    fn init(window: Arc<Window>) -> Gpu {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
+        });
+
+        let surface = instance.create_surface(window.clone()).unwrap();
         let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(surface) };
 
         let adapter = pollster::block_on(instance.request_adapter(
             &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
+                power_preference: wgpu::PowerPreference::default(),
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-                apply_limit_buckets: false,
+                apply_limit_buckets: true,
             },
-        )).expect("No GPU adapter");
+        ))
+        .unwrap();
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
-            ..Default::default()
-        })).expect("Failed to create device");
+        let (device, queue) = pollster::block_on(adapter.request_device(
+            &wgpu::DeviceDescriptor::default(),
+        ))
+        .unwrap();
 
-        log::info!("GPU: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
-
-        let sz = window.surface_size();
+        let sz = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
         let fmt = caps.formats.iter().copied().find(|f| f.is_srgb()).unwrap_or(caps.formats[0]);
         let config = wgpu::SurfaceConfiguration {
@@ -93,136 +94,32 @@ impl App {
         };
         surface.configure(&device, &config);
 
-        GpuState { surface, device, queue, config }
+        log::info!("GPU: {} ({:?})", adapter.get_info().name, adapter.get_info().backend);
+
+        let canvas = App::create_canvas(&device, fmt);
+        Gpu { surface, device, queue, config, canvas }
     }
 
-    fn resize(&mut self, s: winit::dpi::PhysicalSize<u32>) {
-        if let Some(g) = &mut self.gpu {
-            if s.width > 0 && s.height > 0 {
-                g.config.width = s.width;
-                g.config.height = s.height;
-                g.surface.configure(&g.device, &g.config);
-            }
-        }
-    }
-
-    fn screen_to_world(scr_x: f32, scr_y: f32, win_w: f32, win_h: f32, off: (f32, f32), zoom: f32) -> (f32, f32) {
-        let wx = off.0 + (scr_x / win_w - 0.5) * CANVAS_SIZE as f32 / zoom;
-        let wy = off.1 + (-(scr_y / win_h - 0.5)) * CANVAS_SIZE as f32 / zoom;
-        (wx, wy)
-    }
-
-    fn upload(&mut self) {
-        let Some(gpu) = &self.gpu else { return };
-        let Some(tex) = &self.canvas_tex else { return };
-
-        for (key, tile) in self.sdf.tiles.iter_mut() {
-            if !tile.dirty { continue; }
-            let tx = key.0 as u32;
-            let ty = (GRID_TILES - 1 - key.1 as u32);
-            if tx >= GRID_TILES || ty >= GRID_TILES { continue; }
-
-            let mut flipped = tile.data.clone();
-            let row_count = TILE_RES as usize;
-            for r in 0..row_count / 2 {
-                let a = r * row_count;
-                let b = (row_count - 1 - r) * row_count;
-                for c in 0..row_count {
-                    flipped.swap(a + c, b + c);
-                }
-            }
-
-            let raw = bytemuck::cast_slice(&flipped);
-            gpu.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: tex,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d { x: tx * TILE_RES, y: ty * TILE_RES, z: 0 },
-                    aspect: wgpu::TextureAspect::All,
-                },
-                raw,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TILE_RES * 4), rows_per_image: Some(TILE_RES) },
-                wgpu::Extent3d { width: TILE_RES, height: TILE_RES, depth_or_array_layers: 1 },
-            );
-        }
-        self.sdf.clear_dirty();
-    }
-
-    fn render(&mut self) {
-        self.upload();
-
-        let Some(gpu) = &self.gpu else { return };
-        let Some(display) = &self.display else { return };
-        let Some(cbuf) = &self.camera_buf else { return };
-
-        let cam = CameraUniform {
-            offset: [self.offset.0, self.offset.1],
-            zoom: self.zoom,
-            canvas_size: CANVAS_SIZE as f32,
-        };
-        gpu.queue.write_buffer(cbuf, 0, bytemuck::cast_slice(&[cam]));
-
-        let st = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => { gpu.surface.configure(&gpu.device, &gpu.config); t }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Timeout
-            | wgpu::CurrentSurfaceTexture::Occluded => return,
-            wgpu::CurrentSurfaceTexture::Lost => { gpu.surface.configure(&gpu.device, &gpu.config); return }
-            wgpu::CurrentSurfaceTexture::Validation => return,
-        };
-        let sv = st.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("enc") });
-
-        {
-            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &sv,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.12, g: 0.12, b: 0.13, a: 1.0 }),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                depth_stencil_attachment: None, occlusion_query_set: None,
-                timestamp_writes: None, multiview_mask: std::num::NonZeroU32::new(1),
-            });
-            rp.set_pipeline(&display.pipeline);
-            rp.set_bind_group(0, &display.bind_group, &[]);
-            rp.set_vertex_buffer(0, display.vbuf.slice(..));
-            rp.set_index_buffer(display.ibuf.slice(..), wgpu::IndexFormat::Uint16);
-            rp.draw_indexed(0..display.idx_count, 0, 0..1);
-        }
-        gpu.queue.submit(std::iter::once(enc.finish()));
-    }
-}
-
-impl ApplicationHandler for App {
-    fn can_create_surfaces(&mut self, _: &dyn ActiveEventLoop) {}
-
-    fn resumed(&mut self, el: &dyn ActiveEventLoop) {
-        if self.window.is_some() { return; }
-
-        let win = el.create_window(
-            WindowAttributes::default()
-                .with_title("Sketchpad")
-                .with_surface_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
-        ).expect("window");
-
-        let gpu = App::init_gpu(&*win);
-        let dev = &gpu.device;
-
-        let tex = dev.create_texture(&wgpu::TextureDescriptor {
-            label: Some("sdf"), size: wgpu::Extent3d { width: CANVAS_SIZE, height: CANVAS_SIZE, depth_or_array_layers: 1 },
-            mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
+    fn create_canvas(device: &wgpu::Device, surface_fmt: wgpu::TextureFormat) -> Canvas {
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Canvas"),
+            size: wgpu::Extent3d {
+                width: CANVAS_SIZE,
+                height: CANVAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-        let sampler = dev.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("sampler"),
+
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Canvas Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -230,60 +127,236 @@ impl ApplicationHandler for App {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let cbuf = dev.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cam"), size: std::mem::size_of::<CameraUniform>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let display = DisplayPipeline::new(dev, gpu.config.format, &view, &sampler, &cbuf);
 
-        self.gpu = Some(gpu);
-        self.canvas_tex = Some(tex);
-        self.canvas_view = Some(view);
-        self.canvas_sampler = Some(sampler);
-        self.camera_buf = Some(cbuf);
-        self.display = Some(display);
-        self.window = Some(win);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Display Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/display.wgsl").into()),
+        });
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: None,
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+            ],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_fmt,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        Canvas { texture, view, sampler, bind_group, pipeline }
     }
 
-    fn window_event(&mut self, el: &dyn ActiveEventLoop, _: winit::window::WindowId, ev: WindowEvent) {
+    fn upload(&mut self) {
+        let Some(gpu) = &self.gpu else { return };
+
+        for (key, tile) in self.grid.tiles.iter_mut() {
+            if !tile.dirty { continue; }
+            let tx = key.0 as u32;
+            let ty = key.1 as u32;
+            if tx >= GRID_TILES || ty >= GRID_TILES { continue; }
+
+            let mut rgba: Vec<u8> = Vec::with_capacity(tile.data.len() * 4);
+            for &d in &tile.data {
+                let v = ((d / 128.0 + 1.0) * 0.5 * 255.0).clamp(0.0, 255.0) as u8;
+                rgba.extend_from_slice(&[v, v, v, 255]);
+            }
+
+            gpu.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &gpu.canvas.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: tx * TILE_RES, y: ty * TILE_RES, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                &rgba,
+                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(TILE_RES * 4), rows_per_image: Some(TILE_RES) },
+                wgpu::Extent3d { width: TILE_RES, height: TILE_RES, depth_or_array_layers: 1 },
+            );
+        }
+        self.grid.clear_dirty();
+    }
+
+    fn screen_to_world(&self, screen_x: f32, screen_y: f32, win_w: u32, win_h: u32) -> (f32, f32) {
+        let aspect_w = CANVAS_SIZE as f32 / self.zoom;
+        let aspect_h = CANVAS_SIZE as f32 / self.zoom;
+        let wx = self.offset.0 + (screen_x / win_w as f32 - 0.5) * aspect_w;
+        let wy = self.offset.1 + (0.5 - screen_y / win_h as f32) * aspect_h;
+        (wx, wy)
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        if let Some(gpu) = &mut self.gpu {
+            if width > 0 && height > 0 {
+                gpu.config.width = width;
+                gpu.config.height = height;
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                self.configured = true;
+            }
+        }
+    }
+
+    fn render(&mut self) {
+        self.upload();
+
+        if !self.configured { return; }
+        let Some(gpu) = &self.gpu else { return };
+
+        let output = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                t
+            }
+            wgpu::CurrentSurfaceTexture::Timeout
+            | wgpu::CurrentSurfaceTexture::Occluded
+            | wgpu::CurrentSurfaceTexture::Validation => return,
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                gpu.surface.configure(&gpu.device, &gpu.config);
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => { log::error!("Lost"); return; }
+        };
+
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut enc = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+
+        {
+            let mut rp = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: None,
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.12, g: 0.12, b: 0.13, a: 1.0 }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&gpu.canvas.pipeline);
+            rp.set_bind_group(0, &gpu.canvas.bind_group, &[]);
+            rp.draw(0..6, 0..1);
+        }
+
+        gpu.queue.submit(iter::once(enc.finish()));
+        gpu.queue.present(output);
+    }
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, el: &ActiveEventLoop) {
+        let window = Arc::new(
+            el.create_window(
+                Window::default_attributes().with_title("Sketchpad").with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
+            ).unwrap(),
+        );
+
+        let gpu = App::init(window.clone());
+        self.gpu = Some(gpu);
+        self.window = Some(window);
+        self.configured = true;
+    }
+
+    fn window_event(&mut self, el: &ActiveEventLoop, _: winit::window::WindowId, ev: WindowEvent) {
+        let win = self.window.as_ref().map(|w| w.inner_size()).unwrap_or(winit::dpi::PhysicalSize::new(1, 1));
         match ev {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::SurfaceResized(s) => self.resize(s),
+            WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::RedrawRequested => {
                 self.render();
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
-            WindowEvent::PointerMoved { position, .. } => {
+            WindowEvent::CursorMoved { position, .. } => {
+                let (wx, wy) = self.screen_to_world(position.x as f32, position.y as f32, win.width, win.height);
+                self.mouse_pos = (wx, wy);
                 if self.drawing {
-                    if let Some(w) = &self.window {
-                        let sz = w.surface_size();
-                        let (wx, wy) = Self::screen_to_world(position.x as f32, position.y as f32, sz.width as f32, sz.height as f32, self.offset, self.zoom);
-                        self.sdf.stamp_circle(wx, wy, 20.0);
-                        w.request_redraw();
-                    }
+                    self.grid.stamp_circle(wx, wy, 20.0);
+                    if let Some(w) = &self.window { w.request_redraw(); }
                 }
             }
-            WindowEvent::PointerButton { state, position, .. } => {
-                self.drawing = state.is_pressed();
-                if let Some(w) = &self.window {
-                    let sz = w.surface_size();
-                    let (wx, wy) = Self::screen_to_world(position.x as f32, position.y as f32, sz.width as f32, sz.height as f32, self.offset, self.zoom);
-                    if self.drawing { self.sdf.stamp_circle(wx, wy, 20.0); }
-                    w.request_redraw();
+            WindowEvent::MouseInput { state, .. } => {
+                self.drawing = state == ElementState::Pressed;
+                if self.drawing {
+                    self.grid.stamp_circle(self.mouse_pos.0, self.mouse_pos.1, 20.0);
+                    if let Some(w) = &self.window { w.request_redraw(); }
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                let s = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y as f32 * 0.1,
-                    winit::event::MouseScrollDelta::PixelDelta(p) => p.y as f32 * 0.005,
+                let scroll = match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.1,
+                    winit::event::MouseScrollDelta::PixelDelta(pos) => pos.y as f32 * 0.005,
                 };
-                self.zoom = (self.zoom * (1.0 + s)).clamp(0.1, 50.0);
+                self.zoom = (self.zoom * (1.0 + scroll)).clamp(0.1, 50.0);
                 if let Some(w) = &self.window { w.request_redraw(); }
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state.is_pressed() {
-                    if let Key::Named(NamedKey::Escape) = event.logical_key { el.exit(); }
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(KeyCode::Escape) = event.physical_key {
+                        el.exit();
+                    }
                 }
             }
             _ => {}
@@ -293,7 +366,7 @@ impl ApplicationHandler for App {
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let el = EventLoop::new().expect("event loop");
-    el.set_control_flow(winit::event_loop::ControlFlow::Poll);
-    el.run_app(Box::new(App::new())).expect("run");
+    let el = EventLoop::new().unwrap();
+    el.set_control_flow(ControlFlow::Poll);
+    el.run_app(&mut App::new()).unwrap();
 }
