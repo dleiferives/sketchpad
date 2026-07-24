@@ -304,7 +304,7 @@ impl ApplicationHandler for App {
                 let view_w = CANVAS_SIZE as f32 / self.zoom;
                 let view_h = CANVAS_SIZE as f32 / self.zoom;
                 let wx = self.offset.0 + (position.x as f32 / win_size.width as f32 - 0.5) * view_w;
-                let wy = self.offset.1 + (position.y as f32 / win_size.height as f32 - 0.5) * view_h;
+                let wy = self.offset.1 + (1.0 - position.y as f32 / win_size.height as f32 - 0.5) * view_h;
                 if self.drawing {
                     self.grid.stamp_circle(wx, wy, 20.0);
                     if let Some(w) = &self.window { w.request_redraw(); }
