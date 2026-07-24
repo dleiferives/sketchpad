@@ -20,7 +20,7 @@ fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 @fragment
 fn fs(@builtin(position) screen_pos: vec4f) -> @location(0) vec4f {
     let sz = vec2f(1280.0, 720.0);
-    let uv = screen_pos.xy / sz;
+    let uv = vec2f(screen_pos.x / sz.x, 1.0 - screen_pos.y / sz.y);
 
     let view_w = camera.canvas_size / camera.zoom;
     let view_h = camera.canvas_size / camera.zoom;
@@ -31,12 +31,11 @@ fn fs(@builtin(position) screen_pos: vec4f) -> @location(0) vec4f {
     let tx = wx / camera.canvas_size;
     let ty = wy / camera.canvas_size;
 
-    if (tx < 0.0 || tx > 1.0 || ty < 0.0 || ty > 1.0) {
-        return vec4f(0.12, 0.12, 0.13, 1.0);
+    var d: f32 = 128.0;
+    if (tx >= 0.0 && tx <= 1.0 && ty >= 0.0 && ty <= 1.0) {
+        let c = textureSample(sdf_texture, sdf_sampler, vec2f(tx, ty));
+        d = (c.r * 2.0 - 1.0) * 128.0;
     }
-
-    let c = textureSample(sdf_texture, sdf_sampler, vec2f(tx, ty));
-    let d = (c.r * 2.0 - 1.0) * 128.0;
 
     let px = 2.0 / camera.zoom;
     let inside = 1.0 - smoothstep(-px, px, d);
