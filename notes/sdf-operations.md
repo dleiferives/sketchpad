@@ -21,14 +21,14 @@ SDF_canvas = min(SDF_canvas, SDF_stroke)
 
 `min(d1, d2)` takes whichever value is more negative — i.e., whichever shape claims the point is "more inside." If you draw a stroke over empty canvas, the stroke's negative interior overwrites the positive empty space. If you draw over an existing stroke, `min` naturally handles the overlap.
 
-The stroke SDF comes from the GPU stroke expansion pipeline. For each tile the stroke overlaps, the compute shader evaluates the distance from each tile sample to the expanded stroke geometry (polyline or arc segments from the Levien/Uguray algorithm), then does `min`.
+The stroke SDF comes from the GPU stroke expansion pipeline. For each cache page or flat-field region the stroke overlaps, the compute shader evaluates the distance from each sample to the expanded stroke geometry (polyline or arc segments from the Levien/Uguray algorithm), then does `min`.
 
 ```
 Drawing compute shader:
-    for each affected SDF tile:
-        for each sample in tile:
+    for each affected cache page or field region:
+        for each sample in region:
             d_stroke = distance_to_stroke_outline(sample_pos)
-            tile[sample] = min(tile[sample], d_stroke)
+            region[sample] = min(region[sample], d_stroke)
 ```
 
 ### Soft Brushes
@@ -65,17 +65,17 @@ The negation flips the eraser's inside/outside. Inside the eraser, `−SDF_erase
 
 ```
 Eraser compute shader:
-    for each affected SDF tile:
-        for each sample in tile:
+    for each affected cache page or field region:
+        for each sample in region:
             d_eraser = distance_to_eraser_shape(sample_pos)
-            tile[sample] = max(tile[sample], -d_eraser)
+            region[sample] = max(region[sample], -d_eraser)
 ```
 
 The eraser shape SDF is built the same way as a brush — same stroke expansion pipeline, same brush kernel, just used with a different CSG operation. A soft eraser naturally produces soft erased edges.
 
 ### Eraser as a Tool (not a Layer)
 
-Erasing is destructive to the current layer's SDF. It modifies the SDF tile data permanently (until undo). This is simpler and faster than maintaining an eraser mask layer — and it means the SDF stays compact because erased regions become positive (empty) distance values, which are cheap to store (uniform in a tile).
+An eraser is a source operation applied to the current layer and an invalidation of the affected cache regions. The cache may be updated destructively for speed, but the source operation remains available for rebuild and undo.
 
 ## CSG Operations Reference
 
@@ -103,7 +103,7 @@ For a drawing app, this is completely acceptable. The visual result is identical
 
 ## Computing the Stroke SDF
 
-When stamping a stroke into a tile, we need `d_stroke = distance_to_stroke_outline(sample_pos)` for every sample in the tile.
+When stamping a stroke into a cache page or flat field, we need `d_stroke = distance_to_stroke_outline(sample_pos)` for every affected sample.
 
 The stroke outline is the filled polygon produced by the GPU stroke expansion pipeline — an unordered "line soup" of polylines forming closed filled regions.
 
@@ -147,37 +147,31 @@ d_stroke = distance_to_nearest_segment(sample_pos) - half_width
 
 This overestimates slightly at joins (segments meet but the swept area extends past the segment endpoints) but is correct within the flattening tolerance. Joins and caps need separate distance evaluation for correctness.
 
-## Tile Subdivision Trigger
+## Cache Pages and Refinement
 
-A tile subdivides when the SDF detail exceeds the tile's resolution. Specifically:
+A cache page is a document-space storage unit, not a screen-space tile. A page stores samples at a defined document-space spacing. Pages may be sparse and may eventually exist at several refinement levels.
 
-```
-if max |d_gradient| across tile > threshold:
-    subdivide tile into 4 children
-    redistribute the SDF samples
-```
+Refinement must not be driven only by a gradient threshold. A coarse SDF cannot recreate stroke detail that was lost during sampling. The source stroke/operation list must remain available so a finer page can be rebuilt by evaluating the source operations over that page.
 
-The gradient check catches regions where the SDF changes rapidly — near edges, at sharp curves, or where many strokes overlap. Empty tiles (all `d > large_value`) never subdivide.
+For a given viewport, choose the finest available page whose projected sample spacing is appropriate for the screen pixel size. If it is missing, use a coarser valid page temporarily and mark the region for rebuild. Before adding more levels, define page bounds, border samples, invalidation, and the acceptable screen-space error.
 
 ## Undo
 
-Since operations are tile-local (`min` or `max` on a small texture), undo can snapshot affected tiles:
+The source operation list is the canonical undo model. Cache-page snapshots can be used as a performance optimization, but they must not be the only record of an edit because finer pages may need to be rebuilt:
 
 ```
-before drawing: snapshot = affected_tiles.clone()
-on undo:        affected_tiles = snapshot
+before drawing: record = source_operation
+on undo:        remove operation and invalidate affected cache pages
 ```
 
-This is O(tiles touched by stroke) rather than O(total canvas). A single stroke typically touches a few dozen tiles. Snapshotting small textures is cheap — 128×128 f32 = 64KB per tile, so even 100 tiles is only 6.4MB, well within GPU memory for an undo stack.
-
-For ergonomics, keep the last ~50 undo states in GPU memory. Older states can be serialized to CPU or disk lazily.
+Snapshotting small cache pages may still be useful for fast interactive undo, but the source operation remains authoritative. Older cache data can be discarded and rebuilt lazily.
 
 ## Color Data in the SDF Canvas
 
-SDF tiles store geometry (distance to nearest edge). To support color, each tile sample also stores **latent pigment vectors**.
+SDF cache pages store geometry (distance to nearest edge). To support color, each cache sample may also store **latent pigment vectors**.
 
 ```
-Tile sample: (f32 sdf, vec3 latent)
+Cache sample: (f32 sdf, vec3 latent)
   sdf:   signed distance to nearest edge
   latent: [c1, c2, c3] — pigment concentrations (4th implicit)
           residual r = RGB - mix(c) is stored alongside

@@ -21,7 +21,13 @@ Vello (`vello`) sits on top of this stack and provides a complete 2D vector rend
 
 ## Conceptual Architecture
 
-Two representations, one canvas. Strokes come in as Bézier paths (vector), get stamped into sparse SDF tiles (distance field), and display as infinitely zoomable, perfectly anti-aliased SDF evaluation.
+There are three representations, each with a different responsibility:
+
+1. **Document source** — ordered strokes and brush operations in continuous document coordinates.
+2. **SDF render cache** — sampled distance values in document coordinates, rebuilt from the source when needed.
+3. **Screen output** — viewport pixels sampled from the cache.
+
+The SDF cache may eventually be split into sparse pages and multiple resolutions, but those are storage and performance choices. They are not the document model and they are not screen-space tiles.
 
 ```
 ┌──────────────────────────────────────┐
@@ -29,17 +35,17 @@ Two representations, one canvas. Strokes come in as Bézier paths (vector), get 
 │  ┌────────────────────────────────┐  │
 │  │  Document model               │  │
 │  │  Layer stack                   │  │
-│  │  Undo/redo (snapshot tiles)    │  │
+│  │  Undo/redo (source operations) │  │
 │  │  File I/O (.sketchpad format)  │  │
 │  └────────────────────────────────┘  │
 ├──────────────────────────────────────┤
-│  SDF Canvas (GPU side)               │
+│  Document source + SDF cache         │
 │  ┌────────────────────────────────┐  │
-│  │  Sparse quadtree of tiles      │  │
-│  │  Each tile: 128×128 f32 SDF    │  │
-│  │  Auto-subdivide near strokes   │  │
-│  │  Compute shader CSG operations │  │
-│  │    min(d_canvas, d_stroke)     │  │
+│  │  Ordered stroke operations     │  │
+│  │  Flat field first              │  │
+│  │  Optional sparse cache pages  │  │
+│  │  Optional multi-resolution LOD │  │
+│  │  Rebuild pages from source     │  │
 │  └────────────────────────────────┘  │
 │             ↕                         │
 │  ┌────────────────────────────────┐  │
@@ -87,7 +93,7 @@ The solution: **Euler spirals** as an intermediate representation. An Euler spir
 
 ### Pipeline Steps
 
-1. **CPU encoding**: Paths → compact tag stream (tag monoid, prefix-sum). Minimal CPU work.
+1. **CPU encoding**: Paths → compact tag stream (tag monoid, prefix-sum). Minimal CPU work. The original path remains in the document source.
 2. **GPU stage 1 — Stroke expansion compute shader** (per-path-segment, 1 dispatch):
    - Cubic Bézier → Euler spiral fit (7th-order Hermite interpolation)
    - Error estimation (closed-form, no iterative measurement)
@@ -97,8 +103,10 @@ The solution: **Euler spirals** as an intermediate representation. An Euler spir
    - Caps (butt/square/round), joins (bevel/miter/round)
    - Flatten Euler spiral → polylines or arcs
    - Output: unordered "line soup" in GPU storage buffer
-3. **GPU stage 2 — Tile sorting** (prefix-sum based, spatial sort into 16×16 tiles)
-4. **GPU stage 3 — Fine rasterizer** (scanline coverage per tile)
+3. **GPU stage 2 — Spatial binning** (prefix-sum based, spatial sort into render/cache work units)
+4. **GPU stage 3 — Fine rasterizer or SDF cache update**
+
+The paper's rendering work units must not be confused with document-space SDF cache pages. They can have different sizes and lifetimes.
 
 ### Strong vs Weak Correctness
 

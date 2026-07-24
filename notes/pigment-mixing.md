@@ -137,20 +137,22 @@ On GPU, the shader version is a few texture lookups + a polynomial evaluation �
 
 Our canvas uses an SDF (signed distance field) to represent geometry. To support pigment mixing, we need **color at every sample alongside distance**.
 
-### Expanded Tile Format
+### Expanded Cache Page Format
 
 ```
-Current:  SDF tile = 128×128 × f32    = 64 KB per tile
-With color: SDF + Color tile = 128×128 × (f32 + 3×f32) = 256 KB per tile
+Current:  SDF cache page = 128×128 × f32    = 64 KB per page
+With color: SDF + Color page = 128×128 × (f32 + 3×f32) = 256 KB per page
 ```
 
-Or alternatively, store latent vectors directly in the tilestore:
+Or alternatively, store latent vectors directly in the cache-page store:
 
 ```
-SDF + Latent tile = 128×128 × (f32 + 3×f32) = 256 KB per tile
+SDF + Latent page = 128×128 × (f32 + 3×f32) = 256 KB per page
 ```
 
 Storing latent vectors (concentrations + residuals encoded as a `mat3` in GLSL) lets us postpone the decode to display time, which is where color mixing across layers happens.
+
+This is a cache representation, not a complete document color model. A single latent vector per SDF sample cannot by itself preserve ordered layers, opaque overpainting, transparency, or all erasing behavior. Keep ordered source operations and layer semantics authoritative, and define how the color cache is rebuilt before depending on it for Phase 4 behavior.
 
 ### Per-Layer Pigment Palette
 
@@ -166,11 +168,11 @@ This requires precomputing separate LUTs per palette. At 96 MB per LUT pair (48 
 When stamping a brush stroke into the SDF:
 
 1. **Distance**: Compute the brush kernel SDF, `min` into canvas SDF (as before)
-2. **Color**: At each tile sample where the brush SDF < 0 (inside the stroke):
-   - Get current latent from tile: `z_canvas`
+2. **Color**: At each cache sample where the brush SDF < 0 (inside the stroke):
+   - Get current latent from the cache: `z_canvas`
    - Get brush latent: `z_brush = F(brush_color)`
    - Mix based on brush opacity: `z_new = lerp(z_canvas, z_brush, opacity)`
-   - Write back to tile
+   - Write back to the cache
 
 ### Smudge / Blend Brush
 
@@ -178,10 +180,10 @@ A smudge brush blends the current canvas color with nearby colors. This is the o
 
 ```
 Smudge compute shader:
-  for each affected tile sample:
+  for each affected cache sample:
     z_blended = weighted_average of z values in kernel radius
     z_new = lerp(z_current, z_blended, smudge_strength)
-    tile[z] = z_new
+    cache[z] = z_new
 ```
 
 ### Display Shader
