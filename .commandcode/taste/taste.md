@@ -1,0 +1,1 @@
+- Prefers writing custom/low-level rendering code over relying on library APIs when extensibility matters — e.g., implementing a custom GPU stroke renderer from scratch rather than using Vello's built-in `Scene::stroke()`, because bespoke brush behavior (pressure, texture, etc.) can't easily be added through the high-level API. Confidence: 0.80
