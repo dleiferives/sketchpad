@@ -1,3 +1,5 @@
 - Prefers writing custom/low-level rendering code over relying on library APIs when extensibility matters — e.g., implementing a custom GPU stroke renderer from scratch rather than using Vello's built-in `Scene::stroke()`, because bespoke brush behavior (pressure, texture, etc.) can't easily be added through the high-level API. Confidence: 0.80
 - Prefers a documentation-first workflow: research and architecture decisions are written up in a `notes/` subdirectory before any code is written. Confidence: 0.85
 - Initializes git at project inception — even before any code exists, just notes and config files. Confidence: 0.85
+- Prefers a resolution-independent / infinite-zoom canvas using SDF/ADF representation (inspired by Mischief), where strokes are stored as continuous distance functions rather than pixels, enabling free anti-aliasing and zoom via fragment shader evaluation. Confidence: 0.85
+- Prefers a minimal, light interface that maximizes canvas space and gets out of the user's way — floating/dismissible tool palettes, gesture-driven interactions, dark theme that recedes behind the artwork (Sketchbook-inspired). Confidence: 0.80
