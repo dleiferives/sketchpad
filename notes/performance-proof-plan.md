@@ -495,6 +495,43 @@ This separates visibility preparation, instance bandwidth, texture bandwidth,
 fill, and DVFS effects. Use platform GPU counters only after a stable timing
 case identifies the interesting row.
 
+Revision `609a92e` completes the first persistent-state candidate. Visibility
+depends on exact view bounds and the layer allocation generation. Per-page
+instances additionally depend on the residency-slot generation. Ordinary
+damage-only frames reuse both. Replay version 7 exposes
+`--visibility cached|rebuild` and records every rebuild, hit, scan, sort, and
+instance byte.
+
+Clean dense Apollo 60 Hz medians:
+
+| Rate | Rebuild scene p95 / app p95 | Cached scene p95 / app p95 | Cached work |
+| --- | ---: | ---: | --- |
+| 1× | 0.406 / 1.329 ms | 0.268 / 1.150 ms | 22 hits, zero scans/writes |
+| 2× | 0.487 / 1.844 ms | 0.369 / 1.534 ms | 12 hits, zero scans/writes |
+| 4× | 0.546 / 2.582 ms | 0.455 / 2.036 ms | 6 hits, zero scans/writes |
+
+The stable stress scene similarly reduces scene p95 from 0.610 to 0.449 ms.
+The sparse target allocates tiles in five of six displayed frames, so it
+correctly records five rebuilds and only one hit; the cache is not expected to
+hide structural work.
+
+Revision `230bf85` adds centered `--view-zoom` isolation. With the stable
+stress scene at 4×/60 Hz:
+
+| Zoom | Visible tiles | Scene p95 | Render-pass p95 |
+| ---: | ---: | ---: | ---: |
+| 1× | 253 | 0.450 ms | 3.911 ms |
+| 2× | 128 | 0.427 ms | 3.908 ms |
+| 4× | 32 | 0.302 ms | 2.484 ms |
+
+Halving instances from 253 to 128 does not change the render pass. The 32-tile
+magnified view improves texture locality and source-texel reuse as well as
+instance count, so its 36% reduction does not prove one isolated cause.
+Together the rows point away from visibility/instance submission and toward
+fragment texture traffic/locality in the direct `Rgba32Float` tile path. The
+next controlled comparison is a persistent composited display cache across
+lower-bandwidth formats, with identical output tolerances and dirty updates.
+
 ### 6. Frame-paced application replay
 
 Feed the real trace through display opportunities at 60, 120, 144, and 240 Hz.

@@ -298,6 +298,20 @@ remains selectable and defaults to its separately measured 64 KiB threshold.
 This is an Apollo Intel decision and must be requalified on mobile hardware,
 other formats, and different damage geometry.
 
+Revision `609a92e` persists visible tile coordinates, the protected residency
+set, and per-page instance buffers. `RasterLayer::allocation_generation`
+changes when the sparse tile set changes but not for ordinary existing-tile
+pixel edits. Visibility is invalidated by camera bounds or allocation
+generation; instance data is additionally invalidated by residency slot
+generation. Replay format version 7 records rebuilds, cache hits, scanned and
+sorted tiles, instance bytes, and cached-visible count.
+
+`--visibility cached|rebuild` preserves the same-revision rebuild control.
+`--view-zoom Z` selects centered zoom cases for instance/texture isolation.
+On stable dense Apollo frames, caching eliminates all visibility scans, sorts,
+and instance writes and reduces application-to-submit p95 by 14%–21%.
+Allocation-heavy strokes correctly rebuild rather than using stale state.
+
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
 frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where
@@ -363,9 +377,10 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - arbitrary general edits still use full-tile content-bound rescans;
 - brush work is CPU-only;
 - repeated dab/tile intersections are not yet coalesced;
-- offscreen GPU render passes have timestamps, but upload-copy execution,
-  display presentation, and input-to-photon latency are not yet instrumented;
-  current live-window timings still end at CPU queue submission.
+- offscreen GPU render passes and explicit staged upload copies have
+  timestamps, but `write_texture` transfer execution, display presentation,
+  and input-to-photon latency are not yet instrumented; current live-window
+  timings still end at CPU queue submission.
 
 ## Immediate Engineering Order
 
@@ -381,8 +396,8 @@ now governed by
    one submission per display opportunity.
 4. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-5. Persist visibility and instance state, then isolate visible-instance cost
-   from painted-screen coverage and integrated-GPU frequency state.
+5. Compare a stable lower-bandwidth display cache and presentation formats
+   after the visibility/instance matrix points away from instance rebuilding.
 6. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
 7. Capture a physical trace family covering light pressure, fast motion, long

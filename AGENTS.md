@@ -34,7 +34,10 @@ lower-power CPU/integrated-GPU test machine.
   `--texture-upload write-texture|staging-ring` selects the transfer path.
   Staging with a 0 KiB threshold is the application/replay default;
   selecting `write-texture` without an explicit threshold selects its 64 KiB
-  control. Each command first rejects known background
+  control. `--visibility cached|rebuild` selects persistent visibility and
+  instance state or its exact rebuild control. `--view-zoom Z` changes the
+  centered replay camera for renderer-isolation cases. Each command first
+  rejects known background
   applications/containers, non-performance power state, AC disconnection,
   low available memory, or a non-idle CPU.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB

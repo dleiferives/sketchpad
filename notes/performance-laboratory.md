@@ -1266,6 +1266,55 @@ This result does not establish a universal threshold. The 8 MiB fallback,
 24 MiB retained upper bound, mobile mapping behavior, format choice, and
 different brush geometry all remain qualification dimensions.
 
+#### Persistent visibility and instance state, 2026-07-25
+
+Revision `609a92e` separates two invalidation domains:
+
+- visibility: exact view bounds plus sparse layer allocation generation;
+- per-page instances: visibility generation plus GPU residency generation.
+
+Existing-tile pixel edits do not advance allocation generation. Allocation,
+reclamation, undo/redo structure changes, camera movement, eviction, and
+explicit residency clearing invalidate the appropriate cache. The hardware
+smoke test submits an unchanged second frame and requires a visibility hit, an
+instance hit, and zero additional instance-buffer bytes.
+
+Replay format version 7 adds the `cached` and exact `rebuild` controls plus
+rebuild, hit, scan, sort, byte, and cached-count fields. Dense three-run Apollo
+60 Hz medians:
+
+| Rate | Mode | Scene prepare p95 | App-to-submit p95 | Visibility work | Instance bytes |
+| ---: | --- | ---: | ---: | --- | ---: |
+| 1× | rebuild | 0.406 ms | 1.329 ms | 22 rebuilds / 4,620 scans | 147,840 |
+| 1× | cached | 0.268 ms | 1.150 ms | 22 hits / zero scans | 0 |
+| 2× | rebuild | 0.487 ms | 1.844 ms | 12 rebuilds / 2,520 scans | 80,640 |
+| 2× | cached | 0.369 ms | 1.534 ms | 12 hits / zero scans | 0 |
+| 4× | rebuild | 0.546 ms | 2.582 ms | 6 rebuilds / 1,260 scans | 40,320 |
+| 4× | cached | 0.455 ms | 2.036 ms | 6 hits / zero scans | 0 |
+
+GPU render-pass medians remain statistically unchanged, confirming this is a
+CPU preparation optimization. In a stable 253-tile stress scene, cached scene
+preparation is 0.449 ms versus 0.610 ms for rebuild. In the sparse target, five
+of six frames allocate tiles, producing five legitimate rebuilds and one hit;
+that is the intended invalidation behavior.
+
+Revision `230bf85` adds centered view zoom isolation. Stable stress results at
+4× input and 60 Hz:
+
+| View zoom | Cached visible tiles | App-to-submit p95 | GPU render p95 |
+| ---: | ---: | ---: | ---: |
+| 1× | 253 | 2.426 ms | 3.911 ms |
+| 2× | 128 | 2.289 ms | 3.908 ms |
+| 4× | 32 | 2.154 ms | 2.484 ms |
+
+The first halving leaves GPU duration unchanged, ruling out visible-instance
+count as the dominant cost across that range. Zoom 4 also changes source
+texture locality and texel reuse, so its faster pass is evidence—not proof—of
+`Rgba32Float` sampling bandwidth/cache pressure. The next experiment should
+compare direct tile sampling with a dirty-updated composited display cache in
+candidate lower-bandwidth formats. It must keep camera, output, upload work,
+and timestamp boundaries explicit.
+
 ### Periodic device laboratory
 
 At minimum:
