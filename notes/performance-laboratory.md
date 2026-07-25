@@ -787,10 +787,12 @@ temperature, and frequency state. The first setup found that an otherwise
 valid cold build could exhaust swap while unrelated desktop applications were
 active, which is exactly the interference the laboratory metadata must expose.
 
-Hardware-counter profiling is not ready on Apollo: the `perf` executable is
-absent and `perf_event_paranoid` is 3. Enabling it requires an explicit
-administrator-side setup; wall-clock benchmark and application tracing remain
-available without that change.
+Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
+per-process userspace cycles, instructions, branches, and cache events with
+`perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been
+validated against the Jasper Lake PMU, including frequency, Render/3D
+utilization, residency, and per-process activity. Vulkan diagnostics, CPU
+frequency inspection, sysstat, and temperature sensors are also installed.
 
 ### Periodic device laboratory
 
