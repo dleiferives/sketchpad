@@ -27,7 +27,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 6;
+const RESULT_VERSION: u32 = 7;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -111,6 +111,7 @@ struct Arguments {
     damage_coalescing: DamageCoalescing,
     damage_merge_cost_bytes: u64,
     upload_mode: TextureUploadMode,
+    visibility_caching: bool,
     scenes: Vec<Scene>,
     include_unpaced: bool,
     stress_strokes: usize,
@@ -172,6 +173,14 @@ struct GpuWork {
     staging_buffer_allocations: u64,
     staging_buffer_capacity: u64,
     staging_fallback_uploads: u64,
+    visibility_rebuilds: u64,
+    visibility_cache_hits: u64,
+    visibility_tiles_scanned: u64,
+    visibility_tiles_sorted: u64,
+    instance_rebuilds: u64,
+    instance_cache_hits: u64,
+    instance_bytes_written: u64,
+    cached_visible_tiles: u32,
     evictions: u64,
     resident_tiles: u32,
     visible_instances: u32,
@@ -227,6 +236,28 @@ impl GpuWork {
             staging_fallback_uploads: after
                 .staging_fallback_uploads
                 .saturating_sub(before.staging_fallback_uploads),
+            visibility_rebuilds: after
+                .visibility_rebuilds
+                .saturating_sub(before.visibility_rebuilds),
+            visibility_cache_hits: after
+                .visibility_cache_hits
+                .saturating_sub(before.visibility_cache_hits),
+            visibility_tiles_scanned: after
+                .visibility_tiles_scanned
+                .saturating_sub(before.visibility_tiles_scanned),
+            visibility_tiles_sorted: after
+                .visibility_tiles_sorted
+                .saturating_sub(before.visibility_tiles_sorted),
+            instance_rebuilds: after
+                .instance_rebuilds
+                .saturating_sub(before.instance_rebuilds),
+            instance_cache_hits: after
+                .instance_cache_hits
+                .saturating_sub(before.instance_cache_hits),
+            instance_bytes_written: after
+                .instance_bytes_written
+                .saturating_sub(before.instance_bytes_written),
+            cached_visible_tiles: after.cached_visible_tiles,
             evictions: after.evictions.saturating_sub(before.evictions),
             resident_tiles: after.resident_tiles,
             visible_instances: after.visible_instances,
@@ -267,6 +298,7 @@ struct ResultRecord {
     damage_coalescing: &'static str,
     damage_merge_cost_bytes: u64,
     upload_mode: &'static str,
+    visibility_mode: &'static str,
     frame_submissions: usize,
     run: usize,
     wall_micros: u64,
@@ -363,6 +395,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             arguments.damage_merge_cost_bytes,
             arguments.upload_mode,
         );
+        display.set_visibility_caching(arguments.visibility_caching);
         render_restored_frame(&gpu, &mut display, &layer)?;
 
         let mut expected_checksum = None;
@@ -420,6 +453,11 @@ fn run() -> Result<(), Box<dyn Error>> {
                     damage_coalescing: damage_coalescing_name(arguments.damage_coalescing),
                     damage_merge_cost_bytes: arguments.damage_merge_cost_bytes,
                     upload_mode: upload_mode_name(arguments.upload_mode),
+                    visibility_mode: if arguments.visibility_caching {
+                        "cached"
+                    } else {
+                        "rebuild"
+                    },
                     frame_submissions: timed.scene_prepare_cpu_micros.len(),
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
@@ -460,7 +498,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 output.write_all(b"\n")?;
                 output.flush()?;
                 eprintln!(
-                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
+                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} visibility={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
                     scene.name(),
                     run_index,
                     timing.name(),
@@ -471,6 +509,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .display_hz()
                         .map_or_else(|| "-".to_owned(), |hz| hz.to_string()),
                     record.upload_mode,
+                    record.visibility_mode,
                     record.frame_submissions,
                     record.wall_micros as f64 / 1_000.0,
                     record.app_to_submit_cpu.p95 as f64 / 1_000.0,
@@ -996,6 +1035,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut damage_merge_cost_bytes = DEFAULT_DAMAGE_MERGE_COST_BYTES;
     let mut damage_merge_cost_explicit = false;
     let mut upload_mode = TextureUploadMode::StagingRing;
+    let mut visibility_caching = true;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -1031,6 +1071,13 @@ fn parse_arguments() -> Result<Arguments, String> {
                     value => return Err(format!("unknown texture upload mode: {value}")),
                 };
             }
+            "--visibility" => {
+                visibility_caching = match value(&mut arguments, "--visibility")?.as_str() {
+                    "cached" => true,
+                    "rebuild" => false,
+                    value => return Err(format!("unknown visibility mode: {value}")),
+                };
+            }
             "--scenes" => scenes = scenes_value(&mut arguments)?,
             "--no-unpaced" => include_unpaced = false,
             "--stress-strokes" => {
@@ -1051,6 +1098,7 @@ fn parse_arguments() -> Result<Arguments, String> {
                      \x20      [--damage-coalescing union|rect4]\n\
                      \x20      [--damage-merge-cost-kib N]\n\
                      \x20      [--texture-upload write-texture|staging-ring]\n\
+                     \x20      [--visibility cached|rebuild]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
                      \x20      [--seed N] [--revision REV]"
                 );
@@ -1072,6 +1120,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         damage_coalescing,
         damage_merge_cost_bytes,
         upload_mode,
+        visibility_caching,
         scenes,
         include_unpaced,
         stress_strokes,

@@ -187,7 +187,7 @@ pub struct BrushCursorUniform {
     pub color: [f32; 4],
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorldRect {
     pub min: [f32; 2],
     pub max: [f32; 2],
@@ -228,6 +228,14 @@ pub struct RasterPresentationStats {
     pub staging_buffer_allocations: u64,
     pub staging_buffer_capacity: u64,
     pub staging_fallback_uploads: u64,
+    pub visibility_rebuilds: u64,
+    pub visibility_cache_hits: u64,
+    pub visibility_tiles_scanned: u64,
+    pub visibility_tiles_sorted: u64,
+    pub instance_rebuilds: u64,
+    pub instance_cache_hits: u64,
+    pub instance_bytes_written: u64,
+    pub cached_visible_tiles: u32,
     pub evictions: u64,
     pub resident_tiles: u32,
     pub visible_instances: u32,
@@ -323,6 +331,15 @@ pub struct RasterDisplayPipeline {
     upload_mode: TextureUploadMode,
     queued_uploads: Vec<QueuedTileUpload>,
     staging: UploadStagingRing,
+    cached_view: Option<WorldRect>,
+    cached_allocation_generation: u64,
+    cached_visible: Vec<TileCoord>,
+    cached_protected: HashSet<TileCoord>,
+    visibility_generation: u64,
+    residency_generation: u64,
+    instance_visibility_generation: u64,
+    instance_residency_generation: u64,
+    visibility_caching: bool,
     stats: RasterPresentationStats,
 }
 
@@ -617,6 +634,15 @@ impl RasterDisplayPipeline {
                 slots: (0..STAGING_RING_SLOTS).map(|_| None).collect(),
                 ..UploadStagingRing::default()
             },
+            cached_view: None,
+            cached_allocation_generation: 0,
+            cached_visible: Vec::new(),
+            cached_protected: HashSet::new(),
+            visibility_generation: 0,
+            residency_generation: 1,
+            instance_visibility_generation: 0,
+            instance_residency_generation: 0,
+            visibility_caching: true,
             stats: RasterPresentationStats {
                 resident_pages: 1,
                 resident_capacity: page_capacity,
@@ -627,6 +653,15 @@ impl RasterDisplayPipeline {
 
     pub fn stats(&self) -> RasterPresentationStats {
         self.stats
+    }
+
+    pub fn set_visibility_caching(&mut self, enabled: bool) {
+        if self.visibility_caching != enabled {
+            self.visibility_caching = enabled;
+            self.cached_view = None;
+            self.instance_visibility_generation = 0;
+            self.instance_residency_generation = 0;
+        }
     }
 
     pub fn sync_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
@@ -701,6 +736,14 @@ impl RasterDisplayPipeline {
         self.slot_coords.fill(None);
         self.slot_last_used.fill(0);
         self.free_slots = (0..self.total_capacity()).rev().collect();
+        self.cached_view = None;
+        self.cached_visible.clear();
+        self.cached_protected.clear();
+        self.cached_allocation_generation = 0;
+        self.visibility_generation = self.visibility_generation.wrapping_add(1).max(1);
+        self.residency_generation = self.residency_generation.wrapping_add(1).max(1);
+        self.instance_visibility_generation = 0;
+        self.instance_residency_generation = 0;
         for page in &mut self.pages {
             page.instance_count = 0;
         }
@@ -709,6 +752,7 @@ impl RasterDisplayPipeline {
         self.stats.deferred_visible_tiles = 0;
         self.stats.pending_damage_tiles = 0;
         self.stats.pending_damage_regions = 0;
+        self.stats.cached_visible_tiles = 0;
     }
 
     pub fn prepare_visible(
@@ -723,76 +767,115 @@ impl RasterDisplayPipeline {
             "the previous staged uploads must be submitted before preparing another frame"
         );
         self.flush_pending_damage(layer);
-        let view_center = view.center();
-        let mut visible: Vec<TileCoord> = layer
-            .allocated_tile_coords()
-            .filter(|&coord| {
-                let bounds = layer
-                    .tile_bounds(coord)
-                    .expect("allocated tiles always lie inside the canvas");
-                view.intersects_tile(
-                    [bounds.min_x() as f32, bounds.min_y() as f32],
-                    [bounds.max_x() as f32, bounds.max_y() as f32],
-                )
-            })
-            .collect();
-        visible.sort_by(|a, b| {
-            let a_bounds = layer.tile_bounds(*a).unwrap();
-            let b_bounds = layer.tile_bounds(*b).unwrap();
-            let a_center = [
-                (a_bounds.min_x() + a_bounds.max_x()) as f32 * 0.5,
-                (a_bounds.min_y() + a_bounds.max_y()) as f32 * 0.5,
-            ];
-            let b_center = [
-                (b_bounds.min_x() + b_bounds.max_x()) as f32 * 0.5,
-                (b_bounds.min_y() + b_bounds.max_y()) as f32 * 0.5,
-            ];
-            let a_distance =
-                (a_center[0] - view_center[0]).powi(2) + (a_center[1] - view_center[1]).powi(2);
-            let b_distance =
-                (b_center[0] - view_center[0]).powi(2) + (b_center[1] - view_center[1]).powi(2);
-            a_distance.total_cmp(&b_distance)
-        });
-        self.ensure_page_capacity(device, visible.len());
-        let visible_before_limit = visible.len();
-        visible.truncate(self.total_capacity() as usize);
-        self.stats.deferred_visible_tiles =
-            visible_before_limit.saturating_sub(visible.len()) as u32;
-        let protected: HashSet<TileCoord> = visible.iter().copied().collect();
+        let allocation_generation = layer.allocation_generation();
+        let rebuild_visibility = !self.visibility_caching
+            || self.cached_view != Some(view)
+            || self.cached_allocation_generation != allocation_generation;
+        if rebuild_visibility {
+            let view_center = view.center();
+            let mut visible: Vec<TileCoord> = layer
+                .allocated_tile_coords()
+                .filter(|&coord| {
+                    let bounds = layer
+                        .tile_bounds(coord)
+                        .expect("allocated tiles always lie inside the canvas");
+                    view.intersects_tile(
+                        [bounds.min_x() as f32, bounds.min_y() as f32],
+                        [bounds.max_x() as f32, bounds.max_y() as f32],
+                    )
+                })
+                .collect();
+            self.stats.visibility_tiles_scanned = self
+                .stats
+                .visibility_tiles_scanned
+                .saturating_add(layer.allocated_tile_count() as u64);
+            self.stats.visibility_tiles_sorted = self
+                .stats
+                .visibility_tiles_sorted
+                .saturating_add(visible.len() as u64);
+            visible.sort_by(|a, b| {
+                let a_bounds = layer.tile_bounds(*a).unwrap();
+                let b_bounds = layer.tile_bounds(*b).unwrap();
+                let a_center = [
+                    (a_bounds.min_x() + a_bounds.max_x()) as f32 * 0.5,
+                    (a_bounds.min_y() + a_bounds.max_y()) as f32 * 0.5,
+                ];
+                let b_center = [
+                    (b_bounds.min_x() + b_bounds.max_x()) as f32 * 0.5,
+                    (b_bounds.min_y() + b_bounds.max_y()) as f32 * 0.5,
+                ];
+                let a_distance =
+                    (a_center[0] - view_center[0]).powi(2) + (a_center[1] - view_center[1]).powi(2);
+                let b_distance =
+                    (b_center[0] - view_center[0]).powi(2) + (b_center[1] - view_center[1]).powi(2);
+                a_distance.total_cmp(&b_distance)
+            });
+            self.ensure_page_capacity(device, visible.len());
+            let visible_before_limit = visible.len();
+            visible.truncate(self.total_capacity() as usize);
+            self.stats.deferred_visible_tiles =
+                visible_before_limit.saturating_sub(visible.len()) as u32;
+            self.cached_protected.clear();
+            self.cached_protected.extend(visible.iter().copied());
+            self.cached_visible = visible;
+            self.cached_view = Some(view);
+            self.cached_allocation_generation = allocation_generation;
+            self.visibility_generation = self.visibility_generation.wrapping_add(1).max(1);
+            self.stats.visibility_rebuilds = self.stats.visibility_rebuilds.saturating_add(1);
+        } else {
+            self.stats.visibility_cache_hits = self.stats.visibility_cache_hits.saturating_add(1);
+        }
+        self.stats.cached_visible_tiles = self.cached_visible.len() as u32;
 
-        for &coord in &visible {
+        for index in 0..self.cached_visible.len() {
+            let coord = self.cached_visible[index];
             if self.residency.contains_key(&coord) {
                 self.touch(coord);
             } else {
-                self.upload_tile(layer, coord, &protected);
+                self.upload_tile(layer, coord);
             }
         }
 
-        let mut page_instances = vec![Vec::new(); self.pages.len()];
-        for coord in visible {
-            let Some(&slot) = self.residency.get(&coord) else {
-                continue;
-            };
-            let bounds = layer
-                .tile_bounds(coord)
-                .expect("allocated tiles always lie inside the canvas");
-            let page = (slot / self.page_capacity) as usize;
-            page_instances[page].push(TileInstance {
-                origin: [bounds.min_x() as f32, bounds.min_y() as f32],
-                extent: [bounds.width() as f32, bounds.height() as f32],
-                layer: slot % self.page_capacity,
-                _padding: [0; 3],
-            });
-        }
-        let mut instance_count = 0;
-        for (page, instances) in self.pages.iter_mut().zip(page_instances) {
-            if !instances.is_empty() {
-                queue.write_buffer(&page.instance_buffer, 0, bytemuck::cast_slice(&instances));
+        let rebuild_instances = !self.visibility_caching
+            || self.instance_visibility_generation != self.visibility_generation
+            || self.instance_residency_generation != self.residency_generation;
+        if rebuild_instances {
+            let mut page_instances = vec![Vec::new(); self.pages.len()];
+            for &coord in &self.cached_visible {
+                let Some(&slot) = self.residency.get(&coord) else {
+                    continue;
+                };
+                let bounds = layer
+                    .tile_bounds(coord)
+                    .expect("allocated tiles always lie inside the canvas");
+                let page = (slot / self.page_capacity) as usize;
+                page_instances[page].push(TileInstance {
+                    origin: [bounds.min_x() as f32, bounds.min_y() as f32],
+                    extent: [bounds.width() as f32, bounds.height() as f32],
+                    layer: slot % self.page_capacity,
+                    _padding: [0; 3],
+                });
             }
-            page.instance_count = instances.len() as u32;
-            instance_count += page.instance_count;
+            let mut instance_count = 0;
+            for (page, instances) in self.pages.iter_mut().zip(page_instances) {
+                if !instances.is_empty() {
+                    let bytes = bytemuck::cast_slice(&instances);
+                    queue.write_buffer(&page.instance_buffer, 0, bytes);
+                    self.stats.instance_bytes_written = self
+                        .stats
+                        .instance_bytes_written
+                        .saturating_add(bytes.len() as u64);
+                }
+                page.instance_count = instances.len() as u32;
+                instance_count += page.instance_count;
+            }
+            self.stats.visible_instances = instance_count;
+            self.instance_visibility_generation = self.visibility_generation;
+            self.instance_residency_generation = self.residency_generation;
+            self.stats.instance_rebuilds = self.stats.instance_rebuilds.saturating_add(1);
+        } else {
+            self.stats.instance_cache_hits = self.stats.instance_cache_hits.saturating_add(1);
         }
-        self.stats.visible_instances = instance_count;
         self.stats.resident_tiles = self.residency.len() as u32;
         self.stats.resident_pages = self.pages.len() as u32;
         self.stats.resident_capacity = self.total_capacity();
@@ -1000,17 +1083,12 @@ impl RasterDisplayPipeline {
         self.slot_coords.len() as u32
     }
 
-    fn upload_tile(
-        &mut self,
-        layer: &RasterLayer,
-        coord: TileCoord,
-        protected: &HashSet<TileCoord>,
-    ) {
+    fn upload_tile(&mut self, layer: &RasterLayer, coord: TileCoord) {
         let Some(tile) = layer.tile(coord) else {
             self.remove_resident(coord);
             return;
         };
-        let slot = self.ensure_slot(coord, protected);
+        let slot = self.ensure_slot(coord);
         let local_region =
             RectU32::from_min_max(0, 0, tile.bounds().width(), tile.bounds().height())
                 .expect("allocated tiles have nonempty bounds");
@@ -1310,7 +1388,7 @@ impl RasterDisplayPipeline {
             .saturating_add(padded_region_bytes(local_region));
     }
 
-    fn ensure_slot(&mut self, coord: TileCoord, protected: &HashSet<TileCoord>) -> u32 {
+    fn ensure_slot(&mut self, coord: TileCoord) -> u32 {
         if let Some(&slot) = self.residency.get(&coord) {
             return slot;
         }
@@ -1323,7 +1401,8 @@ impl RasterDisplayPipeline {
                 .iter()
                 .enumerate()
                 .filter(|(slot, _)| {
-                    self.slot_coords[*slot].is_none_or(|resident| !protected.contains(&resident))
+                    self.slot_coords[*slot]
+                        .is_none_or(|resident| !self.cached_protected.contains(&resident))
                 })
                 .min_by_key(|(_, used)| **used)
                 .expect("a missing protected tile implies an unprotected resident slot");
@@ -1337,6 +1416,7 @@ impl RasterDisplayPipeline {
 
         self.residency.insert(coord, slot);
         self.slot_coords[slot as usize] = Some(coord);
+        self.residency_generation = self.residency_generation.wrapping_add(1).max(1);
         slot
     }
 
@@ -1347,6 +1427,7 @@ impl RasterDisplayPipeline {
         self.slot_coords[slot as usize] = None;
         self.slot_last_used[slot as usize] = 0;
         self.free_slots.push(slot);
+        self.residency_generation = self.residency_generation.wrapping_add(1).max(1);
     }
 
     fn touch(&mut self, coord: TileCoord) {

@@ -75,6 +75,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     display.encode_uploads(&mut first_upload_encoder);
     let first_upload_submission = queue.submit(iter::once(first_upload_encoder.finish()));
     display.uploads_submitted(first_upload_submission);
+    let cache_before = display.stats();
+    display.prepare_visible(
+        &device,
+        &queue,
+        &layer,
+        WorldRect {
+            min: [0.0, 0.0],
+            max: [SIZE as f32, SIZE as f32],
+        },
+    );
+    let mut cached_frame_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Smoke Cached Frame"),
+    });
+    display.encode_uploads(&mut cached_frame_encoder);
+    let cached_submission = queue.submit(iter::once(cached_frame_encoder.finish()));
+    display.uploads_submitted(cached_submission);
+    let cache_after = display.stats();
+    if cache_after.visibility_cache_hits != cache_before.visibility_cache_hits + 1
+        || cache_after.instance_cache_hits != cache_before.instance_cache_hits + 1
+        || cache_after.instance_bytes_written != cache_before.instance_bytes_written
+    {
+        return Err(format!(
+            "unchanged frame did not reuse visibility and instances: before={cache_before:?} after={cache_after:?}"
+        )
+        .into());
+    }
     let full_upload_bytes = display.stats().upload_bytes;
     let dot = HardRoundStroke::begin(&mut layer, brush, BrushSample::new([64.0, 64.0], 1.0))?;
     let dot_damage = dot

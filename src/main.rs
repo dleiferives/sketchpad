@@ -1024,6 +1024,21 @@ impl App {
         let staging_fallback_uploads = gpu_stats
             .staging_fallback_uploads
             .saturating_sub(self.metrics.gpu_baseline.staging_fallback_uploads);
+        let visibility_rebuilds = gpu_stats
+            .visibility_rebuilds
+            .saturating_sub(self.metrics.gpu_baseline.visibility_rebuilds);
+        let visibility_cache_hits = gpu_stats
+            .visibility_cache_hits
+            .saturating_sub(self.metrics.gpu_baseline.visibility_cache_hits);
+        let instance_rebuilds = gpu_stats
+            .instance_rebuilds
+            .saturating_sub(self.metrics.gpu_baseline.instance_rebuilds);
+        let instance_cache_hits = gpu_stats
+            .instance_cache_hits
+            .saturating_sub(self.metrics.gpu_baseline.instance_cache_hits);
+        let instance_bytes_written = gpu_stats
+            .instance_bytes_written
+            .saturating_sub(self.metrics.gpu_baseline.instance_bytes_written);
         let damage_regions = gpu_stats
             .damage_regions
             .saturating_sub(self.metrics.gpu_baseline.damage_regions);
@@ -1049,6 +1064,8 @@ impl App {
                  source_span_kib={:.1} padded_kib={:.1} upload_api_us={:.1} \
                  pack_us={:.1} encode_us={:.1} staging_waits={} staging_wait_us={:.1} \
                  staging_allocations={} staging_capacity_mib={:.1} staging_fallback_uploads={} \
+                 visibility_rebuilds={} visibility_hits={} cached_visible={} \
+                 instance_rebuilds={} instance_hits={} instance_kib={:.1} \
                  resident={} visible={} pages={} capacity={} \
                  deferred={} evictions={} cpu_tiles={}",
                 input.count,
@@ -1075,6 +1092,12 @@ impl App {
                 gpu_stats.staging_buffer_allocations,
                 gpu_stats.staging_buffer_capacity as f64 / (1024.0 * 1024.0),
                 staging_fallback_uploads,
+                visibility_rebuilds,
+                visibility_cache_hits,
+                gpu_stats.cached_visible_tiles,
+                instance_rebuilds,
+                instance_cache_hits,
+                instance_bytes_written as f64 / 1024.0,
                 gpu_stats.resident_tiles,
                 gpu_stats.visible_instances,
                 gpu_stats.resident_pages,

@@ -701,6 +701,7 @@ pub struct RasterLayer {
     tile_size: u32,
     tile_pixel_count: usize,
     tiles: HashMap<TileCoord, Tile>,
+    allocation_generation: u64,
     undo: Vec<HistoryEntry>,
     redo: Vec<HistoryEntry>,
     next_gesture: u64,
@@ -739,6 +740,7 @@ impl RasterLayer {
             tile_size,
             tile_pixel_count,
             tiles: HashMap::new(),
+            allocation_generation: 1,
             undo: Vec::new(),
             redo: Vec::new(),
             next_gesture: 1,
@@ -773,6 +775,10 @@ impl RasterLayer {
 
     pub fn allocated_tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    pub fn allocation_generation(&self) -> u64 {
+        self.allocation_generation
     }
 
     pub fn tile_is_allocated(&self, coord: TileCoord) -> bool {
@@ -818,6 +824,7 @@ impl RasterLayer {
         };
         state.recompute_content_bounds(self.tile_size as usize, bounds.width(), bounds.height());
         if state.content_bounds.is_some() {
+            let inserted = !self.tiles.contains_key(&coord);
             self.tiles.insert(
                 coord,
                 Tile {
@@ -826,6 +833,9 @@ impl RasterLayer {
                     snapshot_index: 0,
                 },
             );
+            if inserted {
+                self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
+            }
         }
         Ok(())
     }
@@ -1067,6 +1077,7 @@ impl RasterLayer {
 
         let RasterLayer {
             tiles,
+            allocation_generation,
             active_gesture,
             stats,
             ..
@@ -1119,6 +1130,7 @@ impl RasterLayer {
                 gesture.snapshots.push(TileSnapshot { coord, state });
                 stats.before_images_recorded += 1;
                 stats.tiles_allocated += 1;
+                *allocation_generation = allocation_generation.wrapping_add(1).max(1);
                 (
                     vacant.insert(Tile {
                         state: TileState::empty(tile_pixel_count),
@@ -1300,11 +1312,15 @@ impl RasterLayer {
 
             if remove {
                 self.tiles.remove(&snapshot.coord);
+                self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
             }
         }
     }
 
     fn restore_snapshots(&mut self, snapshots: &mut [TileSnapshot]) {
+        if !snapshots.is_empty() {
+            self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
+        }
         for snapshot in snapshots.iter_mut().rev() {
             let target = match &mut snapshot.state {
                 TileSnapshotState::Whole(state) => state.take(),
@@ -1329,6 +1345,9 @@ impl RasterLayer {
     }
 
     fn swap_history_states(&mut self, entry: &mut HistoryEntry) {
+        if !entry.snapshots.is_empty() {
+            self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
+        }
         for snapshot in &mut entry.snapshots {
             let current = self.tiles.remove(&snapshot.coord).map(|tile| tile.state);
             let target = match &mut snapshot.state {
@@ -1524,6 +1543,31 @@ mod tests {
                 content_bound_pixels_scanned: 44 * 72,
             }
         );
+    }
+
+    #[test]
+    fn allocation_generation_ignores_existing_tile_pixel_edits() {
+        let mut layer = layer();
+        let coord = TileCoord::new(0, 0);
+        let initial_generation = layer.allocation_generation();
+        let mut first = layer.scoped_gesture().unwrap();
+        first
+            .edit_tile(coord, rect(0, 0, 1, 1), |tile| {
+                tile.row_mut(0).unwrap()[0] = RED;
+            })
+            .unwrap();
+        first.commit().unwrap();
+        let allocated_generation = layer.allocation_generation();
+        assert_ne!(allocated_generation, initial_generation);
+
+        let mut second = layer.scoped_gesture().unwrap();
+        second
+            .edit_tile(coord, rect(0, 0, 1, 1), |tile| {
+                tile.row_mut(0).unwrap()[0] = BLUE;
+            })
+            .unwrap();
+        second.commit().unwrap();
+        assert_eq!(layer.allocation_generation(), allocated_generation);
     }
 
     #[test]
