@@ -1037,6 +1037,54 @@ challenger, and continue to exclude 32×32. The prototype must report actual
 allocated bytes and capture/undo/redo time; modeled traffic alone does not
 select the final representation.
 
+#### Exact 16×16 implementation comparison, 2026-07-25
+
+Revision `bb5f7c8` implemented pure 16×16 storage behind an explicit profiler
+switch while retaining whole-tile storage as the default/control. It captures
+every conservative block once, keeps per-tile payload contiguous, swaps row
+slices for undo/redo, and separately times paint/capture and undo. The
+recorded-trace oracle, cancellation, new-tile, reclaimed-tile, undo, and redo
+tests are exact.
+
+Two reversed-order 10,000-stroke dense pairs were exceptionally stable:
+
+| Dense 48 px paint | Whole tile | Pure 16×16 |
+| --- | ---: | ---: |
+| paint/capture per stroke | 1.3473 ms | 1.1449 ms |
+| explicit undo per stroke | 0.0072 ms | 0.2057 ms |
+| immediate paint+undo per stroke | 1.3547 ms | 1.3509 ms |
+| captured before-pixels per stroke | 3.152 MiB | 0.917 MiB |
+
+Thus pure blocks improve the active paint/capture boundary by 15.0% and retain
+3.44 times fewer before-pixels. Undo is about 28.5 times slower because blocks
+must preserve the after-state for redo, but remains 0.206 ms per operation on
+Apollo. The synthetic loop's immediate-undo total is effectively tied; normal
+drawing does not undo every committed stroke.
+
+The edge cases were:
+
+| Workload | Whole paint | Blocks paint | Change | Whole undo | Blocks undo | Pixel reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| empty 48 px paint | 1.4538 ms | 1.4450 ms | −0.6% | 0.0321 ms | 0.2944 ms | both zero |
+| stress 48 px erase | 1.1509 ms | 1.1182 ms | −2.8% | 0.0061 ms | 0.2456 ms | 3.41× |
+| stress 192 px paint | 3.6495 ms | 3.6760 ms | +0.7% | 0.0100 ms | 0.6096 ms | 1.90× |
+
+Pure blocks therefore are not the product policy: they waste block metadata
+and redo-copy work on newly allocated tiles, and slightly regress the active
+large-brush case.
+
+The next candidate is hybrid:
+
+- newly allocated tiles retain the existing whole-state `None` marker, which
+  already swaps ownership with zero pixel copying;
+- existing tiles use 16×16 blocks for a small first footprint;
+- an existing tile whose first conservative edit covers at least 32 of its 64
+  possible blocks uses one whole-tile clone.
+
+Keep whole and pure-block modes as controls. The 32-block threshold is a first
+measured hypothesis, not a universal constant; a later promotion mechanism may
+be needed when many initially small dabs eventually cover most of a tile.
+
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with
 `perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been

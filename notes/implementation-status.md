@@ -216,6 +216,12 @@ reclaimed, cancelled, undone, and redone tiles and passes the same
 intermediate oracle. `whole` remains the application and profiler default
 until clean comparisons justify a promotion.
 
+`--undo-storage hybrid16` is the next candidate. It keeps the zero-copy
+whole-state marker for newly allocated tiles, uses 16×16 blocks on small
+existing-tile footprints, and uses a whole snapshot when the first edit
+already covers at least 32 of a tile's 64 blocks. Whole and pure-block modes
+remain available as controls.
+
 The offscreen GPU companion is selected explicitly by adapter:
 
 ```text

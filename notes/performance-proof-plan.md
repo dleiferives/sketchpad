@@ -300,6 +300,19 @@ allocation, reclamation, undo, redo, and the full recorded-trace checkpoint
 oracle. The profiler separately reports paint/capture time and undo time plus
 capture/swap blocks and bytes.
 
+Clean Apollo results at revision `bb5f7c8` show why paint and undo must remain
+separate. On dense 48 px paint, pure blocks cut active paint/capture time by
+15.0% and before-pixels by 3.44×, while undo rises from 0.007 to 0.206 ms.
+Empty-scene paint is flat, eraser paint improves 2.8%, and 192 px paint
+regresses 0.7%.
+
+The next candidate is `Hybrid16`: use the zero-payload whole-state marker for
+new tiles; on existing tiles use whole storage when the first conservative
+edit covers at least half of the tile's 64 blocks, and blocks otherwise. Pure
+whole and pure blocks remain controls. Do not enable the candidate in the app
+until it passes the same exact oracle and improves or holds every active-paint
+row.
+
 ### 4. Transfer-path experiment
 
 Compare, with identical final readback:
