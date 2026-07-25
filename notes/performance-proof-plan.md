@@ -273,6 +273,14 @@ blocks requiring a first-write snapshot. This equivalence must not be extended
 to a future kernel that can mutate and restore the same pixel within one
 gesture; that kernel needs direct first-write marking.
 
+The first clean Apollo matrix at revision `5abeaf3` reduced modeled snapshot
+bytes by 4.97–5.02× for 8×8 blocks, 3.84–3.89× for 16×16 blocks, and
+2.66–2.70× for 32×32 blocks across sparse/dense/stress scenes. Eight-pixel
+blocks used about 3.1 times as many block records as 16-pixel blocks. Advance
+both 8×8 and 16×16 to direct implementation/performance tests; drop 32×32
+from the first comparison. The full table is in
+[performance-laboratory.md](performance-laboratory.md).
+
 ### 4. Transfer-path experiment
 
 Compare, with identical final readback:

@@ -986,6 +986,38 @@ separate paint from undo, and hardware counters still require attachment after
 the emitted `profile-ready` marker. Its immediate role is to quantify the
 whole-tile undo amplification before selecting a shadow-block representation.
 
+#### Undo shadow-block traffic matrix, 2026-07-25
+
+Committed revision `5abeaf3` measured 64 identical deterministic target-stroke
+recipes against sparse, dense, and stress scenes. Each run passed the standard
+Apollo preflight at 94–97% CPU idle, retained the exact intermediate oracle,
+and restored its initial checksum. The measurement compares final before/after
+pixels after undo, which is equivalent to first-write coverage for the current
+monotonic hard-round paint kernel.
+
+The modeled candidate contains pixel payload plus a fixed per-existing-tile
+block bitmap. It does not yet include vector capacity/allocator metadata.
+Newly allocated tiles require an allocation marker but no before-pixel payload,
+matching the current whole-tile byte counter.
+
+| Scene | Current whole tile | 8×8 | Reduction | 16×16 | Reduction | 32×32 | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| sparse | 101.25 MiB | 20.26 MiB | 5.00× | 26.12 MiB | 3.88× | 37.55 MiB | 2.70× |
+| dense | 201.75 MiB | 40.18 MiB | 5.02× | 51.91 MiB | 3.89× | 75.38 MiB | 2.68× |
+| stress | 207.50 MiB | 41.77 MiB | 4.97× | 54.03 MiB | 3.84× | 78.14 MiB | 2.66× |
+
+The dense run found 41,118 existing-tile 8×8 blocks, 13,288 16×16
+blocks, and 4,824 32×32 blocks. The stress run found 42,747, 13,829, and
+5,001 respectively. Thus 8×8 saves a further 22–23% of modeled bytes versus
+16×16 but creates roughly 3.1 times as many block records. Bitmap bytes were
+negligible; copy grouping, lookup cost, allocation layout, undo/redo speed, and
+retained heap capacity are not.
+
+Decision: advance both 8×8 and 16×16 to exact implementation tests. Drop 32×32
+from the first implementation comparison because it is consistently
+byte-dominated by 16×16. Do not select 8×8 solely from this table; first measure
+the real capture/restore representation and add large-brush and eraser cases.
+
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with
 `perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been
