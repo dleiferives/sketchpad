@@ -23,12 +23,13 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-cpu-profile-result";
-const RESULT_VERSION: u32 = 1;
+const RESULT_VERSION: u32 = 2;
 const CANVAS: [u32; 2] = [2048, 2048];
 const DEFAULT_SEED: u64 = 0x5eed_2026_0724;
 const DEFAULT_HOT_STROKES: usize = 10_000;
 const DEFAULT_UNIQUE_STROKES: usize = 64;
 const DEFAULT_WARMUP_STROKES: usize = 128;
+const DEFAULT_TRANSACTION_BATCH_STROKES: usize = 64;
 const DEFAULT_BRUSH_DIAMETER: f32 = 48.0;
 const DEFAULT_BRUSH_OPACITY: f32 = 1.0;
 const BRUSH_SPACING_FRACTION: f32 = 0.18;
@@ -114,6 +115,7 @@ struct Arguments {
     hot_strokes: usize,
     unique_strokes: usize,
     warmup_strokes: usize,
+    transaction_batch_strokes: usize,
     shadow_strokes: usize,
     brush_mode: BrushMode,
     brush_diameter: f32,
@@ -151,12 +153,16 @@ struct ProfileResult {
     shadow_blocks: Option<ShadowBlockMeasurement>,
     warmup_strokes: usize,
     unique_hot_strokes: usize,
+    transaction_batch_strokes: usize,
     hot_strokes: usize,
     hot_micros: u64,
     hot_paint_micros: u64,
     hot_undo_micros: u64,
+    hot_history_cleanup_micros: u64,
     hot_overhead_micros: u64,
     hot_strokes_per_second: f64,
+    hot_paint_strokes_per_second: f64,
+    hot_undo_strokes_per_second: f64,
     hot_dabs_emitted: u64,
     final_checksum: String,
     counters: RasterCounters,
@@ -297,6 +303,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         target_brush,
         &hot_samples,
         arguments.warmup_strokes,
+        arguments.transaction_batch_strokes,
     )?;
     require_checksum(&layer, initial_checksum, "warmup")?;
 
@@ -319,6 +326,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         target_brush,
         &hot_samples,
         arguments.hot_strokes,
+        arguments.transaction_batch_strokes,
     )?;
     let hot_duration = hot_start.elapsed();
     let counters = RasterCounters::from(layer.stats());
@@ -333,10 +341,17 @@ fn run() -> Result<(), Box<dyn Error>> {
     let hot_micros = duration_micros(hot_duration);
     let hot_paint_micros = duration_micros(hot_transactions.paint);
     let hot_undo_micros = duration_micros(hot_transactions.undo);
-    let hot_overhead_micros =
-        hot_micros.saturating_sub(hot_paint_micros.saturating_add(hot_undo_micros));
+    let hot_history_cleanup_micros = duration_micros(hot_transactions.history_cleanup);
+    let measured_phase_micros = hot_paint_micros
+        .saturating_add(hot_undo_micros)
+        .saturating_add(hot_history_cleanup_micros);
+    let hot_overhead_micros = hot_micros.saturating_sub(measured_phase_micros);
     let hot_strokes_per_second =
         arguments.hot_strokes as f64 / hot_duration.as_secs_f64().max(f64::EPSILON);
+    let hot_paint_strokes_per_second =
+        arguments.hot_strokes as f64 / hot_transactions.paint.as_secs_f64().max(f64::EPSILON);
+    let hot_undo_strokes_per_second =
+        arguments.hot_strokes as f64 / hot_transactions.undo.as_secs_f64().max(f64::EPSILON);
     let result = ProfileResult {
         format: RESULT_FORMAT,
         version: RESULT_VERSION,
@@ -367,12 +382,16 @@ fn run() -> Result<(), Box<dyn Error>> {
         shadow_blocks,
         warmup_strokes: arguments.warmup_strokes,
         unique_hot_strokes: arguments.unique_strokes,
+        transaction_batch_strokes: arguments.transaction_batch_strokes,
         hot_strokes: arguments.hot_strokes,
         hot_micros,
         hot_paint_micros,
         hot_undo_micros,
+        hot_history_cleanup_micros,
         hot_overhead_micros,
         hot_strokes_per_second,
+        hot_paint_strokes_per_second,
+        hot_undo_strokes_per_second,
         hot_dabs_emitted: hot_transactions.dabs_emitted,
         final_checksum: format!("{final_checksum:016x}"),
         counters,
@@ -714,6 +733,7 @@ struct TransactionRun {
     dabs_emitted: u64,
     paint: Duration,
     undo: Duration,
+    history_cleanup: Duration,
 }
 
 fn run_transactions(
@@ -721,29 +741,45 @@ fn run_transactions(
     brush: HardRoundBrush,
     samples: &[Vec<ReplaySample>],
     stroke_count: usize,
+    batch_strokes: usize,
 ) -> Result<TransactionRun, ReplayError> {
     let mut dabs_emitted = 0_u64;
     let mut paint = Duration::ZERO;
     let mut undo = Duration::ZERO;
-    for stroke_index in 0..stroke_count {
-        let stroke_samples = &samples[stroke_index % samples.len()];
-        let paint_start = Instant::now();
-        let outcome = paint_unpaced(layer, brush, stroke_samples)?;
-        paint += paint_start.elapsed();
-        dabs_emitted = dabs_emitted.saturating_add(outcome.dabs_emitted);
-        let undo_start = Instant::now();
-        if layer.undo().is_none() {
-            return Err(ReplayError::Invalid(format!(
-                "hot transaction {stroke_index} produced no undo entry"
-            )));
+    let mut history_cleanup = Duration::ZERO;
+    let mut stroke_index = 0;
+    while stroke_index < stroke_count {
+        let batch_len = batch_strokes.min(stroke_count - stroke_index);
+        for offset in 0..batch_len {
+            let sample_index = stroke_index + offset;
+            let stroke_samples = &samples[sample_index % samples.len()];
+            let paint_start = Instant::now();
+            let outcome = paint_unpaced(layer, brush, stroke_samples)?;
+            paint += paint_start.elapsed();
+            dabs_emitted = dabs_emitted.saturating_add(outcome.dabs_emitted);
         }
-        layer.clear_history();
+
+        let undo_start = Instant::now();
+        for offset in (0..batch_len).rev() {
+            if layer.undo().is_none() {
+                return Err(ReplayError::Invalid(format!(
+                    "hot transaction {} produced no undo entry",
+                    stroke_index + offset
+                )));
+            }
+        }
         undo += undo_start.elapsed();
+
+        let cleanup_start = Instant::now();
+        layer.clear_history();
+        history_cleanup += cleanup_start.elapsed();
+        stroke_index += batch_len;
     }
     Ok(TransactionRun {
         dabs_emitted,
         paint,
         undo,
+        history_cleanup,
     })
 }
 
@@ -824,6 +860,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut hot_strokes = DEFAULT_HOT_STROKES;
     let mut unique_strokes = DEFAULT_UNIQUE_STROKES;
     let mut warmup_strokes = DEFAULT_WARMUP_STROKES;
+    let mut transaction_batch_strokes = DEFAULT_TRANSACTION_BATCH_STROKES;
     let mut shadow_strokes = 0;
     let mut brush_mode = BrushMode::Trace;
     let mut brush_diameter = DEFAULT_BRUSH_DIAMETER;
@@ -852,6 +889,10 @@ fn parse_arguments() -> Result<Arguments, String> {
             }
             "--warmup-strokes" => {
                 warmup_strokes = nonnegative_usize(&mut arguments, "--warmup-strokes")?;
+            }
+            "--transaction-batch-strokes" => {
+                transaction_batch_strokes =
+                    positive_usize(&mut arguments, "--transaction-batch-strokes")?;
             }
             "--shadow-strokes" => {
                 shadow_strokes = nonnegative_usize(&mut arguments, "--shadow-strokes")?;
@@ -901,6 +942,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         hot_strokes,
         unique_strokes,
         warmup_strokes,
+        transaction_batch_strokes,
         shadow_strokes,
         brush_mode,
         brush_diameter,
@@ -987,7 +1029,8 @@ fn print_help() {
         "usage: cpu_profile_replay --trace PATH [--output PATH]\n\
          \x20      [--scene empty|sparse|dense|stress] [--stress-strokes N]\n\
          \x20      [--hot-strokes N] [--unique-strokes N]\n\
-         \x20      [--warmup-strokes N] [--shadow-strokes N]\n\
+         \x20      [--warmup-strokes N] [--transaction-batch-strokes N]\n\
+         \x20      [--shadow-strokes N]\n\
          \x20      [--brush-mode trace|paint|erase]\n\
          \x20      [--brush-diameter PX] [--brush-opacity UNIT]\n\
          \x20      [--undo-storage whole|blocks16]\n\
