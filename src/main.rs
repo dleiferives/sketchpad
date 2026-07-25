@@ -585,7 +585,7 @@ impl App {
 
     fn sync_damage(&mut self, damage: &Damage) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.canvas.sync_damage(&gpu.queue, &self.layer, damage);
+            gpu.canvas.sync_damage(&self.layer, damage);
         }
         self.request_redraw();
     }
@@ -999,6 +999,21 @@ impl App {
         let upload_bytes = gpu_stats
             .upload_bytes
             .saturating_sub(self.metrics.gpu_baseline.upload_bytes);
+        let upload_source_span_bytes = gpu_stats
+            .upload_source_span_bytes
+            .saturating_sub(self.metrics.gpu_baseline.upload_source_span_bytes);
+        let upload_padded_bytes = gpu_stats
+            .upload_padded_bytes
+            .saturating_sub(self.metrics.gpu_baseline.upload_padded_bytes);
+        let upload_api_nanos = gpu_stats
+            .upload_api_nanos
+            .saturating_sub(self.metrics.gpu_baseline.upload_api_nanos);
+        let damage_regions = gpu_stats
+            .damage_regions
+            .saturating_sub(self.metrics.gpu_baseline.damage_regions);
+        let coalesced_damage_regions = gpu_stats
+            .coalesced_damage_regions
+            .saturating_sub(self.metrics.gpu_baseline.coalesced_damage_regions);
         let evictions = gpu_stats
             .evictions
             .saturating_sub(self.metrics.gpu_baseline.evictions);
@@ -1007,7 +1022,9 @@ impl App {
             log::info!(
                 "perf input_count={} input_us(mean/p95/max)={}/{}/{} \
                  frame_count={} frame_us(mean/p95/max)={}/{}/{} \
-                 uploads={} upload_kib={:.1} resident={} visible={} pages={} capacity={} \
+                 damage_regions={} coalesced={} uploads={} upload_kib={:.1} \
+                 source_span_kib={:.1} padded_kib={:.1} upload_api_us={:.1} \
+                 resident={} visible={} pages={} capacity={} \
                  deferred={} evictions={} cpu_tiles={}",
                 input.count,
                 input.mean_micros,
@@ -1017,8 +1034,13 @@ impl App {
                 render.mean_micros,
                 render.p95_micros,
                 render.max_micros,
+                damage_regions,
+                coalesced_damage_regions,
                 uploads,
                 upload_bytes as f64 / 1024.0,
+                upload_source_span_bytes as f64 / 1024.0,
+                upload_padded_bytes as f64 / 1024.0,
+                upload_api_nanos as f64 / 1_000.0,
                 gpu_stats.resident_tiles,
                 gpu_stats.visible_instances,
                 gpu_stats.resident_pages,

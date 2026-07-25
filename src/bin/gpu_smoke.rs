@@ -51,7 +51,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // bind-group changes, and multi-page drawing with a small fixture.
     let mut display =
         RasterDisplayPipeline::new_with_residency_limits(&device, format, DEFAULT_TILE_SIZE, 2, 16);
-    display.sync_damage(&queue, &layer, &damage);
+    display.sync_damage(&layer, &damage);
     display.prepare_visible(
         &device,
         &queue,
@@ -66,7 +66,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let dot_damage = dot
         .finish(&mut layer)?
         .expect("the resident-tile dot must damage the layer");
-    display.sync_damage(&queue, &layer, &dot_damage);
+    display.sync_damage(&layer, &dot_damage);
+    display.sync_damage(&layer, &dot_damage);
+    display.prepare_visible(
+        &device,
+        &queue,
+        &layer,
+        WorldRect {
+            min: [0.0, 0.0],
+            max: [SIZE as f32, SIZE as f32],
+        },
+    );
     let partial_upload_bytes = display.stats().upload_bytes - full_upload_bytes;
     let full_tile_bytes = DEFAULT_TILE_SIZE as u64
         * DEFAULT_TILE_SIZE as u64
@@ -203,19 +213,28 @@ fn main() -> Result<(), Box<dyn Error>> {
     if stats.resident_pages < 2
         || stats.visible_instances != stats.resident_tiles
         || stats.deferred_visible_tiles != 0
+        || stats.pending_damage_tiles != 0
+        || stats.coalesced_damage_regions == 0
+        || stats.upload_source_span_bytes < stats.upload_bytes
+        || stats.upload_padded_bytes < stats.upload_bytes
     {
         return Err(format!("multi-page residency invariant failed: {stats:?}").into());
     }
     println!(
-        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} uploads={} upload_bytes={} partial_upload_bytes={}",
+        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} coalesced={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} partial_upload_bytes={}",
         adapter.get_info().name,
         dark_pixels,
         cursor_pixels,
         stats.resident_tiles,
         stats.resident_pages,
         stats.resident_capacity,
+        stats.damage_regions,
+        stats.coalesced_damage_regions,
         stats.tile_uploads,
         stats.upload_bytes,
+        stats.upload_source_span_bytes,
+        stats.upload_padded_bytes,
+        stats.upload_api_nanos,
         partial_upload_bytes
     );
     Ok(())

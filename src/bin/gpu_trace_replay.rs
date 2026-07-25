@@ -26,7 +26,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 1;
+const RESULT_VERSION: u32 = 2;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -136,8 +136,15 @@ struct Distribution {
 
 #[derive(Clone, Copy, Serialize)]
 struct GpuWork {
+    damage_regions: u64,
+    coalesced_damage_regions: u64,
     tile_uploads: u64,
+    full_tile_uploads: u64,
+    partial_tile_uploads: u64,
     upload_bytes: u64,
+    upload_source_span_bytes: u64,
+    upload_padded_bytes: u64,
+    upload_api_nanos: u64,
     evictions: u64,
     resident_tiles: u32,
     visible_instances: u32,
@@ -149,8 +156,27 @@ struct GpuWork {
 impl GpuWork {
     fn between(before: RasterPresentationStats, after: RasterPresentationStats) -> Self {
         Self {
+            damage_regions: after.damage_regions.saturating_sub(before.damage_regions),
+            coalesced_damage_regions: after
+                .coalesced_damage_regions
+                .saturating_sub(before.coalesced_damage_regions),
             tile_uploads: after.tile_uploads.saturating_sub(before.tile_uploads),
+            full_tile_uploads: after
+                .full_tile_uploads
+                .saturating_sub(before.full_tile_uploads),
+            partial_tile_uploads: after
+                .partial_tile_uploads
+                .saturating_sub(before.partial_tile_uploads),
             upload_bytes: after.upload_bytes.saturating_sub(before.upload_bytes),
+            upload_source_span_bytes: after
+                .upload_source_span_bytes
+                .saturating_sub(before.upload_source_span_bytes),
+            upload_padded_bytes: after
+                .upload_padded_bytes
+                .saturating_sub(before.upload_padded_bytes),
+            upload_api_nanos: after
+                .upload_api_nanos
+                .saturating_sub(before.upload_api_nanos),
             evictions: after.evictions.saturating_sub(before.evictions),
             resident_tiles: after.resident_tiles,
             visible_instances: after.visible_instances,
@@ -370,7 +396,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 let undo_damage = layer
                     .undo()
                     .ok_or("GPU target replay did not produce an undo entry")?;
-                display.sync_damage(&gpu.queue, &layer, &undo_damage);
+                display.sync_damage(&layer, &undo_damage);
                 layer.clear_history();
                 if raster_checksum(&layer) != initial_checksum {
                     return Err(format!("GPU replay undo failed in scene {}", scene.name()).into());
@@ -526,7 +552,7 @@ fn play_gpu(
 
         let damage_sync_start = Instant::now();
         if !step.incremental_damage.is_empty() {
-            display.sync_damage(&gpu.queue, layer, &step.incremental_damage);
+            display.sync_damage(layer, &step.incremental_damage);
         }
         if let Some(completed) = step.outcome {
             display.reconcile_committed_damage(

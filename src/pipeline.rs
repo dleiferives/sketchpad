@@ -1,5 +1,8 @@
 use crate::raster::{Damage, RasterLayer, RectU32, TileCoord};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{hash_map::Entry, HashMap, HashSet},
+    time::Instant,
+};
 use wgpu::util::DeviceExt;
 
 pub const DEFAULT_RESIDENT_TILE_CAPACITY: u32 = 256;
@@ -45,8 +48,16 @@ impl WorldRect {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RasterPresentationStats {
+    pub damage_regions: u64,
+    pub coalesced_damage_regions: u64,
+    pub pending_damage_tiles: u32,
     pub tile_uploads: u64,
+    pub full_tile_uploads: u64,
+    pub partial_tile_uploads: u64,
     pub upload_bytes: u64,
+    pub upload_source_span_bytes: u64,
+    pub upload_padded_bytes: u64,
+    pub upload_api_nanos: u64,
     pub evictions: u64,
     pub resident_tiles: u32,
     pub visible_instances: u32,
@@ -99,6 +110,7 @@ pub struct RasterDisplayPipeline {
     slot_last_used: Vec<u64>,
     free_slots: Vec<u32>,
     use_clock: u64,
+    pending_damage: HashMap<TileCoord, RectU32>,
     stats: RasterPresentationStats,
 }
 
@@ -299,6 +311,7 @@ impl RasterDisplayPipeline {
             slot_last_used: vec![0; page_capacity as usize],
             free_slots: (0..page_capacity).rev().collect(),
             use_clock: 0,
+            pending_damage: HashMap::new(),
             stats: RasterPresentationStats {
                 resident_pages: 1,
                 resident_capacity: page_capacity,
@@ -311,28 +324,43 @@ impl RasterDisplayPipeline {
         self.stats
     }
 
-    pub fn sync_damage(&mut self, queue: &wgpu::Queue, layer: &RasterLayer, damage: &Damage) {
+    pub fn sync_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
         for (coord, region) in damage.tile_regions() {
+            self.stats.damage_regions = self.stats.damage_regions.saturating_add(1);
             if layer.tile(coord).is_none() {
+                self.pending_damage.remove(&coord);
                 self.remove_resident(coord);
             } else if self.residency.contains_key(&coord) {
-                self.upload_tile_region(queue, layer, coord, region);
+                match self.pending_damage.entry(coord) {
+                    Entry::Occupied(mut pending) => {
+                        *pending.get_mut() = pending.get().union(region);
+                        self.stats.coalesced_damage_regions =
+                            self.stats.coalesced_damage_regions.saturating_add(1);
+                    }
+                    Entry::Vacant(pending) => {
+                        pending.insert(region);
+                    }
+                }
             }
         }
+        self.stats.pending_damage_tiles = self.pending_damage.len() as u32;
         self.stats.resident_tiles = self.residency.len() as u32;
     }
 
     pub fn reconcile_committed_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
         for &coord in damage.tiles() {
             if layer.tile(coord).is_none() {
+                self.pending_damage.remove(&coord);
                 self.remove_resident(coord);
             }
         }
+        self.stats.pending_damage_tiles = self.pending_damage.len() as u32;
         self.stats.resident_tiles = self.residency.len() as u32;
     }
 
     pub fn clear_residency(&mut self) {
         self.residency.clear();
+        self.pending_damage.clear();
         self.slot_coords.fill(None);
         self.slot_last_used.fill(0);
         self.free_slots = (0..self.total_capacity()).rev().collect();
@@ -342,6 +370,7 @@ impl RasterDisplayPipeline {
         self.stats.resident_tiles = 0;
         self.stats.visible_instances = 0;
         self.stats.deferred_visible_tiles = 0;
+        self.stats.pending_damage_tiles = 0;
     }
 
     pub fn prepare_visible(
@@ -351,6 +380,7 @@ impl RasterDisplayPipeline {
         layer: &RasterLayer,
         view: WorldRect,
     ) {
+        self.flush_pending_damage(queue, layer);
         let view_center = view.center();
         let mut visible: Vec<TileCoord> = layer
             .allocated_tile_coords()
@@ -424,6 +454,19 @@ impl RasterDisplayPipeline {
         self.stats.resident_tiles = self.residency.len() as u32;
         self.stats.resident_pages = self.pages.len() as u32;
         self.stats.resident_capacity = self.total_capacity();
+    }
+
+    fn flush_pending_damage(&mut self, queue: &wgpu::Queue, layer: &RasterLayer) {
+        let pending_damage = std::mem::take(&mut self.pending_damage);
+        for (coord, region) in pending_damage {
+            if layer.tile(coord).is_none() {
+                self.remove_resident(coord);
+            } else if self.residency.contains_key(&coord) {
+                self.upload_tile_region(queue, layer, coord, region);
+            }
+        }
+        self.stats.pending_damage_tiles = 0;
+        self.stats.resident_tiles = self.residency.len() as u32;
     }
 
     pub fn write_camera(&self, queue: &wgpu::Queue, camera: CanvasUniform) {
@@ -602,7 +645,20 @@ impl RasterDisplayPipeline {
         slot: u32,
         local_region: RectU32,
     ) {
+        const PIXEL_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
+
         let start = local_region.min_y() as usize * tile.stride() + local_region.min_x() as usize;
+        let bytes_per_row = u64::from(self.tile_size) * PIXEL_BYTES;
+        let row_bytes = u64::from(local_region.width()) * PIXEL_BYTES;
+        let rows = u64::from(local_region.height());
+        let source_span_bytes = rows
+            .saturating_sub(1)
+            .saturating_mul(bytes_per_row)
+            .saturating_add(row_bytes);
+        let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+        let padded_row_bytes = row_bytes.div_ceil(alignment).saturating_mul(alignment);
+        let padded_bytes = padded_row_bytes.saturating_mul(rows);
+        let upload_start = Instant::now();
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &self.pages[(slot / self.page_capacity) as usize].texture,
@@ -626,8 +682,28 @@ impl RasterDisplayPipeline {
                 depth_or_array_layers: 1,
             },
         );
-        self.stats.tile_uploads += 1;
-        self.stats.upload_bytes += local_region.area() * std::mem::size_of::<[f32; 4]>() as u64;
+        self.stats.upload_api_nanos = self
+            .stats
+            .upload_api_nanos
+            .saturating_add(upload_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        self.stats.tile_uploads = self.stats.tile_uploads.saturating_add(1);
+        if local_region.width() == tile.bounds().width()
+            && local_region.height() == tile.bounds().height()
+        {
+            self.stats.full_tile_uploads = self.stats.full_tile_uploads.saturating_add(1);
+        } else {
+            self.stats.partial_tile_uploads = self.stats.partial_tile_uploads.saturating_add(1);
+        }
+        self.stats.upload_bytes = self
+            .stats
+            .upload_bytes
+            .saturating_add(local_region.area().saturating_mul(PIXEL_BYTES));
+        self.stats.upload_source_span_bytes = self
+            .stats
+            .upload_source_span_bytes
+            .saturating_add(source_span_bytes);
+        self.stats.upload_padded_bytes =
+            self.stats.upload_padded_bytes.saturating_add(padded_bytes);
     }
 
     fn ensure_slot(&mut self, coord: TileCoord, protected: &HashSet<TileCoord>) -> u32 {
