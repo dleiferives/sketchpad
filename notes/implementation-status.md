@@ -197,6 +197,15 @@ exactly match the prepared scene. This workload is for profiling the
 transaction region; it does not replace the latency distributions from
 `trace_replay`.
 
+Pass `--shadow-strokes N` to run an untimed undo-granularity experiment before
+the hot loop. It captures the painted damage, undoes the gesture, compares
+exact before/after pixels, and reports unique 8×8, 16×16, and 32×32 blocks,
+payload bytes, per-tile bitmap bytes, and reduction relative to current
+whole-tile snapshots. This is exact for the current monotonic hard-round
+paint/erase kernels. A future arbitrary kernel that can change a pixel and
+later restore it within one gesture must mark first writes directly rather
+than relying on final pixel differences.
+
 The offscreen GPU companion is selected explicitly by adapter:
 
 ```text

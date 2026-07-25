@@ -3,7 +3,7 @@ use sketchpad::{
     brush::HardRoundBrush,
     input::ToolKind,
     input_trace::InputTrace,
-    raster::{Damage, RasterLayer, RasterStats, DEFAULT_TILE_SIZE},
+    raster::{Damage, LinearRgba, RasterLayer, RasterStats, RectU32, TileCoord, DEFAULT_TILE_SIZE},
     replay::{
         paint_unpaced, raster_checksum, raster_damage_checksum, replay_with_checkpoints,
         DeterministicRng, ReplayCheckpoint, ReplayError, ReplaySample, StrokeGeometry,
@@ -82,6 +82,7 @@ struct Arguments {
     hot_strokes: usize,
     unique_strokes: usize,
     warmup_strokes: usize,
+    shadow_strokes: usize,
     start_delay_millis: u64,
     seed: u64,
     revision: String,
@@ -106,6 +107,7 @@ struct ProfileResult {
     oracle_dabs_emitted: u64,
     oracle_damage_checksum: String,
     oracle_damaged_tiles: usize,
+    shadow_blocks: Option<ShadowBlockMeasurement>,
     warmup_strokes: usize,
     unique_hot_strokes: usize,
     hot_strokes: usize,
@@ -123,6 +125,29 @@ struct CheckpointResult {
     raster_checksum: String,
     incremental_damage_checksum: String,
     incremental_damage_tiles: usize,
+}
+
+#[derive(Serialize)]
+struct ShadowBlockMeasurement {
+    strokes: usize,
+    changed_pixels: u64,
+    changed_tiles: u64,
+    existing_tiles: u64,
+    newly_allocated_tiles: u64,
+    whole_tile_before_images: u64,
+    whole_tile_snapshot_bytes: u64,
+    candidates: Vec<ShadowBlockCandidate>,
+}
+
+#[derive(Serialize)]
+struct ShadowBlockCandidate {
+    block_size: u32,
+    changed_blocks: u64,
+    snapshot_blocks: u64,
+    payload_bytes: u64,
+    tile_bitmap_bytes: u64,
+    modeled_snapshot_bytes: u64,
+    reduction_factor: f64,
 }
 
 impl From<&ReplayCheckpoint> for CheckpointResult {
@@ -196,6 +221,18 @@ fn run() -> Result<(), Box<dyn Error>> {
         scene_seed ^ 0xc0a5_2026_0724,
         arguments.unique_strokes,
     );
+    let shadow_blocks = if arguments.shadow_strokes > 0 {
+        Some(measure_shadow_blocks(
+            &mut layer,
+            target_brush,
+            &hot_samples,
+            arguments.shadow_strokes,
+        )?)
+    } else {
+        None
+    };
+    require_checksum(&layer, initial_checksum, "shadow-block measurement")?;
+
     run_transactions(
         &mut layer,
         target_brush,
@@ -259,6 +296,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         oracle_dabs_emitted: oracle.dabs_emitted,
         oracle_damage_checksum: format!("{:016x}", oracle.damage_checksum),
         oracle_damaged_tiles: oracle.damaged_tiles,
+        shadow_blocks,
         warmup_strokes: arguments.warmup_strokes,
         unique_hot_strokes: arguments.unique_strokes,
         hot_strokes: arguments.hot_strokes,
@@ -436,6 +474,169 @@ fn build_hot_samples(
         .collect()
 }
 
+struct PaintedRegion {
+    coord: TileCoord,
+    region: RectU32,
+    pixels: Vec<LinearRgba>,
+}
+
+fn measure_shadow_blocks(
+    layer: &mut RasterLayer,
+    brush: HardRoundBrush,
+    samples: &[Vec<ReplaySample>],
+    stroke_count: usize,
+) -> Result<ShadowBlockMeasurement, ReplayError> {
+    const BLOCK_SIZES: [u32; 3] = [8, 16, 32];
+
+    let mut changed_pixels = 0_u64;
+    let mut changed_tiles = 0_u64;
+    let mut existing_tiles = 0_u64;
+    let mut newly_allocated_tiles = 0_u64;
+    let mut changed_blocks = [0_u64; BLOCK_SIZES.len()];
+    let mut snapshot_blocks = [0_u64; BLOCK_SIZES.len()];
+    let mut tile_bitmap_bytes = [0_u64; BLOCK_SIZES.len()];
+
+    layer.clear_history();
+    layer.reset_stats();
+    for stroke_index in 0..stroke_count {
+        let stroke_samples = &samples[stroke_index % samples.len()];
+        let outcome = paint_unpaced(layer, brush, stroke_samples)?;
+        let mut painted_regions = Vec::new();
+        if let Some(damage) = &outcome.damage {
+            for (coord, region) in damage.tile_regions() {
+                let mut pixels = Vec::with_capacity(region.area() as usize);
+                for y in region.min_y()..region.max_y() {
+                    for x in region.min_x()..region.max_x() {
+                        pixels.push(
+                            layer
+                                .pixel(x, y)
+                                .expect("gesture damage remains inside the canvas"),
+                        );
+                    }
+                }
+                painted_regions.push(PaintedRegion {
+                    coord,
+                    region,
+                    pixels,
+                });
+            }
+        }
+
+        if layer.undo().is_none() {
+            return Err(ReplayError::Invalid(format!(
+                "shadow measurement stroke {stroke_index} produced no undo entry"
+            )));
+        }
+
+        for painted in painted_regions {
+            let tile_bounds = layer
+                .tile_bounds(painted.coord)
+                .expect("gesture damage references a valid tile");
+            let existed_before = layer.tile(painted.coord).is_some();
+            let mut block_masks: Vec<Vec<bool>> = BLOCK_SIZES
+                .iter()
+                .map(|block_size| {
+                    let blocks_wide = layer.tile_size().div_ceil(*block_size);
+                    vec![false; (blocks_wide * blocks_wide) as usize]
+                })
+                .collect();
+            let mut region_changed_pixels = 0_u64;
+            let mut painted_index = 0;
+
+            for y in painted.region.min_y()..painted.region.max_y() {
+                for x in painted.region.min_x()..painted.region.max_x() {
+                    let after = painted.pixels[painted_index];
+                    painted_index += 1;
+                    let before = layer
+                        .pixel(x, y)
+                        .expect("gesture damage remains inside the canvas");
+                    if before == after {
+                        continue;
+                    }
+
+                    region_changed_pixels += 1;
+                    let local_x = x - tile_bounds.min_x();
+                    let local_y = y - tile_bounds.min_y();
+                    for (candidate_index, block_size) in BLOCK_SIZES.iter().enumerate() {
+                        let blocks_wide = layer.tile_size().div_ceil(*block_size);
+                        let block_x = local_x / block_size;
+                        let block_y = local_y / block_size;
+                        block_masks[candidate_index][(block_y * blocks_wide + block_x) as usize] =
+                            true;
+                    }
+                }
+            }
+
+            if region_changed_pixels == 0 {
+                continue;
+            }
+            changed_pixels = changed_pixels.saturating_add(region_changed_pixels);
+            changed_tiles += 1;
+            if existed_before {
+                existing_tiles += 1;
+            } else {
+                newly_allocated_tiles += 1;
+            }
+            for (candidate_index, block_size) in BLOCK_SIZES.iter().enumerate() {
+                let blocks = block_masks[candidate_index]
+                    .iter()
+                    .filter(|touched| **touched)
+                    .count() as u64;
+                changed_blocks[candidate_index] =
+                    changed_blocks[candidate_index].saturating_add(blocks);
+                if existed_before {
+                    snapshot_blocks[candidate_index] =
+                        snapshot_blocks[candidate_index].saturating_add(blocks);
+                    let blocks_wide = layer.tile_size().div_ceil(*block_size);
+                    tile_bitmap_bytes[candidate_index] = tile_bitmap_bytes[candidate_index]
+                        .saturating_add(u64::from((blocks_wide * blocks_wide).div_ceil(8)));
+                }
+            }
+        }
+        layer.clear_history();
+    }
+
+    let current = layer.stats();
+    let candidates = BLOCK_SIZES
+        .into_iter()
+        .enumerate()
+        .map(|(candidate_index, block_size)| {
+            let payload_bytes = snapshot_blocks[candidate_index]
+                .saturating_mul(u64::from(block_size))
+                .saturating_mul(u64::from(block_size))
+                .saturating_mul(std::mem::size_of::<LinearRgba>() as u64);
+            let modeled_snapshot_bytes =
+                payload_bytes.saturating_add(tile_bitmap_bytes[candidate_index]);
+            let reduction_factor = if modeled_snapshot_bytes == 0 {
+                0.0
+            } else {
+                current.snapshot_bytes as f64 / modeled_snapshot_bytes as f64
+            };
+            ShadowBlockCandidate {
+                block_size,
+                changed_blocks: changed_blocks[candidate_index],
+                snapshot_blocks: snapshot_blocks[candidate_index],
+                payload_bytes,
+                tile_bitmap_bytes: tile_bitmap_bytes[candidate_index],
+                modeled_snapshot_bytes,
+                reduction_factor,
+            }
+        })
+        .collect();
+    layer.reset_stats();
+
+    Ok(ShadowBlockMeasurement {
+        strokes: stroke_count,
+        changed_pixels,
+        changed_tiles,
+        existing_tiles,
+        newly_allocated_tiles,
+        whole_tile_before_images: current.before_images_recorded,
+        whole_tile_snapshot_bytes: current.snapshot_bytes,
+        candidates,
+    })
+}
+
 fn run_transactions(
     layer: &mut RasterLayer,
     brush: HardRoundBrush,
@@ -509,6 +710,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut hot_strokes = DEFAULT_HOT_STROKES;
     let mut unique_strokes = DEFAULT_UNIQUE_STROKES;
     let mut warmup_strokes = DEFAULT_WARMUP_STROKES;
+    let mut shadow_strokes = 0;
     let mut start_delay_millis = 0;
     let mut seed = DEFAULT_SEED;
     let mut revision = env::var("SKETCHPAD_REVISION").unwrap_or_else(|_| "unknown".to_owned());
@@ -532,6 +734,9 @@ fn parse_arguments() -> Result<Arguments, String> {
             }
             "--warmup-strokes" => {
                 warmup_strokes = nonnegative_usize(&mut arguments, "--warmup-strokes")?;
+            }
+            "--shadow-strokes" => {
+                shadow_strokes = nonnegative_usize(&mut arguments, "--shadow-strokes")?;
             }
             "--start-delay-ms" => {
                 start_delay_millis = string_argument(&mut arguments, "--start-delay-ms")?
@@ -561,6 +766,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         hot_strokes,
         unique_strokes,
         warmup_strokes,
+        shadow_strokes,
         start_delay_millis,
         seed,
         revision,
@@ -610,7 +816,8 @@ fn print_help() {
         "usage: cpu_profile_replay --trace PATH [--output PATH]\n\
          \x20      [--scene empty|sparse|dense|stress] [--stress-strokes N]\n\
          \x20      [--hot-strokes N] [--unique-strokes N]\n\
-         \x20      [--warmup-strokes N] [--start-delay-ms N]\n\
+         \x20      [--warmup-strokes N] [--shadow-strokes N]\n\
+         \x20      [--start-delay-ms N]\n\
          \x20      [--seed N] [--revision REV]"
     );
 }
@@ -618,11 +825,50 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sketchpad::input::TabletPhase;
 
     #[test]
     fn batch_sizes_include_all_samples_without_duplicates() {
         assert_eq!(resolved_batch_sizes(3), vec![1, 2, 3]);
         assert_eq!(resolved_batch_sizes(8), vec![1, 2, 4, 8]);
         assert_eq!(resolved_batch_sizes(68), vec![1, 2, 4, 8, 68]);
+    }
+
+    #[test]
+    fn shadow_measurement_counts_exact_existing_tile_blocks() {
+        let samples = vec![vec![
+            ReplaySample {
+                arrival_micros: 0,
+                phase: TabletPhase::Down,
+                position: [20.0, 20.0],
+                pressure: 1.0,
+            },
+            ReplaySample {
+                arrival_micros: 1,
+                phase: TabletPhase::Up,
+                position: [20.0, 20.0],
+                pressure: 1.0,
+            },
+        ]];
+        let seed_brush = HardRoundBrush::new([0.8, 0.1, 0.1], 2.0, 1.0, 0.5).unwrap();
+        let measured_brush = HardRoundBrush::new([0.1, 0.2, 0.8], 2.0, 1.0, 0.5).unwrap();
+        let mut layer = RasterLayer::new(64, 64, 64).unwrap();
+        paint_unpaced(&mut layer, seed_brush, &samples[0]).unwrap();
+        layer.clear_history();
+
+        let measurement = measure_shadow_blocks(&mut layer, measured_brush, &samples, 1).unwrap();
+
+        assert_eq!(measurement.existing_tiles, 1);
+        assert_eq!(measurement.newly_allocated_tiles, 0);
+        assert_eq!(measurement.whole_tile_before_images, 1);
+        assert_eq!(measurement.whole_tile_snapshot_bytes, 64 * 64 * 16);
+        for candidate in &measurement.candidates {
+            assert_eq!(candidate.changed_blocks, 1);
+            assert_eq!(candidate.snapshot_blocks, 1);
+            assert_eq!(
+                candidate.payload_bytes,
+                u64::from(candidate.block_size * candidate.block_size) * 16
+            );
+        }
     }
 }

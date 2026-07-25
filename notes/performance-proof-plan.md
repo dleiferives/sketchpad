@@ -265,6 +265,14 @@ Then implement the best one or two candidates behind the exact undo oracle.
 The first gate is a substantial reduction in snapshot bytes on dense/stress
 traces with no unacceptable regression on small strokes.
 
+`cpu_profile_replay --shadow-strokes N` now implements the measurement-only
+portion for the current hard-round kernels. It captures pixels in committed
+damage, undoes, and compares the exact before/after state. Because current
+paint and erase are monotonic within a gesture, final changed blocks equal the
+blocks requiring a first-write snapshot. This equivalence must not be extended
+to a future kernel that can mutate and restore the same pixel within one
+gesture; that kernel needs direct first-write marking.
+
 ### 4. Transfer-path experiment
 
 Compare, with identical final readback:
@@ -394,7 +402,8 @@ Report before/after counts appropriate to the change:
 
 ### Phase B — remove the clearest memory amplification
 
-1. add shadow-block traffic measurement for 8×8, 16×16, and 32×32;
+1. run the implemented 8×8, 16×16, and 32×32 shadow-block traffic measurement
+   across empty, sparse, dense, stress, eraser, and large-brush traces;
 2. implement the best candidate behind the exact oracle;
 3. compare snapshot bytes, CPU time, undo time, and retained memory.
 

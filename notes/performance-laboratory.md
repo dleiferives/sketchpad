@@ -960,6 +960,32 @@ with timer wake-up and CPU idle-state behavior, so lateness must be reported
 separately from computation time and eventually use a platform-appropriate
 absolute-deadline protocol.
 
+#### First region-dominated CPU transaction baseline, 2026-07-25
+
+Committed revision `d9fce8b` added `cpu_profile_replay`. A clean Apollo dense
+run prepared 128 seed strokes, proved all 68 intermediate canonical states and
+damage under 1/2/4/8/all-sample drains, warmed 128 transactions, and then ran
+10,000 precomputed paint-plus-undo transactions. Checksums and serialization
+were outside the hot interval.
+
+The aggregate hot interval was 13.506209 seconds: 1.350621 ms per transaction,
+740.4 transactions per second. This is an aggregate profiling boundary, not a
+per-stroke latency distribution. It processed 1,457,690 dabs and restored the
+prepared checksum `480a63807d651ccf` exactly.
+
+The interval recorded:
+
+- 2,051,164 tile lookups/bulk tile edits;
+- 128,257 whole-tile before-images;
+- 33,047,445,504 snapshot bytes (30.778 GiB total, 3.152 MiB per stroke);
+- 1,050,131,532 conservatively visited pixels;
+- 2,191 allocations for tiles absent from the prepared scene.
+
+This is the first clean evidence for the new measurement boundary. It does not
+separate paint from undo, and hardware counters still require attachment after
+the emitted `profile-ready` marker. Its immediate role is to quantify the
+whole-tile undo amplification before selecting a shadow-block representation.
+
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with
 `perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been
