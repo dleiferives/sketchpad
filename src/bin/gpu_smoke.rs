@@ -1,6 +1,8 @@
 use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
-    pipeline::{BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, WorldRect},
+    pipeline::{
+        BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, TextureUploadMode, WorldRect,
+    },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
 };
 use std::{error::Error, iter, sync::mpsc};
@@ -49,8 +51,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let format = wgpu::TextureFormat::Rgba8UnormSrgb;
     // Force tiny pages so the smoke test exercises page allocation, uploads,
     // bind-group changes, and multi-page drawing with a small fixture.
-    let mut display =
-        RasterDisplayPipeline::new_with_residency_limits(&device, format, DEFAULT_TILE_SIZE, 2, 16);
+    let mut display = RasterDisplayPipeline::new_with_residency_and_upload_mode(
+        &device,
+        format,
+        DEFAULT_TILE_SIZE,
+        2,
+        16,
+        TextureUploadMode::StagingRing,
+    );
     display.sync_damage(&layer, &damage);
     display.prepare_visible(
         &device,
@@ -61,6 +69,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             max: [SIZE as f32, SIZE as f32],
         },
     );
+    let mut first_upload_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Smoke Initial Uploads"),
+    });
+    display.encode_uploads(&mut first_upload_encoder);
+    let first_upload_submission = queue.submit(iter::once(first_upload_encoder.finish()));
+    display.uploads_submitted(first_upload_submission);
     let full_upload_bytes = display.stats().upload_bytes;
     let dot = HardRoundStroke::begin(&mut layer, brush, BrushSample::new([64.0, 64.0], 1.0))?;
     let dot_damage = dot
@@ -133,6 +147,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("GPU Smoke Encoder"),
     });
+    display.encode_uploads(&mut encoder);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("GPU Smoke Raster Display"),
@@ -174,6 +189,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     let submission = queue.submit(iter::once(encoder.finish()));
+    display.uploads_submitted(submission.clone());
 
     let slice = readback.slice(..);
     let (sender, receiver) = mpsc::channel();
@@ -222,7 +238,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("multi-page residency invariant failed: {stats:?}").into());
     }
     println!(
-        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} merged={} forced_merges={} merge_extra_padded_bytes={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} partial_upload_bytes={}",
+        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} merged={} forced_merges={} merge_extra_padded_bytes={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} upload_pack_nanos={} upload_encode_nanos={} staging_waits={} staging_allocations={} staging_capacity={} partial_upload_bytes={}",
         adapter.get_info().name,
         dark_pixels,
         cursor_pixels,
@@ -238,6 +254,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats.upload_source_span_bytes,
         stats.upload_padded_bytes,
         stats.upload_api_nanos,
+        stats.upload_pack_nanos,
+        stats.upload_encode_nanos,
+        stats.staging_waits,
+        stats.staging_buffer_allocations,
+        stats.staging_buffer_capacity,
         partial_upload_bytes
     );
     Ok(())

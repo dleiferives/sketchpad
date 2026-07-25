@@ -921,20 +921,6 @@ impl App {
             return;
         };
 
-        gpu.canvas
-            .prepare_visible(&gpu.device, &gpu.queue, &self.layer, camera.view_bounds());
-        gpu.canvas.write_camera(
-            &gpu.queue,
-            CanvasUniform {
-                center: camera.center,
-                zoom: camera.zoom,
-                _padding: 0.0,
-                viewport_size: [gpu.config.width as f32, gpu.config.height as f32],
-                canvas_size: camera.canvas_size,
-            },
-        );
-        gpu.canvas.write_cursor(&gpu.queue, cursor);
-
         let output = match gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(texture) => texture,
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
@@ -958,6 +944,20 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Raster Frame"),
             });
+        gpu.canvas
+            .prepare_visible(&gpu.device, &gpu.queue, &self.layer, camera.view_bounds());
+        gpu.canvas.write_camera(
+            &gpu.queue,
+            CanvasUniform {
+                center: camera.center,
+                zoom: camera.zoom,
+                _padding: 0.0,
+                viewport_size: [gpu.config.width as f32, gpu.config.height as f32],
+                canvas_size: camera.canvas_size,
+            },
+        );
+        gpu.canvas.write_cursor(&gpu.queue, cursor);
+        gpu.canvas.encode_uploads(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Raster Display"),
@@ -977,7 +977,8 @@ impl App {
             });
             gpu.canvas.draw(&mut pass);
         }
-        gpu.queue.submit(iter::once(encoder.finish()));
+        let submission = gpu.queue.submit(iter::once(encoder.finish()));
+        gpu.canvas.uploads_submitted(submission);
         gpu.queue.present(output);
         self.metrics.rendering.record(render_start.elapsed());
     }
@@ -1008,6 +1009,21 @@ impl App {
         let upload_api_nanos = gpu_stats
             .upload_api_nanos
             .saturating_sub(self.metrics.gpu_baseline.upload_api_nanos);
+        let upload_pack_nanos = gpu_stats
+            .upload_pack_nanos
+            .saturating_sub(self.metrics.gpu_baseline.upload_pack_nanos);
+        let upload_encode_nanos = gpu_stats
+            .upload_encode_nanos
+            .saturating_sub(self.metrics.gpu_baseline.upload_encode_nanos);
+        let staging_wait_nanos = gpu_stats
+            .staging_wait_nanos
+            .saturating_sub(self.metrics.gpu_baseline.staging_wait_nanos);
+        let staging_waits = gpu_stats
+            .staging_waits
+            .saturating_sub(self.metrics.gpu_baseline.staging_waits);
+        let staging_fallback_uploads = gpu_stats
+            .staging_fallback_uploads
+            .saturating_sub(self.metrics.gpu_baseline.staging_fallback_uploads);
         let damage_regions = gpu_stats
             .damage_regions
             .saturating_sub(self.metrics.gpu_baseline.damage_regions);
@@ -1031,6 +1047,8 @@ impl App {
                  damage_regions={} merged={} forced_merges={} merge_extra_kib={:.1} \
                  uploads={} upload_kib={:.1} \
                  source_span_kib={:.1} padded_kib={:.1} upload_api_us={:.1} \
+                 pack_us={:.1} encode_us={:.1} staging_waits={} staging_wait_us={:.1} \
+                 staging_allocations={} staging_capacity_mib={:.1} staging_fallback_uploads={} \
                  resident={} visible={} pages={} capacity={} \
                  deferred={} evictions={} cpu_tiles={}",
                 input.count,
@@ -1050,6 +1068,13 @@ impl App {
                 upload_source_span_bytes as f64 / 1024.0,
                 upload_padded_bytes as f64 / 1024.0,
                 upload_api_nanos as f64 / 1_000.0,
+                upload_pack_nanos as f64 / 1_000.0,
+                upload_encode_nanos as f64 / 1_000.0,
+                staging_waits,
+                staging_wait_nanos as f64 / 1_000.0,
+                gpu_stats.staging_buffer_allocations,
+                gpu_stats.staging_buffer_capacity as f64 / (1024.0 * 1024.0),
+                staging_fallback_uploads,
                 gpu_stats.resident_tiles,
                 gpu_stats.visible_instances,
                 gpu_stats.resident_pages,

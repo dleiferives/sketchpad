@@ -1,6 +1,7 @@
 use crate::raster::{Damage, RasterLayer, RectU32, TileCoord};
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
+    sync::mpsc,
     time::Instant,
 };
 use wgpu::util::DeviceExt;
@@ -11,12 +12,22 @@ pub const DEFAULT_DAMAGE_MERGE_COST_BYTES: u64 = 64 * 1024;
 
 const PIXEL_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
 const MAX_PENDING_REGIONS_PER_TILE: usize = 4;
+const STAGING_RING_SLOTS: usize = 3;
+const MIN_STAGING_BUFFER_BYTES: u64 = 1024 * 1024;
+const MAX_STAGING_FRAME_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum DamageCoalescing {
     SingleUnion,
     #[default]
     CostAware,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextureUploadMode {
+    #[default]
+    WriteTexture,
+    StagingRing,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -105,6 +116,26 @@ fn padded_region_bytes(region: RectU32) -> u64 {
         .saturating_mul(u64::from(region.height()))
 }
 
+struct TileRegionSource<'a> {
+    bytes: &'a [u8],
+    source_span_bytes: u64,
+}
+
+fn tile_region_source<'a>(
+    tile: &'a crate::raster::RasterTile<'_>,
+    local_region: RectU32,
+) -> TileRegionSource<'a> {
+    let start = local_region.min_y() as usize * tile.stride() + local_region.min_x() as usize;
+    let source_pixels = (local_region.height() as usize - 1)
+        .saturating_mul(tile.stride())
+        .saturating_add(local_region.width() as usize);
+    let pixels = &tile.pixels()[start..start + source_pixels];
+    TileRegionSource {
+        bytes: bytemuck::cast_slice(pixels),
+        source_span_bytes: (source_pixels as u64).saturating_mul(PIXEL_BYTES),
+    }
+}
+
 fn merge_extra_padded_bytes(first: RectU32, second: RectU32) -> u64 {
     padded_region_bytes(first.union(second))
         .saturating_sub(padded_region_bytes(first).saturating_add(padded_region_bytes(second)))
@@ -185,12 +216,53 @@ pub struct RasterPresentationStats {
     pub upload_source_span_bytes: u64,
     pub upload_padded_bytes: u64,
     pub upload_api_nanos: u64,
+    pub upload_pack_nanos: u64,
+    pub upload_encode_nanos: u64,
+    pub staging_wait_nanos: u64,
+    pub staging_waits: u64,
+    pub staging_buffer_allocations: u64,
+    pub staging_buffer_capacity: u64,
+    pub staging_fallback_uploads: u64,
     pub evictions: u64,
     pub resident_tiles: u32,
     pub visible_instances: u32,
     pub resident_pages: u32,
     pub resident_capacity: u32,
     pub deferred_visible_tiles: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct QueuedTileUpload {
+    coord: TileCoord,
+    slot: u32,
+    local_region: RectU32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StagedTileCopy {
+    offset: u64,
+    bytes_per_row: u32,
+    slot: u32,
+    local_region: RectU32,
+}
+
+enum StagingSlotState {
+    Mapped,
+    InFlight(wgpu::SubmissionIndex),
+}
+
+struct StagingSlot {
+    buffer: wgpu::Buffer,
+    capacity: u64,
+    state: StagingSlotState,
+}
+
+#[derive(Default)]
+struct UploadStagingRing {
+    slots: Vec<Option<StagingSlot>>,
+    next_slot: usize,
+    active_slot: Option<usize>,
+    copies: Vec<StagedTileCopy>,
 }
 
 #[repr(C)]
@@ -240,6 +312,9 @@ pub struct RasterDisplayPipeline {
     pending_damage: HashMap<TileCoord, PendingTileDamage>,
     damage_coalescing: DamageCoalescing,
     damage_merge_cost_bytes: u64,
+    upload_mode: TextureUploadMode,
+    queued_uploads: Vec<QueuedTileUpload>,
+    staging: UploadStagingRing,
     stats: RasterPresentationStats,
 }
 
@@ -253,6 +328,7 @@ impl RasterDisplayPipeline {
             MAX_RESIDENT_TILES,
             DamageCoalescing::CostAware,
             DEFAULT_DAMAGE_MERGE_COST_BYTES,
+            TextureUploadMode::WriteTexture,
         )
     }
 
@@ -271,6 +347,27 @@ impl RasterDisplayPipeline {
             MAX_RESIDENT_TILES,
             damage_coalescing,
             damage_merge_cost_bytes,
+            TextureUploadMode::WriteTexture,
+        )
+    }
+
+    pub fn new_with_transfer_configuration(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        tile_size: u32,
+        damage_coalescing: DamageCoalescing,
+        damage_merge_cost_bytes: u64,
+        upload_mode: TextureUploadMode,
+    ) -> Self {
+        Self::new_with_configuration(
+            device,
+            surface_format,
+            tile_size,
+            DEFAULT_RESIDENT_TILE_CAPACITY,
+            MAX_RESIDENT_TILES,
+            damage_coalescing,
+            damage_merge_cost_bytes,
+            upload_mode,
         )
     }
 
@@ -290,6 +387,28 @@ impl RasterDisplayPipeline {
             max_resident_tiles,
             DamageCoalescing::CostAware,
             DEFAULT_DAMAGE_MERGE_COST_BYTES,
+            TextureUploadMode::WriteTexture,
+        )
+    }
+
+    #[doc(hidden)]
+    pub fn new_with_residency_and_upload_mode(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        tile_size: u32,
+        page_capacity: u32,
+        max_resident_tiles: u32,
+        upload_mode: TextureUploadMode,
+    ) -> Self {
+        Self::new_with_configuration(
+            device,
+            surface_format,
+            tile_size,
+            page_capacity,
+            max_resident_tiles,
+            DamageCoalescing::CostAware,
+            DEFAULT_DAMAGE_MERGE_COST_BYTES,
+            upload_mode,
         )
     }
 
@@ -301,6 +420,7 @@ impl RasterDisplayPipeline {
         max_resident_tiles: u32,
         damage_coalescing: DamageCoalescing,
         damage_merge_cost_bytes: u64,
+        upload_mode: TextureUploadMode,
     ) -> Self {
         let page_capacity = page_capacity
             .min(device.limits().max_texture_array_layers)
@@ -483,6 +603,12 @@ impl RasterDisplayPipeline {
             pending_damage: HashMap::new(),
             damage_coalescing,
             damage_merge_cost_bytes,
+            upload_mode,
+            queued_uploads: Vec::new(),
+            staging: UploadStagingRing {
+                slots: (0..STAGING_RING_SLOTS).map(|_| None).collect(),
+                ..UploadStagingRing::default()
+            },
             stats: RasterPresentationStats {
                 resident_pages: 1,
                 resident_capacity: page_capacity,
@@ -563,6 +689,7 @@ impl RasterDisplayPipeline {
     pub fn clear_residency(&mut self) {
         self.residency.clear();
         self.pending_damage.clear();
+        self.queued_uploads.clear();
         self.slot_coords.fill(None);
         self.slot_last_used.fill(0);
         self.free_slots = (0..self.total_capacity()).rev().collect();
@@ -583,7 +710,11 @@ impl RasterDisplayPipeline {
         layer: &RasterLayer,
         view: WorldRect,
     ) {
-        self.flush_pending_damage(queue, layer);
+        assert!(
+            self.staging.active_slot.is_none(),
+            "the previous staged uploads must be submitted before preparing another frame"
+        );
+        self.flush_pending_damage(layer);
         let view_center = view.center();
         let mut visible: Vec<TileCoord> = layer
             .allocated_tile_coords()
@@ -625,7 +756,7 @@ impl RasterDisplayPipeline {
             if self.residency.contains_key(&coord) {
                 self.touch(coord);
             } else {
-                self.upload_tile(queue, layer, coord, &protected);
+                self.upload_tile(layer, coord, &protected);
             }
         }
 
@@ -657,22 +788,76 @@ impl RasterDisplayPipeline {
         self.stats.resident_tiles = self.residency.len() as u32;
         self.stats.resident_pages = self.pages.len() as u32;
         self.stats.resident_capacity = self.total_capacity();
+        self.prepare_uploads(device, queue, layer);
     }
 
-    fn flush_pending_damage(&mut self, queue: &wgpu::Queue, layer: &RasterLayer) {
+    fn flush_pending_damage(&mut self, layer: &RasterLayer) {
         let pending_damage = std::mem::take(&mut self.pending_damage);
         for (coord, pending) in pending_damage {
             if layer.tile(coord).is_none() {
                 self.remove_resident(coord);
             } else if self.residency.contains_key(&coord) {
                 for region in pending.regions() {
-                    self.upload_tile_region(queue, layer, coord, region);
+                    self.upload_tile_region(layer, coord, region);
                 }
             }
         }
         self.stats.pending_damage_tiles = 0;
         self.stats.pending_damage_regions = 0;
         self.stats.resident_tiles = self.residency.len() as u32;
+    }
+
+    pub fn encode_uploads(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        let Some(active_slot) = self.staging.active_slot else {
+            return;
+        };
+        let Some(slot) = self.staging.slots[active_slot].as_ref() else {
+            unreachable!("an active staging slot must exist");
+        };
+        let encode_start = Instant::now();
+        for copy in &self.staging.copies {
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &slot.buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: copy.offset,
+                        bytes_per_row: Some(copy.bytes_per_row),
+                        rows_per_image: Some(copy.local_region.height()),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.pages[(copy.slot / self.page_capacity) as usize].texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: copy.local_region.min_x(),
+                        y: copy.local_region.min_y(),
+                        z: copy.slot % self.page_capacity,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: copy.local_region.width(),
+                    height: copy.local_region.height(),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        self.stats.upload_encode_nanos = self
+            .stats
+            .upload_encode_nanos
+            .saturating_add(encode_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+    }
+
+    pub fn uploads_submitted(&mut self, submission: wgpu::SubmissionIndex) {
+        let Some(active_slot) = self.staging.active_slot.take() else {
+            return;
+        };
+        let slot = self.staging.slots[active_slot]
+            .as_mut()
+            .expect("an active staging slot must exist");
+        debug_assert!(matches!(slot.state, StagingSlotState::Mapped));
+        slot.state = StagingSlotState::InFlight(submission);
+        self.staging.copies.clear();
     }
 
     pub fn write_camera(&self, queue: &wgpu::Queue, camera: CanvasUniform) {
@@ -801,7 +986,6 @@ impl RasterDisplayPipeline {
 
     fn upload_tile(
         &mut self,
-        queue: &wgpu::Queue,
         layer: &RasterLayer,
         coord: TileCoord,
         protected: &HashSet<TileCoord>,
@@ -814,13 +998,12 @@ impl RasterDisplayPipeline {
         let local_region =
             RectU32::from_min_max(0, 0, tile.bounds().width(), tile.bounds().height())
                 .expect("allocated tiles have nonempty bounds");
-        self.write_tile_region(queue, &tile, slot, local_region);
+        self.queue_tile_region(coord, slot, local_region);
         self.touch(coord);
     }
 
     fn upload_tile_region(
         &mut self,
-        queue: &wgpu::Queue,
         layer: &RasterLayer,
         coord: TileCoord,
         global_region: RectU32,
@@ -840,8 +1023,52 @@ impl RasterDisplayPipeline {
             global_region.max_y() - tile_bounds.min_y(),
         )
         .expect("damage regions are nonempty and belong to their tile");
-        self.write_tile_region(queue, &tile, slot, local_region);
+        self.queue_tile_region(coord, slot, local_region);
         self.touch(coord);
+    }
+
+    fn queue_tile_region(&mut self, coord: TileCoord, slot: u32, local_region: RectU32) {
+        self.queued_uploads.push(QueuedTileUpload {
+            coord,
+            slot,
+            local_region,
+        });
+    }
+
+    fn prepare_uploads(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, layer: &RasterLayer) {
+        if self.queued_uploads.is_empty() {
+            return;
+        }
+
+        match self.upload_mode {
+            TextureUploadMode::WriteTexture => self.write_queued_uploads(queue, layer),
+            TextureUploadMode::StagingRing => {
+                let required_bytes: u64 = self
+                    .queued_uploads
+                    .iter()
+                    .map(|upload| padded_region_bytes(upload.local_region))
+                    .sum();
+                if required_bytes <= MAX_STAGING_FRAME_BYTES {
+                    self.pack_staged_uploads(device, layer);
+                } else {
+                    self.stats.staging_fallback_uploads = self
+                        .stats
+                        .staging_fallback_uploads
+                        .saturating_add(self.queued_uploads.len() as u64);
+                    self.write_queued_uploads(queue, layer);
+                }
+            }
+        }
+    }
+
+    fn write_queued_uploads(&mut self, queue: &wgpu::Queue, layer: &RasterLayer) {
+        let queued = std::mem::take(&mut self.queued_uploads);
+        for upload in queued {
+            let tile = layer
+                .tile(upload.coord)
+                .expect("queued uploads must refer to allocated tiles");
+            self.write_tile_region(queue, &tile, upload.slot, upload.local_region);
+        }
     }
 
     fn write_tile_region(
@@ -851,15 +1078,7 @@ impl RasterDisplayPipeline {
         slot: u32,
         local_region: RectU32,
     ) {
-        let start = local_region.min_y() as usize * tile.stride() + local_region.min_x() as usize;
-        let bytes_per_row = u64::from(self.tile_size) * PIXEL_BYTES;
-        let row_bytes = u64::from(local_region.width()) * PIXEL_BYTES;
-        let rows = u64::from(local_region.height());
-        let source_span_bytes = rows
-            .saturating_sub(1)
-            .saturating_mul(bytes_per_row)
-            .saturating_add(row_bytes);
-        let padded_bytes = padded_region_bytes(local_region);
+        let source = tile_region_source(tile, local_region);
         let upload_start = Instant::now();
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -872,7 +1091,7 @@ impl RasterDisplayPipeline {
                 },
                 aspect: wgpu::TextureAspect::All,
             },
-            bytemuck::cast_slice(&tile.pixels()[start..]),
+            source.bytes,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(self.tile_size * std::mem::size_of::<[f32; 4]>() as u32),
@@ -888,6 +1107,169 @@ impl RasterDisplayPipeline {
             .stats
             .upload_api_nanos
             .saturating_add(upload_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        self.record_upload_stats(tile, local_region, source.source_span_bytes);
+    }
+
+    fn pack_staged_uploads(&mut self, device: &wgpu::Device, layer: &RasterLayer) {
+        let queued = std::mem::take(&mut self.queued_uploads);
+        let required_bytes = queued
+            .iter()
+            .map(|upload| padded_region_bytes(upload.local_region))
+            .sum();
+        let active_slot = self.acquire_staging_slot(device, required_bytes);
+        let slot = self.staging.slots[active_slot]
+            .as_ref()
+            .expect("an acquired staging slot must exist");
+        let pack_start = Instant::now();
+        let mut mapped = slot
+            .buffer
+            .slice(..required_bytes)
+            .get_mapped_range_mut()
+            .expect("an acquired staging slot must be mapped");
+        let mut copies = Vec::with_capacity(queued.len());
+        let mut offset = 0;
+        let mut full_uploads = 0_u64;
+        let mut partial_uploads = 0_u64;
+        let mut logical_bytes = 0_u64;
+        let mut source_span_bytes = 0_u64;
+        let mut padded_bytes = 0_u64;
+        for upload in &queued {
+            let tile = layer
+                .tile(upload.coord)
+                .expect("queued uploads must refer to allocated tiles");
+            let region = upload.local_region;
+            let row_bytes = u64::from(region.width()).saturating_mul(PIXEL_BYTES);
+            let aligned_row_bytes = row_bytes
+                .div_ceil(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
+                .saturating_mul(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
+            let tile_start = region.min_y() as usize * tile.stride() + region.min_x() as usize;
+            for row in 0..region.height() as usize {
+                let source_start = tile_start + row * tile.stride();
+                let source_end = source_start + region.width() as usize;
+                let source = bytemuck::cast_slice(&tile.pixels()[source_start..source_end]);
+                let destination_start = offset as usize + row * aligned_row_bytes as usize;
+                mapped
+                    .slice(destination_start..destination_start + source.len())
+                    .copy_from_slice(source);
+            }
+            copies.push(StagedTileCopy {
+                offset,
+                bytes_per_row: aligned_row_bytes as u32,
+                slot: upload.slot,
+                local_region: region,
+            });
+            let source = tile_region_source(&tile, region);
+            if region.width() == tile.bounds().width() && region.height() == tile.bounds().height()
+            {
+                full_uploads = full_uploads.saturating_add(1);
+            } else {
+                partial_uploads = partial_uploads.saturating_add(1);
+            }
+            logical_bytes = logical_bytes.saturating_add(region.area().saturating_mul(PIXEL_BYTES));
+            source_span_bytes = source_span_bytes.saturating_add(source.source_span_bytes);
+            padded_bytes = padded_bytes.saturating_add(padded_region_bytes(region));
+            offset = offset.saturating_add(aligned_row_bytes * u64::from(region.height()));
+        }
+        drop(mapped);
+        slot.buffer.unmap();
+        self.staging.copies = copies;
+        self.stats.tile_uploads = self.stats.tile_uploads.saturating_add(queued.len() as u64);
+        self.stats.full_tile_uploads = self.stats.full_tile_uploads.saturating_add(full_uploads);
+        self.stats.partial_tile_uploads = self
+            .stats
+            .partial_tile_uploads
+            .saturating_add(partial_uploads);
+        self.stats.upload_bytes = self.stats.upload_bytes.saturating_add(logical_bytes);
+        self.stats.upload_source_span_bytes = self
+            .stats
+            .upload_source_span_bytes
+            .saturating_add(source_span_bytes);
+        self.stats.upload_padded_bytes =
+            self.stats.upload_padded_bytes.saturating_add(padded_bytes);
+        self.stats.upload_pack_nanos = self
+            .stats
+            .upload_pack_nanos
+            .saturating_add(pack_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
+        self.staging.active_slot = Some(active_slot);
+        self.staging.next_slot = (active_slot + 1) % STAGING_RING_SLOTS;
+    }
+
+    fn acquire_staging_slot(&mut self, device: &wgpu::Device, required_bytes: u64) -> usize {
+        let slot_index = self.staging.next_slot;
+        let required_capacity = required_bytes
+            .max(MIN_STAGING_BUFFER_BYTES)
+            .next_power_of_two();
+        let replace = self.staging.slots[slot_index]
+            .as_ref()
+            .is_none_or(|slot| slot.capacity < required_capacity);
+
+        if let Some(slot) = self.staging.slots[slot_index].as_mut() {
+            if let StagingSlotState::InFlight(submission) = &slot.state {
+                let wait_start = Instant::now();
+                device
+                    .poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission.clone()),
+                        timeout: None,
+                    })
+                    .expect("waiting for a staging ring slot must succeed");
+                self.stats.staging_wait_nanos = self.stats.staging_wait_nanos.saturating_add(
+                    wait_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                );
+                self.stats.staging_waits = self.stats.staging_waits.saturating_add(1);
+            }
+        }
+
+        if replace {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Raster Upload Staging Ring Slot"),
+                size: required_capacity,
+                usage: wgpu::BufferUsages::MAP_WRITE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: true,
+            });
+            self.staging.slots[slot_index] = Some(StagingSlot {
+                buffer,
+                capacity: required_capacity,
+                state: StagingSlotState::Mapped,
+            });
+            self.stats.staging_buffer_allocations =
+                self.stats.staging_buffer_allocations.saturating_add(1);
+        } else {
+            let slot = self.staging.slots[slot_index]
+                .as_mut()
+                .expect("a retained staging slot must exist");
+            let slice = slot.buffer.slice(..required_bytes);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Write, move |result| {
+                let _ = sender.send(result);
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .expect("mapping a completed staging slot must succeed");
+            receiver
+                .recv()
+                .expect("staging map callback must run")
+                .expect("staging slot remap must succeed");
+            slot.state = StagingSlotState::Mapped;
+        }
+        self.stats.staging_buffer_capacity = self
+            .staging
+            .slots
+            .iter()
+            .flatten()
+            .map(|slot| slot.capacity)
+            .sum();
+        slot_index
+    }
+
+    fn record_upload_stats(
+        &mut self,
+        tile: &crate::raster::RasterTile<'_>,
+        local_region: RectU32,
+        source_span_bytes: u64,
+    ) {
         self.stats.tile_uploads = self.stats.tile_uploads.saturating_add(1);
         if local_region.width() == tile.bounds().width()
             && local_region.height() == tile.bounds().height()
@@ -904,8 +1286,10 @@ impl RasterDisplayPipeline {
             .stats
             .upload_source_span_bytes
             .saturating_add(source_span_bytes);
-        self.stats.upload_padded_bytes =
-            self.stats.upload_padded_bytes.saturating_add(padded_bytes);
+        self.stats.upload_padded_bytes = self
+            .stats
+            .upload_padded_bytes
+            .saturating_add(padded_region_bytes(local_region));
     }
 
     fn ensure_slot(&mut self, coord: TileCoord, protected: &HashSet<TileCoord>) -> u32 {

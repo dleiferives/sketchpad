@@ -4,7 +4,7 @@ use sketchpad::{
     input_trace::InputTrace,
     pipeline::{
         BrushCursorUniform, CanvasUniform, DamageCoalescing, RasterDisplayPipeline,
-        RasterPresentationStats, WorldRect, DEFAULT_DAMAGE_MERGE_COST_BYTES,
+        RasterPresentationStats, TextureUploadMode, WorldRect, DEFAULT_DAMAGE_MERGE_COST_BYTES,
     },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
     replay::{
@@ -26,7 +26,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 5;
+const RESULT_VERSION: u32 = 6;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -109,6 +109,7 @@ struct Arguments {
     display_hz: Vec<f64>,
     damage_coalescing: DamageCoalescing,
     damage_merge_cost_bytes: u64,
+    upload_mode: TextureUploadMode,
     scenes: Vec<Scene>,
     include_unpaced: bool,
     stress_strokes: usize,
@@ -122,6 +123,7 @@ struct Gpu {
     queue: wgpu::Queue,
     target_view: wgpu::TextureView,
     timestamp_queries: bool,
+    encoder_timestamp_queries: bool,
 }
 
 struct TimedGpuStroke {
@@ -134,6 +136,7 @@ struct TimedGpuStroke {
     schedule_lateness_micros: Vec<u64>,
     sample_ready_wait_micros: Vec<u64>,
     gpu_render_pass_micros: Vec<u64>,
+    gpu_upload_copy_micros: Vec<u64>,
     outcome: StrokeOutcome,
     stats: GpuWork,
 }
@@ -161,6 +164,13 @@ struct GpuWork {
     upload_source_span_bytes: u64,
     upload_padded_bytes: u64,
     upload_api_nanos: u64,
+    upload_pack_nanos: u64,
+    upload_encode_nanos: u64,
+    staging_wait_nanos: u64,
+    staging_waits: u64,
+    staging_buffer_allocations: u64,
+    staging_buffer_capacity: u64,
+    staging_fallback_uploads: u64,
     evictions: u64,
     resident_tiles: u32,
     visible_instances: u32,
@@ -199,6 +209,23 @@ impl GpuWork {
             upload_api_nanos: after
                 .upload_api_nanos
                 .saturating_sub(before.upload_api_nanos),
+            upload_pack_nanos: after
+                .upload_pack_nanos
+                .saturating_sub(before.upload_pack_nanos),
+            upload_encode_nanos: after
+                .upload_encode_nanos
+                .saturating_sub(before.upload_encode_nanos),
+            staging_wait_nanos: after
+                .staging_wait_nanos
+                .saturating_sub(before.staging_wait_nanos),
+            staging_waits: after.staging_waits.saturating_sub(before.staging_waits),
+            staging_buffer_allocations: after
+                .staging_buffer_allocations
+                .saturating_sub(before.staging_buffer_allocations),
+            staging_buffer_capacity: after.staging_buffer_capacity,
+            staging_fallback_uploads: after
+                .staging_fallback_uploads
+                .saturating_sub(before.staging_fallback_uploads),
             evictions: after.evictions.saturating_sub(before.evictions),
             resident_tiles: after.resident_tiles,
             visible_instances: after.visible_instances,
@@ -226,6 +253,7 @@ struct ResultRecord {
     adapter_vendor: u32,
     adapter_device: u32,
     timestamp_queries: bool,
+    encoder_timestamp_queries: bool,
     canvas: [u32; 2],
     target: [u32; 2],
     tile_size: u32,
@@ -237,6 +265,7 @@ struct ResultRecord {
     display_hz: Option<f64>,
     damage_coalescing: &'static str,
     damage_merge_cost_bytes: u64,
+    upload_mode: &'static str,
     frame_submissions: usize,
     run: usize,
     wall_micros: u64,
@@ -250,6 +279,7 @@ struct ResultRecord {
     schedule_lateness: Option<Distribution>,
     sample_ready_wait: Option<Distribution>,
     gpu_render_pass: Option<Distribution>,
+    gpu_upload_copy: Option<Distribution>,
     dabs_emitted: u64,
     damaged_tiles: usize,
     checksum: String,
@@ -262,6 +292,7 @@ struct ResultRecord {
     raw_schedule_lateness_micros: Vec<u64>,
     raw_sample_ready_wait_micros: Vec<u64>,
     raw_gpu_render_pass_micros: Vec<u64>,
+    raw_gpu_upload_copy_micros: Vec<u64>,
 }
 
 fn main() {
@@ -323,12 +354,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         let mut layer = build_scene(&geometry, scene_seed, initial_strokes)?;
         let initial_checksum = raster_checksum(&layer);
-        let mut display = RasterDisplayPipeline::new_with_damage_coalescing(
+        let mut display = RasterDisplayPipeline::new_with_transfer_configuration(
             &gpu.device,
             wgpu::TextureFormat::Rgba8UnormSrgb,
             128,
             arguments.damage_coalescing,
             arguments.damage_merge_cost_bytes,
+            arguments.upload_mode,
         );
         render_restored_frame(&gpu, &mut display, &layer)?;
 
@@ -374,6 +406,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     adapter_vendor: gpu.adapter_info.vendor,
                     adapter_device: gpu.adapter_info.device,
                     timestamp_queries: gpu.timestamp_queries,
+                    encoder_timestamp_queries: gpu.encoder_timestamp_queries,
                     canvas: CANVAS,
                     target: TARGET,
                     tile_size: DEFAULT_TILE_SIZE,
@@ -385,6 +418,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     display_hz: timing.display_hz(),
                     damage_coalescing: damage_coalescing_name(arguments.damage_coalescing),
                     damage_merge_cost_bytes: arguments.damage_merge_cost_bytes,
+                    upload_mode: upload_mode_name(arguments.upload_mode),
                     frame_submissions: timed.scene_prepare_cpu_micros.len(),
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
@@ -401,6 +435,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .then(|| distribution(&timed.sample_ready_wait_micros)),
                     gpu_render_pass: (!timed.gpu_render_pass_micros.is_empty())
                         .then(|| distribution(&timed.gpu_render_pass_micros)),
+                    gpu_upload_copy: (!timed.gpu_upload_copy_micros.is_empty())
+                        .then(|| distribution(&timed.gpu_upload_copy_micros)),
                     dabs_emitted: timed.outcome.dabs_emitted,
                     damaged_tiles: timed
                         .outcome
@@ -417,12 +453,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                     raw_schedule_lateness_micros: timed.schedule_lateness_micros,
                     raw_sample_ready_wait_micros: timed.sample_ready_wait_micros,
                     raw_gpu_render_pass_micros: timed.gpu_render_pass_micros,
+                    raw_gpu_upload_copy_micros: timed.gpu_upload_copy_micros,
                 };
                 serde_json::to_writer(&mut output, &record)?;
                 output.write_all(b"\n")?;
                 output.flush()?;
                 eprintln!(
-                    "scene={} run={} timing={} rate={} display_hz={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
+                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
                     scene.name(),
                     run_index,
                     timing.name(),
@@ -432,9 +469,14 @@ fn run() -> Result<(), Box<dyn Error>> {
                     timing
                         .display_hz()
                         .map_or_else(|| "-".to_owned(), |hz| hz.to_string()),
+                    record.upload_mode,
                     record.frame_submissions,
                     record.wall_micros as f64 / 1_000.0,
                     record.app_to_submit_cpu.p95 as f64 / 1_000.0,
+                    record.gpu_upload_copy.map_or_else(
+                        || "-".to_owned(),
+                        |value| format!("{:.3}", value.p95 as f64 / 1_000.0)
+                    ),
                     record.gpu_render_pass.map_or_else(
                         || "-".to_owned(),
                         |value| format!("{:.3}", value.p95 as f64 / 1_000.0)
@@ -487,12 +529,18 @@ fn create_gpu(adapter_filter: Option<&str>) -> Result<Gpu, Box<dyn Error>> {
             .ok_or("no GPU adapter available")?
     };
     let adapter_info = adapter.get_info();
-    let timestamp_queries = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
-    let required_features = if timestamp_queries {
-        wgpu::Features::TIMESTAMP_QUERY
-    } else {
-        wgpu::Features::empty()
-    };
+    let adapter_features = adapter.features();
+    let timestamp_queries = adapter_features.contains(wgpu::Features::TIMESTAMP_QUERY);
+    let encoder_timestamp_queries = adapter_features.contains(
+        wgpu::Features::TIMESTAMP_QUERY | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS,
+    );
+    let mut required_features = wgpu::Features::empty();
+    if timestamp_queries {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY;
+    }
+    if encoder_timestamp_queries {
+        required_features |= wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+    }
     let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
         label: Some("GPU Trace Replay Device"),
         required_features,
@@ -518,6 +566,7 @@ fn create_gpu(adapter_filter: Option<&str>) -> Result<Gpu, Box<dyn Error>> {
         queue,
         target_view: target.create_view(&Default::default()),
         timestamp_queries,
+        encoder_timestamp_queries,
     })
 }
 
@@ -605,7 +654,8 @@ fn play_gpu(
     timing: Timing,
 ) -> Result<TimedGpuStroke, Box<dyn Error>> {
     let frame_groups = frame_groups(samples, timing);
-    let query_count = frame_groups.len() as u32 * 2;
+    let queries_per_frame = if gpu.encoder_timestamp_queries { 4 } else { 2 };
+    let query_count = frame_groups.len() as u32 * queries_per_frame;
     let query_set = gpu.timestamp_queries.then(|| {
         gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("GPU Trace Replay Timestamps"),
@@ -693,13 +743,32 @@ fn play_gpu(
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("GPU Trace Replay Frame"),
             });
+        let query_base = frame_index as u32 * queries_per_frame;
+        if gpu.encoder_timestamp_queries {
+            encoder.write_timestamp(
+                query_set
+                    .as_ref()
+                    .expect("encoder timestamps require a query set"),
+                query_base,
+            );
+        }
+        display.encode_uploads(&mut encoder);
+        if gpu.encoder_timestamp_queries {
+            encoder.write_timestamp(
+                query_set
+                    .as_ref()
+                    .expect("encoder timestamps require a query set"),
+                query_base + 1,
+            );
+        }
+        let render_query_base = query_base + u32::from(gpu.encoder_timestamp_queries) * 2;
         let timestamp_writes =
             query_set
                 .as_ref()
                 .map(|query_set| wgpu::RenderPassTimestampWrites {
                     query_set,
-                    beginning_of_pass_write_index: Some(frame_index as u32 * 2),
-                    end_of_pass_write_index: Some(frame_index as u32 * 2 + 1),
+                    beginning_of_pass_write_index: Some(render_query_base),
+                    end_of_pass_write_index: Some(render_query_base + 1),
                 });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -720,55 +789,65 @@ fn play_gpu(
             });
             display.draw(&mut pass);
         }
-        gpu.queue.submit(iter::once(encoder.finish()));
+        let submission = gpu.queue.submit(iter::once(encoder.finish()));
+        display.uploads_submitted(submission);
         encode_submit_cpu_micros.push(duration_micros(encode_submit_start.elapsed()));
         app_to_submit_cpu_micros.push(duration_micros(app_start.elapsed()));
     }
     let wall = start.elapsed();
     let outcome = outcome.ok_or("GPU replay did not finish")?;
-    let gpu_render_pass_micros = if let (Some(query_set), Some(resolve), Some(readback)) =
-        (&query_set, &resolve_buffer, &readback_buffer)
-    {
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("GPU Trace Replay Query Readback"),
+    let (gpu_render_pass_micros, gpu_upload_copy_micros) =
+        if let (Some(query_set), Some(resolve), Some(readback)) =
+            (&query_set, &resolve_buffer, &readback_buffer)
+        {
+            let mut encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("GPU Trace Replay Query Readback"),
+                });
+            encoder.resolve_query_set(query_set, 0..query_count, resolve, 0);
+            encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, query_bytes);
+            let submission = gpu.queue.submit(iter::once(encoder.finish()));
+            let slice = readback.slice(..);
+            let (sender, receiver) = mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
             });
-        encoder.resolve_query_set(query_set, 0..query_count, resolve, 0);
-        encoder.copy_buffer_to_buffer(resolve, 0, readback, 0, query_bytes);
-        let submission = gpu.queue.submit(iter::once(encoder.finish()));
-        let slice = readback.slice(..);
-        let (sender, receiver) = mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |result| {
-            let _ = sender.send(result);
-        });
-        gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: None,
-        })?;
-        receiver.recv()??;
-        let mapped = slice.get_mapped_range()?;
-        let timestamps: Vec<u64> = mapped
-            .chunks_exact(8)
-            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
-            .collect();
-        drop(mapped);
-        readback.unmap();
-        let period = gpu.queue.get_timestamp_period() as f64;
-        timestamps
-            .chunks_exact(2)
-            .map(|pair| {
-                let ticks = pair[1].saturating_sub(pair[0]);
+            gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })?;
+            receiver.recv()??;
+            let mapped = slice.get_mapped_range()?;
+            let timestamps: Vec<u64> = mapped
+                .chunks_exact(8)
+                .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
+                .collect();
+            drop(mapped);
+            readback.unmap();
+            let period = gpu.queue.get_timestamp_period() as f64;
+            let duration = |start: u64, end: u64| {
+                let ticks = end.saturating_sub(start);
                 (ticks as f64 * period / 1_000.0).round() as u64
-            })
-            .collect()
-    } else {
-        gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: None,
-            timeout: None,
-        })?;
-        Vec::new()
-    };
+            };
+            let mut render = Vec::with_capacity(frame_groups.len());
+            let mut upload = Vec::with_capacity(frame_groups.len());
+            for frame in timestamps.chunks_exact(queries_per_frame as usize) {
+                if gpu.encoder_timestamp_queries {
+                    upload.push(duration(frame[0], frame[1]));
+                    render.push(duration(frame[2], frame[3]));
+                } else {
+                    render.push(duration(frame[0], frame[1]));
+                }
+            }
+            (render, upload)
+        } else {
+            gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            })?;
+            (Vec::new(), Vec::new())
+        };
     Ok(TimedGpuStroke {
         wall,
         input_processing_micros,
@@ -779,6 +858,7 @@ fn play_gpu(
         schedule_lateness_micros,
         sample_ready_wait_micros,
         gpu_render_pass_micros,
+        gpu_upload_copy_micros,
         outcome,
         stats: GpuWork::between(stats_before, display.stats()),
     })
@@ -823,6 +903,7 @@ fn render_restored_frame(
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("GPU Trace Replay Warm Frame"),
         });
+    display.encode_uploads(&mut encoder);
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("GPU Trace Replay Warm Render"),
@@ -843,6 +924,7 @@ fn render_restored_frame(
         display.draw(&mut pass);
     }
     let submission = gpu.queue.submit(iter::once(encoder.finish()));
+    display.uploads_submitted(submission.clone());
     gpu.device.poll(wgpu::PollType::Wait {
         submission_index: Some(submission),
         timeout: None,
@@ -895,6 +977,13 @@ fn damage_coalescing_name(policy: DamageCoalescing) -> &'static str {
     }
 }
 
+fn upload_mode_name(mode: TextureUploadMode) -> &'static str {
+    match mode {
+        TextureUploadMode::WriteTexture => "write-texture",
+        TextureUploadMode::StagingRing => "staging-ring",
+    }
+}
+
 fn parse_arguments() -> Result<Arguments, String> {
     let mut trace = None;
     let mut output = None;
@@ -904,6 +993,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut display_hz = Vec::new();
     let mut damage_coalescing = DamageCoalescing::CostAware;
     let mut damage_merge_cost_bytes = DEFAULT_DAMAGE_MERGE_COST_BYTES;
+    let mut upload_mode = TextureUploadMode::WriteTexture;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -931,6 +1021,13 @@ fn parse_arguments() -> Result<Arguments, String> {
                 damage_merge_cost_bytes =
                     u64_value(&mut arguments, "--damage-merge-cost-kib")?.saturating_mul(1024);
             }
+            "--texture-upload" => {
+                upload_mode = match value(&mut arguments, "--texture-upload")?.as_str() {
+                    "write-texture" => TextureUploadMode::WriteTexture,
+                    "staging-ring" => TextureUploadMode::StagingRing,
+                    value => return Err(format!("unknown texture upload mode: {value}")),
+                };
+            }
             "--scenes" => scenes = scenes_value(&mut arguments)?,
             "--no-unpaced" => include_unpaced = false,
             "--stress-strokes" => {
@@ -950,6 +1047,7 @@ fn parse_arguments() -> Result<Arguments, String> {
                      \x20      [--display-hz 60,120]\n\
                      \x20      [--damage-coalescing union|rect4]\n\
                      \x20      [--damage-merge-cost-kib N]\n\
+                     \x20      [--texture-upload write-texture|staging-ring]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
                      \x20      [--seed N] [--revision REV]"
                 );
@@ -967,6 +1065,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         display_hz,
         damage_coalescing,
         damage_merge_cost_bytes,
+        upload_mode,
         scenes,
         include_unpaced,
         stress_strokes,
