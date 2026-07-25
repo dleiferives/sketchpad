@@ -349,7 +349,7 @@ impl HardRoundStroke {
             return Err(BrushError::InvalidSample);
         }
 
-        let gesture = layer.begin_gesture()?;
+        let gesture = layer.begin_brush_gesture(brush.diameter())?;
         if let Err(error) = brush.paint_dab(layer, gesture, sample) {
             let _ = layer.cancel_gesture(gesture);
             return Err(error);

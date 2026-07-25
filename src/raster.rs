@@ -189,6 +189,25 @@ pub enum UndoStorage {
     #[default]
     WholeTile,
     Blocks16,
+    BrushAdaptive16,
+}
+
+impl UndoStorage {
+    fn for_brush_diameter(self, diameter: f32, tile_size: u32) -> Self {
+        match self {
+            Self::WholeTile => Self::WholeTile,
+            Self::Blocks16 => Self::Blocks16,
+            Self::BrushAdaptive16 if diameter <= tile_size as f32 => Self::Blocks16,
+            Self::BrushAdaptive16 => Self::WholeTile,
+        }
+    }
+
+    fn without_brush_hint(self) -> Self {
+        match self {
+            Self::BrushAdaptive16 => Self::WholeTile,
+            concrete => concrete,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -670,6 +689,7 @@ struct HistoryEntry {
 
 struct ActiveGesture {
     id: GestureId,
+    undo_storage: UndoStorage,
     snapshots: Vec<TileSnapshot>,
     damage: Damage,
     pending_damage: Damage,
@@ -691,7 +711,7 @@ pub struct RasterLayer {
 
 impl RasterLayer {
     pub fn new(width: u32, height: u32, tile_size: u32) -> Result<Self, RasterError> {
-        Self::new_with_undo_storage(width, height, tile_size, UndoStorage::WholeTile)
+        Self::new_with_undo_storage(width, height, tile_size, UndoStorage::BrushAdaptive16)
     }
 
     pub fn new_with_undo_storage(
@@ -881,6 +901,21 @@ impl RasterLayer {
     }
 
     pub fn begin_gesture(&mut self) -> Result<GestureId, RasterError> {
+        self.begin_gesture_with_storage(self.undo_storage.without_brush_hint())
+    }
+
+    pub fn begin_brush_gesture(&mut self, diameter: f32) -> Result<GestureId, RasterError> {
+        let undo_storage = self
+            .undo_storage
+            .for_brush_diameter(diameter, self.tile_size);
+        self.begin_gesture_with_storage(undo_storage)
+    }
+
+    fn begin_gesture_with_storage(
+        &mut self,
+        undo_storage: UndoStorage,
+    ) -> Result<GestureId, RasterError> {
+        debug_assert_ne!(undo_storage, UndoStorage::BrushAdaptive16);
         if self.active_gesture.is_some() {
             return Err(RasterError::GestureAlreadyActive);
         }
@@ -896,6 +931,7 @@ impl RasterLayer {
 
         self.active_gesture = Some(ActiveGesture {
             id: gesture_id,
+            undo_storage,
             snapshots: Vec::new(),
             damage: Damage::default(),
             pending_damage: Damage::default(),
@@ -1027,7 +1063,6 @@ impl RasterLayer {
         let tile_pixel_count = self.tile_pixel_count;
         let tile_size_u32 = self.tile_size;
         let tile_size = tile_size_u32 as usize;
-        let undo_storage = self.undo_storage;
         let pixel_bytes = (tile_pixel_count * mem::size_of::<LinearRgba>()) as u64;
 
         let RasterLayer {
@@ -1039,6 +1074,7 @@ impl RasterLayer {
         let gesture = active_gesture
             .as_mut()
             .expect("the active gesture was validated above");
+        let undo_storage = gesture.undo_storage;
         stats.write_tile_lookups += 1;
         stats.bulk_tile_edits += 1;
         stats.conservatively_touched_pixels += local_damage.area();
@@ -1055,6 +1091,9 @@ impl RasterLayer {
                         UndoStorage::Blocks16 => TileSnapshotState::Blocks16(
                             BlockTileSnapshot::new(Some(&occupied.get().state), tile_size_u32),
                         ),
+                        UndoStorage::BrushAdaptive16 => {
+                            unreachable!("brush-adaptive storage resolves at gesture start")
+                        }
                     };
                     gesture.snapshots.push(TileSnapshot { coord, state });
                     stats.before_images_recorded += 1;
@@ -1073,6 +1112,9 @@ impl RasterLayer {
                     // marker also lets undo/redo transfer the whole tile without copying
                     // block payloads.
                     UndoStorage::Blocks16 => TileSnapshotState::Whole(None),
+                    UndoStorage::BrushAdaptive16 => {
+                        unreachable!("brush-adaptive storage resolves at gesture start")
+                    }
                 };
                 gesture.snapshots.push(TileSnapshot { coord, state });
                 stats.before_images_recorded += 1;
@@ -1506,6 +1548,33 @@ mod tests {
             128 * 128 * mem::size_of::<LinearRgba>() as u64
         );
         assert_eq!(layer.undo_depth(), 2);
+    }
+
+    #[test]
+    fn brush_adaptive_undo_resolves_once_at_gesture_start() {
+        let mut layer = RasterLayer::new(128, 128, 128).unwrap();
+        assert_eq!(layer.undo_storage(), UndoStorage::BrushAdaptive16);
+
+        let small = layer.begin_brush_gesture(128.0).unwrap();
+        assert_eq!(
+            layer.active_gesture.as_ref().unwrap().undo_storage,
+            UndoStorage::Blocks16
+        );
+        layer.cancel_gesture(small).unwrap();
+
+        let large = layer.begin_brush_gesture(128.01).unwrap();
+        assert_eq!(
+            layer.active_gesture.as_ref().unwrap().undo_storage,
+            UndoStorage::WholeTile
+        );
+        layer.cancel_gesture(large).unwrap();
+
+        let generic = layer.begin_gesture().unwrap();
+        assert_eq!(
+            layer.active_gesture.as_ref().unwrap().undo_storage,
+            UndoStorage::WholeTile
+        );
+        layer.cancel_gesture(generic).unwrap();
     }
 
     #[test]

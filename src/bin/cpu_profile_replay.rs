@@ -831,6 +831,7 @@ fn undo_storage_name(storage: UndoStorage) -> &'static str {
     match storage {
         UndoStorage::WholeTile => "whole",
         UndoStorage::Blocks16 => "blocks16",
+        UndoStorage::BrushAdaptive16 => "adaptive16",
     }
 }
 
@@ -1020,6 +1021,7 @@ fn parse_undo_storage(value: &str) -> Result<UndoStorage, String> {
     match value {
         "whole" => Ok(UndoStorage::WholeTile),
         "blocks16" => Ok(UndoStorage::Blocks16),
+        "adaptive16" => Ok(UndoStorage::BrushAdaptive16),
         _ => Err(format!("unknown undo storage: {value}")),
     }
 }
@@ -1033,7 +1035,7 @@ fn print_help() {
          \x20      [--shadow-strokes N]\n\
          \x20      [--brush-mode trace|paint|erase]\n\
          \x20      [--brush-diameter PX] [--brush-opacity UNIT]\n\
-         \x20      [--undo-storage whole|blocks16]\n\
+         \x20      [--undo-storage whole|blocks16|adaptive16]\n\
          \x20      [--start-delay-ms N]\n\
          \x20      [--seed N] [--revision REV]"
     );
@@ -1069,7 +1071,8 @@ mod tests {
         ]];
         let seed_brush = HardRoundBrush::new([0.8, 0.1, 0.1], 2.0, 1.0, 0.5).unwrap();
         let measured_brush = HardRoundBrush::new([0.1, 0.2, 0.8], 2.0, 1.0, 0.5).unwrap();
-        let mut layer = RasterLayer::new(64, 64, 64).unwrap();
+        let mut layer =
+            RasterLayer::new_with_undo_storage(64, 64, 64, UndoStorage::WholeTile).unwrap();
         paint_unpaced(&mut layer, seed_brush, &samples[0]).unwrap();
         layer.clear_history();
 
