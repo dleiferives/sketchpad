@@ -24,6 +24,7 @@ usage:
   scripts/$remote_host fetch <.artifacts/path> [local-path]
   scripts/$remote_host record [local-trace-path]
   scripts/$remote_host benchmark cpu [trace-replay-options...]
+  scripts/$remote_host benchmark profile [cpu-profile-options...]
   scripts/$remote_host benchmark gpu <adapter-filter> [gpu-replay-options...]
 EOF
   exit 2
@@ -169,6 +170,9 @@ benchmark_suite() {
   case "$kind" in
     cpu)
       ;;
+    profile)
+      label="cpu-profile"
+      ;;
     gpu)
       if [[ "$#" -lt 1 ]]; then
         usage
@@ -195,20 +199,30 @@ benchmark_suite() {
 
   run_remote_command scripts/benchmark-preflight
   run_remote_command scripts/benchmark-context "$context_artifact"
-  if [[ "$kind" == cpu ]]; then
-    run_remote_command cargo run --release --locked --bin trace_replay -- \
-      --trace traces/canonical-wacom-v1.json \
-      --output "$result_artifact" \
-      --revision "$revision" \
-      "$@"
-  else
-    run_remote_command cargo run --release --locked --bin gpu_trace_replay -- \
-      --trace traces/canonical-wacom-v1.json \
-      --output "$result_artifact" \
-      --adapter "$adapter" \
-      --revision "$revision" \
-      "$@"
-  fi
+  case "$kind" in
+    cpu)
+      run_remote_command cargo run --release --locked --bin trace_replay -- \
+        --trace traces/canonical-wacom-v1.json \
+        --output "$result_artifact" \
+        --revision "$revision" \
+        "$@"
+      ;;
+    profile)
+      run_remote_command cargo run --release --locked --bin cpu_profile_replay -- \
+        --trace traces/canonical-wacom-v1.json \
+        --output "$result_artifact" \
+        --revision "$revision" \
+        "$@"
+      ;;
+    gpu)
+      run_remote_command cargo run --release --locked --bin gpu_trace_replay -- \
+        --trace traces/canonical-wacom-v1.json \
+        --output "$result_artifact" \
+        --adapter "$adapter" \
+        --revision "$revision" \
+        "$@"
+      ;;
+  esac
   fetch_remote_artifact "$result_artifact"
   fetch_remote_artifact "$context_artifact"
   printf 'benchmark_result=%s\nbenchmark_context=%s\n' \

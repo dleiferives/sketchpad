@@ -233,6 +233,17 @@ Create a prepared-scene workload that:
 - can isolate resampling/dab generation, tile binning/lookup, first-write
   snapshotting, blending, bounds/damage maintenance, commit, and undo.
 
+The first implementation is `cpu_profile_replay`, invoked through:
+
+```text
+scripts/apollo benchmark profile --scene dense --hot-strokes 10000
+```
+
+It verifies exact 1/2/4/8/all-sample checkpoints before warmup, precomputes
+the transformed hot strokes, prints a `profile-ready` process ID, and performs
+no checksum or serialization inside its aggregate paint-plus-undo interval.
+Coarse paint/undo subdivision remains the next instrumentation step.
+
 Start with coarse spans, then subdivide only the largest span. Build profiling
 releases with line tables and frame pointers. Use allocation tools separately
 from hardware counters.

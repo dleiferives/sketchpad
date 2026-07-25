@@ -232,6 +232,71 @@ pub struct StrokeOutcome {
     pub damage: Option<Damage>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReplayCheckpoint {
+    pub sample_index: usize,
+    pub phase: TabletPhase,
+    pub raster_checksum: u64,
+    pub incremental_damage_checksum: u64,
+    pub incremental_damage_tiles: usize,
+}
+
+#[derive(Debug)]
+pub struct CheckedReplay {
+    pub checkpoints: Vec<ReplayCheckpoint>,
+    pub outcome: StrokeOutcome,
+}
+
+pub fn replay_with_checkpoints(
+    layer: &mut RasterLayer,
+    brush: HardRoundBrush,
+    samples: &[ReplaySample],
+    maximum_batch_samples: usize,
+) -> Result<CheckedReplay, ReplayError> {
+    if maximum_batch_samples == 0 {
+        return Err(ReplayError::Invalid(
+            "replay batch size must be greater than zero".to_owned(),
+        ));
+    }
+
+    let mut player = StrokePlayer::new(brush);
+    let mut checkpoints = Vec::with_capacity(samples.len());
+    let mut outcome = None;
+    let mut sample_index = 0;
+
+    for batch in samples.chunks(maximum_batch_samples) {
+        for &sample in batch {
+            let step = player.process_step(layer, sample)?;
+            checkpoints.push(ReplayCheckpoint {
+                sample_index,
+                phase: sample.phase,
+                raster_checksum: raster_checksum(layer),
+                incremental_damage_checksum: raster_damage_checksum(
+                    layer,
+                    Some(&step.incremental_damage),
+                ),
+                incremental_damage_tiles: step.incremental_damage.tiles().len(),
+            });
+            if step.outcome.is_some() {
+                outcome = step.outcome;
+            }
+            sample_index += 1;
+        }
+    }
+
+    if !player.is_finished() {
+        return Err(ReplayError::Invalid(
+            "checked replay ended without an Up sample".to_owned(),
+        ));
+    }
+    let outcome = outcome
+        .ok_or_else(|| ReplayError::Invalid("checked replay produced no outcome".to_owned()))?;
+    Ok(CheckedReplay {
+        checkpoints,
+        outcome,
+    })
+}
+
 pub fn paint_unpaced(
     layer: &mut RasterLayer,
     brush: HardRoundBrush,
@@ -520,6 +585,42 @@ mod tests {
         paint_unpaced(&mut first, brush(), &samples).unwrap();
         paint_unpaced(&mut second, brush(), &samples).unwrap();
         assert_eq!(raster_checksum(&first), raster_checksum(&second));
+    }
+
+    #[test]
+    fn input_drain_batching_preserves_every_semantic_checkpoint() {
+        let geometry = StrokeGeometry::from_trace(&trace()).unwrap();
+        let samples = geometry.transformed(geometry.canonical_transform([256, 256]));
+        let mut reference_layer = RasterLayer::new(256, 256, 64).unwrap();
+        let reference =
+            replay_with_checkpoints(&mut reference_layer, brush(), &samples, 1).unwrap();
+
+        for batch_size in [2, 4, 8, samples.len()] {
+            let mut candidate_layer = RasterLayer::new(256, 256, 64).unwrap();
+            let candidate =
+                replay_with_checkpoints(&mut candidate_layer, brush(), &samples, batch_size)
+                    .unwrap();
+            assert_eq!(candidate.checkpoints, reference.checkpoints);
+            assert_eq!(
+                candidate.outcome.dabs_emitted,
+                reference.outcome.dabs_emitted
+            );
+            assert_eq!(
+                raster_checksum(&candidate_layer),
+                raster_checksum(&reference_layer)
+            );
+        }
+    }
+
+    #[test]
+    fn checked_replay_rejects_an_empty_batch() {
+        let geometry = StrokeGeometry::from_trace(&trace()).unwrap();
+        let samples = geometry.transformed(geometry.canonical_transform([256, 256]));
+        let mut layer = RasterLayer::new(256, 256, 64).unwrap();
+        assert!(matches!(
+            replay_with_checkpoints(&mut layer, brush(), &samples, 0),
+            Err(ReplayError::Invalid(_))
+        ));
     }
 
     #[test]

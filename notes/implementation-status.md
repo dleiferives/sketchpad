@@ -182,6 +182,21 @@ raw event time and lateness arrays, percentiles, damage, allocation, snapshot,
 pixel-visit, tile, and byte counters. Optional PPM references make mismatches
 inspectable rather than reducing correctness to timing.
 
+The CPU profiling companion prepares one selected scene, verifies the same
+canonical stroke at every input boundary under 1/2/4/8/all-sample drain
+batches, warms deterministic transactions, and then repeats precomputed
+paint-plus-undo transactions with checksums and JSON outside the timed region:
+
+```text
+scripts/apollo benchmark profile --scene dense --hot-strokes 10000
+```
+
+It emits `profile-ready` with its process ID before the hot interval so Linux
+hardware counters can attach after scene/oracle setup. The final checksum must
+exactly match the prepared scene. This workload is for profiling the
+transaction region; it does not replace the latency distributions from
+`trace_replay`.
+
 The offscreen GPU companion is selected explicitly by adapter:
 
 ```text
