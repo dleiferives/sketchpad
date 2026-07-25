@@ -268,16 +268,25 @@ This is an architectural integration checkpoint, not yet the usable painter:
 
 ## Immediate Engineering Order
 
-1. Run stable repeated CPU/GPU baselines from the recorded trace on Atlas
-   Intel, Atlas NVIDIA, and Apollo, then profile the largest measured stages.
-2. Add an interactive presentation/input-to-photon measurement protocol and
-   determine how to attribute upload-copy GPU execution.
-3. Capture a small physical trace family covering light pressure, fast motion,
-   long curves, eraser use, and distinct drawing styles.
-4. Decide whether arbitrary mixed/destructive kernels need a stronger
-   nonempty-bound structure than the current full-scan fallback.
-5. Compare an 8-byte working pixel representation with the `f32` reference.
-6. Add Wayland tablet-v2 after the X11 trace is reliable.
-7. Add GPU filtering/mip experiments for navigation quality.
-8. Add a second textured brush only after hard-ink feel and latency are
-   measured.
+The measured bottlenecks, exact-quality gates, and experiment definitions are
+now governed by
+[performance-proof-plan.md](performance-proof-plan.md). The immediate order is:
+
+1. Add exact intermediate replay checkpoints, batch-schedule invariance, and a
+   region-dominated CPU profiling workload.
+2. Measure 8×8, 16×16, and 32×32 first-write undo shadow blocks, then implement
+   the best exact candidate.
+3. Add frame-paced replay that processes every sample but coalesces GPU work to
+   one submission per display opportunity.
+4. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
+   staging-ring transfers with copy timing and exact GPU readback.
+5. Persist visibility and instance state, then isolate visible-instance cost
+   from painted-screen coverage and integrated-GPU frequency state.
+6. Profile the remaining CPU kernel and only then test scanline
+   specialization, SIMD dispatch, LTO, and PGO.
+7. Capture a physical trace family covering light pressure, fast motion, long
+   curves, eraser use, and distinct drawing styles.
+8. Resume stable Atlas Intel/NVIDIA baselines only when that machine is idle;
+   use Apollo for the current constrained-hardware work.
+9. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
+   brush after the proof-system and hard-ink latency work.

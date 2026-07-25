@@ -14,6 +14,12 @@ allocation policy, and instrumentation rules in
 [performance-aware-code.md](performance-aware-code.md). The laboratory tests
 those rules; it does not replace them.
 
+The current measurements, exact-quality gate, unresolved attribution, and
+ordered optimization experiments are consolidated in
+[performance-proof-plan.md](performance-proof-plan.md). That plan governs the
+next implementation milestone; this note remains the broader benchmark and
+hardware protocol.
+
 ## Decision
 
 **Build the performance and correctness framework before treating any renderer
@@ -993,7 +999,25 @@ Do not accept:
 - hand-tuned device overrides without a portable baseline;
 - benchmark summaries without raw results and context.
 
-## First Laboratory Milestone
+## Current Performance-Proof Milestone
+
+Before treating any implementation change as an optimization:
+
+1. compare exact canonical checksums at intermediate replay boundaries;
+2. prove input-drain batching does not change document semantics;
+3. move scene construction, large checksums, and reporting outside a
+   region-dominated CPU profiling interval;
+4. measure candidate undo shadow-block traffic before changing undo storage;
+5. compare transfer mechanisms with actual padded bytes and copy execution
+   distinguished from render-pass time;
+6. introduce display-paced replay that processes every sample but submits at
+   most once per display opportunity;
+7. isolate visible instance count from painted screen coverage and DVFS.
+
+The acceptance gates and execution order live in
+[performance-proof-plan.md](performance-proof-plan.md).
+
+## Broader Laboratory Milestone
 
 The first useful milestone does not need every platform tool. It needs:
 

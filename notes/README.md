@@ -27,6 +27,10 @@ The notes are organized by purpose:
   document/input/edit/view traces, cache protocols, correctness oracles,
   measurements, regression policy, and the hardware matrix for comparing
   renderers honestly.
+- [Performance proof plan](performance-proof-plan.md) — what the current
+  Apollo/trace evidence proves, the bit-exact optimization contract, the
+  measurement gaps, and the ordered route from work amplification to
+  frame-paced rendering and specialized kernels.
 - [Performance-aware code](performance-aware-code.md) — the implementation
   doctrine derived from Casey Muratori, data-oriented design, and Rust
   performance guidance: control/pixel planes, contiguous tile kernels,
