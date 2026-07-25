@@ -300,18 +300,44 @@ allocation, reclamation, undo, redo, and the full recorded-trace checkpoint
 oracle. The profiler separately reports paint/capture time and undo time plus
 capture/swap blocks and bytes.
 
-Clean Apollo results at revision `bb5f7c8` show why paint and undo must remain
-separate. On dense 48 px paint, pure blocks cut active paint/capture time by
-15.0% and before-pixels by 3.44×, while undo rises from 0.007 to 0.206 ms.
-Empty-scene paint is flat, eraser paint improves 2.8%, and 192 px paint
-regresses 0.7%.
+The initial Apollo results at revision `bb5f7c8` used an adversarial
+one-paint/one-undo transaction loop. On dense 48 px paint, pure blocks cut the
+reported paint/capture interval by 15.0% and before-pixels by 3.44×, while
+explicit undo rose from 0.007 to 0.206 ms. Empty-scene paint was flat, eraser
+paint improved 2.8%, and 192 px paint regressed 0.7%.
 
-The next candidate is `Hybrid16`: use the zero-payload whole-state marker for
-new tiles; on existing tiles use whole storage when the first conservative
-edit covers at least half of the tile's 64 blocks, and blocks otherwise. Pure
-whole and pure blocks remain controls. Do not enable the candidate in the app
-until it passes the same exact oracle and improves or holds every active-paint
-row.
+The first `Hybrid16` experiment at revision `9dff4da` was rejected. It kept
+the zero-payload whole-state marker for new tiles and chose a whole snapshot
+when the *first* conservative edit covered at least half of a tile. Recorded
+strokes enter a tile through a small leading footprint, including the 192 px
+brush, so the threshold never fired. It retained the same block counts while
+making the block path materially slower. The experiment was removed rather
+than hidden behind an unmeasured constant.
+
+That failure also exposed a workload-definition problem. Repeating
+paint-one/undo-one measures an unusual allocator and history-ownership cycle.
+Revision `ed948f3` changes result format version 2 to paint a configurable
+burst—64 strokes by default—before undoing the burst to restore the exact
+initial raster. It reports paint, explicit undo, history destruction, and
+remaining harness overhead separately. `--transaction-batch-strokes 1`
+preserves the adversarial control.
+
+Clean batch-64 Apollo rows at revision `ed948f3` are:
+
+| Workload | Storage | Paint/stroke | Undo/stroke | Before bytes |
+| --- | --- | ---: | ---: | ---: |
+| dense, 48 px paint | whole | 1.382 ms | 0.0017 ms | 6,321.5 MiB |
+| dense, 48 px paint | blocks16 | 1.170 ms | 0.2711 ms | 1,836.5 MiB |
+| stress, 192 px paint | whole | 3.693 ms | 0.0022 ms | 4,490.0 MiB |
+| stress, 192 px paint | blocks16 | 3.811 ms | 0.6439 ms | 2,368.1 MiB |
+
+Thus 16×16 history improves the normal 48 px drawing interval by 15.4% and
+reduces before-pixels 3.44×, but regresses 192 px drawing by 3.2% for a 1.90×
+reduction. Do not choose one global storage mode. Measure intermediate brush
+diameters, then resolve whole versus blocks once per gesture using brush/kernel
+footprint information. History entries already carry their concrete
+representation, so mixed exact undo is compatible with the current design.
+Whole and blocks remain explicit benchmark controls.
 
 ### 4. Transfer-path experiment
 

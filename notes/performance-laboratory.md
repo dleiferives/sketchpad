@@ -1069,21 +1069,45 @@ The edge cases were:
 | stress 48 px erase | 1.1509 ms | 1.1182 ms | −2.8% | 0.0061 ms | 0.2456 ms | 3.41× |
 | stress 192 px paint | 3.6495 ms | 3.6760 ms | +0.7% | 0.0100 ms | 0.6096 ms | 1.90× |
 
-Pure blocks therefore are not the product policy: they waste block metadata
-and redo-copy work on newly allocated tiles, and slightly regress the active
-large-brush case.
+Those rows use a one-paint/one-undo loop. That remains useful as an adversarial
+transaction and allocator control, but it is not representative of continuous
+drawing. It also made the cost of new-tile ownership depend on the artificial
+immediate rollback.
 
-The next candidate is hybrid:
+The first hybrid experiment was rejected. It used the whole-state `None`
+marker for new tiles and chose a whole snapshot when the first edit to an
+existing tile covered at least 32 blocks. Even a 192 px round brush normally
+enters a tile through a small leading intersection, so the threshold did not
+fire: snapshot counts and bytes stayed identical to pure blocks while dense
+and large-brush timings regressed. The implementation was removed.
 
-- newly allocated tiles retain the existing whole-state `None` marker, which
-  already swaps ownership with zero pixel copying;
-- existing tiles use 16×16 blocks for a small first footprint;
-- an existing tile whose first conservative edit covers at least 32 of its 64
-  possible blocks uses one whole-tile clone.
+Profiler result format version 2 now paints a burst before restoring the exact
+prepared raster. The default burst is 64 varied strokes; batch 1 remains
+available through `--transaction-batch-strokes 1`. It separately reports
+active paint/capture, explicit undo, redo-history destruction, and residual
+harness overhead.
 
-Keep whole and pure-block modes as controls. The 32-block threshold is a first
-measured hypothesis, not a universal constant; a later promotion mechanism may
-be needed when many initially small dabs eventually cover most of a tile.
+Clean Apollo batch-64 results at revision `ed948f3`:
+
+| Workload | Storage | Paint/stroke | Undo/stroke | Cleanup/stroke | Before bytes |
+| --- | --- | ---: | ---: | ---: | ---: |
+| dense 48 px paint, 2,000 strokes | whole | 1.3824 ms | 0.0017 ms | 0.0071 ms | 6,321.5 MiB |
+| dense 48 px paint, 2,000 strokes | blocks16 | 1.1698 ms | 0.2711 ms | 0.0079 ms | 1,836.5 MiB |
+| stress 192 px paint, 1,000 strokes | whole | 3.6932 ms | 0.0022 ms | 0.0065 ms | 4,490.0 MiB |
+| stress 192 px paint, 1,000 strokes | blocks16 | 3.8112 ms | 0.6439 ms | 0.0160 ms | 2,368.1 MiB |
+
+For the ordinary 48 px case, block snapshots make the user-facing drawing
+interval 15.4% faster and retain 3.44× fewer before-pixels. Explicit undo is
+slower but remains 0.271 ms per stroke on Apollo. At 192 px, blocks make active
+drawing 3.2% slower and retain only 1.90× fewer before-pixels. The evidence
+therefore rejects a global mode.
+
+The next experiment is a brush-diameter crossover matrix. If it is stable,
+the hard-round brush will select whole or block history once at gesture start.
+That is information the brush actually owns; it avoids trying to infer a
+completed stroke from its first tile intersection. Concrete history entries
+already self-describe their representation, so exact mixed-policy undo does
+not require a document-format change.
 
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with

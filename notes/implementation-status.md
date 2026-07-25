@@ -208,19 +208,25 @@ hard-round paint/erase kernels. A future arbitrary kernel that can change a
 pixel and later restore it within one gesture must mark first writes directly
 rather than relying on final pixel differences.
 
-`--undo-storage blocks16` selects the first real block-history prototype in
-the profiler. It captures each conservative 16×16 region once per tile and
-gesture into a flat per-tile payload, stores tile bounds metadata separately,
-and swaps block rows for undo/redo. It handles existing, newly allocated,
-reclaimed, cancelled, undone, and redone tiles and passes the same
+`--undo-storage blocks16` selects the real block-history prototype in the
+profiler. It captures each conservative 16×16 region once per existing tile
+and gesture into a flat per-tile payload, stores tile bounds metadata
+separately, and swaps block rows for undo/redo. Newly allocated tiles use the
+whole-state absence marker because they have no before-pixels. Existing,
+newly allocated, reclaimed, cancelled, undone, and redone tiles pass the same
 intermediate oracle. `whole` remains the application and profiler default
 until clean comparisons justify a promotion.
 
-`--undo-storage hybrid16` is the next candidate. It keeps the zero-copy
-whole-state marker for newly allocated tiles, uses 16×16 blocks on small
-existing-tile footprints, and uses a whole snapshot when the first edit
-already covers at least 32 of a tile's 64 blocks. Whole and pure-block modes
-remain available as controls.
+The first `hybrid16` implementation was removed after measurement. Its
+first-edit threshold never selected whole storage for the recorded 192 px
+stroke and slowed the block path. The next policy experiment will resolve
+storage once per brush gesture after measuring the crossover diameter; it
+will not infer a whole-stroke footprint from the first dab entering a tile.
+
+Profiler result format version 2 paints bursts of 64 strokes before restoring
+the initial raster. `--transaction-batch-strokes N` changes the burst, with
+`1` retained as the adversarial one-paint/one-undo control. Paint, explicit
+undo, history destruction, and harness overhead are separate result fields.
 
 The offscreen GPU companion is selected explicitly by adapter:
 
