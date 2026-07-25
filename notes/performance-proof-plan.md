@@ -431,8 +431,8 @@ counts, added padded bytes, and remaining pending regions. Use:
 --damage-coalescing rect4 --damage-merge-cost-kib 0|16|32|64
 ```
 
-Three-repeat Apollo runs at 60 Hz select 64 KiB as the current application
-default for its Intel UHD Graphics integrated GPU:
+Three-repeat Apollo runs at 60 Hz select 64 KiB for the `write_texture`
+control on its Intel UHD Graphics integrated GPU:
 
 | Rate | 16 KiB uploads / padded / API median | 64 KiB uploads / padded / API median |
 | --- | ---: | ---: |
@@ -447,10 +447,37 @@ calls and bytes as single union while preserving the ability to keep future
 widely separated regions apart. Every candidate ends at checksum
 `7d45a406ea4f3667`.
 
-This is an Apollo-derived default, not a universal GPU constant. Explicit
-staging changes the effective per-call cost, and mobile devices, formats, and
-brush shapes may change the transfer tradeoff. Rerun the threshold matrix
-when those boundaries change.
+This is an Apollo-derived `write_texture` setting, not a universal GPU
+constant. Explicit staging changes the effective per-call cost.
+
+Revisions `61b2cd4` and `4335258` add a reusable three-slot mapped staging
+ring and asynchronous remapping after submission. Each frame packs compact
+aligned rows and encodes all buffer-to-texture copies before rendering.
+Staging is capped at 8 MiB per frame; larger cold-residency bursts use the
+existing `write_texture` path rather than expanding a slot without bound.
+Replay result version 6 measures CPU pack, encode, actual wait, allocation,
+capacity, fallback, and encoder-timestamped GPU copy duration.
+
+Retuning the merge threshold under staging selects 0 KiB. Three-repeat Apollo
+60 Hz medians compare as follows:
+
+| Rate | Staged 0 KiB: uploads / padded / upload CPU / app p95 | `write_texture` 64 KiB: uploads / padded / API CPU / app p95 |
+| --- | ---: | ---: |
+| 1× | 102 / 4.047 MiB / 0.901 ms / 1.201 ms | 75 / 4.452 MiB / 1.837 ms / 1.391 ms |
+| 2× | 96 / 4.026 MiB / 0.864 ms / 1.597 ms | 62 / 4.563 MiB / 1.495 ms / 1.875 ms |
+| 4× | 91 / 4.018 MiB / 0.803 ms / 2.160 ms | 52 / 4.627 MiB / 1.304 ms / 2.454 ms |
+
+All rows end at checksum `7d45a406ea4f3667`, and staged display-paced rows
+record zero ring waits. The explicit staged GPU copy p95 is
+0.227/0.318/0.584 ms. It is not directly comparable with the
+`write_texture` timestamp gap because that transfer executes outside the
+control's command encoder.
+
+Revision `1f85a50` makes staging plus 0 KiB the current application/replay
+default. Selecting `write-texture` without a threshold retains its 64 KiB
+control. This remains an Apollo-specific choice: mobile mapping behavior,
+other formats, damage geometry, and the 8 MiB/24 MiB memory policy require
+separate qualification.
 
 ### 5. Renderer isolation matrix
 

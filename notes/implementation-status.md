@@ -273,15 +273,30 @@ Revision `e8f56c4` replaces unconditional one-rectangle-per-tile union with a
 fixed-capacity cost-aware rectangle set. Four rectangles are stored inline;
 pair merges compare their additional padded transfer bytes with a configurable
 call-equivalent threshold. The fifth rectangle forces the cheapest pair merge.
-The live application defaults to `rect4` with 64 KiB, selected from clean
+The original `write_texture` path selected `rect4` with 64 KiB from clean
 three-repeat Apollo Intel runs. Result format version 5 adds
 `damage_coalescing`, `damage_merge_cost_bytes`, forced-merge, merge-byte, and
 pending-region fields. Replay controls are `--damage-coalescing union|rect4`
 and `--damage-merge-cost-kib N`.
 
-The 64 KiB value is a current Apollo-derived default. It must be remeasured
-after introducing explicit staging and when qualifying mobile hardware,
-different texture formats, or materially different brush damage patterns.
+Revisions `61b2cd4` and `4335258` add and refine a reusable three-slot mapped
+staging ring. Frame damage is packed into aligned compact rows, unmapped,
+encoded as buffer-to-texture copies, submitted before rendering, and
+immediately requested for asynchronous remapping. Reuse polls first and blocks
+only if a slot is genuinely unfinished. Frames above 8 MiB fall back to
+`write_texture`, preventing cold residency from growing each ring slot to the
+entire visible working set. Three slots can retain at most 24 MiB.
+
+Result format version 6 adds `upload_mode`, CPU pack/encode/wait counters,
+staging allocation/capacity/fallback counters, encoder-timestamp capability,
+and GPU copy-batch distributions. `--texture-upload
+write-texture|staging-ring` selects the path.
+
+Revision `1f85a50` promotes `staging-ring`, `rect4`, and a 0 KiB merge
+threshold to the current application and replay defaults. `write-texture`
+remains selectable and defaults to its separately measured 64 KiB threshold.
+This is an Apollo Intel decision and must be requalified on mobile hardware,
+other formats, and different damage geometry.
 
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,

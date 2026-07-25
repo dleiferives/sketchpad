@@ -1212,16 +1212,59 @@ three-run Apollo medians at 60 Hz were:
 
 Zero KiB produced 102, 96, and 91 calls at 1×, 2×, and 4×. The 32 KiB
 candidate was a genuine intermediate but did not beat 64 KiB for
-`write_texture` API CPU or preparation latency. Therefore 64 KiB is the
-current application default. On this contiguous trace it happens to converge
-to the single-union call and byte totals, but unlike unconditional union it
-can retain disconnected damage when the intervening padded bytes exceed the
-threshold.
+`write_texture` API CPU or preparation latency. Therefore 64 KiB was selected
+for the `write_texture` control. On this contiguous trace it happens to
+converge to the single-union call and byte totals, but unlike unconditional
+union it can retain disconnected damage when the intervening padded bytes
+exceed the threshold.
 
 This value is evidence for Apollo's Intel UHD Graphics path, not a portable
 hardware constant. The threshold represents the current `write_texture` call
-tradeoff. Explicit reusable staging, other formats, mobile unified-memory
-systems, and different damage geometry all require the matrix to be rerun.
+tradeoff. It is not the threshold selected for the staged path below.
+
+#### Reusable explicit upload staging, 2026-07-25
+
+Revisions `61b2cd4` and `4335258` add a selectable three-slot staging ring.
+Dirty rectangles are packed directly into persistently owned mapped buffers
+with 256-byte-aligned compact rows. The buffers are unmapped, copied into tile
+textures by the frame command encoder, and requested for remapping immediately
+after submission. Reuse polls without blocking first. An 8 MiB per-frame cap
+falls back to `write_texture`, so a cold 210-tile residency fill cannot create
+a 64 MiB ring slot; the three-slot steady upper bound is 24 MiB.
+
+Replay format version 6 reports CPU pack, copy-command encoding, actual ring
+wait, allocations, retained capacity, oversized fallbacks, and an
+encoder-timestamped GPU copy batch. The GPU copy timestamp is available on
+Apollo Vulkan. It cannot be compared directly with the near-zero timestamp
+gap in the `write_texture` control: `Queue::write_texture` transfer execution
+occurs outside that control's command encoder.
+
+With asynchronous remapping, all 60 Hz threshold runs recorded zero ring
+waits and exact checksum `7d45a406ea4f3667`. Three-run medians:
+
+| Threshold | Rate | Uploads | Padded | Pack + encode CPU | App-to-submit p95 | Explicit GPU copy p95 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 KiB | 1× | 102 | 4.047 MiB | 0.901 ms | 1.201 ms | 0.227 ms |
+| 0 KiB | 2× | 96 | 4.026 MiB | 0.864 ms | 1.597 ms | 0.318 ms |
+| 0 KiB | 4× | 91 | 4.018 MiB | 0.803 ms | 2.160 ms | 0.584 ms |
+| 32 KiB | 1× | 78 | 4.318 MiB | 0.977 ms | 1.349 ms | 0.197 ms |
+| 32 KiB | 2× | 67 | 4.358 MiB | 0.873 ms | 1.771 ms | 0.285 ms |
+| 32 KiB | 4× | 58 | 4.384 MiB | 0.950 ms | 2.487 ms | 0.470 ms |
+| 64 KiB | 1× | 75 | 4.452 MiB | 0.981 ms | 1.365 ms | 0.200 ms |
+| 64 KiB | 2× | 62 | 4.563 MiB | 0.894 ms | 1.833 ms | 0.283 ms |
+| 64 KiB | 4× | 52 | 4.627 MiB | 0.926 ms | 2.496 ms | 0.464 ms |
+
+The extra copy commands at 0 KiB cost at most 0.12 ms GPU p95 versus 64 KiB
+in this matrix, while reducing transfer bytes and winning application CPU p95
+at every rate. Against the separately measured 64 KiB `write_texture`
+control, staged 0 KiB reduces measured upload-side CPU totals from
+1.837/1.495/1.304 ms to 0.901/0.864/0.803 ms and application p95 from
+1.391/1.875/2.454 ms to 1.201/1.597/2.160 ms. Revision `1f85a50` therefore
+selects staged 0 KiB as the current Apollo-derived application default.
+
+This result does not establish a universal threshold. The 8 MiB fallback,
+24 MiB retained upper bound, mobile mapping behavior, format choice, and
+different brush geometry all remain qualification dimensions.
 
 ### Periodic device laboratory
 

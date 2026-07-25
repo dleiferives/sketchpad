@@ -30,9 +30,13 @@ lower-power CPU/integrated-GPU test machine.
   control. GPU replay accepts `--display-hz 60,120` to compare late-latched
   display opportunities against one-submit-per-sample scheduling.
   `--damage-coalescing union|rect4` and `--damage-merge-cost-kib N` select the
-  pending-damage policy and its call-equivalent merge threshold. Each command
-  first rejects known background applications/containers, non-performance
-  power state, AC disconnection, low available memory, or a non-idle CPU.
+  pending-damage policy and its call-equivalent merge threshold.
+  `--texture-upload write-texture|staging-ring` selects the transfer path.
+  Staging with a 0 KiB threshold is the application/replay default;
+  selecting `write-texture` without an explicit threshold selects its 64 KiB
+  control. Each command first rejects known background
+  applications/containers, non-performance power state, AC disconnection,
+  low available memory, or a non-idle CPU.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB
   memory budget. Override with `SKETCHPAD_CARGO_BUILD_JOBS=<count>` when a
   deliberately isolated compile test needs another setting. Runtime

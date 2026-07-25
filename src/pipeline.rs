@@ -117,6 +117,10 @@ fn padded_region_bytes(region: RectU32) -> u64 {
         .saturating_mul(u64::from(region.height()))
 }
 
+fn fits_staging_frame(bytes: u64) -> bool {
+    bytes <= MAX_STAGING_FRAME_BYTES
+}
+
 struct TileRegionSource<'a> {
     bytes: &'a [u8],
     source_span_bytes: u64,
@@ -1060,7 +1064,7 @@ impl RasterDisplayPipeline {
                     .iter()
                     .map(|upload| padded_region_bytes(upload.local_region))
                     .sum();
-                if required_bytes <= MAX_STAGING_FRAME_BYTES {
+                if fits_staging_frame(required_bytes) {
                     self.pack_staged_uploads(device, layer);
                 } else {
                     self.stats.staging_fallback_uploads = self
@@ -1367,6 +1371,12 @@ mod tests {
         assert_eq!(padded_region_bytes(rect(0, 0, 1, 2)), 512);
         assert_eq!(padded_region_bytes(rect(0, 0, 16, 2)), 512);
         assert_eq!(padded_region_bytes(rect(0, 0, 17, 2)), 1_024);
+    }
+
+    #[test]
+    fn staging_frame_cap_has_an_exact_fallback_boundary() {
+        assert!(fits_staging_frame(MAX_STAGING_FRAME_BYTES));
+        assert!(!fits_staging_frame(MAX_STAGING_FRAME_BYTES + 1));
     }
 
     #[test]
