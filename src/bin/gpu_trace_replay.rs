@@ -112,6 +112,7 @@ struct Arguments {
     damage_merge_cost_bytes: u64,
     upload_mode: TextureUploadMode,
     visibility_caching: bool,
+    view_zoom: f32,
     scenes: Vec<Scene>,
     include_unpaced: bool,
     stress_strokes: usize,
@@ -299,6 +300,7 @@ struct ResultRecord {
     damage_merge_cost_bytes: u64,
     upload_mode: &'static str,
     visibility_mode: &'static str,
+    view_zoom: f32,
     frame_submissions: usize,
     run: usize,
     wall_micros: u64,
@@ -396,7 +398,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             arguments.upload_mode,
         );
         display.set_visibility_caching(arguments.visibility_caching);
-        render_restored_frame(&gpu, &mut display, &layer)?;
+        render_restored_frame(&gpu, &mut display, &layer, arguments.view_zoom)?;
 
         let mut expected_checksum = None;
         for run_index in 0..arguments.runs {
@@ -408,6 +410,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     target_brush,
                     &target_samples,
                     timing,
+                    arguments.view_zoom,
                 )?;
                 let checksum = raster_checksum(&layer);
                 if let Some(expected) = expected_checksum.replace(checksum) {
@@ -458,6 +461,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     } else {
                         "rebuild"
                     },
+                    view_zoom: arguments.view_zoom,
                     frame_submissions: timed.scene_prepare_cpu_micros.len(),
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
@@ -498,7 +502,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 output.write_all(b"\n")?;
                 output.flush()?;
                 eprintln!(
-                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} visibility={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
+                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} visibility={} view_zoom={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
                     scene.name(),
                     run_index,
                     timing.name(),
@@ -510,6 +514,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .map_or_else(|| "-".to_owned(), |hz| hz.to_string()),
                     record.upload_mode,
                     record.visibility_mode,
+                    record.view_zoom,
                     record.frame_submissions,
                     record.wall_micros as f64 / 1_000.0,
                     record.app_to_submit_cpu.p95 as f64 / 1_000.0,
@@ -534,7 +539,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 if raster_checksum(&layer) != initial_checksum {
                     return Err(format!("GPU replay undo failed in scene {}", scene.name()).into());
                 }
-                render_restored_frame(&gpu, &mut display, &layer)?;
+                render_restored_frame(&gpu, &mut display, &layer, arguments.view_zoom)?;
             }
         }
     }
@@ -692,6 +697,7 @@ fn play_gpu(
     brush: HardRoundBrush,
     samples: &[ReplaySample],
     timing: Timing,
+    view_zoom: f32,
 ) -> Result<TimedGpuStroke, Box<dyn Error>> {
     let frame_groups = frame_groups(samples, timing);
     let queries_per_frame = if gpu.encoder_timestamp_queries { 4 } else { 2 };
@@ -774,7 +780,7 @@ fn play_gpu(
         }
 
         let scene_prepare_start = Instant::now();
-        prepare_display(display, &gpu.device, &gpu.queue, layer);
+        prepare_display(display, &gpu.device, &gpu.queue, layer, view_zoom);
         scene_prepare_cpu_micros.push(duration_micros(scene_prepare_start.elapsed()));
 
         let encode_submit_start = Instant::now();
@@ -909,21 +915,25 @@ fn prepare_display(
     device: &wgpu::Device,
     queue: &wgpu::Queue,
     layer: &RasterLayer,
+    view_zoom: f32,
 ) {
+    let view_height = CANVAS[1] as f32 / view_zoom;
+    let view_width = view_height * TARGET[0] as f32 / TARGET[1] as f32;
+    let center = [CANVAS[0] as f32 * 0.5, CANVAS[1] as f32 * 0.5];
     display.prepare_visible(
         device,
         queue,
         layer,
         WorldRect {
-            min: [0.0, 0.0],
-            max: [CANVAS[0] as f32, CANVAS[1] as f32],
+            min: [center[0] - view_width * 0.5, center[1] - view_height * 0.5],
+            max: [center[0] + view_width * 0.5, center[1] + view_height * 0.5],
         },
     );
     display.write_camera(
         queue,
         CanvasUniform {
-            center: [CANVAS[0] as f32 * 0.5, CANVAS[1] as f32 * 0.5],
-            zoom: 1.0,
+            center,
+            zoom: view_zoom,
             _padding: 0.0,
             viewport_size: [TARGET[0] as f32, TARGET[1] as f32],
             canvas_size: [CANVAS[0] as f32, CANVAS[1] as f32],
@@ -936,8 +946,9 @@ fn render_restored_frame(
     gpu: &Gpu,
     display: &mut RasterDisplayPipeline,
     layer: &RasterLayer,
+    view_zoom: f32,
 ) -> Result<(), Box<dyn Error>> {
-    prepare_display(display, &gpu.device, &gpu.queue, layer);
+    prepare_display(display, &gpu.device, &gpu.queue, layer, view_zoom);
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -1036,6 +1047,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut damage_merge_cost_explicit = false;
     let mut upload_mode = TextureUploadMode::StagingRing;
     let mut visibility_caching = true;
+    let mut view_zoom = 1.0_f32;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -1078,6 +1090,15 @@ fn parse_arguments() -> Result<Arguments, String> {
                     value => return Err(format!("unknown visibility mode: {value}")),
                 };
             }
+            "--view-zoom" => {
+                let raw = value(&mut arguments, "--view-zoom")?;
+                view_zoom = raw
+                    .parse()
+                    .map_err(|_| format!("invalid --view-zoom value: {raw}"))?;
+                if !view_zoom.is_finite() || view_zoom <= 0.0 {
+                    return Err("--view-zoom must be finite and positive".to_owned());
+                }
+            }
             "--scenes" => scenes = scenes_value(&mut arguments)?,
             "--no-unpaced" => include_unpaced = false,
             "--stress-strokes" => {
@@ -1099,6 +1120,7 @@ fn parse_arguments() -> Result<Arguments, String> {
                      \x20      [--damage-merge-cost-kib N]\n\
                      \x20      [--texture-upload write-texture|staging-ring]\n\
                      \x20      [--visibility cached|rebuild]\n\
+                     \x20      [--view-zoom Z]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
                      \x20      [--seed N] [--revision REV]"
                 );
@@ -1121,6 +1143,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         damage_merge_cost_bytes,
         upload_mode,
         visibility_caching,
+        view_zoom,
         scenes,
         include_unpaced,
         stress_strokes,
