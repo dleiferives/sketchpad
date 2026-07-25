@@ -193,6 +193,7 @@ benchmark_suite() {
   result_artifact=".artifacts/results/${stem}.jsonl"
   context_artifact=".artifacts/results/${stem}.context.txt"
 
+  run_remote_command scripts/benchmark-preflight
   run_remote_command scripts/benchmark-context "$context_artifact"
   if [[ "$kind" == cpu ]]; then
     run_remote_command cargo run --release --locked --bin trace_replay -- \

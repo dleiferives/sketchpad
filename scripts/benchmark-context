@@ -22,6 +22,18 @@ mkdir -p "$(dirname "$output")"
   echo "[uptime and load]"
   uptime
   echo
+  echo "[power profile]"
+  powerprofilesctl get
+  powerprofilesctl list
+  echo
+  echo "[power supplies]"
+  for path in /sys/class/power_supply/*/online; do
+    if [[ -r "$path" ]]; then
+      printf '%s=' "$path"
+      cat "$path"
+    fi
+  done
+  echo
   echo "[cpu]"
   lscpu
   echo
@@ -37,6 +49,14 @@ mkdir -p "$(dirname "$output")"
   echo "[sensors]"
   sensors
   echo
+  echo "[intel gpu frequency]"
+  for path in /sys/class/drm/card*/gt_*_freq_mhz; do
+    if [[ -r "$path" ]]; then
+      printf '%s=' "$path"
+      cat "$path"
+    fi
+  done
+  echo
   echo "[vulkan]"
   vulkaninfo --summary
   echo
@@ -46,6 +66,15 @@ mkdir -p "$(dirname "$output")"
   echo
   echo "[nvidia]"
   nvidia-smi --query-gpu=name,driver_version,pstate,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw,memory.total,memory.used --format=csv
+  echo
+  echo "[top user processes]"
+  ps -u "$(id -un)" -o pid,ppid,stat,comm,%cpu,%mem,etimes,args \
+    --sort=-%cpu |
+    head -n 30
+  echo
+  echo "[benchmark service state]"
+  systemctl is-active rustdesk.service
+  docker ps --format '{{.Names}} {{.Image}}'
 } >"$output" 2>&1
 
 echo "benchmark_context=$output"

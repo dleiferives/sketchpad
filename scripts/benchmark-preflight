@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -u
+
+failed=false
+
+fail() {
+  printf 'benchmark preflight: %s\n' "$1" >&2
+  failed=true
+}
+
+power_profile="$(powerprofilesctl get 2>/dev/null || true)"
+if [[ "$power_profile" != "performance" ]]; then
+  fail "power profile is '${power_profile:-unknown}', expected 'performance'"
+fi
+
+ac_online=false
+for path in /sys/class/power_supply/*/online; do
+  if [[ -r "$path" && "$(cat "$path")" == 1 ]]; then
+    ac_online=true
+    break
+  fi
+done
+if [[ "$ac_online" != true ]]; then
+  fail "no online AC power supply was found"
+fi
+
+for process in \
+  java firefox-esr minecraft motrix aria2c syncthing \
+  aw-server aw-watcher-afk aw-watcher-window \
+  deskflow deskflow-core rustdesk fluidsynth speech-dispatcher
+do
+  matches="$(
+    ps -eo pid=,args= |
+      awk -v process="$process" '
+        {
+          pid = $1
+          executable = $2
+          sub(/^.*\//, "", executable)
+          if (executable == process) print pid
+        }
+      ' |
+      xargs
+  )"
+  if [[ -n "$matches" ]]; then
+    fail "interfering process '$process' is running (PIDs: $matches)"
+  fi
+done
+
+if systemctl is-active --quiet rustdesk.service 2>/dev/null; then
+  fail "rustdesk.service is active"
+fi
+
+containers="$(docker ps --format '{{.Names}}' 2>/dev/null || true)"
+if [[ -n "$containers" ]]; then
+  fail "Docker containers are running: $containers"
+fi
+
+available_kib="$(
+  awk '/^MemAvailable:/ { print $2; exit }' /proc/meminfo
+)"
+minimum_available_kib=$((3 * 1024 * 1024))
+if ((available_kib < minimum_available_kib)); then
+  fail "only $((available_kib / 1024)) MiB memory is available; require at least 3072 MiB"
+fi
+
+read -r total_before idle_before < <(
+  awk '/^cpu / {
+    total = 0
+    for (field = 2; field <= NF; field++) total += $field
+    print total, $5 + $6
+    exit
+  }' /proc/stat
+)
+sleep 1
+read -r total_after idle_after < <(
+  awk '/^cpu / {
+    total = 0
+    for (field = 2; field <= NF; field++) total += $field
+    print total, $5 + $6
+    exit
+  }' /proc/stat
+)
+total_delta=$((total_after - total_before))
+idle_delta=$((idle_after - idle_before))
+idle_percent=$((idle_delta * 100 / total_delta))
+if ((idle_percent < 90)); then
+  fail "CPU was only ${idle_percent}% idle during the preflight sample; require at least 90%"
+fi
+
+if [[ "$failed" == true ]]; then
+  exit 1
+fi
+
+printf 'benchmark_preflight=ready power_profile=%s ac_online=true available_mib=%d idle_percent=%d\n' \
+  "$power_profile" "$((available_kib / 1024))" "$idle_percent"

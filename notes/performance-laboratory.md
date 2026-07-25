@@ -894,6 +894,66 @@ temperature, and frequency state. The first setup found that an otherwise
 valid cold build could exhaust swap while unrelated desktop applications were
 active, which is exactly the interference the laboratory metadata must expose.
 
+The `scripts/<host> benchmark ...` convenience path now performs a preflight
+before every recorded run. It requires AC power, the performance power
+profile, at least 3 GiB available memory, and at least 90% CPU idle over a
+one-second sample. It rejects known development/media applications, RustDesk,
+and running Docker containers rather than preserving a misleading result.
+Context artifacts also record the power profile, AC state, Intel GPU
+frequency range/current state, top user processes, and relevant service state.
+
+Apollo's first controlled cleanup demonstrated why this is required.
+Minecraft, Firefox, Motrix, RustDesk, Flaresolverr, Vivado helpers, sync and
+activity monitors collectively changed CPU corpus p95 by roughly 25–29%.
+Low-power mode produced a separate multi-fold regression. Conversely,
+Minecraft could keep the integrated GPU out of its low-frequency state and
+make isolated GPU pass timestamps look faster while worsening CPU scheduling
+and memory pressure. Cold, warm, and sustained GPU protocols must therefore
+remain distinct rather than relying on whichever DVFS state preceded a run.
+
+#### Controlled Apollo baseline, 2026-07-24
+
+Commit `762a9f4` was measured after stopping all identified applications,
+RustDesk, and Docker containers while retaining the X11/GNOME/Wacom session
+and SSH control path. Apollo was on AC power in the performance profile with
+about 6.4 GiB available memory, no active swap traffic, and 96–100% idle CPU
+during the settling sample.
+
+The 1,000-stroke CPU corpus produced:
+
+| Scene | Full-stroke median | Full-stroke p95 |
+| --- | ---: | ---: |
+| empty | 1.113 ms | 2.740 ms |
+| sparse | 1.307 ms | 2.605 ms |
+| dense | 1.321 ms | 2.611 ms |
+| stress | 1.432 ms | 2.644 ms |
+
+These p95 values were 24.6–28.5% lower than the first
+Minecraft/background-application-contaminated run.
+
+Three 1× GPU repetitions produced these per-sample p95 medians:
+
+| Scene | Application to submit | GPU render pass |
+| --- | ---: | ---: |
+| empty | 0.950 ms | 1.556 ms |
+| sparse | 0.866 ms | 2.801 ms |
+| dense | 0.951 ms | 3.866 ms |
+| stress | 1.000 ms | 4.430 ms |
+
+The stress GPU result was tightly grouped at 4.414–4.485 ms. Apollo's Intel
+GPU idles around 200–350 MHz and can boost to 850 MHz. Faster-paced and
+unpaced playback lowered individual pass times by sustaining GPU frequency;
+continuous unrelated GPU work can therefore make a pass appear faster rather
+than simply adding contention. The portable baseline must retain natural DVFS,
+while separate cold, warmed, fixed-frequency diagnostic, and sustained suites
+explain that behavior.
+
+The strict 250 µs scheduling-lateness count sometimes increased on the clean,
+otherwise idle system even as all processing spans improved. This is consistent
+with timer wake-up and CPU idle-state behavior, so lateness must be reported
+separately from computation time and eventually use a platform-appropriate
+absolute-deadline protocol.
+
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with
 `perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been

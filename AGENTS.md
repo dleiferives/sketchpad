@@ -22,7 +22,9 @@ lower-power CPU/integrated-GPU test machine.
   `scripts/atlas record [local-trace-path]`.
 - Run and fetch a release replay plus machine-context artifact with
   `scripts/<host> benchmark cpu [options...]` or
-  `scripts/<host> benchmark gpu <adapter-filter> [options...]`.
+  `scripts/<host> benchmark gpu <adapter-filter> [options...]`. The command
+  first rejects known background applications/containers, non-performance
+  power state, AC disconnection, low available memory, or a non-idle CPU.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB
   memory budget. Override with `SKETCHPAD_CARGO_BUILD_JOBS=<count>` when a
   deliberately isolated compile test needs another setting. Runtime
