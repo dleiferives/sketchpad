@@ -416,6 +416,42 @@ should retain multiple rectangles when their union's extra byte cost exceeds
 the measured per-call cost. Do not replace this tradeoff with a fixed
 “one rectangle per tile” dogma.
 
+Revision `e8f56c4` implements that representation without adding a
+per-damage heap allocation. Each resident tile retains up to four inline
+rectangles. The cheapest pair is merged when its additional 256-byte-row-
+aligned transfer cost is at most a configurable call-equivalent byte cost; a
+fifth rectangle forces only the cheapest merge so storage remains bounded.
+The old single-union strategy remains selectable as an exact control.
+
+The version 5 replay schema records policy, threshold, pair and forced merge
+counts, added padded bytes, and remaining pending regions. Use:
+
+```text
+--damage-coalescing union
+--damage-coalescing rect4 --damage-merge-cost-kib 0|16|32|64
+```
+
+Three-repeat Apollo runs at 60 Hz select 64 KiB as the current application
+default for its Intel UHD Graphics integrated GPU:
+
+| Rate | 16 KiB uploads / padded / API median | 64 KiB uploads / padded / API median |
+| --- | ---: | ---: |
+| 1× | 83 / 4.200 MiB / 3.019 ms | 75 / 4.452 MiB / 2.845 ms |
+| 2× | 74 / 4.204 MiB / 2.216 ms | 62 / 4.563 MiB / 2.160 ms |
+| 4× | 65 / 4.230 MiB / 1.720 ms | 52 / 4.627 MiB / 1.615 ms |
+
+Zero KiB minimizes merge amplification but leaves 91–102 upload calls. A
+32 KiB intermediate saves 0.13–0.24 MiB of padded traffic versus 64 KiB but
+does not win the CPU-first objective. In this trace, 64 KiB reaches the same
+calls and bytes as single union while preserving the ability to keep future
+widely separated regions apart. Every candidate ends at checksum
+`7d45a406ea4f3667`.
+
+This is an Apollo-derived default, not a universal GPU constant. Explicit
+staging changes the effective per-call cost, and mobile devices, formats, and
+brush shapes may change the transfer tradeoff. Rerun the threshold matrix
+when those boundaries change.
+
 ### 5. Renderer isolation matrix
 
 Vary independently:

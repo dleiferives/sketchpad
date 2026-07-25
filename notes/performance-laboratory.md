@@ -1187,6 +1187,42 @@ The GPU render-pass p95 is not used to select the coalescer: uploads occur
 outside the timestamp pair, and DVFS/queue ordering can change the following
 pass. Explicit staging-copy timestamps are still required.
 
+#### Cost-aware dirty rectangle set, 2026-07-25
+
+Revision `e8f56c4` adds a fixed-capacity alternative to single union. A tile
+stores at most four pending rectangles inline. Pair selection minimizes:
+
+```text
+padded_bytes(union) - padded_bytes(a) - padded_bytes(b)
+```
+
+where rows use WebGPU's 256-byte copy alignment and the current
+`Rgba32Float` 16-byte pixels. A pair merges when the added bytes do not exceed
+the configured call-equivalent cost. A fifth region forces only the cheapest
+merge. This bounds work and storage without allocating a `Vec` per tile.
+
+The replay exposes `union` and `rect4`, records the threshold and forced
+merges, and preserves the final checksum for every tested policy. Clean
+three-run Apollo medians at 60 Hz were:
+
+| Threshold | 1× uploads / padded / API | 2× uploads / padded / API | 4× uploads / padded / API |
+| --- | ---: | ---: | ---: |
+| 16 KiB | 83 / 4.200 MiB / 3.019 ms | 74 / 4.204 MiB / 2.216 ms | 65 / 4.230 MiB / 1.720 ms |
+| 64 KiB | 75 / 4.452 MiB / 2.845 ms | 62 / 4.563 MiB / 2.160 ms | 52 / 4.627 MiB / 1.615 ms |
+
+Zero KiB produced 102, 96, and 91 calls at 1×, 2×, and 4×. The 32 KiB
+candidate was a genuine intermediate but did not beat 64 KiB for
+`write_texture` API CPU or preparation latency. Therefore 64 KiB is the
+current application default. On this contiguous trace it happens to converge
+to the single-union call and byte totals, but unlike unconditional union it
+can retain disconnected damage when the intervening padded bytes exceed the
+threshold.
+
+This value is evidence for Apollo's Intel UHD Graphics path, not a portable
+hardware constant. The threshold represents the current `write_texture` call
+tradeoff. Explicit reusable staging, other formats, mobile unified-memory
+systems, and different damage geometry all require the matrix to be rerun.
+
 ### Periodic device laboratory
 
 At minimum:

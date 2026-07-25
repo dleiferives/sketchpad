@@ -269,6 +269,20 @@ timestamps are per displayed frame. `sample_ready_wait` reports deliberate
 late-latching delay, while `schedule_lateness` reports missing the display
 deadline itself. The final raster checksum must match per-sample scheduling.
 
+Revision `e8f56c4` replaces unconditional one-rectangle-per-tile union with a
+fixed-capacity cost-aware rectangle set. Four rectangles are stored inline;
+pair merges compare their additional padded transfer bytes with a configurable
+call-equivalent threshold. The fifth rectangle forces the cheapest pair merge.
+The live application defaults to `rect4` with 64 KiB, selected from clean
+three-repeat Apollo Intel runs. Result format version 5 adds
+`damage_coalescing`, `damage_merge_cost_bytes`, forced-merge, merge-byte, and
+pending-region fields. Replay controls are `--damage-coalescing union|rect4`
+and `--damage-merge-cost-kib N`.
+
+The 64 KiB value is a current Apollo-derived default. It must be remeasured
+after introducing explicit staging and when qualifying mobile hardware,
+different texture formats, or materially different brush damage patterns.
+
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
 frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where

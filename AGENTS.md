@@ -28,7 +28,9 @@ lower-power CPU/integrated-GPU test machine.
   64-stroke transaction bursts by default;
   `--transaction-batch-strokes 1` preserves the adversarial immediate-undo
   control. GPU replay accepts `--display-hz 60,120` to compare late-latched
-  display opportunities against one-submit-per-sample scheduling. Each command
+  display opportunities against one-submit-per-sample scheduling.
+  `--damage-coalescing union|rect4` and `--damage-merge-cost-kib N` select the
+  pending-damage policy and its call-equivalent merge threshold. Each command
   first rejects known background applications/containers, non-performance
   power state, AC disconnection, low available memory, or a non-idle CPU.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB
