@@ -1310,10 +1310,35 @@ Revision `230bf85` adds centered view zoom isolation. Stable stress results at
 The first halving leaves GPU duration unchanged, ruling out visible-instance
 count as the dominant cost across that range. Zoom 4 also changes source
 texture locality and texel reuse, so its faster pass is evidence—not proof—of
-`Rgba32Float` sampling bandwidth/cache pressure. The next experiment should
-compare direct tile sampling with a dirty-updated composited display cache in
-candidate lower-bandwidth formats. It must keep camera, output, upload work,
-and timestamp boundaries explicit.
+`Rgba32Float` sampling bandwidth/cache pressure.
+
+#### Full-precision display-cache control, 2026-07-25
+
+Replay format version 8 adds `--presentation direct|cache-rgba32`. The cache
+mode owns one canvas-sized `Rgba32Float` texture, copies only queued dirty
+regions into their canvas-space positions, and presents it with one fullscreen
+draw. Direct tile-array rendering remains the default and same-revision
+control. Tile reclamation conservatively discards the cache and rebuilds
+visible content, so deletion cannot leave stale pixels.
+
+An initial `Rgba16Float` probe was rejected and removed. Although it reduced
+display bandwidth, Apollo readback found 92 one-value differences among
+1,048,576 output channels. That is small but violates the project rule that a
+performance experiment must not silently change quality. It also introduced
+conversion work that confounded the presentation-layout comparison.
+
+The retained `Rgba32Float` cache has no conversion path or half-float
+dependency. Apollo's hardware smoke test renders the same raster, paper, and
+cursor through direct tiles and the cache, reads both outputs back, and
+requires exact byte equality. The current result is zero differing channels,
+zero total absolute error, and zero maximum error.
+
+The full-precision timing matrix remains an experiment rather than an
+application-default decision. It must determine whether contiguous texture
+locality and one draw offset the additional canvas-sized allocation without
+credit from reduced precision. Follow-up work should separately measure cold
+cache creation, steady dirty updates, static dense presentation, erasure
+rebuilds, canvas-size limits, and memory pressure.
 
 ### Periodic device laboratory
 

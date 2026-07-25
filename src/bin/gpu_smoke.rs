@@ -1,7 +1,8 @@
 use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
     pipeline::{
-        BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, TextureUploadMode, WorldRect,
+        BrushCursorUniform, CanvasUniform, PresentationMode, RasterDisplayPipeline,
+        TextureUploadMode, WorldRect,
     },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
 };
@@ -232,6 +233,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let mapped = slice.get_mapped_range()?;
+    let direct_pixels = mapped.to_vec();
     let dark_pixels = mapped
         .chunks_exact(4)
         .filter(|pixel| pixel[0] < 100 && pixel[1] < 100 && pixel[2] < 140)
@@ -251,20 +253,116 @@ fn main() -> Result<(), Box<dyn Error>> {
         );
     }
 
-    let stats = display.stats();
-    if stats.resident_pages < 2
-        || stats.visible_instances != stats.resident_tiles
-        || stats.deferred_visible_tiles != 0
-        || stats.pending_damage_tiles != 0
-        || stats.pending_damage_regions != 0
-        || stats.coalesced_damage_regions == 0
-        || stats.upload_source_span_bytes < stats.upload_bytes
-        || stats.upload_padded_bytes < stats.upload_bytes
+    let direct_stats = display.stats();
+    if direct_stats.resident_pages < 2
+        || direct_stats.visible_instances != direct_stats.resident_tiles
+        || direct_stats.deferred_visible_tiles != 0
+        || direct_stats.pending_damage_tiles != 0
+        || direct_stats.pending_damage_regions != 0
+        || direct_stats.coalesced_damage_regions == 0
+        || direct_stats.upload_source_span_bytes < direct_stats.upload_bytes
+        || direct_stats.upload_padded_bytes < direct_stats.upload_bytes
     {
-        return Err(format!("multi-page residency invariant failed: {stats:?}").into());
+        return Err(format!("multi-page residency invariant failed: {direct_stats:?}").into());
     }
+
+    let cache_stats_before = display.stats();
+    display.set_presentation_mode(PresentationMode::CacheRgba32Float);
+    display.prepare_visible(
+        &device,
+        &queue,
+        &layer,
+        WorldRect {
+            min: [0.0, 0.0],
+            max: [SIZE as f32, SIZE as f32],
+        },
+    );
+    let mut cache_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Smoke Display Cache Encoder"),
+    });
+    display.encode_uploads(&mut cache_encoder);
+    {
+        let mut pass = cache_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GPU Smoke Display Cache"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            occlusion_query_set: None,
+            timestamp_writes: None,
+            multiview_mask: None,
+        });
+        display.draw(&mut pass);
+    }
+    cache_encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &output,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: SIZE,
+            height: SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    let cache_submission = queue.submit(iter::once(cache_encoder.finish()));
+    display.uploads_submitted(cache_submission.clone());
+    let cache_slice = readback.slice(..);
+    let (cache_sender, cache_receiver) = mpsc::channel();
+    cache_slice.map_async(wgpu::MapMode::Read, move |result| {
+        cache_sender.send(result).unwrap();
+    });
+    device.poll(wgpu::PollType::Wait {
+        submission_index: Some(cache_submission),
+        timeout: None,
+    })?;
+    cache_receiver.recv()??;
+    let cache_mapped = cache_slice.get_mapped_range()?;
+    let mut differing_channels = 0_u64;
+    let mut total_abs_error = 0_u64;
+    let mut max_abs_error = 0_u8;
+    for (&direct, &cached) in direct_pixels.iter().zip(cache_mapped.iter()) {
+        let error = direct.abs_diff(cached);
+        differing_channels += u64::from(error != 0);
+        total_abs_error += u64::from(error);
+        max_abs_error = max_abs_error.max(error);
+    }
+    drop(cache_mapped);
+    readback.unmap();
+    let cache_stats = display.stats();
+    if cache_stats.display_cache_updates == cache_stats_before.display_cache_updates
+        || cache_stats.display_cache_bytes == cache_stats_before.display_cache_bytes
+        || cache_stats.display_cache_draws == cache_stats_before.display_cache_draws
+        || cache_stats.visible_instances != 0
+    {
+        return Err(format!("display cache was not exercised: {cache_stats:?}").into());
+    }
+    if max_abs_error != 0 {
+        return Err(format!(
+            "Rgba32Float display cache changed output: max={max_abs_error} differing={differing_channels} total_abs_error={total_abs_error}"
+        )
+        .into());
+    }
+
+    let stats = direct_stats;
     println!(
-        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} merged={} forced_merges={} merge_extra_padded_bytes={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} upload_pack_nanos={} upload_encode_nanos={} staging_waits={} staging_allocations={} staging_capacity={} partial_upload_bytes={}",
+        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} merged={} forced_merges={} merge_extra_padded_bytes={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} upload_pack_nanos={} upload_encode_nanos={} staging_waits={} staging_allocations={} staging_capacity={} partial_upload_bytes={} cache_updates={} cache_bytes={} cache_draws={} cache_differing_channels={} cache_total_abs_error={} cache_max_abs_error={}",
         adapter.get_info().name,
         dark_pixels,
         cursor_pixels,
@@ -285,7 +383,19 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats.staging_waits,
         stats.staging_buffer_allocations,
         stats.staging_buffer_capacity,
-        partial_upload_bytes
+        partial_upload_bytes,
+        cache_stats
+            .display_cache_updates
+            .saturating_sub(cache_stats_before.display_cache_updates),
+        cache_stats
+            .display_cache_bytes
+            .saturating_sub(cache_stats_before.display_cache_bytes),
+        cache_stats
+            .display_cache_draws
+            .saturating_sub(cache_stats_before.display_cache_draws),
+        differing_channels,
+        total_abs_error,
+        max_abs_error,
     );
     Ok(())
 }

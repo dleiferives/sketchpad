@@ -3,9 +3,9 @@ use sketchpad::{
     brush::HardRoundBrush,
     input_trace::InputTrace,
     pipeline::{
-        BrushCursorUniform, CanvasUniform, DamageCoalescing, RasterDisplayPipeline,
-        RasterPresentationStats, TextureUploadMode, WorldRect, DEFAULT_DAMAGE_MERGE_COST_BYTES,
-        DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
+        BrushCursorUniform, CanvasUniform, DamageCoalescing, PresentationMode,
+        RasterDisplayPipeline, RasterPresentationStats, TextureUploadMode, WorldRect,
+        DEFAULT_DAMAGE_MERGE_COST_BYTES, DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
     },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
     replay::{
@@ -27,7 +27,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 7;
+const RESULT_VERSION: u32 = 8;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -111,6 +111,7 @@ struct Arguments {
     damage_coalescing: DamageCoalescing,
     damage_merge_cost_bytes: u64,
     upload_mode: TextureUploadMode,
+    presentation_mode: PresentationMode,
     visibility_caching: bool,
     view_zoom: f32,
     scenes: Vec<Scene>,
@@ -182,6 +183,9 @@ struct GpuWork {
     instance_cache_hits: u64,
     instance_bytes_written: u64,
     cached_visible_tiles: u32,
+    display_cache_updates: u64,
+    display_cache_bytes: u64,
+    display_cache_draws: u64,
     evictions: u64,
     resident_tiles: u32,
     visible_instances: u32,
@@ -259,6 +263,15 @@ impl GpuWork {
                 .instance_bytes_written
                 .saturating_sub(before.instance_bytes_written),
             cached_visible_tiles: after.cached_visible_tiles,
+            display_cache_updates: after
+                .display_cache_updates
+                .saturating_sub(before.display_cache_updates),
+            display_cache_bytes: after
+                .display_cache_bytes
+                .saturating_sub(before.display_cache_bytes),
+            display_cache_draws: after
+                .display_cache_draws
+                .saturating_sub(before.display_cache_draws),
             evictions: after.evictions.saturating_sub(before.evictions),
             resident_tiles: after.resident_tiles,
             visible_instances: after.visible_instances,
@@ -299,6 +312,7 @@ struct ResultRecord {
     damage_coalescing: &'static str,
     damage_merge_cost_bytes: u64,
     upload_mode: &'static str,
+    presentation_mode: &'static str,
     visibility_mode: &'static str,
     view_zoom: f32,
     frame_submissions: usize,
@@ -397,6 +411,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             arguments.damage_merge_cost_bytes,
             arguments.upload_mode,
         );
+        display.set_presentation_mode(arguments.presentation_mode);
         display.set_visibility_caching(arguments.visibility_caching);
         render_restored_frame(&gpu, &mut display, &layer, arguments.view_zoom)?;
 
@@ -456,6 +471,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     damage_coalescing: damage_coalescing_name(arguments.damage_coalescing),
                     damage_merge_cost_bytes: arguments.damage_merge_cost_bytes,
                     upload_mode: upload_mode_name(arguments.upload_mode),
+                    presentation_mode: presentation_mode_name(arguments.presentation_mode),
                     visibility_mode: if arguments.visibility_caching {
                         "cached"
                     } else {
@@ -502,7 +518,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                 output.write_all(b"\n")?;
                 output.flush()?;
                 eprintln!(
-                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} visibility={} view_zoom={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
+                    "scene={} run={} timing={} rate={} display_hz={} upload_mode={} presentation={} visibility={} view_zoom={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_copy_p95_ms={} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
                     scene.name(),
                     run_index,
                     timing.name(),
@@ -513,6 +529,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .display_hz()
                         .map_or_else(|| "-".to_owned(), |hz| hz.to_string()),
                     record.upload_mode,
+                    record.presentation_mode,
                     record.visibility_mode,
                     record.view_zoom,
                     record.frame_submissions,
@@ -1035,6 +1052,13 @@ fn upload_mode_name(mode: TextureUploadMode) -> &'static str {
     }
 }
 
+fn presentation_mode_name(mode: PresentationMode) -> &'static str {
+    match mode {
+        PresentationMode::DirectTiles => "direct",
+        PresentationMode::CacheRgba32Float => "cache-rgba32",
+    }
+}
+
 fn parse_arguments() -> Result<Arguments, String> {
     let mut trace = None;
     let mut output = None;
@@ -1046,6 +1070,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut damage_merge_cost_bytes = DEFAULT_DAMAGE_MERGE_COST_BYTES;
     let mut damage_merge_cost_explicit = false;
     let mut upload_mode = TextureUploadMode::StagingRing;
+    let mut presentation_mode = PresentationMode::DirectTiles;
     let mut visibility_caching = true;
     let mut view_zoom = 1.0_f32;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
@@ -1081,6 +1106,13 @@ fn parse_arguments() -> Result<Arguments, String> {
                     "write-texture" => TextureUploadMode::WriteTexture,
                     "staging-ring" => TextureUploadMode::StagingRing,
                     value => return Err(format!("unknown texture upload mode: {value}")),
+                };
+            }
+            "--presentation" => {
+                presentation_mode = match value(&mut arguments, "--presentation")?.as_str() {
+                    "direct" => PresentationMode::DirectTiles,
+                    "cache-rgba32" => PresentationMode::CacheRgba32Float,
+                    value => return Err(format!("unknown presentation mode: {value}")),
                 };
             }
             "--visibility" => {
@@ -1119,6 +1151,7 @@ fn parse_arguments() -> Result<Arguments, String> {
                      \x20      [--damage-coalescing union|rect4]\n\
                      \x20      [--damage-merge-cost-kib N]\n\
                      \x20      [--texture-upload write-texture|staging-ring]\n\
+                     \x20      [--presentation direct|cache-rgba32]\n\
                      \x20      [--visibility cached|rebuild]\n\
                      \x20      [--view-zoom Z]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
@@ -1142,6 +1175,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         damage_coalescing,
         damage_merge_cost_bytes,
         upload_mode,
+        presentation_mode,
         visibility_caching,
         view_zoom,
         scenes,

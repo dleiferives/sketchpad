@@ -32,6 +32,8 @@ lower-power CPU/integrated-GPU test machine.
   `--damage-coalescing union|rect4` and `--damage-merge-cost-kib N` select the
   pending-damage policy and its call-equivalent merge threshold.
   `--texture-upload write-texture|staging-ring` selects the transfer path.
+  `--presentation direct|cache-rgba32` compares direct tile-array sampling
+  with the full-precision dirty-updated display cache.
   Staging with a 0 KiB threshold is the application/replay default;
   selecting `write-texture` without an explicit threshold selects its 64 KiB
   control. `--visibility cached|rebuild` selects persistent visibility and

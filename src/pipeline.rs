@@ -32,6 +32,13 @@ pub enum TextureUploadMode {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PresentationMode {
+    #[default]
+    DirectTiles,
+    CacheRgba32Float,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct PendingMergeStats {
     merges: u64,
     forced_merges: u64,
@@ -109,7 +116,11 @@ impl PendingTileDamage {
 }
 
 fn padded_region_bytes(region: RectU32) -> u64 {
-    let row_bytes = u64::from(region.width()).saturating_mul(PIXEL_BYTES);
+    padded_region_bytes_for(region, PIXEL_BYTES)
+}
+
+fn padded_region_bytes_for(region: RectU32, pixel_bytes: u64) -> u64 {
+    let row_bytes = u64::from(region.width()).saturating_mul(pixel_bytes);
     let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     row_bytes
         .div_ceil(alignment)
@@ -236,6 +247,9 @@ pub struct RasterPresentationStats {
     pub instance_cache_hits: u64,
     pub instance_bytes_written: u64,
     pub cached_visible_tiles: u32,
+    pub display_cache_updates: u64,
+    pub display_cache_bytes: u64,
+    pub display_cache_draws: u64,
     pub evictions: u64,
     pub resident_tiles: u32,
     pub visible_instances: u32,
@@ -255,8 +269,15 @@ struct QueuedTileUpload {
 struct StagedTileCopy {
     offset: u64,
     bytes_per_row: u32,
+    coord: TileCoord,
     slot: u32,
     local_region: RectU32,
+}
+
+struct DisplayCache {
+    texture: wgpu::Texture,
+    bind_group: wgpu::BindGroup,
+    size: [u32; 2],
 }
 
 enum StagingSlotState {
@@ -315,6 +336,8 @@ pub struct RasterDisplayPipeline {
     background_pipeline: wgpu::RenderPipeline,
     tile_pipeline: wgpu::RenderPipeline,
     cursor_pipeline: wgpu::RenderPipeline,
+    display_cache_layout: wgpu::BindGroupLayout,
+    display_cache_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     cursor_buffer: wgpu::Buffer,
     tile_size: u32,
@@ -340,6 +363,8 @@ pub struct RasterDisplayPipeline {
     instance_visibility_generation: u64,
     instance_residency_generation: u64,
     visibility_caching: bool,
+    presentation_mode: PresentationMode,
+    display_cache: Option<DisplayCache>,
     stats: RasterPresentationStats,
 }
 
@@ -600,6 +625,68 @@ impl RasterDisplayPipeline {
             multiview_mask: None,
             cache: None,
         });
+        let display_cache_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Display Cache Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let display_cache_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Display Cache Pipeline Layout"),
+                bind_group_layouts: &[Some(&display_cache_layout)],
+                immediate_size: 0,
+            });
+        let display_cache_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Display Cache Shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/display_cache.wgsl").into()),
+        });
+        let display_cache_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Display Cache Pipeline"),
+                layout: Some(&display_cache_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &display_cache_shader,
+                    entry_point: Some("cache_vs"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &display_cache_shader,
+                    entry_point: Some("cache_fs"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: surface_format,
+                        blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let first_page = Self::create_page(
             device,
@@ -615,6 +702,8 @@ impl RasterDisplayPipeline {
             background_pipeline,
             tile_pipeline,
             cursor_pipeline,
+            display_cache_layout,
+            display_cache_pipeline,
             camera_buffer,
             cursor_buffer,
             tile_size,
@@ -643,6 +732,8 @@ impl RasterDisplayPipeline {
             instance_visibility_generation: 0,
             instance_residency_generation: 0,
             visibility_caching: true,
+            presentation_mode: PresentationMode::DirectTiles,
+            display_cache: None,
             stats: RasterPresentationStats {
                 resident_pages: 1,
                 resident_capacity: page_capacity,
@@ -664,7 +755,16 @@ impl RasterDisplayPipeline {
         }
     }
 
+    pub fn set_presentation_mode(&mut self, mode: PresentationMode) {
+        if self.presentation_mode != mode {
+            self.presentation_mode = mode;
+            self.display_cache = None;
+            self.clear_residency();
+        }
+    }
+
     pub fn sync_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
+        let mut reset_display_cache = false;
         for (coord, region) in damage.tile_regions() {
             self.stats.damage_regions = self.stats.damage_regions.saturating_add(1);
             if layer.tile(coord).is_none() {
@@ -675,6 +775,7 @@ impl RasterDisplayPipeline {
                         .saturating_sub(pending.len() as u32);
                 }
                 self.remove_resident(coord);
+                reset_display_cache |= self.presentation_mode == PresentationMode::CacheRgba32Float;
             } else if self.residency.contains_key(&coord) {
                 match self.pending_damage.entry(coord) {
                     Entry::Occupied(mut pending) => {
@@ -709,11 +810,15 @@ impl RasterDisplayPipeline {
                 }
             }
         }
+        if reset_display_cache {
+            self.clear_residency();
+        }
         self.stats.pending_damage_tiles = self.pending_damage.len() as u32;
         self.stats.resident_tiles = self.residency.len() as u32;
     }
 
     pub fn reconcile_committed_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
+        let mut reset_display_cache = false;
         for &coord in damage.tiles() {
             if layer.tile(coord).is_none() {
                 if let Some(pending) = self.pending_damage.remove(&coord) {
@@ -723,13 +828,20 @@ impl RasterDisplayPipeline {
                         .saturating_sub(pending.len() as u32);
                 }
                 self.remove_resident(coord);
+                reset_display_cache |= self.presentation_mode == PresentationMode::CacheRgba32Float;
             }
+        }
+        if reset_display_cache {
+            self.clear_residency();
         }
         self.stats.pending_damage_tiles = self.pending_damage.len() as u32;
         self.stats.resident_tiles = self.residency.len() as u32;
     }
 
     pub fn clear_residency(&mut self) {
+        if self.presentation_mode == PresentationMode::CacheRgba32Float {
+            self.display_cache = None;
+        }
         self.residency.clear();
         self.pending_damage.clear();
         self.queued_uploads.clear();
@@ -766,6 +878,10 @@ impl RasterDisplayPipeline {
             self.staging.active_slot.is_none(),
             "the previous staged uploads must be submitted before preparing another frame"
         );
+        if self.presentation_mode == PresentationMode::CacheRgba32Float {
+            self.ensure_display_cache(device, layer);
+            self.stats.display_cache_draws = self.stats.display_cache_draws.saturating_add(1);
+        }
         self.flush_pending_damage(layer);
         let allocation_generation = layer.allocation_generation();
         let rebuild_visibility = !self.visibility_caching
@@ -839,7 +955,9 @@ impl RasterDisplayPipeline {
         let rebuild_instances = !self.visibility_caching
             || self.instance_visibility_generation != self.visibility_generation
             || self.instance_residency_generation != self.residency_generation;
-        if rebuild_instances {
+        if self.presentation_mode == PresentationMode::CacheRgba32Float {
+            self.stats.visible_instances = 0;
+        } else if rebuild_instances {
             let mut page_instances = vec![Vec::new(); self.pages.len()];
             for &coord in &self.cached_visible {
                 let Some(&slot) = self.residency.get(&coord) else {
@@ -882,6 +1000,53 @@ impl RasterDisplayPipeline {
         self.prepare_uploads(device, queue, layer);
     }
 
+    fn ensure_display_cache(&mut self, device: &wgpu::Device, layer: &RasterLayer) {
+        let size = [layer.width(), layer.height()];
+        if self
+            .display_cache
+            .as_ref()
+            .is_some_and(|cache| cache.size == size)
+        {
+            return;
+        }
+        let texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Rgba32Float Display Cache"),
+            size: wgpu::Extent3d {
+                width: size[0],
+                height: size[1],
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                | wgpu::TextureUsages::COPY_DST
+                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&Default::default());
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Display Cache Bind Group"),
+            layout: &self.display_cache_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: self.camera_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        self.display_cache = Some(DisplayCache {
+            texture,
+            bind_group,
+            size,
+        });
+    }
+
     fn flush_pending_damage(&mut self, layer: &RasterLayer) {
         let pending_damage = std::mem::take(&mut self.pending_damage);
         for (coord, pending) in pending_damage {
@@ -907,6 +1072,30 @@ impl RasterDisplayPipeline {
         };
         let encode_start = Instant::now();
         for copy in &self.staging.copies {
+            let (texture, origin) = match self.presentation_mode {
+                PresentationMode::DirectTiles => (
+                    &self.pages[(copy.slot / self.page_capacity) as usize].texture,
+                    wgpu::Origin3d {
+                        x: copy.local_region.min_x(),
+                        y: copy.local_region.min_y(),
+                        z: copy.slot % self.page_capacity,
+                    },
+                ),
+                PresentationMode::CacheRgba32Float => {
+                    let cache = self
+                        .display_cache
+                        .as_ref()
+                        .expect("cache presentation requires a display cache");
+                    (
+                        &cache.texture,
+                        wgpu::Origin3d {
+                            x: copy.coord.x * self.tile_size + copy.local_region.min_x(),
+                            y: copy.coord.y * self.tile_size + copy.local_region.min_y(),
+                            z: 0,
+                        },
+                    )
+                }
+            };
             encoder.copy_buffer_to_texture(
                 wgpu::TexelCopyBufferInfo {
                     buffer: &slot.buffer,
@@ -917,13 +1106,9 @@ impl RasterDisplayPipeline {
                     },
                 },
                 wgpu::TexelCopyTextureInfo {
-                    texture: &self.pages[(copy.slot / self.page_capacity) as usize].texture,
+                    texture,
                     mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: copy.local_region.min_x(),
-                        y: copy.local_region.min_y(),
-                        z: copy.slot % self.page_capacity,
-                    },
+                    origin,
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::Extent3d {
@@ -972,14 +1157,27 @@ impl RasterDisplayPipeline {
         pass.set_pipeline(&self.background_pipeline);
         pass.draw(0..6, 0..1);
 
-        pass.set_pipeline(&self.tile_pipeline);
-        for page in &self.pages {
-            if page.instance_count == 0 {
-                continue;
+        match self.presentation_mode {
+            PresentationMode::DirectTiles => {
+                pass.set_pipeline(&self.tile_pipeline);
+                for page in &self.pages {
+                    if page.instance_count == 0 {
+                        continue;
+                    }
+                    pass.set_bind_group(0, &page.bind_group, &[]);
+                    pass.set_vertex_buffer(0, page.instance_buffer.slice(..));
+                    pass.draw(0..6, 0..page.instance_count);
+                }
             }
-            pass.set_bind_group(0, &page.bind_group, &[]);
-            pass.set_vertex_buffer(0, page.instance_buffer.slice(..));
-            pass.draw(0..6, 0..page.instance_count);
+            PresentationMode::CacheRgba32Float => {
+                let cache = self
+                    .display_cache
+                    .as_ref()
+                    .expect("cache presentation requires a display cache");
+                pass.set_pipeline(&self.display_cache_pipeline);
+                pass.set_bind_group(0, &cache.bind_group, &[]);
+                pass.draw(0..6, 0..1);
+            }
         }
 
         pass.set_bind_group(0, &self.pages[0].bind_group, &[]);
@@ -1137,10 +1335,11 @@ impl RasterDisplayPipeline {
         match self.upload_mode {
             TextureUploadMode::WriteTexture => self.write_queued_uploads(queue, layer),
             TextureUploadMode::StagingRing => {
+                let pixel_bytes = self.upload_destination_pixel_bytes();
                 let required_bytes: u64 = self
                     .queued_uploads
                     .iter()
-                    .map(|upload| padded_region_bytes(upload.local_region))
+                    .map(|upload| padded_region_bytes_for(upload.local_region, pixel_bytes))
                     .sum();
                 if fits_staging_frame(required_bytes) {
                     self.pack_staged_uploads(device, layer);
@@ -1153,6 +1352,10 @@ impl RasterDisplayPipeline {
                 }
             }
         }
+    }
+
+    fn upload_destination_pixel_bytes(&self) -> u64 {
+        PIXEL_BYTES
     }
 
     fn write_queued_uploads(&mut self, queue: &wgpu::Queue, layer: &RasterLayer) {
@@ -1174,29 +1377,72 @@ impl RasterDisplayPipeline {
     ) {
         let source = tile_region_source(tile, local_region);
         let upload_start = Instant::now();
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.pages[(slot / self.page_capacity) as usize].texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d {
-                    x: local_region.min_x(),
-                    y: local_region.min_y(),
-                    z: slot % self.page_capacity,
-                },
-                aspect: wgpu::TextureAspect::All,
-            },
-            source.bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(self.tile_size * std::mem::size_of::<[f32; 4]>() as u32),
-                rows_per_image: Some(self.tile_size),
-            },
-            wgpu::Extent3d {
-                width: local_region.width(),
-                height: local_region.height(),
-                depth_or_array_layers: 1,
-            },
-        );
+        match self.presentation_mode {
+            PresentationMode::DirectTiles => {
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.pages[(slot / self.page_capacity) as usize].texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: local_region.min_x(),
+                            y: local_region.min_y(),
+                            z: slot % self.page_capacity,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    source.bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(
+                            self.tile_size * std::mem::size_of::<[f32; 4]>() as u32,
+                        ),
+                        rows_per_image: Some(self.tile_size),
+                    },
+                    wgpu::Extent3d {
+                        width: local_region.width(),
+                        height: local_region.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+            PresentationMode::CacheRgba32Float => {
+                let cache = self
+                    .display_cache
+                    .as_ref()
+                    .expect("cache presentation requires a display cache");
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &cache.texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d {
+                            x: tile.bounds().min_x() + local_region.min_x(),
+                            y: tile.bounds().min_y() + local_region.min_y(),
+                            z: 0,
+                        },
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    source.bytes,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(
+                            self.tile_size * std::mem::size_of::<[f32; 4]>() as u32,
+                        ),
+                        rows_per_image: Some(self.tile_size),
+                    },
+                    wgpu::Extent3d {
+                        width: local_region.width(),
+                        height: local_region.height(),
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.stats.display_cache_updates =
+                    self.stats.display_cache_updates.saturating_add(1);
+                self.stats.display_cache_bytes = self
+                    .stats
+                    .display_cache_bytes
+                    .saturating_add(local_region.area().saturating_mul(PIXEL_BYTES));
+            }
+        }
         self.stats.upload_api_nanos = self
             .stats
             .upload_api_nanos
@@ -1206,9 +1452,10 @@ impl RasterDisplayPipeline {
 
     fn pack_staged_uploads(&mut self, device: &wgpu::Device, layer: &RasterLayer) {
         let queued = std::mem::take(&mut self.queued_uploads);
+        let pixel_bytes = self.upload_destination_pixel_bytes();
         let required_bytes = queued
             .iter()
-            .map(|upload| padded_region_bytes(upload.local_region))
+            .map(|upload| padded_region_bytes_for(upload.local_region, pixel_bytes))
             .sum();
         let active_slot = self.acquire_staging_slot(device, required_bytes);
         let slot = self.staging.slots[active_slot]
@@ -1232,7 +1479,7 @@ impl RasterDisplayPipeline {
                 .tile(upload.coord)
                 .expect("queued uploads must refer to allocated tiles");
             let region = upload.local_region;
-            let row_bytes = u64::from(region.width()).saturating_mul(PIXEL_BYTES);
+            let row_bytes = u64::from(region.width()).saturating_mul(pixel_bytes);
             let aligned_row_bytes = row_bytes
                 .div_ceil(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT))
                 .saturating_mul(u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT));
@@ -1240,8 +1487,8 @@ impl RasterDisplayPipeline {
             for row in 0..region.height() as usize {
                 let source_start = tile_start + row * tile.stride();
                 let source_end = source_start + region.width() as usize;
-                let source = bytemuck::cast_slice(&tile.pixels()[source_start..source_end]);
                 let destination_start = offset as usize + row * aligned_row_bytes as usize;
+                let source = bytemuck::cast_slice(&tile.pixels()[source_start..source_end]);
                 mapped
                     .slice(destination_start..destination_start + source.len())
                     .copy_from_slice(source);
@@ -1249,6 +1496,7 @@ impl RasterDisplayPipeline {
             copies.push(StagedTileCopy {
                 offset,
                 bytes_per_row: aligned_row_bytes as u32,
+                coord: upload.coord,
                 slot: upload.slot,
                 local_region: region,
             });
@@ -1261,7 +1509,8 @@ impl RasterDisplayPipeline {
             }
             logical_bytes = logical_bytes.saturating_add(region.area().saturating_mul(PIXEL_BYTES));
             source_span_bytes = source_span_bytes.saturating_add(source.source_span_bytes);
-            padded_bytes = padded_bytes.saturating_add(padded_region_bytes(region));
+            padded_bytes =
+                padded_bytes.saturating_add(padded_region_bytes_for(region, pixel_bytes));
             offset = offset.saturating_add(aligned_row_bytes * u64::from(region.height()));
         }
         drop(mapped);
@@ -1280,6 +1529,14 @@ impl RasterDisplayPipeline {
             .saturating_add(source_span_bytes);
         self.stats.upload_padded_bytes =
             self.stats.upload_padded_bytes.saturating_add(padded_bytes);
+        if self.presentation_mode == PresentationMode::CacheRgba32Float {
+            self.stats.display_cache_updates = self
+                .stats
+                .display_cache_updates
+                .saturating_add(queued.len() as u64);
+            self.stats.display_cache_bytes =
+                self.stats.display_cache_bytes.saturating_add(logical_bytes);
+        }
         self.stats.upload_pack_nanos = self
             .stats
             .upload_pack_nanos
@@ -1382,10 +1639,13 @@ impl RasterDisplayPipeline {
             .stats
             .upload_source_span_bytes
             .saturating_add(source_span_bytes);
-        self.stats.upload_padded_bytes = self
-            .stats
-            .upload_padded_bytes
-            .saturating_add(padded_region_bytes(local_region));
+        self.stats.upload_padded_bytes =
+            self.stats
+                .upload_padded_bytes
+                .saturating_add(padded_region_bytes_for(
+                    local_region,
+                    self.upload_destination_pixel_bytes(),
+                ));
     }
 
     fn ensure_slot(&mut self, coord: TileCoord) -> u32 {

@@ -312,6 +312,14 @@ On stable dense Apollo frames, caching eliminates all visibility scans, sorts,
 and instance writes and reduces application-to-submit p95 by 14%–21%.
 Allocation-heavy strokes correctly rebuild rather than using stale state.
 
+Replay format version 8 adds `--presentation direct|cache-rgba32`. The
+experimental cache is a canvas-sized `Rgba32Float` texture updated from queued
+dirty regions and drawn once per frame. It deliberately preserves the
+reference format: a tested `Rgba16Float` variant was removed after the
+readback oracle detected nonzero output differences. Direct tiles remain the
+application and replay default until the full-precision memory/performance
+matrix is complete.
+
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
 frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where
@@ -335,8 +343,10 @@ It:
 5. draws the paper, tile instances, and a visible eraser cursor into an
    offscreen texture;
 6. copies the image back to the CPU;
-7. verifies that every resident tile is drawn with no deferred visible tiles;
-8. fails if enough dark ink and cursor-colored pixels are not present.
+7. renders the identical state through the full-precision display cache;
+8. requires exact byte equality between direct and cached output;
+9. verifies that every resident tile is drawn with no deferred visible tiles;
+10. fails if enough dark ink and cursor-colored pixels are not present.
 
 On the Atlas Intel UHD 630 it currently finds 15,178 dark ink/outline pixels
 and 312 cursor-colored pixels. The resident update transfers 23,104 bytes
@@ -396,8 +406,9 @@ now governed by
    one submission per display opportunity.
 4. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-5. Compare a stable lower-bandwidth display cache and presentation formats
-   after the visibility/instance matrix points away from instance rebuilding.
+5. Measure the exact `Rgba32Float` display cache against direct tiles without
+   changing image quality; keep reduced-precision formats out of the product
+   path unless the quality policy explicitly changes.
 6. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
 7. Capture a physical trace family covering light pressure, fast motion, long
