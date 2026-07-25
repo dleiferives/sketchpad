@@ -1,0 +1,1035 @@
+{
+  "format": "sketchpad-input-trace",
+  "version": 1,
+  "viewport": [
+    1280,
+    720
+  ],
+  "device": {
+    "id": 18,
+    "name": "Wacom Intuos Pro S Pen stylus",
+    "tool": "Pen"
+  },
+  "samples": [
+    {
+      "arrival_micros": 0,
+      "source_millis": 52867439,
+      "phase": "Down",
+      "position": [
+        567.3313,
+        310.61383
+      ],
+      "pressure": 0.31704712,
+      "tilt": [
+        0.71428573,
+        0.31746033
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 1012,
+      "source_millis": 52867444,
+      "phase": "Move",
+      "position": [
+        567.8074,
+        310.77844
+      ],
+      "pressure": 0.31900024,
+      "tilt": [
+        0.6984127,
+        0.31746033
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 1569,
+      "source_millis": 52867449,
+      "phase": "Move",
+      "position": [
+        565.8203,
+        310.943
+      ],
+      "pressure": 0.32095337,
+      "tilt": [
+        0.6984127,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 1963,
+      "source_millis": 52867454,
+      "phase": "Move",
+      "position": [
+        562.1875,
+        310.05273
+      ],
+      "pressure": 0.32681274,
+      "tilt": [
+        0.6825397,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 2465,
+      "source_millis": 52867459,
+      "phase": "Move",
+      "position": [
+        558.9697,
+        311.8333
+      ],
+      "pressure": 0.34146118,
+      "tilt": [
+        0.6666667,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 7803,
+      "source_millis": 52867464,
+      "phase": "Move",
+      "position": [
+        551.813,
+        310.90063
+      ],
+      "pressure": 0.36003113,
+      "tilt": [
+        0.6507937,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 49916,
+      "source_millis": 52867469,
+      "phase": "Move",
+      "position": [
+        545.7781,
+        309.25482
+      ],
+      "pressure": 0.3756714,
+      "tilt": [
+        0.63492066,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 51556,
+      "source_millis": 52867474,
+      "phase": "Move",
+      "position": [
+        539.3528,
+        308.5666
+      ],
+      "pressure": 0.38934326,
+      "tilt": [
+        0.63492066,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 53109,
+      "source_millis": 52867479,
+      "phase": "Move",
+      "position": [
+        534.4153,
+        305.89087
+      ],
+      "pressure": 0.39959717,
+      "tilt": [
+        0.61904764,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 53685,
+      "source_millis": 52867484,
+      "phase": "Move",
+      "position": [
+        529.96533,
+        301.00824
+      ],
+      "pressure": 0.40350342,
+      "tilt": [
+        0.61904764,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 54265,
+      "source_millis": 52867489,
+      "phase": "Move",
+      "position": [
+        524.4907,
+        297.75403
+      ],
+      "pressure": 0.4103546,
+      "tilt": [
+        0.61904764,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 56392,
+      "source_millis": 52867494,
+      "phase": "Move",
+      "position": [
+        521.1133,
+        290.90887
+      ],
+      "pressure": 0.41474915,
+      "tilt": [
+        0.61904764,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 57996,
+      "source_millis": 52867499,
+      "phase": "Move",
+      "position": [
+        519.5647,
+        282.97897
+      ],
+      "pressure": 0.42012024,
+      "tilt": [
+        0.61904764,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 58701,
+      "source_millis": 52867504,
+      "phase": "Move",
+      "position": [
+        518.2107,
+        272.18378
+      ],
+      "pressure": 0.42842102,
+      "tilt": [
+        0.61904764,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 59526,
+      "source_millis": 52867509,
+      "phase": "Move",
+      "position": [
+        520.99,
+        261.01706
+      ],
+      "pressure": 0.43476868,
+      "tilt": [
+        0.61904764,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 69571,
+      "source_millis": 52867514,
+      "phase": "Move",
+      "position": [
+        523.96387,
+        248.86285
+      ],
+      "pressure": 0.4367218,
+      "tilt": [
+        0.61904764,
+        0.31746033
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 70611,
+      "source_millis": 52867519,
+      "phase": "Move",
+      "position": [
+        529.0105,
+        233.37946
+      ],
+      "pressure": 0.44015503,
+      "tilt": [
+        0.61904764,
+        0.31746033
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 71631,
+      "source_millis": 52867525,
+      "phase": "Move",
+      "position": [
+        538.64185,
+        219.95093
+      ],
+      "pressure": 0.443573,
+      "tilt": [
+        0.61904764,
+        0.33333334
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 72624,
+      "source_millis": 52867529,
+      "phase": "Move",
+      "position": [
+        547.7971,
+        204.57727
+      ],
+      "pressure": 0.44454956,
+      "tilt": [
+        0.61904764,
+        0.33333334
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 94996,
+      "source_millis": 52867535,
+      "phase": "Move",
+      "position": [
+        558.5984,
+        190.64249
+      ],
+      "pressure": 0.44699097,
+      "tilt": [
+        0.61904764,
+        0.34920636
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 97415,
+      "source_millis": 52867539,
+      "phase": "Move",
+      "position": [
+        571.86255,
+        176.53064
+      ],
+      "pressure": 0.45333862,
+      "tilt": [
+        0.61904764,
+        0.36507937
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 99274,
+      "source_millis": 52867545,
+      "phase": "Move",
+      "position": [
+        585.04126,
+        163.68057
+      ],
+      "pressure": 0.45724487,
+      "tilt": [
+        0.61904764,
+        0.3809524
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 99961,
+      "source_millis": 52867549,
+      "phase": "Move",
+      "position": [
+        601.03687,
+        151.42151
+      ],
+      "pressure": 0.45870972,
+      "tilt": [
+        0.61904764,
+        0.3968254
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 102330,
+      "source_millis": 52867555,
+      "phase": "Move",
+      "position": [
+        616.36206,
+        141.13745
+      ],
+      "pressure": 0.46261597,
+      "tilt": [
+        0.6031746,
+        0.3968254
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 103354,
+      "source_millis": 52867559,
+      "phase": "Move",
+      "position": [
+        630.1633,
+        133.04785
+      ],
+      "pressure": 0.4645691,
+      "tilt": [
+        0.6031746,
+        0.41269842
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 108681,
+      "source_millis": 52867565,
+      "phase": "Move",
+      "position": [
+        643.98926,
+        127.26242
+      ],
+      "pressure": 0.46261597,
+      "tilt": [
+        0.6031746,
+        0.42857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 125723,
+      "source_millis": 52867570,
+      "phase": "Move",
+      "position": [
+        654.0835,
+        123.56171
+      ],
+      "pressure": 0.46359253,
+      "tilt": [
+        0.6031746,
+        0.42857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 126483,
+      "source_millis": 52867575,
+      "phase": "Move",
+      "position": [
+        666.08057,
+        121.83603
+      ],
+      "pressure": 0.46603394,
+      "tilt": [
+        0.5873016,
+        0.44444445
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 149831,
+      "source_millis": 52867580,
+      "phase": "Move",
+      "position": [
+        676.0415,
+        121.08533
+      ],
+      "pressure": 0.4645691,
+      "tilt": [
+        0.5873016,
+        0.44444445
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 150290,
+      "source_millis": 52867585,
+      "phase": "Move",
+      "position": [
+        685.6614,
+        124.87076
+      ],
+      "pressure": 0.4645691,
+      "tilt": [
+        0.5873016,
+        0.44444445
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 151406,
+      "source_millis": 52867590,
+      "phase": "Move",
+      "position": [
+        692.5132,
+        127.3569
+      ],
+      "pressure": 0.46995544,
+      "tilt": [
+        0.5714286,
+        0.44444445
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 151920,
+      "source_millis": 52867595,
+      "phase": "Move",
+      "position": [
+        698.5366,
+        133.54373
+      ],
+      "pressure": 0.47434998,
+      "tilt": [
+        0.5714286,
+        0.44444445
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 152242,
+      "source_millis": 52867600,
+      "phase": "Move",
+      "position": [
+        702.1824,
+        140.21182
+      ],
+      "pressure": 0.4787445,
+      "tilt": [
+        0.5714286,
+        0.42857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 153007,
+      "source_millis": 52867605,
+      "phase": "Move",
+      "position": [
+        704.0852,
+        149.80005
+      ],
+      "pressure": 0.48362732,
+      "tilt": [
+        0.5714286,
+        0.42857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 153407,
+      "source_millis": 52867610,
+      "phase": "Move",
+      "position": [
+        703.1228,
+        159.80219
+      ],
+      "pressure": 0.4870453,
+      "tilt": [
+        0.5714286,
+        0.42857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 158577,
+      "source_millis": 52867615,
+      "phase": "Move",
+      "position": [
+        699.9297,
+        172.6571
+      ],
+      "pressure": 0.486557,
+      "tilt": [
+        0.5555556,
+        0.41269842
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 169771,
+      "source_millis": 52867620,
+      "phase": "Move",
+      "position": [
+        691.0183,
+        188.694
+      ],
+      "pressure": 0.4889984,
+      "tilt": [
+        0.5555556,
+        0.41269842
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 171402,
+      "source_millis": 52867625,
+      "phase": "Move",
+      "position": [
+        681.5713,
+        207.46146
+      ],
+      "pressure": 0.48997498,
+      "tilt": [
+        0.5555556,
+        0.3968254
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 173626,
+      "source_millis": 52867630,
+      "phase": "Move",
+      "position": [
+        666.5886,
+        230.35599
+      ],
+      "pressure": 0.4889984,
+      "tilt": [
+        0.5555556,
+        0.3809524
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 191077,
+      "source_millis": 52867635,
+      "phase": "Move",
+      "position": [
+        648.8511,
+        256.9811
+      ],
+      "pressure": 0.4894867,
+      "tilt": [
+        0.5555556,
+        0.36507937
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 204813,
+      "source_millis": 52867640,
+      "phase": "Move",
+      "position": [
+        625.6145,
+        285.22705
+      ],
+      "pressure": 0.49046326,
+      "tilt": [
+        0.5714286,
+        0.34920636
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 207059,
+      "source_millis": 52867645,
+      "phase": "Move",
+      "position": [
+        600.1223,
+        319.27094
+      ],
+      "pressure": 0.49143982,
+      "tilt": [
+        0.5714286,
+        0.33333334
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 223480,
+      "source_millis": 52867650,
+      "phase": "Move",
+      "position": [
+        573.77686,
+        355.94818
+      ],
+      "pressure": 0.49339294,
+      "tilt": [
+        0.5873016,
+        0.31746033
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 226011,
+      "source_millis": 52867655,
+      "phase": "Move",
+      "position": [
+        544.91895,
+        393.38098
+      ],
+      "pressure": 0.5300293,
+      "tilt": [
+        0.5873016,
+        0.3015873
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 244735,
+      "source_millis": 52867660,
+      "phase": "Move",
+      "position": [
+        516.7925,
+        434.7589
+      ],
+      "pressure": 0.55885315,
+      "tilt": [
+        0.6031746,
+        0.2857143
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 248008,
+      "source_millis": 52867665,
+      "phase": "Move",
+      "position": [
+        489.28735,
+        474.107
+      ],
+      "pressure": 0.5803528,
+      "tilt": [
+        0.61904764,
+        0.26984128
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 251362,
+      "source_millis": 52867670,
+      "phase": "Move",
+      "position": [
+        465.7444,
+        513.05365
+      ],
+      "pressure": 0.5950165,
+      "tilt": [
+        0.63492066,
+        0.25396827
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 253768,
+      "source_millis": 52867675,
+      "phase": "Move",
+      "position": [
+        444.05347,
+        548.29474
+      ],
+      "pressure": 0.6042938,
+      "tilt": [
+        0.63492066,
+        0.22222222
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 257561,
+      "source_millis": 52867680,
+      "phase": "Move",
+      "position": [
+        430.2146,
+        577.22675
+      ],
+      "pressure": 0.6067352,
+      "tilt": [
+        0.6507937,
+        0.20634921
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 277975,
+      "source_millis": 52867686,
+      "phase": "Move",
+      "position": [
+        421.61792,
+        600.6852
+      ],
+      "pressure": 0.6101532,
+      "tilt": [
+        0.6507937,
+        0.1904762
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 279574,
+      "source_millis": 52867690,
+      "phase": "Move",
+      "position": [
+        417.6543,
+        616.5053
+      ],
+      "pressure": 0.61112976,
+      "tilt": [
+        0.6666667,
+        0.17460318
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 281198,
+      "source_millis": 52867695,
+      "phase": "Move",
+      "position": [
+        418.95752,
+        626.2908
+      ],
+      "pressure": 0.6370239,
+      "tilt": [
+        0.6666667,
+        0.15873016
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 281557,
+      "source_millis": 52867700,
+      "phase": "Move",
+      "position": [
+        423.77197,
+        630.75464
+      ],
+      "pressure": 0.6629181,
+      "tilt": [
+        0.6825397,
+        0.14285715
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 282429,
+      "source_millis": 52867706,
+      "phase": "Move",
+      "position": [
+        433.52368,
+        628.5553
+      ],
+      "pressure": 0.67707825,
+      "tilt": [
+        0.6984127,
+        0.12698413
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 282959,
+      "source_millis": 52867710,
+      "phase": "Move",
+      "position": [
+        448.66455,
+        622.9671
+      ],
+      "pressure": 0.6809845,
+      "tilt": [
+        0.6984127,
+        0.12698413
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 284551,
+      "source_millis": 52867716,
+      "phase": "Move",
+      "position": [
+        467.76782,
+        611.5386
+      ],
+      "pressure": 0.6829376,
+      "tilt": [
+        0.71428573,
+        0.12698413
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 285731,
+      "source_millis": 52867720,
+      "phase": "Move",
+      "position": [
+        490.13794,
+        597.81836
+      ],
+      "pressure": 0.685379,
+      "tilt": [
+        0.6984127,
+        0.11111111
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 287805,
+      "source_millis": 52867726,
+      "phase": "Move",
+      "position": [
+        518.01904,
+        579.24536
+      ],
+      "pressure": 0.6863556,
+      "tilt": [
+        0.6984127,
+        0.11111111
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 290347,
+      "source_millis": 52867730,
+      "phase": "Move",
+      "position": [
+        550.19214,
+        559.7522
+      ],
+      "pressure": 0.68733215,
+      "tilt": [
+        0.6984127,
+        0.11111111
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 306924,
+      "source_millis": 52867736,
+      "phase": "Move",
+      "position": [
+        585.2053,
+        536.2292
+      ],
+      "pressure": 0.6648712,
+      "tilt": [
+        0.6825397,
+        0.11111111
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 326048,
+      "source_millis": 52867741,
+      "phase": "Move",
+      "position": [
+        624.9253,
+        512.04785
+      ],
+      "pressure": 0.60917664,
+      "tilt": [
+        0.6825397,
+        0.12698413
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 357218,
+      "source_millis": 52867746,
+      "phase": "Move",
+      "position": [
+        664.9385,
+        487.96375
+      ],
+      "pressure": 0.53541565,
+      "tilt": [
+        0.6666667,
+        0.14285715
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 369963,
+      "source_millis": 52867751,
+      "phase": "Move",
+      "position": [
+        703.61084,
+        462.45807
+      ],
+      "pressure": 0.48265076,
+      "tilt": [
+        0.6507937,
+        0.15873016
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 372529,
+      "source_millis": 52867756,
+      "phase": "Move",
+      "position": [
+        741.9912,
+        441.90247
+      ],
+      "pressure": 0.42500305,
+      "tilt": [
+        0.63492066,
+        0.15873016
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 375488,
+      "source_millis": 52867761,
+      "phase": "Move",
+      "position": [
+        775.958,
+        423.9677
+      ],
+      "pressure": 0.3409729,
+      "tilt": [
+        0.61904764,
+        0.17460318
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 382406,
+      "source_millis": 52867766,
+      "phase": "Move",
+      "position": [
+        806.9988,
+        409.2697
+      ],
+      "pressure": 0.14459229,
+      "tilt": [
+        0.6031746,
+        0.17460318
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 383618,
+      "source_millis": 52867771,
+      "phase": "Move",
+      "position": [
+        834.4065,
+        399.42456
+      ],
+      "pressure": 0.0,
+      "tilt": [
+        0.5873016,
+        0.17460318
+      ],
+      "distance": 0.0
+    },
+    {
+      "arrival_micros": 385124,
+      "source_millis": 52867771,
+      "phase": "Up",
+      "position": [
+        858.4065,
+        391.42456
+      ],
+      "pressure": 0.0,
+      "tilt": [
+        0.5873016,
+        0.17460318
+      ],
+      "distance": 0.0
+    }
+  ]
+}

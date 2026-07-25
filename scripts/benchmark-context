@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -u
+
+if [[ "$#" -ne 1 || "$1" != .artifacts/* || "/$1/" == *"/../"* ]]; then
+  echo "usage: scripts/benchmark-context .artifacts/path" >&2
+  exit 2
+fi
+
+output="$1"
+mkdir -p "$(dirname "$output")"
+
+{
+  echo "sketchpad benchmark context v1"
+  echo
+  echo "[clock]"
+  date --utc --iso-8601=seconds
+  echo
+  echo "[host]"
+  hostname
+  uname -a
+  echo
+  echo "[uptime and load]"
+  uptime
+  echo
+  echo "[cpu]"
+  lscpu
+  echo
+  echo "[cpu frequency]"
+  cpupower frequency-info
+  echo
+  echo "[memory]"
+  free --bytes
+  echo
+  echo "[swap]"
+  swapon --show --bytes
+  echo
+  echo "[sensors]"
+  sensors
+  echo
+  echo "[vulkan]"
+  vulkaninfo --summary
+  echo
+  echo "[rust]"
+  rustc -Vv
+  cargo -V
+  echo
+  echo "[nvidia]"
+  nvidia-smi --query-gpu=name,driver_version,pstate,temperature.gpu,clocks.current.graphics,clocks.current.memory,power.draw,memory.total,memory.used --format=csv
+} >"$output" 2>&1
+
+echo "benchmark_context=$output"

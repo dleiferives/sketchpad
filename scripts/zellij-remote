@@ -21,6 +21,10 @@ usage:
   scripts/$remote_host interrupt
   scripts/$remote_host sync
   scripts/$remote_host status
+  scripts/$remote_host fetch <.artifacts/path> [local-path]
+  scripts/$remote_host record [local-trace-path]
+  scripts/$remote_host benchmark cpu [trace-replay-options...]
+  scripts/$remote_host benchmark gpu <adapter-filter> [gpu-replay-options...]
 EOF
   exit 2
 }
@@ -114,6 +118,102 @@ run_remote_command() {
   return "$status"
 }
 
+validate_artifact_path() {
+  local artifact="$1"
+  if [[ "$artifact" != .artifacts/* || "/$artifact/" == *"/../"* ]]; then
+    echo "Remote artifacts must be beneath .artifacts/ without '..' components." >&2
+    return 2
+  fi
+}
+
+fetch_remote_artifact() {
+  if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
+    usage
+  fi
+  local artifact="$1"
+  local local_path="${2:-$artifact}"
+  local repo_root
+  validate_artifact_path "$artifact"
+  repo_root="$(git rev-parse --show-toplevel)"
+  if [[ "$local_path" != /* ]]; then
+    local_path="$repo_root/$local_path"
+  fi
+  mkdir -p "$(dirname "$local_path")"
+  rsync --archive --compress \
+    "$remote_host:$remote_dir/$artifact" \
+    "$local_path"
+}
+
+record_stroke() {
+  if [[ "$#" -gt 1 ]]; then
+    usage
+  fi
+  local local_path="${1:-traces/canonical-wacom-v1.json}"
+  local file_name remote_artifact
+  file_name="$(basename "$local_path")"
+  remote_artifact=".artifacts/recordings/$file_name"
+
+  run_remote_command cargo run --release --locked --bin sketchpad -- \
+    --record-stroke "$remote_artifact"
+  fetch_remote_artifact "$remote_artifact" "$local_path"
+  printf 'recorded_trace=%s\n' "$local_path"
+}
+
+benchmark_suite() {
+  if [[ "$#" -lt 1 ]]; then
+    usage
+  fi
+  local kind="$1"
+  shift
+  local adapter="" label="$kind"
+  case "$kind" in
+    cpu)
+      ;;
+    gpu)
+      if [[ "$#" -lt 1 ]]; then
+        usage
+      fi
+      adapter="$1"
+      shift
+      label="gpu-$(printf '%s' "$adapter" | tr -cs '[:alnum:]._- ' '_' | tr -d ' ')"
+      ;;
+    *)
+      usage
+      ;;
+  esac
+
+  local repo_root revision timestamp stem result_artifact context_artifact
+  repo_root="$(git rev-parse --show-toplevel)"
+  revision="$(git -C "$repo_root" rev-parse --short=12 HEAD)"
+  if [[ -n "$(git -C "$repo_root" status --porcelain --untracked-files=normal)" ]]; then
+    revision="${revision}-dirty"
+  fi
+  timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  stem="${remote_host}-${label}-${timestamp}-${revision}"
+  result_artifact=".artifacts/results/${stem}.jsonl"
+  context_artifact=".artifacts/results/${stem}.context.txt"
+
+  run_remote_command scripts/benchmark-context "$context_artifact"
+  if [[ "$kind" == cpu ]]; then
+    run_remote_command cargo run --release --locked --bin trace_replay -- \
+      --trace traces/canonical-wacom-v1.json \
+      --output "$result_artifact" \
+      --revision "$revision" \
+      "$@"
+  else
+    run_remote_command cargo run --release --locked --bin gpu_trace_replay -- \
+      --trace traces/canonical-wacom-v1.json \
+      --output "$result_artifact" \
+      --adapter "$adapter" \
+      --revision "$revision" \
+      "$@"
+  fi
+  fetch_remote_artifact "$result_artifact"
+  fetch_remote_artifact "$context_artifact"
+  printf 'benchmark_result=%s\nbenchmark_context=%s\n' \
+    "$repo_root/$result_artifact" "$repo_root/$context_artifact"
+}
+
 command="${1:-}"
 if [[ -n "$command" ]]; then
   shift
@@ -143,6 +243,15 @@ case "$command" in
     printf 'host=%s session=%s tab=%s pane=%s remote_dir=%s cargo_build_jobs=%s\n' \
       "$remote_host" "$zellij_session" "$zellij_tab" "$pane" "$remote_dir" \
       "${cargo_build_jobs:-default}"
+    ;;
+  fetch)
+    fetch_remote_artifact "$@"
+    ;;
+  record)
+    record_stroke "$@"
+    ;;
+  benchmark)
+    benchmark_suite "$@"
     ;;
   *)
     usage

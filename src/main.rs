@@ -2,6 +2,7 @@ use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
+    input_trace::{InputTrace, TraceDevice, TraceSample},
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
@@ -9,8 +10,9 @@ use sketchpad::{
     raster::{Damage, RasterLayer, DEFAULT_TILE_SIZE},
 };
 use std::{
-    io, iter,
+    env, io, iter,
     path::PathBuf,
+    process,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -196,6 +198,76 @@ impl LiveMetrics {
     }
 }
 
+struct StrokeRecorder {
+    output: PathBuf,
+    started: Option<Instant>,
+    viewport: [u32; 2],
+    device: Option<TraceDevice>,
+    samples: Vec<TraceSample>,
+}
+
+impl StrokeRecorder {
+    fn new(output: PathBuf) -> Self {
+        Self {
+            output,
+            started: None,
+            viewport: [0, 0],
+            device: None,
+            samples: Vec::with_capacity(2_048),
+        }
+    }
+
+    fn observe(
+        &mut self,
+        now: Instant,
+        viewport: [u32; 2],
+        device_name: String,
+        phase: TabletPhase,
+        sample: TabletSample,
+    ) -> Result<Option<InputTrace>, sketchpad::input_trace::TraceError> {
+        if self.started.is_none() {
+            if phase != TabletPhase::Down {
+                return Ok(None);
+            }
+            self.started = Some(now);
+            self.viewport = viewport;
+            self.device = Some(TraceDevice {
+                id: sample.device_id,
+                name: device_name,
+                tool: sample.tool,
+            });
+        }
+
+        let Some(device) = &self.device else {
+            return Ok(None);
+        };
+        if device.id != sample.device_id || device.tool != sample.tool {
+            return Ok(None);
+        }
+        let arrival_micros = now
+            .duration_since(
+                self.started
+                    .expect("a recording device implies a start time"),
+            )
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        self.samples
+            .push(TraceSample::from_tablet(arrival_micros, phase, sample));
+
+        if phase != TabletPhase::Up {
+            return Ok(None);
+        }
+        InputTrace::new(
+            self.viewport,
+            self.device
+                .clone()
+                .expect("a completed recording has a device"),
+            std::mem::take(&mut self.samples),
+        )
+        .map(Some)
+    }
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -225,6 +297,8 @@ struct App {
     checkpoint_path: PathBuf,
     checkpoint_dirty: bool,
     checkpoint_due: Option<Instant>,
+    stroke_recorder: Option<StrokeRecorder>,
+    persistence_enabled: bool,
     #[cfg(target_os = "linux")]
     tablet_backend: Option<TabletBackend>,
 }
@@ -234,7 +308,9 @@ impl App {
         tablet_proxy: EventLoopProxy<TabletEvent>,
         layer: RasterLayer,
         checkpoint_path: PathBuf,
+        record_stroke: Option<PathBuf>,
     ) -> Self {
+        let persistence_enabled = record_stroke.is_none();
         Self {
             window: None,
             gpu: None,
@@ -264,6 +340,8 @@ impl App {
             checkpoint_path,
             checkpoint_dirty: false,
             checkpoint_due: None,
+            stroke_recorder: record_stroke.map(StrokeRecorder::new),
+            persistence_enabled,
             #[cfg(target_os = "linux")]
             tablet_backend: None,
         }
@@ -394,9 +472,15 @@ impl App {
         let brush = self.brush_for_tool(self.cursor_tool);
         let pressure = pressure.map_or_else(String::new, |value| format!(" p={value:.3}"));
         let dirty = if self.checkpoint_dirty { " *" } else { "" };
+        let recording = if self.stroke_recorder.is_some() {
+            " [RECORD NEXT STROKE]"
+        } else {
+            ""
+        };
         window.set_title(&format!(
-            "Sketchpad{} — {:?} {:.0}px {:.0}%{}",
+            "Sketchpad{}{} — {:?} {:.0}px {:.0}%{}",
             dirty,
+            recording,
             self.cursor_tool,
             brush.diameter(),
             brush.opacity() * 100.0,
@@ -527,13 +611,16 @@ impl App {
     }
 
     fn mark_document_dirty(&mut self) {
+        if !self.persistence_enabled {
+            return;
+        }
         self.checkpoint_dirty = true;
         self.checkpoint_due = Some(Instant::now() + AUTOSAVE_DELAY);
         self.update_window_title(None);
     }
 
     fn save_checkpoint(&mut self) {
-        if self.active_stroke.is_some() {
+        if !self.persistence_enabled || self.active_stroke.is_some() {
             return;
         }
         let started = Instant::now();
@@ -563,7 +650,7 @@ impl App {
     }
 
     fn load_checkpoint(&mut self) {
-        if self.active_stroke.is_some() {
+        if !self.persistence_enabled || self.active_stroke.is_some() {
             return;
         }
         match checkpoint::load(&self.checkpoint_path) {
@@ -603,7 +690,8 @@ impl App {
     }
 
     fn maybe_autosave(&mut self) {
-        if self.checkpoint_dirty
+        if self.persistence_enabled
+            && self.checkpoint_dirty
             && self.active_stroke.is_none()
             && self
                 .checkpoint_due
@@ -711,6 +799,24 @@ impl App {
         }
         self.last_tablet_title_update = Some(now);
         self.update_window_title(Some(sample.pressure));
+    }
+
+    fn tablet_device_name(&self, sample: TabletSample) -> String {
+        #[cfg(target_os = "linux")]
+        if let Some(name) = self
+            .tablet_backend
+            .as_ref()
+            .and_then(|backend| {
+                backend
+                    .devices()
+                    .iter()
+                    .find(|device| device.id == sample.device_id)
+            })
+            .map(|device| device.name.clone())
+        {
+            return name;
+        }
+        format!("Tablet device {}", sample.device_id)
     }
 
     fn zoom_at_cursor(&mut self, scroll: f32) {
@@ -1117,9 +1223,55 @@ impl ApplicationHandler<TabletEvent> for App {
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: TabletEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TabletEvent) {
         match event {
-            TabletEvent::Sample { phase, sample } => self.handle_tablet_sample(phase, sample),
+            TabletEvent::Sample { phase, sample } => {
+                let device_name = self.tablet_device_name(sample);
+                let viewport = self
+                    .window
+                    .as_ref()
+                    .map(|window| {
+                        let size = window.inner_size();
+                        [size.width.max(1), size.height.max(1)]
+                    })
+                    .unwrap_or([1, 1]);
+                let completed_trace = self.stroke_recorder.as_mut().map(|recorder| {
+                    recorder.observe(Instant::now(), viewport, device_name, phase, sample)
+                });
+                self.handle_tablet_sample(phase, sample);
+
+                match completed_trace {
+                    Some(Ok(Some(trace))) => {
+                        let recorder = self
+                            .stroke_recorder
+                            .take()
+                            .expect("a completed trace has a recorder");
+                        match trace.save_atomic(&recorder.output) {
+                            Ok(()) => log::info!(
+                                "stroke trace recorded: path={:?} samples={} duration_ms={:.3} hash={:016x}",
+                                recorder.output,
+                                trace.samples.len(),
+                                trace.duration_micros() as f64 / 1_000.0,
+                                trace.content_hash()
+                            ),
+                            Err(error) => {
+                                log::error!(
+                                    "could not save stroke trace {:?}: {error}",
+                                    recorder.output
+                                );
+                                event_loop.exit();
+                                return;
+                            }
+                        }
+                        event_loop.exit();
+                    }
+                    Some(Err(error)) => {
+                        log::error!("could not record stroke trace: {error}");
+                        event_loop.exit();
+                    }
+                    _ => {}
+                }
+            }
             TabletEvent::BackendError(error) => {
                 log::error!("native tablet input stopped: {error}");
                 if matches!(self.active_pointer, Some(PointerOwner::Tablet { .. })) {
@@ -1153,46 +1305,90 @@ impl ApplicationHandler<TabletEvent> for App {
     }
 }
 
+struct Startup {
+    record_stroke: Option<PathBuf>,
+}
+
+fn parse_startup() -> Result<Startup, String> {
+    let mut arguments = env::args().skip(1);
+    let mut record_stroke = None;
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--record-stroke" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--record-stroke requires an output path".to_owned())?;
+                if record_stroke.replace(PathBuf::from(path)).is_some() {
+                    return Err("--record-stroke may only be specified once".to_owned());
+                }
+            }
+            "-h" | "--help" => {
+                println!("usage: sketchpad [--record-stroke PATH]");
+                println!(
+                    "       recording mode starts blank, saves the next tablet stroke, and exits"
+                );
+                process::exit(0);
+            }
+            _ => return Err(format!("unknown argument: {argument}")),
+        }
+    }
+    Ok(Startup { record_stroke })
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let startup = parse_startup().unwrap_or_else(|message| {
+        eprintln!("{message}");
+        process::exit(2);
+    });
     let checkpoint_path = checkpoint::default_recovery_path();
-    let layer = match checkpoint::load(&checkpoint_path) {
-        Ok(layer)
-            if layer.width() == CANVAS_WIDTH
-                && layer.height() == CANVAS_HEIGHT
-                && layer.tile_size() == DEFAULT_TILE_SIZE =>
-        {
-            log::info!(
-                "checkpoint recovered: path={:?} tiles={}",
-                checkpoint_path,
-                layer.allocated_tile_count()
-            );
-            layer
-        }
-        Ok(_) => {
-            log::error!(
-                "checkpoint geometry is incompatible; starting blank without replacing it: {:?}",
-                checkpoint_path
-            );
-            RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
-        }
-        Err(CheckpointError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
-            log::info!("no recovery checkpoint found: {:?}", checkpoint_path);
-            RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
-        }
-        Err(error) => {
-            log::error!(
-                "checkpoint recovery failed; starting blank without replacing it: path={:?}: {error}",
-                checkpoint_path
-            );
-            RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+    let layer = if startup.record_stroke.is_some() {
+        log::info!("stroke recording mode: draw one tablet stroke in the blank window");
+        RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+    } else {
+        match checkpoint::load(&checkpoint_path) {
+            Ok(layer)
+                if layer.width() == CANVAS_WIDTH
+                    && layer.height() == CANVAS_HEIGHT
+                    && layer.tile_size() == DEFAULT_TILE_SIZE =>
+            {
+                log::info!(
+                    "checkpoint recovered: path={:?} tiles={}",
+                    checkpoint_path,
+                    layer.allocated_tile_count()
+                );
+                layer
+            }
+            Ok(_) => {
+                log::error!(
+                    "checkpoint geometry is incompatible; starting blank without replacing it: {:?}",
+                    checkpoint_path
+                );
+                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+            }
+            Err(CheckpointError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                log::info!("no recovery checkpoint found: {:?}", checkpoint_path);
+                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+            }
+            Err(error) => {
+                log::error!(
+                    "checkpoint recovery failed; starting blank without replacing it: path={:?}: {error}",
+                    checkpoint_path
+                );
+                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+            }
         }
     };
     let event_loop = EventLoop::<TabletEvent>::with_user_event().build().unwrap();
     let tablet_proxy = event_loop.create_proxy();
     event_loop.set_control_flow(ControlFlow::Wait);
     event_loop
-        .run_app(&mut App::new(tablet_proxy, layer, checkpoint_path))
+        .run_app(&mut App::new(
+            tablet_proxy,
+            layer,
+            checkpoint_path,
+            startup.record_stroke,
+        ))
         .unwrap();
 }
 

@@ -693,7 +693,9 @@ dirty-subrectangle uploads, visible tile instancing, a deterministic hard
 round brush, native Atlas pressure, pan/zoom, and idle-on-no-damage are
 connected end to end. A sustained physical Wacom run grew to 911 visible tiles
 across four GPU pages without deferral or eviction. Rotation, GPU stage
-timings, filtering, and a reproducible frame-budget trace remain.
+filtering, live presentation timing, and input-to-photon measurement remain.
+The recorded offscreen runner now reports separate CPU stages and hardware
+render-pass timestamps on both Atlas adapters and Apollo.
 
 ### Milestone 3 — Input and drawing feel
 
@@ -711,7 +713,9 @@ physical pen versus eraser identity, pressure, tilt, surface position, and
 unwrapped source timestamps; mouse fallback remains. Constant-distance
 resampling, cancellation, and one transaction per contact are connected. A
 GPU footprint cursor and between-stroke size/opacity controls now expose the
-actual brush state. Interactive Wacom use has begun, but a captured replay,
+actual brush state. One physical Wacom stroke is now a versioned,
+content-hashed replay fixture exercised unpaced and at 1×/2×/4× over
+deterministic existing content. A representative physical trace family,
 drawing-feel evaluation, coalesced history, active-tail handling, and
 input-to-presentation latency instrumentation remain.
 

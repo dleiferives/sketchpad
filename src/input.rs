@@ -1,10 +1,10 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ToolKind {
     Pen,
     Eraser,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum TabletPhase {
     Hover,
     Down,
@@ -12,7 +12,7 @@ pub enum TabletPhase {
     Up,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Deserialize, serde::Serialize)]
 pub struct TabletSample {
     pub device_id: u16,
     pub tool: ToolKind,

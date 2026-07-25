@@ -2,8 +2,10 @@ pub mod brush;
 pub mod checkpoint;
 pub mod document;
 pub mod input;
+pub mod input_trace;
 pub mod pipeline;
 pub mod raster;
+pub mod replay;
 pub mod sdf;
 
 #[cfg(target_os = "linux")]

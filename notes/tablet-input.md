@@ -129,16 +129,24 @@ The backend also has a live startup check proving that a second XInput client
 can query both Wacom devices, select events, coexist with winit, and coexist
 with the Vulkan surface.
 
-The missing proof is an actual physical trace. The next Wacom session must
-verify:
+The first physical proof is now committed as
+`traces/canonical-wacom-v1.json`: 68 samples from pen-down through pen-up over
+385.124 ms of application-arrival time from the Wacom Intuos Pro S Pen stylus.
+It preserves source timestamps, pressure, tilt, distance, device/tool identity,
+raw window position, and recording viewport, with content hash
+`46da823fd749864d`. It verifies that the production XInput path can be captured
+and deterministically replayed; one gesture is not a representative input
+corpus.
 
-1. pen down/move/up delivery;
-2. pressure reaching a useful low-to-high range;
-3. tilt signs matching physical direction;
-4. eraser-end switching;
-5. no doubled mouse/native marks;
-6. no lost release when leaving the window;
-7. sample cadence and timestamp deltas during fast strokes.
+The next Wacom sessions must expand coverage for:
+
+1. very light through maximum pressure;
+2. tilt signs matching deliberate physical directions;
+3. eraser-end switching;
+4. fast strokes and coalescing/backlog behavior;
+5. long curves and repeated stylistically distinct marks;
+6. no doubled mouse/native marks;
+7. no lost release when leaving the window.
 
 ## Portability Boundary
 
@@ -176,10 +184,10 @@ explicit; they must not be fabricated merely to make every backend look alike.
 
 ## Immediate Follow-up
 
-1. Record the first real Atlas Wacom trace with raw normalized samples and
-   contact boundaries.
-2. Add input receipt, brush completion, upload, submit, and presentation
-   timestamps to measure the real latency chain.
+1. Record the small trace family above and keep each recipe/version explicit.
+2. Add live input receipt, brush completion, upload, submit, and presentation
+   timestamps to measure the real latency chain; the offscreen runner now
+   covers the middle CPU stages and GPU render pass only.
 3. Consume event batches rather than one proxy wakeup per sample if profiling
    shows dispatch overhead or backlog.
 4. Validate the new GPU brush cursor against pen hover, contact pressure,

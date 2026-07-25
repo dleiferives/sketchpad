@@ -1,8 +1,8 @@
 # Performance and Correctness Laboratory
 
-Status: design specification, 2026-07-24. This defines the laboratory Sketchpad
-needs before selecting or optimizing renderer backends. It does not select an
-implementation crate and does not imply production code work now.
+Status: active specification and implementation ledger, 2026-07-24. This
+defines the laboratory Sketchpad needs before selecting or optimizing renderer
+backends and records the first implemented trace/replay slice.
 
 The laboratory's immediate priority is the sparse-raster painter defined in
 [first-usable-product.md](first-usable-product.md), especially active drawing
@@ -280,6 +280,103 @@ available. [`wgpu::QueryType::Timestamp`](https://docs.rs/wgpu/latest/wgpu/enum.
 records GPU timestamps; values must be converted using the queue timestamp
 period, and the feature must be requested from the adapter.
 
+#### Implemented recorded-trace slice
+
+The first backend-neutral workload begins with a committed physical trace:
+
+- `traces/canonical-wacom-v1.json`;
+- Wacom Intuos Pro S Pen stylus on Atlas/XInput2;
+- 68 down/move/up samples;
+- 385.124 ms application-arrival duration and 332 ms X11 source duration;
+- normalized pressure range 0.0–0.6873;
+- normalized tilt ranges x=0.5556–0.7143 and y=0.1111–0.4444;
+- content hash `46da823fd749864d`.
+
+Recording mode uses a blank transient document, never reads or overwrites the
+recovery checkpoint, writes atomically, exits on the first pen-up, and fetches
+only the resulting artifact:
+
+```text
+scripts/atlas record traces/canonical-wacom-v1.json
+```
+
+The CPU runner normalizes the recorded geometry and deterministically places
+it in a 2048×2048 reference canvas. For each selected scene it replays one
+canonical stroke unpaced and at 1×, 2×, and 4× arrival cadence. Defaults are
+three repetitions and these initial states:
+
+| Scene | Deterministic seed strokes |
+| --- | ---: |
+| empty | 0 |
+| sparse | 12 |
+| dense | 128 |
+| stress | 1,000 |
+
+It then runs 1,000 independently transformed target strokes per scene by
+default. Every target is undone immediately so the initial scene remains
+constant rather than becoming an accidental progressive workload. A full
+scene checksum is verified every 100 corpus strokes and after the final
+stroke.
+
+Run the release suite and fetch its result and machine context:
+
+```text
+scripts/atlas benchmark cpu
+scripts/apollo benchmark cpu
+```
+
+The GPU runner uses the same trace, brush, scene recipes, timing modes, seed,
+and CPU-canonical raster result. It creates a named 1280×720 offscreen target
+and requires explicit adapter selection in normal use:
+
+```text
+scripts/atlas benchmark gpu intel
+scripts/atlas benchmark gpu nvidia
+scripts/apollo benchmark gpu intel
+```
+
+One GPU frame is submitted per input sample. Each versioned JSON Lines row
+keeps the raw per-sample arrays and distributions for:
+
+- brush/document processing;
+- resident damage synchronization and upload preparation;
+- visible-scene preparation;
+- command encoding and queue submission;
+- total application receipt-to-submit work;
+- scheduled-deadline lateness;
+- hardware-timestamped render-pass execution.
+
+It also retains exact upload counts/bytes, dabs, damaged tiles, residency,
+visible instances, allocated pages/capacity, deferrals, evictions, output
+checksum, adapter IDs, driver information, trace hash, scene seed, revision,
+and host. The CPU runner adds raster allocation, before-image, snapshot-byte,
+tile-lookup, conservative-pixel, and content-bound-scan counters. Optional PPM
+references and mismatch images are available from the CPU runner.
+
+The GPU timestamp pair brackets the render pass only. `queue.write_texture`
+may schedule upload work outside that pair, so upload counts and CPU
+synchronization time must not be interpreted as upload GPU execution.
+Offscreen results also exclude compositor/presentation and physical
+input-to-photon latency.
+
+The convenience command records a sibling `.context.txt` containing UTC time,
+kernel/host, load, CPU topology, frequency policy, memory/swap, sensors,
+Vulkan summary, toolchain, and NVIDIA state where present. Both files live
+beneath ignored `.artifacts/results`; benchmark evidence is not silently added
+to the source tree.
+
+Smoke validation has passed with hardware timestamps on Atlas's Intel UHD 630,
+Atlas's NVIDIA GTX 1650 Max-Q, and Apollo's Intel Jasper Lake UHD. Exact
+same-machine comparisons require repeated controlled runs; these one-run
+checks validate the measurement paths and are not durable performance
+baselines.
+
+The implemented slice deliberately does not yet include a view trace,
+prediction/correction track, GPU upload-pass timestamps, presentation,
+image readback in the timed GPU runner, random interleaving of variants, or
+mobile thermal protocols. The existing `gpu_smoke` readback test remains the
+GPU-presentation correctness oracle while those pieces are added.
+
 ### 3. Interactive application replay
 
 Run the same trace through the real event loop, surface, pacing, and
@@ -328,9 +425,11 @@ duplicate XInput tip packets can arrive after newer button packets rather than
 only adjacent to their original, so the native adapter now rejects duplicates
 against a short per-device button history.
 
-This instrumentation is useful for detecting CPU and traffic amplification,
-but it still has no GPU timestamps, compositor/presentation signal, or photon
-measurement.
+This live-window instrumentation is useful for detecting CPU and traffic
+amplification, but it still has no GPU timestamps, compositor/presentation
+signal, or photon measurement. The offscreen recorded-trace runner now has
+render-pass timestamps; those should not be conflated with the missing live
+boundaries.
 
 ### 4. Device experience and sustained tests
 
@@ -760,6 +859,13 @@ Run the canonical and sweep suites on:
 Record the selected adapter explicitly. Never treat whichever adapter the
 runtime chose as an adequate result label.
 
+Hardware-counter profiling is ready on Atlas. CPU `perf` events work with
+`perf_event_paranoid=2`; `intel_gpu_top` has `CAP_PERFMON`; Vulkan diagnostics,
+CPU-frequency inspection, sysstat, and temperature sensors are installed. The
+discrete path also has `nvidia-smi` and NVIDIA Nsight Systems (`nsys`). The
+portable trace harness should identify a hot case before these tools are used
+to explain it.
+
 ### Continuous constrained checks on Apollo
 
 Apollo is the lower-power x86/integrated-GPU target:
@@ -775,10 +881,11 @@ Zellij capture as `scripts/atlas`, but defaults Cargo compilation to two jobs
 so a cold wgpu build does not consume the machine's whole memory budget.
 Compilation throttling does not apply to the program being benchmarked.
 
-The initial setup passed all 42 tests and the offscreen GPU smoke test on the
-hardware adapter. The smoke result contained 15,178 dark pixels and 312 cursor
-pixels across eight resident tiles and four deliberately tiny cache pages.
-This proves functional wgpu/Vulkan rendering; it is not a performance result.
+The initial setup passed all 42 then-current tests and the offscreen GPU smoke
+test on the hardware adapter. The smoke result contained 15,178 dark pixels
+and 312 cursor pixels across eight resident tiles and four deliberately tiny
+cache pages. This proves functional wgpu/Vulkan rendering; it is not a
+performance result.
 
 Apollo should run short CPU kernels, offscreen GPU replays, and interactive
 latency captures for every performance-sensitive change. Before recording a

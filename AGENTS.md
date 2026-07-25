@@ -14,6 +14,15 @@ lower-power CPU/integrated-GPU test machine.
   exit status.
 - Use `scripts/{atlas,apollo} screen`, `interrupt`, `sync`, and `status` for
   the corresponding common operations.
+- Remote-generated files belong beneath `.artifacts/`, which source sync
+  deliberately preserves. Fetch a specific artifact with
+  `scripts/<host> fetch .artifacts/<path> [local-path]`; this is the only
+  remote-to-local transfer and must never be used to pull source edits.
+- Record and fetch the next complete Atlas tablet stroke with
+  `scripts/atlas record [local-trace-path]`.
+- Run and fetch a release replay plus machine-context artifact with
+  `scripts/<host> benchmark cpu [options...]` or
+  `scripts/<host> benchmark gpu <adapter-filter> [options...]`.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB
   memory budget. Override with `SKETCHPAD_CARGO_BUILD_JOBS=<count>` when a
   deliberately isolated compile test needs another setting. Runtime
@@ -27,4 +36,5 @@ lower-power CPU/integrated-GPU test machine.
   other project tooling locally.
 - Treat every sync as one-way. Do not edit source files in either remote
   mirror.
-- `.git`, `.commandcode`, and `target` are host-local and are not synchronized.
+- `.git`, `.commandcode`, `.artifacts`, and `target` are host-local and are not
+  synchronized.

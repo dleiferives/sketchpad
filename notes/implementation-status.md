@@ -128,6 +128,9 @@ The current test suite covers:
 - sparse valuator-state merging;
 - physical pen/eraser classification;
 - duplicate XInput tip-packet rejection;
+- versioned input-trace parsing, validation, atomic replacement, and stable
+  content hashing;
+- deterministic seeded replay transforms and pixel-identical repeated replay;
 - deterministic checkpoint encoding and exact sparse-raster round trips;
 - checksum, truncation, trailing-data, and atomic replacement rejection/tests;
 - destination-out erasing and undo restoration;
@@ -148,6 +151,58 @@ cargo run --release --bin brush_bench -- --runs 12
 
 The current provisional Atlas result is recorded in
 [performance-laboratory.md](performance-laboratory.md).
+
+### Recorded tablet replay
+
+`traces/canonical-wacom-v1.json` is a real pen-down-through-pen-up gesture from
+Atlas's Wacom Intuos Pro S. It contains 68 samples over 385.124 ms of
+application-arrival time, retains X11 source time, position, pressure, tilt,
+distance, phase, viewport, and device identity, and has content hash
+`46da823fd749864d`.
+
+Record a replacement trace:
+
+```text
+scripts/atlas record traces/canonical-wacom-v1.json
+```
+
+Run and automatically fetch a release CPU replay with its machine context:
+
+```text
+scripts/atlas benchmark cpu
+scripts/apollo benchmark cpu
+```
+
+`trace_replay` uses that trace for deterministic unpaced, 1×, 2×, and 4×
+playback over empty, sparse, dense, and 1,000-seed-stroke scenes. It also runs
+1,000 deterministic transformed target strokes per scene by default. Every
+scheduled variant must produce the same exact `f32` raster checksum; every
+undo must restore the scene checksum. The versioned JSON Lines record retains
+raw event time and lateness arrays, percentiles, damage, allocation, snapshot,
+pixel-visit, tile, and byte counters. Optional PPM references make mismatches
+inspectable rather than reducing correctness to timing.
+
+The offscreen GPU companion is selected explicitly by adapter:
+
+```text
+scripts/atlas benchmark gpu intel
+scripts/atlas benchmark gpu nvidia
+scripts/apollo benchmark gpu intel
+```
+
+It submits one frame per recorded sample and reports separate raw distributions
+for brush processing, damage/upload synchronization, visible-scene
+preparation, encoding/submission, total app-to-submit CPU time, schedule
+lateness, and hardware-timestamped GPU render-pass time. It also records exact
+upload bytes/counts, residency, pages, evictions, visible/deferred instances,
+adapter/driver identity, and output checksum. GPU render-pass timestamps do not
+include `queue.write_texture` upload execution or display presentation; those
+remain separate measurement boundaries.
+
+The convenience commands write ignored artifacts beneath `.artifacts/results`
+and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
+frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where
+available.
 
 ### GPU smoke replay
 
@@ -180,8 +235,9 @@ eight visible tiles span four forced two-layer pages.
 This is an architectural integration checkpoint, not yet the usable painter:
 
 - native tablet input currently supports Atlas/X11 only;
-- the physical Wacom event path has only been observed interactively on one
-  Atlas setup; a reproducible captured trace is still needed;
+- the committed trace covers one pen gesture on one Wacom model; eraser,
+  very light pressure, fast motion, long strokes, and multiple drawing styles
+  still need separate physical traces;
 - no explicit proximity, twist, side-button, pad, coalesced-history, or
   prediction support;
 - tilt and source timestamps are preserved but not yet consumed by the round
@@ -206,18 +262,22 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - arbitrary general edits still use full-tile content-bound rescans;
 - brush work is CPU-only;
 - repeated dab/tile intersections are not yet coalesced;
-- GPU execution, display presentation, and input-to-photon latency are not yet
-  instrumented; current live timings end at CPU queue submission.
+- offscreen GPU render passes have timestamps, but upload-copy execution,
+  display presentation, and input-to-photon latency are not yet instrumented;
+  current live-window timings still end at CPU queue submission.
 
 ## Immediate Engineering Order
 
-1. Capture and analyze a real Atlas Wacom trace, including input cadence and
-   pressure range.
-2. Add GPU timestamps and a presentation/input-to-photon measurement protocol.
-3. Decide whether arbitrary mixed/destructive kernels need a stronger
+1. Run stable repeated CPU/GPU baselines from the recorded trace on Atlas
+   Intel, Atlas NVIDIA, and Apollo, then profile the largest measured stages.
+2. Add an interactive presentation/input-to-photon measurement protocol and
+   determine how to attribute upload-copy GPU execution.
+3. Capture a small physical trace family covering light pressure, fast motion,
+   long curves, eraser use, and distinct drawing styles.
+4. Decide whether arbitrary mixed/destructive kernels need a stronger
    nonempty-bound structure than the current full-scan fallback.
-4. Compare an 8-byte working pixel representation with the `f32` reference.
-5. Add Wayland tablet-v2 after the X11 trace is reliable.
-6. Add GPU filtering/mip experiments for navigation quality.
-7. Add a second textured brush only after hard-ink feel and latency are
+5. Compare an 8-byte working pixel representation with the `f32` reference.
+6. Add Wayland tablet-v2 after the X11 trace is reliable.
+7. Add GPU filtering/mip experiments for navigation quality.
+8. Add a second textured brush only after hard-ink feel and latency are
    measured.

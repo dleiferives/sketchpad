@@ -8,12 +8,17 @@ repo_root="$(git rev-parse --show-toplevel)"
 printf -v remote_dir_quoted '%q' "$remote_dir"
 ssh "$remote_host" "mkdir -p \"\$HOME\"/$remote_dir_quoted"
 
+# Compare contents and timestamp transferred files on the destination. Preserved
+# local mtimes can predate a slow remote build and make Cargo reuse stale output.
 rsync \
   --archive \
+  --no-times \
+  --checksum \
   --compress \
   --delete \
   --exclude='/.git/' \
   --exclude='/.commandcode/' \
+  --exclude='/.artifacts/' \
   --exclude='/target/' \
   --exclude='/.DS_Store' \
   "$repo_root/" \
