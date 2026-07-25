@@ -1,5 +1,9 @@
 # Research — GPU Stroke Rendering Deep Dive
 
+Status: technical summary of one stroke-expansion method. It is not a selection
+of Sketchpad's document model or renderer. See
+[research-synthesis.md](research-synthesis.md) for the architecture context.
+
 ## Primary Reference
 
 **"GPU-friendly Stroke Expansion"** — Raph Levien, Arman Uguray  
@@ -7,7 +11,35 @@ SIGGRAPH 2024 (ACM Transactions on Graphics)
 [arXiv: 2405.00127](https://arxiv.org/abs/2405.00127)  
 [Full paper (HTML)](https://arxiv.org/html/2405.00127v2)
 
-Authors are from Google. Raph Levien is also the creator of Vello (formerly piet-gpu), kurbo, peniko, and the Xilem GUI toolkit. This is the source of truth for the modern GPU stroke rendering approach.
+The authors are from Google, and the work is closely related to Vello's
+compute-centric rendering research. It is an important modern method, not the
+only valid GPU stroking architecture.
+
+## Scope of the Paper
+
+The paper solves a specific problem well:
+
+```
+stroked constant-style path
+  → strongly correct expanded boundary
+  → bounded line or arc approximation
+  → input to a fill rasterizer
+```
+
+It does not define:
+
+- tablet sampling, smoothing, or prediction;
+- a pressure-varying artistic brush model;
+- textured, soft, wet, or smudging paint;
+- a retained document and undo model;
+- ADF construction or incremental SDF updates;
+- persistent document-space cache pages;
+- layers, alpha, and color compositing.
+
+This boundary is central. The expanded “line soup” is useful renderer input,
+but converting it to a signed-distance cache still needs spatial candidate
+lookup, inside classification, sampling/reconstruction error, and cache
+invalidation.
 
 ## The Core Insight: Why Euler Spirals
 
@@ -116,6 +148,9 @@ Each thread processes its segment + the join to the next segment. A special "str
 
 The "line soup" output is an unordered list of line segments. A prefix-sum sorts them into 16×16 pixel tiles. This is analogous to the `cudaraster` / MPVG approach.
 
+These are transient screen-rasterization work tiles. They are not evidence for
+a particular persistent document-space SDF/ADF page size or lifetime.
+
 ### Stage 4: Fine Rasterizer
 
 Per-tile scanline rasterization computing pixel coverage. Winding numbers are computed per-pixel and resolved with the nonzero fill rule.
@@ -169,11 +204,77 @@ n = s · ∛(|κ'|·(1 + 0.4·|h·s·κ'|) / (120d))
 | Nehab 2020 | CPU | Strong | Quad Béziers + lines | Sampling-based |
 | Kilgard 2020 | GPU | Angular only | Lines | Angle step (not Fréchet bounded) |
 | **This paper** | **GPU** | **Strong** | **Lines or arcs** | **Analytical, invertible** |
-| Vello | GPU | Strong | Polyline | Same algorithm |
+| Vello lineage | GPU | strong-correctness goal | Polyline/renderer-specific | related method |
+
+The table compares the stroking subproblem, not whole drawing applications.
+Production suitability also depends on compositing, allocation, caching,
+incremental edits, device support, and brush semantics.
+
+## Implications for Sketchpad
+
+### Direct rendering baseline
+
+The most direct use is to feed expanded outlines into a coverage rasterizer and
+composite ordered strokes. That path should be measured—using
+[Vello](https://github.com/linebender/vello) where practical—before assuming an
+SDF cache is faster.
+
+This 2024 pipeline should not be read as evidence that production geometry work
+belongs entirely on the GPU. Vello's 2026 Hybrid development has moved
+significant path processing to CPU SIMD and sends compact strip work to the
+GPU. Its coarse-raster arrangement was then rewritten in July 2026 after CPU
+overhead and filter-layer interactions proved costly. Sketchpad should keep
+stroke expansion swappable and report CPU preparation separately from GPU time
+on integrated and mobile-class hardware.
+
+### Variable-width brushes remain research
+
+Replacing one constant half-width with sampled pressure is not automatically a
+correct variable-width algorithm. Width interpolation changes the swept
+boundary, joins, cusps, and error bounds. Taper, calligraphic nib orientation,
+and textured footprints need their own derivation or a different brush
+representation.
+
+### SDF/ADF construction is a separate pipeline
+
+If expanded outlines are used to build a field, the design must answer:
+
+- which outline segments can affect each document cell;
+- how winding/inside state is computed;
+- how distance and reconstruction error are bounded;
+- how cells update after append, erase, reorder, or transform;
+- whether construction cost is recovered by later redraw savings.
+
+The paper supplies high-quality boundary primitives, not those answers.
+
+### Active stroke versus committed scene
+
+The live stroke may justify a specialized incremental path and transient
+overlay. Finalized strokes can then enter the retained scene or render cache as
+one logical operation. The expansion pipeline should not dictate the lifetime
+of canonical input.
+
+### Coverage remains a separate choice
+
+The expanded boundary could feed:
+
+- Vello-style sparse strips;
+- Slug-style analytic quadratic-curve coverage;
+- a conventional expanded mesh;
+- an ADF builder if that cache later proves worthwhile.
+
+The right comparison includes outline-generation time, coverage time, upload
+bytes, memory, transform reuse, and visual error. A fast expander does not make
+one of those coverage representations automatically best.
 
 ## Implementation References
 
 - Vello source: https://github.com/linebender/vello
+- Vello sparse strips:
+  https://skia.googlesource.com/external/github.com/linebender/vello/+/refs/tags/sparse-strips-v0.0.9/sparse_strips/
+- Slug analytic curve rendering: https://github.com/EricLengyel/Slug
+- Ciallo brush-rendering tutorial:
+  https://shenciao.github.io/brush-rendering-tutorial/
 - wgpu docs: https://docs.rs/wgpu
 - kurbo (curve math): https://docs.rs/kurbo
 - winit (windowing): https://docs.rs/winit

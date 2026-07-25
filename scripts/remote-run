@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "$#" -eq 0 ]]; then
+  echo "usage: scripts/remote-run <command> [args...]" >&2
+  exit 2
+fi
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+remote_host="${SKETCHPAD_REMOTE_HOST:-atlas}"
+remote_dir="${SKETCHPAD_REMOTE_DIR:-projs/sketchpad}"
+
+"$script_dir/sync-to-atlas"
+
+printf -v remote_dir_quoted '%q' "$remote_dir"
+remote_command=""
+for argument in "$@"; do
+  printf -v argument_quoted '%q' "$argument"
+  remote_command+="$argument_quoted "
+done
+
+ssh -t "$remote_host" "cd \"\$HOME\"/$remote_dir_quoted && exec $remote_command"

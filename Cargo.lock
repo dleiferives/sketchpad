@@ -1606,8 +1606,10 @@ dependencies = [
  "env_logger",
  "log",
  "pollster",
+ "raw-window-handle",
  "wgpu",
  "winit",
+ "x11rb",
 ]
 
 [[package]]

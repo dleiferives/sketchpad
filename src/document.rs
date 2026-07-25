@@ -16,6 +16,12 @@ pub struct Document {
     pub field: SdfField,
 }
 
+impl Default for Document {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Document {
     pub fn new() -> Self {
         Self {
