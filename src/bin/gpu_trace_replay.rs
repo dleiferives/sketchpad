@@ -26,7 +26,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 2;
+const RESULT_VERSION: u32 = 3;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -72,6 +72,7 @@ impl Scene {
 enum Timing {
     Unpaced,
     Scheduled(f64),
+    DisplayPaced { rate: f64, display_hz: f64 },
 }
 
 impl Timing {
@@ -79,6 +80,7 @@ impl Timing {
         match self {
             Self::Unpaced => "unpaced",
             Self::Scheduled(_) => "scheduled",
+            Self::DisplayPaced { .. } => "display-paced",
         }
     }
 
@@ -86,6 +88,14 @@ impl Timing {
         match self {
             Self::Unpaced => None,
             Self::Scheduled(rate) => Some(rate),
+            Self::DisplayPaced { rate, .. } => Some(rate),
+        }
+    }
+
+    fn display_hz(self) -> Option<f64> {
+        match self {
+            Self::DisplayPaced { display_hz, .. } => Some(display_hz),
+            Self::Unpaced | Self::Scheduled(_) => None,
         }
     }
 }
@@ -96,6 +106,7 @@ struct Arguments {
     adapter: Option<String>,
     runs: usize,
     rates: Vec<f64>,
+    display_hz: Vec<f64>,
     scenes: Vec<Scene>,
     include_unpaced: bool,
     stress_strokes: usize,
@@ -212,6 +223,8 @@ struct ResultRecord {
     initial_strokes: usize,
     timing: &'static str,
     rate: Option<f64>,
+    display_hz: Option<f64>,
+    frame_submissions: usize,
     run: usize,
     wall_micros: u64,
     late_threshold_micros: u64,
@@ -276,6 +289,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         timings.push(Timing::Unpaced);
     }
     timings.extend(arguments.rates.iter().copied().map(Timing::Scheduled));
+    timings.extend(arguments.rates.iter().copied().flat_map(|rate| {
+        arguments
+            .display_hz
+            .iter()
+            .copied()
+            .map(move |display_hz| Timing::DisplayPaced { rate, display_hz })
+    }));
     let target_samples = geometry.transformed(geometry.canonical_transform(CANVAS));
     let target_brush = HardRoundBrush::new([0.025, 0.06, 0.18], 48.0, 1.0, 0.18)?;
 
@@ -342,6 +362,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     initial_strokes,
                     timing: timing.name(),
                     rate: timing.rate(),
+                    display_hz: timing.display_hz(),
+                    frame_submissions: timed.scene_prepare_cpu_micros.len(),
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
                     late_threshold_micros: LATE_THRESHOLD_MICROS,
@@ -375,13 +397,17 @@ fn run() -> Result<(), Box<dyn Error>> {
                 output.write_all(b"\n")?;
                 output.flush()?;
                 eprintln!(
-                    "scene={} run={} timing={} rate={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
+                    "scene={} run={} timing={} rate={} display_hz={} frames={} wall_ms={:.3} app_to_submit_p95_ms={:.3} gpu_render_pass_p95_ms={} late={} uploads={} upload_mib={:.3}",
                     scene.name(),
                     run_index,
                     timing.name(),
                     timing
                         .rate()
                         .map_or_else(|| "-".to_owned(), |rate| rate.to_string()),
+                    timing
+                        .display_hz()
+                        .map_or_else(|| "-".to_owned(), |hz| hz.to_string()),
+                    record.frame_submissions,
                     record.wall_micros as f64 / 1_000.0,
                     record.app_to_submit_cpu.p95 as f64 / 1_000.0,
                     record.gpu_render_pass.map_or_else(
@@ -488,6 +514,63 @@ fn build_scene(
     Ok(layer)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameGroup {
+    start: usize,
+    end: usize,
+    deadline: Option<Duration>,
+}
+
+fn sample_deadline(sample: ReplaySample, rate: f64) -> Duration {
+    Duration::from_secs_f64(sample.arrival_micros as f64 / 1_000_000.0 / rate)
+}
+
+fn frame_groups(samples: &[ReplaySample], timing: Timing) -> Vec<FrameGroup> {
+    match timing {
+        Timing::Unpaced => samples
+            .iter()
+            .enumerate()
+            .map(|(index, _)| FrameGroup {
+                start: index,
+                end: index + 1,
+                deadline: None,
+            })
+            .collect(),
+        Timing::Scheduled(rate) => samples
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, sample)| FrameGroup {
+                start: index,
+                end: index + 1,
+                deadline: Some(sample_deadline(sample, rate)),
+            })
+            .collect(),
+        Timing::DisplayPaced { rate, display_hz } => {
+            let interval = Duration::from_secs_f64(1.0 / display_hz);
+            let mut deadline = interval;
+            let mut start = 0;
+            let mut groups = Vec::new();
+            while start < samples.len() {
+                let mut end = start;
+                while end < samples.len() && sample_deadline(samples[end], rate) <= deadline {
+                    end += 1;
+                }
+                if end > start {
+                    groups.push(FrameGroup {
+                        start,
+                        end,
+                        deadline: Some(deadline),
+                    });
+                    start = end;
+                }
+                deadline = deadline.saturating_add(interval);
+            }
+            groups
+        }
+    }
+}
+
 fn play_gpu(
     gpu: &Gpu,
     display: &mut RasterDisplayPipeline,
@@ -496,7 +579,8 @@ fn play_gpu(
     samples: &[ReplaySample],
     timing: Timing,
 ) -> Result<TimedGpuStroke, Box<dyn Error>> {
-    let query_count = samples.len() as u32 * 2;
+    let frame_groups = frame_groups(samples, timing);
+    let query_count = frame_groups.len() as u32 * 2;
     let query_set = gpu.timestamp_queries.then(|| {
         gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
             label: Some("GPU Trace Replay Timestamps"),
@@ -533,38 +617,42 @@ fn play_gpu(
     let mut schedule_lateness_micros = Vec::with_capacity(samples.len());
     let mut outcome = None;
 
-    for (sample_index, &sample) in samples.iter().enumerate() {
-        if let Timing::Scheduled(rate) = timing {
-            let deadline =
-                start + Duration::from_secs_f64(sample.arrival_micros as f64 / 1_000_000.0 / rate);
+    for (frame_index, frame) in frame_groups.iter().copied().enumerate() {
+        if let Some(deadline) = frame.deadline.map(|deadline| start + deadline) {
             if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
                 thread::sleep(remaining);
             }
-            schedule_lateness_micros.push(duration_micros(
-                Instant::now().saturating_duration_since(deadline),
-            ));
         }
 
         let app_start = Instant::now();
-        let input_start = Instant::now();
-        let step = player.process_step(layer, sample)?;
-        input_processing_micros.push(duration_micros(input_start.elapsed()));
+        for &sample in &samples[frame.start..frame.end] {
+            if let Some(rate) = timing.rate() {
+                let deadline = start + sample_deadline(sample, rate);
+                schedule_lateness_micros.push(duration_micros(
+                    Instant::now().saturating_duration_since(deadline),
+                ));
+            }
 
-        let damage_sync_start = Instant::now();
-        if !step.incremental_damage.is_empty() {
-            display.sync_damage(layer, &step.incremental_damage);
+            let input_start = Instant::now();
+            let step = player.process_step(layer, sample)?;
+            input_processing_micros.push(duration_micros(input_start.elapsed()));
+
+            let damage_sync_start = Instant::now();
+            if !step.incremental_damage.is_empty() {
+                display.sync_damage(layer, &step.incremental_damage);
+            }
+            if let Some(completed) = step.outcome {
+                display.reconcile_committed_damage(
+                    layer,
+                    completed
+                        .damage
+                        .as_ref()
+                        .unwrap_or(&step.incremental_damage),
+                );
+                outcome = Some(completed);
+            }
+            damage_sync_cpu_micros.push(duration_micros(damage_sync_start.elapsed()));
         }
-        if let Some(completed) = step.outcome {
-            display.reconcile_committed_damage(
-                layer,
-                completed
-                    .damage
-                    .as_ref()
-                    .unwrap_or(&step.incremental_damage),
-            );
-            outcome = Some(completed);
-        }
-        damage_sync_cpu_micros.push(duration_micros(damage_sync_start.elapsed()));
 
         let scene_prepare_start = Instant::now();
         prepare_display(display, &gpu.device, &gpu.queue, layer);
@@ -581,8 +669,8 @@ fn play_gpu(
                 .as_ref()
                 .map(|query_set| wgpu::RenderPassTimestampWrites {
                     query_set,
-                    beginning_of_pass_write_index: Some(sample_index as u32 * 2),
-                    end_of_pass_write_index: Some(sample_index as u32 * 2 + 1),
+                    beginning_of_pass_write_index: Some(frame_index as u32 * 2),
+                    end_of_pass_write_index: Some(frame_index as u32 * 2 + 1),
                 });
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -776,6 +864,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut adapter = None;
     let mut runs = 1;
     let mut rates = vec![1.0, 2.0, 4.0];
+    let mut display_hz = Vec::new();
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -789,6 +878,9 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--adapter" => adapter = Some(value(&mut arguments, "--adapter")?),
             "--runs" => runs = usize_value(&mut arguments, "--runs", false)?,
             "--rates" => rates = rates_value(&mut arguments)?,
+            "--display-hz" => {
+                display_hz = positive_f64_list(&mut arguments, "--display-hz")?;
+            }
             "--scenes" => scenes = scenes_value(&mut arguments)?,
             "--no-unpaced" => include_unpaced = false,
             "--stress-strokes" => {
@@ -805,6 +897,7 @@ fn parse_arguments() -> Result<Arguments, String> {
                 println!(
                     "usage: gpu_trace_replay --trace PATH [--output PATH] [--adapter NAME]\n\
                      \x20      [--runs N] [--rates 1,2,4] [--no-unpaced]\n\
+                     \x20      [--display-hz 60,120]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
                      \x20      [--seed N] [--revision REV]"
                 );
@@ -819,6 +912,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         adapter,
         runs,
         rates,
+        display_hz,
         scenes,
         include_unpaced,
         stress_strokes,
@@ -857,7 +951,14 @@ fn usize_value(
 }
 
 fn rates_value(arguments: &mut impl Iterator<Item = String>) -> Result<Vec<f64>, String> {
-    value(arguments, "--rates")?
+    positive_f64_list(arguments, "--rates")
+}
+
+fn positive_f64_list(
+    arguments: &mut impl Iterator<Item = String>,
+    option: &str,
+) -> Result<Vec<f64>, String> {
+    value(arguments, option)?
         .split(',')
         .map(|raw| {
             let rate: f64 = raw.parse().map_err(|_| format!("invalid rate: {raw}"))?;
@@ -881,4 +982,55 @@ fn scenes_value(arguments: &mut impl Iterator<Item = String>) -> Result<Vec<Scen
             _ => Err(format!("unknown scene: {raw}")),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sketchpad::input::TabletPhase;
+
+    fn sample(arrival_micros: u64) -> ReplaySample {
+        ReplaySample {
+            arrival_micros,
+            phase: TabletPhase::Move,
+            position: [0.0, 0.0],
+            pressure: 1.0,
+        }
+    }
+
+    #[test]
+    fn display_pacing_groups_every_ready_sample_without_dropping_order() {
+        let samples = [sample(0), sample(5_000), sample(17_000), sample(33_000)];
+        let groups = frame_groups(
+            &samples,
+            Timing::DisplayPaced {
+                rate: 1.0,
+                display_hz: 60.0,
+            },
+        );
+
+        assert_eq!(
+            groups
+                .iter()
+                .map(|group| group.start..group.end)
+                .collect::<Vec<_>>(),
+            vec![0..2, 2..4]
+        );
+    }
+
+    #[test]
+    fn playback_rate_changes_samples_ready_for_a_display_frame() {
+        let samples = [sample(0), sample(5_000), sample(17_000), sample(33_000)];
+        let groups = frame_groups(
+            &samples,
+            Timing::DisplayPaced {
+                rate: 2.0,
+                display_hz: 60.0,
+            },
+        );
+
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].start, 0);
+        assert_eq!(groups[0].end, samples.len());
+    }
 }
