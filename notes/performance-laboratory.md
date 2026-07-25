@@ -1102,12 +1102,25 @@ slower but remains 0.271 ms per stroke on Apollo. At 192 px, blocks make active
 drawing 3.2% slower and retain only 1.90× fewer before-pixels. The evidence
 therefore rejects a global mode.
 
-The next experiment is a brush-diameter crossover matrix. If it is stable,
-the hard-round brush will select whole or block history once at gesture start.
-That is information the brush actually owns; it avoids trying to infer a
-completed stroke from its first tile intersection. Concrete history entries
-already self-describe their representation, so exact mixed-policy undo does
-not require a document-format change.
+A stress-scene 128 px crossover row measured 2.6742 ms/stroke for whole
+capture and 2.6459 ms/stroke for blocks: blocks remain 1.1% faster while
+reducing before-pixels from 3,955.25 MiB to 1,767.53 MiB, or 2.24×. The first
+safe boundary is therefore the tile width rather than a fitted magic number.
+
+Revision `1678118` implements `adaptive16`. The hard-round brush selects
+blocks once at gesture start when its diameter is at most the 128 px tile
+width, and whole storage above it. That is information the brush actually
+owns; it avoids trying to infer a completed stroke from its first tile
+intersection. General raster gestures without a brush hint conservatively use
+whole tiles. Concrete history entries self-describe their representation, so
+exact mixed-policy undo does not require a document-format change.
+
+Clean adaptive validation reproduces the selected controls:
+
+| Workload | Adaptive choice | Paint/stroke | Undo/stroke | Before bytes | Final checksum |
+| --- | --- | ---: | ---: | ---: | --- |
+| dense 48 px paint, 2,000 strokes | blocks16 | 1.1688 ms | 0.2714 ms | 1,836.5 MiB | `480a63807d651ccf` |
+| stress 192 px paint, 1,000 strokes | whole | 3.6842 ms | 0.0022 ms | 4,490.0 MiB | `50ed3172c1cd83a5` |
 
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with

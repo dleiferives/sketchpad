@@ -214,14 +214,17 @@ and gesture into a flat per-tile payload, stores tile bounds metadata
 separately, and swaps block rows for undo/redo. Newly allocated tiles use the
 whole-state absence marker because they have no before-pixels. Existing,
 newly allocated, reclaimed, cancelled, undone, and redone tiles pass the same
-intermediate oracle. `whole` remains the application and profiler default
-until clean comparisons justify a promotion.
+intermediate oracle. `whole` remained the application and profiler default
+while those comparisons were collected.
 
 The first `hybrid16` implementation was removed after measurement. Its
 first-edit threshold never selected whole storage for the recorded 192 px
-stroke and slowed the block path. The next policy experiment will resolve
-storage once per brush gesture after measuring the crossover diameter; it
-will not infer a whole-stroke footprint from the first dab entering a tile.
+stroke and slowed the block path. Its replacement is `adaptive16`, which
+resolves storage once per brush gesture from information the brush owns:
+diameters through the 128 px tile width use blocks and larger brushes use
+whole tiles. General raster gestures without a brush hint conservatively use
+whole storage. `RasterLayer::new` and the application now default to this
+policy; profiler modes `whole` and `blocks16` remain concrete controls.
 
 Profiler result format version 2 paints bursts of 64 strokes before restoring
 the initial raster. `--transaction-batch-strokes N` changes the burst, with
@@ -304,9 +307,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - a future document with more than 1,024 simultaneously visible allocated
   tiles would defer the farther candidates, although that count is now logged;
 - nearest tile sampling has no mipmaps, gutters, or zoom-out filtering;
-- the application still defaults to whole-tile undo snapshots; an exact
-  16×16 block prototype is available only through the profiling path pending
-  performance and retained-memory comparison;
+- hard-round brush undo is adaptive only at the coarse measured 128 px
+  diameter boundary; more brush families and devices require their own
+  footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
 - brush work is CPU-only;
 - repeated dab/tile intersections are not yet coalesced;

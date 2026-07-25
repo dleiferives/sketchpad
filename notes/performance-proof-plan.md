@@ -291,8 +291,9 @@ Prototype 16×16 first, then compare 8×8 directly if record/copy overhead leave
 room. The 16×16 pixel payload is 4 KiB, but that convenient size is a layout
 hypothesis rather than a presumed performance win.
 
-The first `UndoStorage::Blocks16` implementation now exists behind
-`cpu_profile_replay --undo-storage blocks16`; whole-tile remains the default.
+The first `UndoStorage::Blocks16` implementation was introduced behind
+`cpu_profile_replay --undo-storage blocks16`; whole-tile remained the default
+while it was measured.
 It uses conservative edit bounds rather than the final-change lower bound,
 deduplicates blocks with a per-tile bitset, keeps payload pixels contiguous per
 tile, and row-copies/cross-swaps 16-pixel spans. Exact tests cover cancellation,
@@ -333,11 +334,17 @@ Clean batch-64 Apollo rows at revision `ed948f3` are:
 
 Thus 16×16 history improves the normal 48 px drawing interval by 15.4% and
 reduces before-pixels 3.44×, but regresses 192 px drawing by 3.2% for a 1.90×
-reduction. Do not choose one global storage mode. Measure intermediate brush
-diameters, then resolve whole versus blocks once per gesture using brush/kernel
-footprint information. History entries already carry their concrete
-representation, so mixed exact undo is compatible with the current design.
-Whole and blocks remain explicit benchmark controls.
+reduction. A 128 px stress row—the tile width—still favors blocks by 1.1% in
+the paint interval and reduces before-pixels 2.24×. Revision `1678118`
+therefore selects blocks once at gesture start when brush diameter is at most
+the tile width and whole storage above it. Unhinted general raster gestures
+conservatively use whole storage.
+
+`adaptive16` exact replays choose the measured control behavior: at 48 px they
+report 1,836.5 MiB and the block checksum; at 192 px they report 4,490.0 MiB,
+zero block swaps, and the whole checksum. History entries carry their concrete
+representation, so exact mixed undo requires no document-format change. Whole
+and blocks remain explicit benchmark controls.
 
 ### 4. Transfer-path experiment
 
