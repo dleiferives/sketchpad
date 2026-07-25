@@ -391,6 +391,31 @@ before frame preparation. That should exercise the live coalescer, reduce
 upload calls, and give the explicit staging comparison a representative
 submit schedule.
 
+Revision `e428e8a` completes that replay step. `--display-hz 60,120` adds
+display-paced rows for every requested playback rate. All ready samples are
+processed in semantic order, then one frame is prepared and submitted.
+Per-sample ready-to-process wait is reported separately from per-frame
+deadline miss; intentional wait for the next display opportunity is not
+misclassified as scheduler lateness.
+
+The dense Apollo matrix remains exact at checksum `7d45a406ea4f3667`:
+
+| Rate/display | Frames | Uploads | Logical bytes | `write_texture` CPU | Frame-late p95 | Sample wait p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1×, per sample | 68 | 128 | 3.607 MiB | 11.57 ms | 15.19 ms | 15.19 ms |
+| 1×, 60 Hz | 22 | 75 | 4.065 MiB | 2.99 ms | 0.45 ms | 15.92 ms |
+| 1×, 120 Hz | 27 | 81 | 3.946 MiB | 3.21 ms | 0.43 ms | 8.15 ms |
+| 2×, 60 Hz | 12 | 62 | 4.216 MiB | 2.16 ms | 0.43 ms | 16.15 ms |
+| 4×, 60 Hz | 6 | 52 | 4.361 MiB | 1.63 ms | 0.42 ms | 16.48 ms |
+
+The per-sample 1× row missed deadlines on this run because one-submit-per-input
+GPU work can backpressure the schedule; it is a control, not a target pacing
+policy. Coalescing cuts calls and API CPU substantially, but rectangle unions
+amplify logical bytes by 12.7%–20.9% in the 60 Hz rows. The next representation
+should retain multiple rectangles when their union's extra byte cost exceeds
+the measured per-call cost. Do not replace this tradeoff with a fixed
+“one rectangle per tile” dogma.
+
 ### 5. Renderer isolation matrix
 
 Vary independently:

@@ -1159,6 +1159,34 @@ and submit at most one frame per display opportunity. That will quantify
 actual coalescing before comparing `write_texture` with a reusable staging
 ring and explicitly timestamped buffer-to-texture copies.
 
+Revision `e428e8a` adds that display-paced replay. The result schema is version
+4 because deliberate sample wait until late-latched frame preparation is now
+separate from actual frame-deadline miss.
+
+Dense Apollo results:
+
+| Rate/display | Frames | Regions coalesced | Uploads | Logical | Padded candidate | `write_texture` CPU | Frame-late p95 | Sample wait p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1×, per sample | 68 | 0 | 128 | 3.607 MiB | 4.183 MiB | 11.57 ms | 15.19 ms | 15.19 ms |
+| 1×, 60 Hz | 22 | 53 | 75 | 4.065 MiB | 4.452 MiB | 2.99 ms | 0.45 ms | 15.92 ms |
+| 1×, 120 Hz | 27 | 47 | 81 | 3.946 MiB | 4.356 MiB | 3.21 ms | 0.43 ms | 8.15 ms |
+| 2×, 60 Hz | 12 | 66 | 62 | 4.216 MiB | 4.563 MiB | 2.16 ms | 0.43 ms | 16.15 ms |
+| 2×, 120 Hz | 22 | 53 | 75 | 4.065 MiB | 4.452 MiB | 3.00 ms | 0.42 ms | 8.00 ms |
+| 4×, 60 Hz | 6 | 76 | 52 | 4.361 MiB | 4.627 MiB | 1.63 ms | 0.42 ms | 16.48 ms |
+| 4×, 120 Hz | 12 | 66 | 62 | 4.216 MiB | 4.563 MiB | 2.19 ms | 0.41 ms | 8.30 ms |
+
+Every row preserves all 68 samples and ends at checksum
+`7d45a406ea4f3667`. At 60 Hz, coalescing reduces upload calls by 41%–59% and
+`write_texture` CPU by 74%–86% relative to this run's per-sample 1× control.
+The price is 13%–21% more logical dirty bytes because a union rectangle can
+enclose unchanged pixels. Therefore the next coalescer candidate is a small
+per-tile rectangle set with a merge cost based on added padded bytes versus
+measured call overhead. A universal one-rectangle rule is not justified.
+
+The GPU render-pass p95 is not used to select the coalescer: uploads occur
+outside the timestamp pair, and DVFS/queue ordering can change the following
+pass. Explicit staging-copy timestamps are still required.
+
 ### Periodic device laboratory
 
 At minimum:

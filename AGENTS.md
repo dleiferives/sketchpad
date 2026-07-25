@@ -27,9 +27,10 @@ lower-power CPU/integrated-GPU test machine.
   replay oracle and region-dominated CPU transaction loop. It paints
   64-stroke transaction bursts by default;
   `--transaction-batch-strokes 1` preserves the adversarial immediate-undo
-  control. Each command first
-  rejects known background applications/containers, non-performance power
-  state, AC disconnection, low available memory, or a non-idle CPU.
+  control. GPU replay accepts `--display-hz 60,120` to compare late-latched
+  display opportunities against one-submit-per-sample scheduling. Each command
+  first rejects known background applications/containers, non-performance
+  power state, AC disconnection, low available memory, or a non-idle CPU.
 - Apollo defaults Cargo to two parallel build jobs to coexist with its 8 GB
   memory budget. Override with `SKETCHPAD_CARGO_BUILD_JOBS=<count>` when a
   deliberately isolated compile test needs another setting. Runtime

@@ -261,6 +261,14 @@ source rows, a tightly packed 256-byte-aligned staging-byte estimate, and CPU
 time spent inside `write_texture`. GPU replay result format version 2 exports
 the same counters. The address span and API time are not GPU execution time.
 
+GPU replay result format version 4 also supports `--display-hz 60,120`.
+Display-paced rows drain all samples ready for a display deadline, preserve
+their semantic order, and submit one frame. Input and damage timing remain
+per sample; scene preparation, encoding, submission, and render-pass
+timestamps are per displayed frame. `sample_ready_wait` reports deliberate
+late-latching delay, while `schedule_lateness` reports missing the display
+deadline itself. The final raster checksum must match per-sample scheduling.
+
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
 frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where
