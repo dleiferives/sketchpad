@@ -1,6 +1,6 @@
 use serde::Serialize;
 use sketchpad::{
-    brush::HardRoundBrush,
+    brush::{HardRoundBrush, HardRoundMode},
     input::ToolKind,
     input_trace::InputTrace,
     raster::{Damage, LinearRgba, RasterLayer, RasterStats, RectU32, TileCoord, DEFAULT_TILE_SIZE},
@@ -26,6 +26,9 @@ const DEFAULT_SEED: u64 = 0x5eed_2026_0724;
 const DEFAULT_HOT_STROKES: usize = 10_000;
 const DEFAULT_UNIQUE_STROKES: usize = 64;
 const DEFAULT_WARMUP_STROKES: usize = 128;
+const DEFAULT_BRUSH_DIAMETER: f32 = 48.0;
+const DEFAULT_BRUSH_OPACITY: f32 = 1.0;
+const BRUSH_SPACING_FRACTION: f32 = 0.18;
 
 #[derive(Clone, Copy, Debug)]
 enum Scene {
@@ -74,6 +77,32 @@ impl Scene {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum BrushMode {
+    Trace,
+    Paint,
+    Erase,
+}
+
+impl BrushMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "trace" => Ok(Self::Trace),
+            "paint" => Ok(Self::Paint),
+            "erase" => Ok(Self::Erase),
+            _ => Err(format!("unknown brush mode: {value}")),
+        }
+    }
+
+    fn resolve(self, trace_tool: ToolKind) -> ToolKind {
+        match self {
+            Self::Trace => trace_tool,
+            Self::Paint => ToolKind::Pen,
+            Self::Erase => ToolKind::Eraser,
+        }
+    }
+}
+
 struct Arguments {
     trace: PathBuf,
     output: Option<PathBuf>,
@@ -83,6 +112,9 @@ struct Arguments {
     unique_strokes: usize,
     warmup_strokes: usize,
     shadow_strokes: usize,
+    brush_mode: BrushMode,
+    brush_diameter: f32,
+    brush_opacity: f32,
     start_delay_millis: u64,
     seed: u64,
     revision: String,
@@ -102,6 +134,10 @@ struct ProfileResult {
     scene_seed: u64,
     initial_strokes: usize,
     initial_checksum: String,
+    brush_mode: &'static str,
+    brush_diameter: f32,
+    brush_opacity: f32,
+    brush_spacing_fraction: f32,
     oracle_batch_sizes: Vec<usize>,
     oracle_checkpoints: Vec<CheckpointResult>,
     oracle_dabs_emitted: u64,
@@ -198,7 +234,11 @@ fn run() -> Result<(), Box<dyn Error>> {
     let arguments = parse_arguments()?;
     let trace = InputTrace::load(&arguments.trace)?;
     let geometry = StrokeGeometry::from_trace(&trace)?;
-    let target_brush = brush_for_tool(geometry.tool())?;
+    let target_brush = brush_for_tool(
+        arguments.brush_mode.resolve(geometry.tool()),
+        arguments.brush_diameter,
+        arguments.brush_opacity,
+    )?;
     let scene_seed = arguments.seed ^ arguments.scene.seed_salt();
     let initial_strokes = arguments.scene.initial_strokes(arguments.stress_strokes);
     let mut layer = build_scene(&geometry, scene_seed, initial_strokes)?;
@@ -287,6 +327,10 @@ fn run() -> Result<(), Box<dyn Error>> {
         scene_seed,
         initial_strokes,
         initial_checksum: format!("{initial_checksum:016x}"),
+        brush_mode: brush_mode_name(target_brush.mode()),
+        brush_diameter: target_brush.diameter(),
+        brush_opacity: target_brush.opacity(),
+        brush_spacing_fraction: BRUSH_SPACING_FRACTION,
         oracle_batch_sizes,
         oracle_checkpoints: oracle
             .checkpoints
@@ -677,11 +721,27 @@ fn build_scene(
     Ok(layer)
 }
 
-fn brush_for_tool(tool: ToolKind) -> Result<HardRoundBrush, ReplayError> {
+fn brush_for_tool(
+    tool: ToolKind,
+    diameter: f32,
+    opacity: f32,
+) -> Result<HardRoundBrush, ReplayError> {
     Ok(match tool {
-        ToolKind::Pen => HardRoundBrush::new([0.025, 0.06, 0.18], 48.0, 1.0, 0.18)?,
-        ToolKind::Eraser => HardRoundBrush::eraser(48.0, 1.0, 0.18)?,
+        ToolKind::Pen => HardRoundBrush::new(
+            [0.025, 0.06, 0.18],
+            diameter,
+            opacity,
+            BRUSH_SPACING_FRACTION,
+        )?,
+        ToolKind::Eraser => HardRoundBrush::eraser(diameter, opacity, BRUSH_SPACING_FRACTION)?,
     })
+}
+
+fn brush_mode_name(mode: HardRoundMode) -> &'static str {
+    match mode {
+        HardRoundMode::Paint => "paint",
+        HardRoundMode::Erase => "erase",
+    }
 }
 
 fn resolved_batch_sizes(sample_count: usize) -> Vec<usize> {
@@ -711,6 +771,9 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut unique_strokes = DEFAULT_UNIQUE_STROKES;
     let mut warmup_strokes = DEFAULT_WARMUP_STROKES;
     let mut shadow_strokes = 0;
+    let mut brush_mode = BrushMode::Trace;
+    let mut brush_diameter = DEFAULT_BRUSH_DIAMETER;
+    let mut brush_opacity = DEFAULT_BRUSH_OPACITY;
     let mut start_delay_millis = 0;
     let mut seed = DEFAULT_SEED;
     let mut revision = env::var("SKETCHPAD_REVISION").unwrap_or_else(|_| "unknown".to_owned());
@@ -737,6 +800,15 @@ fn parse_arguments() -> Result<Arguments, String> {
             }
             "--shadow-strokes" => {
                 shadow_strokes = nonnegative_usize(&mut arguments, "--shadow-strokes")?;
+            }
+            "--brush-mode" => {
+                brush_mode = BrushMode::parse(&string_argument(&mut arguments, "--brush-mode")?)?;
+            }
+            "--brush-diameter" => {
+                brush_diameter = positive_f32(&mut arguments, "--brush-diameter")?;
+            }
+            "--brush-opacity" => {
+                brush_opacity = unit_f32(&mut arguments, "--brush-opacity")?;
             }
             "--start-delay-ms" => {
                 start_delay_millis = string_argument(&mut arguments, "--start-delay-ms")?
@@ -767,6 +839,9 @@ fn parse_arguments() -> Result<Arguments, String> {
         unique_strokes,
         warmup_strokes,
         shadow_strokes,
+        brush_mode,
+        brush_diameter,
+        brush_opacity,
         start_delay_millis,
         seed,
         revision,
@@ -811,12 +886,38 @@ fn nonnegative_usize(
         .map_err(|_| format!("invalid {option} value: {value}"))
 }
 
+fn positive_f32(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<f32, String> {
+    let value = string_argument(arguments, option)?;
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid {option} value: {value}"))?;
+    if parsed.is_finite() && parsed > 0.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{option} must be finite and greater than zero"))
+    }
+}
+
+fn unit_f32(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<f32, String> {
+    let value = string_argument(arguments, option)?;
+    let parsed: f32 = value
+        .parse()
+        .map_err(|_| format!("invalid {option} value: {value}"))?;
+    if parsed.is_finite() && (0.0..=1.0).contains(&parsed) {
+        Ok(parsed)
+    } else {
+        Err(format!("{option} must be finite and within 0..=1"))
+    }
+}
+
 fn print_help() {
     println!(
         "usage: cpu_profile_replay --trace PATH [--output PATH]\n\
          \x20      [--scene empty|sparse|dense|stress] [--stress-strokes N]\n\
          \x20      [--hot-strokes N] [--unique-strokes N]\n\
          \x20      [--warmup-strokes N] [--shadow-strokes N]\n\
+         \x20      [--brush-mode trace|paint|erase]\n\
+         \x20      [--brush-diameter PX] [--brush-opacity UNIT]\n\
          \x20      [--start-delay-ms N]\n\
          \x20      [--seed N] [--revision REV]"
     );

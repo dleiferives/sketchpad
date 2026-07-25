@@ -280,6 +280,9 @@ blocks used about 3.1 times as many block records as 16-pixel blocks. Advance
 both 8×8 and 16×16 to direct implementation/performance tests; drop 32×32
 from the first comparison. The full table is in
 [performance-laboratory.md](performance-laboratory.md).
+The profiler now accepts explicit brush mode, diameter, and opacity so the
+pending large-brush and eraser rows retain their workload configuration in the
+raw artifact.
 
 ### 4. Transfer-path experiment
 
