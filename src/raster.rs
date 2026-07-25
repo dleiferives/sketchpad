@@ -189,7 +189,6 @@ pub enum UndoStorage {
     #[default]
     WholeTile,
     Blocks16,
-    Hybrid16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -424,19 +423,6 @@ impl BlockTileSnapshot {
     const BLOCK_SIZE: u32 = 16;
     const BLOCK_PIXELS: usize = (Self::BLOCK_SIZE * Self::BLOCK_SIZE) as usize;
     const BLOCK_BYTES: u64 = Self::BLOCK_PIXELS as u64 * mem::size_of::<LinearRgba>() as u64;
-    const HYBRID_WHOLE_TILE_THRESHOLD: u32 = 32;
-
-    fn damage_block_count(damage: RectU32) -> u32 {
-        let min_block_x = damage.min_x() / Self::BLOCK_SIZE;
-        let min_block_y = damage.min_y() / Self::BLOCK_SIZE;
-        let max_block_x = (damage.max_x() - 1) / Self::BLOCK_SIZE;
-        let max_block_y = (damage.max_y() - 1) / Self::BLOCK_SIZE;
-        (max_block_x - min_block_x + 1) * (max_block_y - min_block_y + 1)
-    }
-
-    fn hybrid_prefers_whole_tile(damage: RectU32) -> bool {
-        Self::damage_block_count(damage) >= Self::HYBRID_WHOLE_TILE_THRESHOLD
-    }
 
     fn new(target: Option<&TileState>, tile_size: u32) -> Self {
         let blocks_wide = tile_size.div_ceil(Self::BLOCK_SIZE);
@@ -1069,18 +1055,6 @@ impl RasterLayer {
                         UndoStorage::Blocks16 => TileSnapshotState::Blocks16(
                             BlockTileSnapshot::new(Some(&occupied.get().state), tile_size_u32),
                         ),
-                        UndoStorage::Hybrid16 => {
-                            if BlockTileSnapshot::hybrid_prefers_whole_tile(local_damage) {
-                                stats.snapshot_bytes =
-                                    stats.snapshot_bytes.saturating_add(pixel_bytes);
-                                TileSnapshotState::Whole(Some(occupied.get().state.clone()))
-                            } else {
-                                TileSnapshotState::Blocks16(BlockTileSnapshot::new(
-                                    Some(&occupied.get().state),
-                                    tile_size_u32,
-                                ))
-                            }
-                        }
                     };
                     gesture.snapshots.push(TileSnapshot { coord, state });
                     stats.before_images_recorded += 1;
@@ -1095,10 +1069,10 @@ impl RasterLayer {
                 let snapshot_index = gesture.snapshots.len();
                 let state = match undo_storage {
                     UndoStorage::WholeTile => TileSnapshotState::Whole(None),
-                    UndoStorage::Blocks16 => {
-                        TileSnapshotState::Blocks16(BlockTileSnapshot::new(None, tile_size_u32))
-                    }
-                    UndoStorage::Hybrid16 => TileSnapshotState::Whole(None),
+                    // A newly allocated tile has no before-pixels to preserve. The absence
+                    // marker also lets undo/redo transfer the whole tile without copying
+                    // block payloads.
+                    UndoStorage::Blocks16 => TileSnapshotState::Whole(None),
                 };
                 gesture.snapshots.push(TileSnapshot { coord, state });
                 stats.before_images_recorded += 1;
@@ -1583,17 +1557,14 @@ mod tests {
         let damage = layer.commit_gesture(gesture).unwrap().unwrap();
 
         assert_eq!(layer.allocated_tile_count(), 1);
-        assert_eq!(layer.stats().snapshot_blocks, 1);
+        assert_eq!(layer.stats().snapshot_blocks, 0);
         assert_eq!(layer.stats().snapshot_bytes, 0);
 
         assert_eq!(layer.undo(), Some(damage.clone()));
         assert_eq!(layer.allocated_tile_count(), 0);
         assert_eq!(layer.pixel(4, 4), Some(LinearRgba::TRANSPARENT));
-        assert_eq!(layer.stats().history_swap_blocks, 1);
-        assert_eq!(
-            layer.stats().history_swap_bytes,
-            16 * 16 * mem::size_of::<LinearRgba>() as u64
-        );
+        assert_eq!(layer.stats().history_swap_blocks, 0);
+        assert_eq!(layer.stats().history_swap_bytes, 0);
 
         assert_eq!(layer.redo(), Some(damage));
         assert_eq!(layer.allocated_tile_count(), 1);
@@ -1643,70 +1614,6 @@ mod tests {
         assert_eq!(layer.redo(), Some(damage));
         assert_eq!(layer.pixel(4, 4), Some(LinearRgba::TRANSPARENT));
         assert_eq!(layer.allocated_tile_count(), 0);
-    }
-
-    #[test]
-    fn hybrid_undo_uses_whole_state_for_new_and_large_tile_edits() {
-        let mut new_layer =
-            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Hybrid16).unwrap();
-        let new_gesture = new_layer.begin_gesture().unwrap();
-        new_layer.set_pixel(new_gesture, 4, 4, RED).unwrap();
-        let new_damage = new_layer.commit_gesture(new_gesture).unwrap().unwrap();
-        assert_eq!(new_layer.stats().snapshot_blocks, 0);
-        assert_eq!(new_layer.stats().snapshot_bytes, 0);
-        new_layer.undo();
-        assert_eq!(new_layer.stats().history_swap_blocks, 0);
-        assert_eq!(new_layer.allocated_tile_count(), 0);
-        assert_eq!(new_layer.redo(), Some(new_damage));
-        assert_eq!(new_layer.pixel(4, 4), Some(RED));
-
-        let mut existing =
-            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Hybrid16).unwrap();
-        let seed = existing.begin_gesture().unwrap();
-        existing.set_pixel(seed, 4, 4, RED).unwrap();
-        existing.commit_gesture(seed).unwrap();
-        existing.clear_history();
-        existing.reset_stats();
-
-        let full_tile = rect(0, 0, 128, 128);
-        let gesture = existing.begin_gesture().unwrap();
-        existing
-            .edit_tile_additive(gesture, TileCoord::new(0, 0), full_tile, |tile| {
-                tile.pixels_mut().fill(BLUE);
-                ((), Some(full_tile))
-            })
-            .unwrap();
-        existing.commit_gesture(gesture).unwrap();
-        assert_eq!(existing.stats().snapshot_blocks, 0);
-        assert_eq!(
-            existing.stats().snapshot_bytes,
-            128 * 128 * mem::size_of::<LinearRgba>() as u64
-        );
-        existing.undo();
-        assert_eq!(existing.pixel(4, 4), Some(RED));
-        assert_eq!(existing.pixel(100, 100), Some(LinearRgba::TRANSPARENT));
-    }
-
-    #[test]
-    fn hybrid_undo_uses_blocks_for_small_existing_tile_edits() {
-        let mut layer =
-            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Hybrid16).unwrap();
-        let seed = layer.begin_gesture().unwrap();
-        layer.set_pixel(seed, 4, 4, RED).unwrap();
-        layer.commit_gesture(seed).unwrap();
-        layer.clear_history();
-        layer.reset_stats();
-
-        let gesture = layer.begin_gesture().unwrap();
-        layer.set_pixel(gesture, 4, 4, BLUE).unwrap();
-        layer.commit_gesture(gesture).unwrap();
-        assert_eq!(layer.stats().snapshot_blocks, 1);
-        assert_eq!(
-            layer.stats().snapshot_bytes,
-            16 * 16 * mem::size_of::<LinearRgba>() as u64
-        );
-        layer.undo();
-        assert_eq!(layer.pixel(4, 4), Some(RED));
     }
 
     #[test]

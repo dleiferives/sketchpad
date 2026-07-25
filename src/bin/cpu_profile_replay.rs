@@ -795,7 +795,6 @@ fn undo_storage_name(storage: UndoStorage) -> &'static str {
     match storage {
         UndoStorage::WholeTile => "whole",
         UndoStorage::Blocks16 => "blocks16",
-        UndoStorage::Hybrid16 => "hybrid16",
     }
 }
 
@@ -979,7 +978,6 @@ fn parse_undo_storage(value: &str) -> Result<UndoStorage, String> {
     match value {
         "whole" => Ok(UndoStorage::WholeTile),
         "blocks16" => Ok(UndoStorage::Blocks16),
-        "hybrid16" => Ok(UndoStorage::Hybrid16),
         _ => Err(format!("unknown undo storage: {value}")),
     }
 }
@@ -992,7 +990,7 @@ fn print_help() {
          \x20      [--warmup-strokes N] [--shadow-strokes N]\n\
          \x20      [--brush-mode trace|paint|erase]\n\
          \x20      [--brush-diameter PX] [--brush-opacity UNIT]\n\
-         \x20      [--undo-storage whole|blocks16|hybrid16]\n\
+         \x20      [--undo-storage whole|blocks16]\n\
          \x20      [--start-delay-ms N]\n\
          \x20      [--seed N] [--revision REV]"
     );
