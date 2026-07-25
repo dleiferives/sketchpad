@@ -248,7 +248,10 @@ struct StagedTileCopy {
 
 enum StagingSlotState {
     Mapped,
-    InFlight(wgpu::SubmissionIndex),
+    Remapping {
+        submission: wgpu::SubmissionIndex,
+        receiver: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    },
 }
 
 struct StagingSlot {
@@ -856,7 +859,15 @@ impl RasterDisplayPipeline {
             .as_mut()
             .expect("an active staging slot must exist");
         debug_assert!(matches!(slot.state, StagingSlotState::Mapped));
-        slot.state = StagingSlotState::InFlight(submission);
+        let slice = slot.buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        slice.map_async(wgpu::MapMode::Write, move |result| {
+            let _ = sender.send(result);
+        });
+        slot.state = StagingSlotState::Remapping {
+            submission,
+            receiver,
+        };
         self.staging.copies.clear();
     }
 
@@ -1203,22 +1214,6 @@ impl RasterDisplayPipeline {
             .as_ref()
             .is_none_or(|slot| slot.capacity < required_capacity);
 
-        if let Some(slot) = self.staging.slots[slot_index].as_mut() {
-            if let StagingSlotState::InFlight(submission) = &slot.state {
-                let wait_start = Instant::now();
-                device
-                    .poll(wgpu::PollType::Wait {
-                        submission_index: Some(submission.clone()),
-                        timeout: None,
-                    })
-                    .expect("waiting for a staging ring slot must succeed");
-                self.stats.staging_wait_nanos = self.stats.staging_wait_nanos.saturating_add(
-                    wait_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
-                );
-                self.stats.staging_waits = self.stats.staging_waits.saturating_add(1);
-            }
-        }
-
         if replace {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Raster Upload Staging Ring Slot"),
@@ -1237,21 +1232,39 @@ impl RasterDisplayPipeline {
             let slot = self.staging.slots[slot_index]
                 .as_mut()
                 .expect("a retained staging slot must exist");
-            let slice = slot.buffer.slice(..required_bytes);
-            let (sender, receiver) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Write, move |result| {
-                let _ = sender.send(result);
-            });
             device
-                .poll(wgpu::PollType::Wait {
-                    submission_index: None,
-                    timeout: None,
-                })
-                .expect("mapping a completed staging slot must succeed");
-            receiver
-                .recv()
-                .expect("staging map callback must run")
-                .expect("staging slot remap must succeed");
+                .poll(wgpu::PollType::Poll)
+                .expect("polling a staging ring slot must succeed");
+            let StagingSlotState::Remapping {
+                submission,
+                receiver,
+            } = &slot.state
+            else {
+                unreachable!("a retained inactive staging slot must be remapping");
+            };
+            match receiver.try_recv() {
+                Ok(result) => result.expect("staging slot remap must succeed"),
+                Err(mpsc::TryRecvError::Empty) => {
+                    let wait_start = Instant::now();
+                    device
+                        .poll(wgpu::PollType::Wait {
+                            submission_index: Some(submission.clone()),
+                            timeout: None,
+                        })
+                        .expect("waiting for a staging ring slot must succeed");
+                    receiver
+                        .recv()
+                        .expect("staging map callback must run")
+                        .expect("staging slot remap must succeed");
+                    self.stats.staging_wait_nanos = self.stats.staging_wait_nanos.saturating_add(
+                        wait_start.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64,
+                    );
+                    self.stats.staging_waits = self.stats.staging_waits.saturating_add(1);
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    panic!("staging map callback disconnected")
+                }
+            }
             slot.state = StagingSlotState::Mapped;
         }
         self.stats.staging_buffer_capacity = self
