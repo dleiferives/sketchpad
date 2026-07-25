@@ -794,6 +794,20 @@ After the first product is useful, evaluate:
 The existing research notes remain valuable evidence for these items. They are
 not the first-product checklist.
 
+### Long-term TODO — Brush editor
+
+After the core brush set and drawing feel are stable, build a proper brush
+editor over versioned brush recipes. It should support creating and duplicating
+presets, live mark previews, pressure/tilt/velocity response curves, spacing
+and texture controls, pickup/deposit and mixing parameters, safe parameter
+ranges, and deterministic recipe serialization. The editor must configure the
+same brush engine used by documents and replay rather than introduce a second
+preview-only implementation.
+
+This is intentionally post-MVP. First establish a few excellent brushes and
+learn which controls artists actually need; do not expose unstable internal
+renderer knobs merely because they exist.
+
 ## Decisions Still Needed Soon
 
 These are near-term decisions, not permission to expand scope:
