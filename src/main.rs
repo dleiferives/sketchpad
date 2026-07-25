@@ -1014,6 +1014,12 @@ impl App {
         let coalesced_damage_regions = gpu_stats
             .coalesced_damage_regions
             .saturating_sub(self.metrics.gpu_baseline.coalesced_damage_regions);
+        let forced_damage_region_merges = gpu_stats
+            .forced_damage_region_merges
+            .saturating_sub(self.metrics.gpu_baseline.forced_damage_region_merges);
+        let merge_extra_padded_bytes = gpu_stats
+            .merge_extra_padded_bytes
+            .saturating_sub(self.metrics.gpu_baseline.merge_extra_padded_bytes);
         let evictions = gpu_stats
             .evictions
             .saturating_sub(self.metrics.gpu_baseline.evictions);
@@ -1022,7 +1028,8 @@ impl App {
             log::info!(
                 "perf input_count={} input_us(mean/p95/max)={}/{}/{} \
                  frame_count={} frame_us(mean/p95/max)={}/{}/{} \
-                 damage_regions={} coalesced={} uploads={} upload_kib={:.1} \
+                 damage_regions={} merged={} forced_merges={} merge_extra_kib={:.1} \
+                 uploads={} upload_kib={:.1} \
                  source_span_kib={:.1} padded_kib={:.1} upload_api_us={:.1} \
                  resident={} visible={} pages={} capacity={} \
                  deferred={} evictions={} cpu_tiles={}",
@@ -1036,6 +1043,8 @@ impl App {
                 render.max_micros,
                 damage_regions,
                 coalesced_damage_regions,
+                forced_damage_region_merges,
+                merge_extra_padded_bytes as f64 / 1024.0,
                 uploads,
                 upload_bytes as f64 / 1024.0,
                 upload_source_span_bytes as f64 / 1024.0,

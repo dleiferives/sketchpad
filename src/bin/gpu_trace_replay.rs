@@ -3,8 +3,8 @@ use sketchpad::{
     brush::HardRoundBrush,
     input_trace::InputTrace,
     pipeline::{
-        BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
-        WorldRect,
+        BrushCursorUniform, CanvasUniform, DamageCoalescing, RasterDisplayPipeline,
+        RasterPresentationStats, WorldRect, DEFAULT_DAMAGE_MERGE_COST_BYTES,
     },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
     replay::{
@@ -26,7 +26,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 4;
+const RESULT_VERSION: u32 = 5;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -107,6 +107,8 @@ struct Arguments {
     runs: usize,
     rates: Vec<f64>,
     display_hz: Vec<f64>,
+    damage_coalescing: DamageCoalescing,
+    damage_merge_cost_bytes: u64,
     scenes: Vec<Scene>,
     include_unpaced: bool,
     stress_strokes: usize,
@@ -150,6 +152,8 @@ struct Distribution {
 struct GpuWork {
     damage_regions: u64,
     coalesced_damage_regions: u64,
+    forced_damage_region_merges: u64,
+    merge_extra_padded_bytes: u64,
     tile_uploads: u64,
     full_tile_uploads: u64,
     partial_tile_uploads: u64,
@@ -172,6 +176,12 @@ impl GpuWork {
             coalesced_damage_regions: after
                 .coalesced_damage_regions
                 .saturating_sub(before.coalesced_damage_regions),
+            forced_damage_region_merges: after
+                .forced_damage_region_merges
+                .saturating_sub(before.forced_damage_region_merges),
+            merge_extra_padded_bytes: after
+                .merge_extra_padded_bytes
+                .saturating_sub(before.merge_extra_padded_bytes),
             tile_uploads: after.tile_uploads.saturating_sub(before.tile_uploads),
             full_tile_uploads: after
                 .full_tile_uploads
@@ -225,6 +235,8 @@ struct ResultRecord {
     timing: &'static str,
     rate: Option<f64>,
     display_hz: Option<f64>,
+    damage_coalescing: &'static str,
+    damage_merge_cost_bytes: u64,
     frame_submissions: usize,
     run: usize,
     wall_micros: u64,
@@ -311,8 +323,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         );
         let mut layer = build_scene(&geometry, scene_seed, initial_strokes)?;
         let initial_checksum = raster_checksum(&layer);
-        let mut display =
-            RasterDisplayPipeline::new(&gpu.device, wgpu::TextureFormat::Rgba8UnormSrgb, 128);
+        let mut display = RasterDisplayPipeline::new_with_damage_coalescing(
+            &gpu.device,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            128,
+            arguments.damage_coalescing,
+            arguments.damage_merge_cost_bytes,
+        );
         render_restored_frame(&gpu, &mut display, &layer)?;
 
         let mut expected_checksum = None;
@@ -366,6 +383,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     timing: timing.name(),
                     rate: timing.rate(),
                     display_hz: timing.display_hz(),
+                    damage_coalescing: damage_coalescing_name(arguments.damage_coalescing),
+                    damage_merge_cost_bytes: arguments.damage_merge_cost_bytes,
                     frame_submissions: timed.scene_prepare_cpu_micros.len(),
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
@@ -869,6 +888,13 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unknown".to_owned())
 }
 
+fn damage_coalescing_name(policy: DamageCoalescing) -> &'static str {
+    match policy {
+        DamageCoalescing::SingleUnion => "union",
+        DamageCoalescing::CostAware => "rect4",
+    }
+}
+
 fn parse_arguments() -> Result<Arguments, String> {
     let mut trace = None;
     let mut output = None;
@@ -876,6 +902,8 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut runs = 1;
     let mut rates = vec![1.0, 2.0, 4.0];
     let mut display_hz = Vec::new();
+    let mut damage_coalescing = DamageCoalescing::CostAware;
+    let mut damage_merge_cost_bytes = DEFAULT_DAMAGE_MERGE_COST_BYTES;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -891,6 +919,17 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--rates" => rates = rates_value(&mut arguments)?,
             "--display-hz" => {
                 display_hz = positive_f64_list(&mut arguments, "--display-hz")?;
+            }
+            "--damage-coalescing" => {
+                damage_coalescing = match value(&mut arguments, "--damage-coalescing")?.as_str() {
+                    "union" => DamageCoalescing::SingleUnion,
+                    "rect4" => DamageCoalescing::CostAware,
+                    value => return Err(format!("unknown damage coalescing policy: {value}")),
+                };
+            }
+            "--damage-merge-cost-kib" => {
+                damage_merge_cost_bytes =
+                    u64_value(&mut arguments, "--damage-merge-cost-kib")?.saturating_mul(1024);
             }
             "--scenes" => scenes = scenes_value(&mut arguments)?,
             "--no-unpaced" => include_unpaced = false,
@@ -909,6 +948,8 @@ fn parse_arguments() -> Result<Arguments, String> {
                     "usage: gpu_trace_replay --trace PATH [--output PATH] [--adapter NAME]\n\
                      \x20      [--runs N] [--rates 1,2,4] [--no-unpaced]\n\
                      \x20      [--display-hz 60,120]\n\
+                     \x20      [--damage-coalescing union|rect4]\n\
+                     \x20      [--damage-merge-cost-kib N]\n\
                      \x20      [--scenes empty,sparse,dense,stress] [--stress-strokes N]\n\
                      \x20      [--seed N] [--revision REV]"
                 );
@@ -924,6 +965,8 @@ fn parse_arguments() -> Result<Arguments, String> {
         runs,
         rates,
         display_hz,
+        damage_coalescing,
+        damage_merge_cost_bytes,
         scenes,
         include_unpaced,
         stress_strokes,
@@ -959,6 +1002,12 @@ fn usize_value(
     } else {
         Ok(parsed)
     }
+}
+
+fn u64_value(arguments: &mut impl Iterator<Item = String>, option: &str) -> Result<u64, String> {
+    let raw = value(arguments, option)?;
+    raw.parse()
+        .map_err(|_| format!("invalid {option} value: {raw}"))
 }
 
 fn rates_value(arguments: &mut impl Iterator<Item = String>) -> Result<Vec<f64>, String> {

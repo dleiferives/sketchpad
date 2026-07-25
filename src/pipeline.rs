@@ -7,6 +7,130 @@ use wgpu::util::DeviceExt;
 
 pub const DEFAULT_RESIDENT_TILE_CAPACITY: u32 = 256;
 pub const MAX_RESIDENT_TILES: u32 = 1_024;
+pub const DEFAULT_DAMAGE_MERGE_COST_BYTES: u64 = 64 * 1024;
+
+const PIXEL_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
+const MAX_PENDING_REGIONS_PER_TILE: usize = 4;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum DamageCoalescing {
+    SingleUnion,
+    #[default]
+    CostAware,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PendingMergeStats {
+    merges: u64,
+    forced_merges: u64,
+    extra_padded_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingTileDamage {
+    regions: [RectU32; MAX_PENDING_REGIONS_PER_TILE],
+    len: u8,
+}
+
+impl PendingTileDamage {
+    fn new(region: RectU32) -> Self {
+        Self {
+            regions: [region; MAX_PENDING_REGIONS_PER_TILE],
+            len: 1,
+        }
+    }
+
+    fn len(self) -> usize {
+        self.len as usize
+    }
+
+    fn regions(self) -> impl Iterator<Item = RectU32> {
+        self.regions.into_iter().take(self.len())
+    }
+
+    fn add(
+        &mut self,
+        region: RectU32,
+        policy: DamageCoalescing,
+        merge_cost_bytes: u64,
+    ) -> PendingMergeStats {
+        if policy == DamageCoalescing::SingleUnion {
+            let existing = self.regions[0];
+            let union = existing.union(region);
+            self.regions[0] = union;
+            return PendingMergeStats {
+                merges: 1,
+                extra_padded_bytes: merge_extra_padded_bytes(existing, region),
+                ..PendingMergeStats::default()
+            };
+        }
+
+        let mut stats = PendingMergeStats::default();
+        if self.len() < MAX_PENDING_REGIONS_PER_TILE {
+            self.regions[self.len()] = region;
+            self.len += 1;
+        } else {
+            let mut candidates = [region; MAX_PENDING_REGIONS_PER_TILE + 1];
+            candidates[..self.len()].copy_from_slice(&self.regions[..self.len()]);
+            let (first, second, extra) = cheapest_merge(&candidates, candidates.len());
+            let mut candidate_len = candidates.len() as u8;
+            merge_pair(&mut candidates, &mut candidate_len, first, second);
+            self.len = candidate_len;
+            let len = self.len();
+            self.regions.copy_from_slice(&candidates[..len]);
+            stats.merges = stats.merges.saturating_add(1);
+            stats.forced_merges = stats.forced_merges.saturating_add(1);
+            stats.extra_padded_bytes = stats.extra_padded_bytes.saturating_add(extra);
+        }
+
+        while self.len() > 1 {
+            let (first, second, extra) = cheapest_merge(&self.regions, self.len());
+            if extra > merge_cost_bytes {
+                break;
+            }
+            merge_pair(&mut self.regions, &mut self.len, first, second);
+            stats.merges = stats.merges.saturating_add(1);
+            stats.extra_padded_bytes = stats.extra_padded_bytes.saturating_add(extra);
+        }
+        stats
+    }
+}
+
+fn padded_region_bytes(region: RectU32) -> u64 {
+    let row_bytes = u64::from(region.width()).saturating_mul(PIXEL_BYTES);
+    let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    row_bytes
+        .div_ceil(alignment)
+        .saturating_mul(alignment)
+        .saturating_mul(u64::from(region.height()))
+}
+
+fn merge_extra_padded_bytes(first: RectU32, second: RectU32) -> u64 {
+    padded_region_bytes(first.union(second))
+        .saturating_sub(padded_region_bytes(first).saturating_add(padded_region_bytes(second)))
+}
+
+fn cheapest_merge(regions: &[RectU32], len: usize) -> (usize, usize, u64) {
+    debug_assert!(len >= 2 && len <= regions.len());
+    let mut best = (0, 1, merge_extra_padded_bytes(regions[0], regions[1]));
+    for first in 0..len - 1 {
+        for second in first + 1..len {
+            let extra = merge_extra_padded_bytes(regions[first], regions[second]);
+            if extra < best.2 {
+                best = (first, second, extra);
+            }
+        }
+    }
+    best
+}
+
+fn merge_pair(regions: &mut [RectU32], len: &mut u8, first: usize, second: usize) {
+    debug_assert!(first < second && second < *len as usize);
+    regions[first] = regions[first].union(regions[second]);
+    let last = *len as usize - 1;
+    regions[second] = regions[last];
+    *len -= 1;
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -50,7 +174,10 @@ impl WorldRect {
 pub struct RasterPresentationStats {
     pub damage_regions: u64,
     pub coalesced_damage_regions: u64,
+    pub forced_damage_region_merges: u64,
+    pub merge_extra_padded_bytes: u64,
     pub pending_damage_tiles: u32,
+    pub pending_damage_regions: u32,
     pub tile_uploads: u64,
     pub full_tile_uploads: u64,
     pub partial_tile_uploads: u64,
@@ -110,18 +237,40 @@ pub struct RasterDisplayPipeline {
     slot_last_used: Vec<u64>,
     free_slots: Vec<u32>,
     use_clock: u64,
-    pending_damage: HashMap<TileCoord, RectU32>,
+    pending_damage: HashMap<TileCoord, PendingTileDamage>,
+    damage_coalescing: DamageCoalescing,
+    damage_merge_cost_bytes: u64,
     stats: RasterPresentationStats,
 }
 
 impl RasterDisplayPipeline {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat, tile_size: u32) -> Self {
-        Self::new_with_residency_limits(
+        Self::new_with_configuration(
             device,
             surface_format,
             tile_size,
             DEFAULT_RESIDENT_TILE_CAPACITY,
             MAX_RESIDENT_TILES,
+            DamageCoalescing::CostAware,
+            DEFAULT_DAMAGE_MERGE_COST_BYTES,
+        )
+    }
+
+    pub fn new_with_damage_coalescing(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        tile_size: u32,
+        damage_coalescing: DamageCoalescing,
+        damage_merge_cost_bytes: u64,
+    ) -> Self {
+        Self::new_with_configuration(
+            device,
+            surface_format,
+            tile_size,
+            DEFAULT_RESIDENT_TILE_CAPACITY,
+            MAX_RESIDENT_TILES,
+            damage_coalescing,
+            damage_merge_cost_bytes,
         )
     }
 
@@ -132,6 +281,26 @@ impl RasterDisplayPipeline {
         tile_size: u32,
         page_capacity: u32,
         max_resident_tiles: u32,
+    ) -> Self {
+        Self::new_with_configuration(
+            device,
+            surface_format,
+            tile_size,
+            page_capacity,
+            max_resident_tiles,
+            DamageCoalescing::CostAware,
+            DEFAULT_DAMAGE_MERGE_COST_BYTES,
+        )
+    }
+
+    fn new_with_configuration(
+        device: &wgpu::Device,
+        surface_format: wgpu::TextureFormat,
+        tile_size: u32,
+        page_capacity: u32,
+        max_resident_tiles: u32,
+        damage_coalescing: DamageCoalescing,
+        damage_merge_cost_bytes: u64,
     ) -> Self {
         let page_capacity = page_capacity
             .min(device.limits().max_texture_array_layers)
@@ -312,6 +481,8 @@ impl RasterDisplayPipeline {
             free_slots: (0..page_capacity).rev().collect(),
             use_clock: 0,
             pending_damage: HashMap::new(),
+            damage_coalescing,
+            damage_merge_cost_bytes,
             stats: RasterPresentationStats {
                 resident_pages: 1,
                 resident_capacity: page_capacity,
@@ -328,17 +499,43 @@ impl RasterDisplayPipeline {
         for (coord, region) in damage.tile_regions() {
             self.stats.damage_regions = self.stats.damage_regions.saturating_add(1);
             if layer.tile(coord).is_none() {
-                self.pending_damage.remove(&coord);
+                if let Some(pending) = self.pending_damage.remove(&coord) {
+                    self.stats.pending_damage_regions = self
+                        .stats
+                        .pending_damage_regions
+                        .saturating_sub(pending.len() as u32);
+                }
                 self.remove_resident(coord);
             } else if self.residency.contains_key(&coord) {
                 match self.pending_damage.entry(coord) {
                     Entry::Occupied(mut pending) => {
-                        *pending.get_mut() = pending.get().union(region);
-                        self.stats.coalesced_damage_regions =
-                            self.stats.coalesced_damage_regions.saturating_add(1);
+                        let merge = pending.get_mut().add(
+                            region,
+                            self.damage_coalescing,
+                            self.damage_merge_cost_bytes,
+                        );
+                        self.stats.coalesced_damage_regions = self
+                            .stats
+                            .coalesced_damage_regions
+                            .saturating_add(merge.merges);
+                        self.stats.forced_damage_region_merges = self
+                            .stats
+                            .forced_damage_region_merges
+                            .saturating_add(merge.forced_merges);
+                        self.stats.merge_extra_padded_bytes = self
+                            .stats
+                            .merge_extra_padded_bytes
+                            .saturating_add(merge.extra_padded_bytes);
+                        self.stats.pending_damage_regions = self
+                            .stats
+                            .pending_damage_regions
+                            .saturating_add(1)
+                            .saturating_sub(merge.merges as u32);
                     }
                     Entry::Vacant(pending) => {
-                        pending.insert(region);
+                        pending.insert(PendingTileDamage::new(region));
+                        self.stats.pending_damage_regions =
+                            self.stats.pending_damage_regions.saturating_add(1);
                     }
                 }
             }
@@ -350,7 +547,12 @@ impl RasterDisplayPipeline {
     pub fn reconcile_committed_damage(&mut self, layer: &RasterLayer, damage: &Damage) {
         for &coord in damage.tiles() {
             if layer.tile(coord).is_none() {
-                self.pending_damage.remove(&coord);
+                if let Some(pending) = self.pending_damage.remove(&coord) {
+                    self.stats.pending_damage_regions = self
+                        .stats
+                        .pending_damage_regions
+                        .saturating_sub(pending.len() as u32);
+                }
                 self.remove_resident(coord);
             }
         }
@@ -371,6 +573,7 @@ impl RasterDisplayPipeline {
         self.stats.visible_instances = 0;
         self.stats.deferred_visible_tiles = 0;
         self.stats.pending_damage_tiles = 0;
+        self.stats.pending_damage_regions = 0;
     }
 
     pub fn prepare_visible(
@@ -458,14 +661,17 @@ impl RasterDisplayPipeline {
 
     fn flush_pending_damage(&mut self, queue: &wgpu::Queue, layer: &RasterLayer) {
         let pending_damage = std::mem::take(&mut self.pending_damage);
-        for (coord, region) in pending_damage {
+        for (coord, pending) in pending_damage {
             if layer.tile(coord).is_none() {
                 self.remove_resident(coord);
             } else if self.residency.contains_key(&coord) {
-                self.upload_tile_region(queue, layer, coord, region);
+                for region in pending.regions() {
+                    self.upload_tile_region(queue, layer, coord, region);
+                }
             }
         }
         self.stats.pending_damage_tiles = 0;
+        self.stats.pending_damage_regions = 0;
         self.stats.resident_tiles = self.residency.len() as u32;
     }
 
@@ -645,8 +851,6 @@ impl RasterDisplayPipeline {
         slot: u32,
         local_region: RectU32,
     ) {
-        const PIXEL_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
-
         let start = local_region.min_y() as usize * tile.stride() + local_region.min_x() as usize;
         let bytes_per_row = u64::from(self.tile_size) * PIXEL_BYTES;
         let row_bytes = u64::from(local_region.width()) * PIXEL_BYTES;
@@ -655,9 +859,7 @@ impl RasterDisplayPipeline {
             .saturating_sub(1)
             .saturating_mul(bytes_per_row)
             .saturating_add(row_bytes);
-        let alignment = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
-        let padded_row_bytes = row_bytes.div_ceil(alignment).saturating_mul(alignment);
-        let padded_bytes = padded_row_bytes.saturating_mul(rows);
+        let padded_bytes = padded_region_bytes(local_region);
         let upload_start = Instant::now();
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
@@ -751,5 +953,69 @@ impl RasterDisplayPipeline {
         };
         self.use_clock = self.use_clock.wrapping_add(1).max(1);
         self.slot_last_used[slot as usize] = self.use_clock;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect(min_x: u32, min_y: u32, max_x: u32, max_y: u32) -> RectU32 {
+        RectU32::from_min_max(min_x, min_y, max_x, max_y).unwrap()
+    }
+
+    #[test]
+    fn padded_region_cost_uses_webgpu_row_alignment() {
+        assert_eq!(padded_region_bytes(rect(0, 0, 1, 2)), 512);
+        assert_eq!(padded_region_bytes(rect(0, 0, 16, 2)), 512);
+        assert_eq!(padded_region_bytes(rect(0, 0, 17, 2)), 1_024);
+    }
+
+    #[test]
+    fn cost_aware_damage_merges_only_below_the_byte_threshold() {
+        let first = rect(0, 0, 16, 16);
+        let second = rect(32, 0, 48, 16);
+        assert_eq!(merge_extra_padded_bytes(first, second), 4_096);
+
+        let mut separate = PendingTileDamage::new(first);
+        let separate_stats = separate.add(second, DamageCoalescing::CostAware, 4_095);
+        assert_eq!(separate.len(), 2);
+        assert_eq!(separate_stats.merges, 0);
+
+        let mut merged = PendingTileDamage::new(first);
+        let merged_stats = merged.add(second, DamageCoalescing::CostAware, 4_096);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged_stats.merges, 1);
+        assert_eq!(merged_stats.extra_padded_bytes, 4_096);
+    }
+
+    #[test]
+    fn fifth_cost_aware_region_forces_only_the_cheapest_pair() {
+        let mut pending = PendingTileDamage::new(rect(0, 0, 8, 8));
+        for region in [rect(32, 0, 40, 8), rect(64, 0, 72, 8), rect(96, 0, 104, 8)] {
+            let stats = pending.add(region, DamageCoalescing::CostAware, 0);
+            assert_eq!(stats.merges, 0);
+        }
+        assert_eq!(pending.len(), 4);
+
+        let stats = pending.add(rect(120, 120, 128, 128), DamageCoalescing::CostAware, 0);
+        assert_eq!(pending.len(), 4);
+        assert_eq!(stats.merges, 1);
+        assert_eq!(stats.forced_merges, 1);
+    }
+
+    #[test]
+    fn single_union_control_always_retains_one_region() {
+        let first = rect(0, 0, 8, 8);
+        let second = rect(120, 120, 128, 128);
+        let mut pending = PendingTileDamage::new(first);
+        let stats = pending.add(second, DamageCoalescing::SingleUnion, 0);
+
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending.regions().collect::<Vec<_>>(),
+            vec![first.union(second)]
+        );
+        assert_eq!(stats.merges, 1);
     }
 }

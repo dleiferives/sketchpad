@@ -214,6 +214,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         || stats.visible_instances != stats.resident_tiles
         || stats.deferred_visible_tiles != 0
         || stats.pending_damage_tiles != 0
+        || stats.pending_damage_regions != 0
         || stats.coalesced_damage_regions == 0
         || stats.upload_source_span_bytes < stats.upload_bytes
         || stats.upload_padded_bytes < stats.upload_bytes
@@ -221,7 +222,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("multi-page residency invariant failed: {stats:?}").into());
     }
     println!(
-        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} coalesced={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} partial_upload_bytes={}",
+        "gpu_smoke adapter={:?} dark_pixels={} cursor_pixels={} resident_tiles={} pages={} capacity={} damage_regions={} merged={} forced_merges={} merge_extra_padded_bytes={} uploads={} upload_bytes={} source_span_bytes={} padded_bytes={} upload_api_nanos={} partial_upload_bytes={}",
         adapter.get_info().name,
         dark_pixels,
         cursor_pixels,
@@ -230,6 +231,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats.resident_capacity,
         stats.damage_regions,
         stats.coalesced_damage_regions,
+        stats.forced_damage_region_merges,
+        stats.merge_extra_padded_bytes,
         stats.tile_uploads,
         stats.upload_bytes,
         stats.upload_source_span_bytes,
