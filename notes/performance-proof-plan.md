@@ -362,6 +362,35 @@ available, render-pass time, and final GPU output checksum. The objective is
 not merely fewer calls; it is less total CPU/driver/copy work at the intended
 frame schedule.
 
+Revision `9417f45` establishes the first instrumented baseline and changes the
+live boundary: damage packets now union into one pending rectangle per
+resident tile and flush during frame preparation instead of calling
+`Queue::write_texture` immediately from every input event. The offscreen
+one-submit-per-sample control intentionally still flushes every sample.
+
+On Apollo's Intel iGPU, the dense recorded stroke produces 128 damage regions
+and therefore 128 partial uploads in that control. The final checksum remains
+`7d45a406ea4f3667`. The new transfer counters report:
+
+| Quantity | Dense stroke |
+| --- | ---: |
+| logical dirty pixels | 3.607 MiB |
+| address span of strided CPU source rows | 9.303 MiB |
+| tightly packed 256-byte-aligned staging candidate | 4.183 MiB |
+| scheduled `write_texture` API CPU total | 5.07–6.42 ms |
+| unpaced `write_texture` API CPU total | 28.29 ms |
+
+The address span is not a claim about bytes copied internally by wgpu; it
+measures the source range implied by the current full-tile row stride. The
+padded number is the explicit compact-staging candidate. The unpaced API spike
+is consistent with cold allocation or queue backpressure but is not yet
+attributed; it must not be labeled GPU copy execution.
+
+Next, make the replay drain all samples ready for one display opportunity
+before frame preparation. That should exercise the live coalescer, reduce
+upload calls, and give the explicit staging comparison a representative
+submit schedule.
+
 ### 5. Renderer isolation matrix
 
 Vary independently:

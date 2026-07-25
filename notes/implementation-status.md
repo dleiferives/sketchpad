@@ -248,6 +248,19 @@ adapter/driver identity, and output checksum. GPU render-pass timestamps do not
 include `queue.write_texture` upload execution or display presentation; those
 remain separate measurement boundaries.
 
+The live presentation path now defers resident-tile damage uploads until frame
+preparation and unions repeated damage to the same tile. This preserves every
+document sample while avoiding redundant `Queue::write_texture` calls when
+winit collapses several redraw requests into one frame. Reclaimed tiles remove
+their pending work; newly visible nonresident tiles still receive one current
+full-tile upload.
+
+Presentation stats now distinguish incoming and coalesced damage regions,
+full and partial uploads, logical dirty bytes, the address span of strided
+source rows, a tightly packed 256-byte-aligned staging-byte estimate, and CPU
+time spent inside `write_texture`. GPU replay result format version 2 exports
+the same counters. The address span and API time are not GPU execution time.
+
 The convenience commands write ignored artifacts beneath `.artifacts/results`
 and fetch both the JSON Lines result and a text snapshot of host, load, CPU,
 frequency policy, memory/swap, sensors, Vulkan, Rust, and NVIDIA state where

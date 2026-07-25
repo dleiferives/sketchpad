@@ -1129,6 +1129,36 @@ validated against the Jasper Lake PMU, including frequency, Render/3D
 utilization, residency, and per-process activity. Vulkan diagnostics, CPU
 frequency inspection, sysstat, and temperature sensors are also installed.
 
+#### Frame-coalesced upload baseline, 2026-07-25
+
+Revision `9417f45` moves live dirty upload from input-event handling to frame
+preparation. Pending resident-tile regions are unioned by tile; removals clear
+pending work; a newly visible tile still receives a full upload of its current
+state. The hardware smoke test queued duplicate resident damage and verified
+that it coalesced before upload, left no pending work, and preserved the exact
+GPU readback.
+
+The current offscreen replay remains the one-submit-per-input-sample control,
+so its dense trace has no opportunity to coalesce:
+
+| Timing | Regions | Coalesced | Uploads | Logical | Source span | Packed+padded candidate | `write_texture` CPU |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| unpaced | 128 | 0 | 128 | 3.607 MiB | 9.303 MiB | 4.183 MiB | 28.29 ms |
+| scheduled 1× | 128 | 0 | 128 | 3.607 MiB | 9.303 MiB | 4.183 MiB | 5.74 ms |
+| scheduled 2× | 128 | 0 | 128 | 3.607 MiB | 9.303 MiB | 4.183 MiB | 5.07 ms |
+| scheduled 4× | 128 | 0 | 128 | 3.607 MiB | 9.303 MiB | 4.183 MiB | 6.42 ms |
+
+All four rows end at checksum `7d45a406ea4f3667`. “Source span” is the
+address range implied by the current full-tile row stride, not measured
+internal wgpu traffic. “Packed+padded” is the byte count an explicit compact
+staging layout would use with 256-byte row alignment. API CPU time can include
+allocation or backpressure and is not GPU-copy execution.
+
+The next replay version must process every ready document sample but prepare
+and submit at most one frame per display opportunity. That will quantify
+actual coalescing before comparing `write_texture` with a reusable staging
+ring and explicitly timestamped buffer-to-texture copies.
+
 ### Periodic device laboratory
 
 At minimum:
