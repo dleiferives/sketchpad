@@ -208,6 +208,14 @@ hard-round paint/erase kernels. A future arbitrary kernel that can change a
 pixel and later restore it within one gesture must mark first writes directly
 rather than relying on final pixel differences.
 
+`--undo-storage blocks16` selects the first real block-history prototype in
+the profiler. It captures each conservative 16×16 region once per tile and
+gesture into a flat per-tile payload, stores tile bounds metadata separately,
+and swaps block rows for undo/redo. It handles existing, newly allocated,
+reclaimed, cancelled, undone, and redone tiles and passes the same
+intermediate oracle. `whole` remains the application and profiler default
+until clean comparisons justify a promotion.
+
 The offscreen GPU companion is selected explicitly by adapter:
 
 ```text
@@ -284,7 +292,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - a future document with more than 1,024 simultaneously visible allocated
   tiles would defer the farther candidates, although that count is now logged;
 - nearest tile sampling has no mipmaps, gutters, or zoom-out filtering;
-- undo snapshots still copy whole touched tiles;
+- the application still defaults to whole-tile undo snapshots; an exact
+  16×16 block prototype is available only through the profiling path pending
+  performance and retained-memory comparison;
 - arbitrary general edits still use full-tile content-bound rescans;
 - brush work is CPU-only;
 - repeated dab/tile intersections are not yet coalesced;

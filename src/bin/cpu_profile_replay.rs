@@ -3,7 +3,10 @@ use sketchpad::{
     brush::{HardRoundBrush, HardRoundMode},
     input::ToolKind,
     input_trace::InputTrace,
-    raster::{Damage, LinearRgba, RasterLayer, RasterStats, RectU32, TileCoord, DEFAULT_TILE_SIZE},
+    raster::{
+        Damage, LinearRgba, RasterLayer, RasterStats, RectU32, TileCoord, UndoStorage,
+        DEFAULT_TILE_SIZE,
+    },
     replay::{
         paint_unpaced, raster_checksum, raster_damage_checksum, replay_with_checkpoints,
         DeterministicRng, ReplayCheckpoint, ReplayError, ReplaySample, StrokeGeometry,
@@ -115,6 +118,7 @@ struct Arguments {
     brush_mode: BrushMode,
     brush_diameter: f32,
     brush_opacity: f32,
+    undo_storage: UndoStorage,
     start_delay_millis: u64,
     seed: u64,
     revision: String,
@@ -138,6 +142,7 @@ struct ProfileResult {
     brush_diameter: f32,
     brush_opacity: f32,
     brush_spacing_fraction: f32,
+    undo_storage: &'static str,
     oracle_batch_sizes: Vec<usize>,
     oracle_checkpoints: Vec<CheckpointResult>,
     oracle_dabs_emitted: u64,
@@ -148,6 +153,9 @@ struct ProfileResult {
     unique_hot_strokes: usize,
     hot_strokes: usize,
     hot_micros: u64,
+    hot_paint_micros: u64,
+    hot_undo_micros: u64,
+    hot_overhead_micros: u64,
     hot_strokes_per_second: f64,
     hot_dabs_emitted: u64,
     final_checksum: String,
@@ -204,7 +212,10 @@ struct RasterCounters {
     bulk_tile_edits: u64,
     tiles_allocated: u64,
     before_images_recorded: u64,
+    snapshot_blocks: u64,
     snapshot_bytes: u64,
+    history_swap_blocks: u64,
+    history_swap_bytes: u64,
     conservatively_touched_pixels: u64,
     content_bound_pixels_scanned: u64,
 }
@@ -216,7 +227,10 @@ impl From<RasterStats> for RasterCounters {
             bulk_tile_edits: stats.bulk_tile_edits,
             tiles_allocated: stats.tiles_allocated,
             before_images_recorded: stats.before_images_recorded,
+            snapshot_blocks: stats.snapshot_blocks,
             snapshot_bytes: stats.snapshot_bytes,
+            history_swap_blocks: stats.history_swap_blocks,
+            history_swap_bytes: stats.history_swap_bytes,
             conservatively_touched_pixels: stats.conservatively_touched_pixels,
             content_bound_pixels_scanned: stats.content_bound_pixels_scanned,
         }
@@ -241,7 +255,12 @@ fn run() -> Result<(), Box<dyn Error>> {
     )?;
     let scene_seed = arguments.seed ^ arguments.scene.seed_salt();
     let initial_strokes = arguments.scene.initial_strokes(arguments.stress_strokes);
-    let mut layer = build_scene(&geometry, scene_seed, initial_strokes)?;
+    let mut layer = build_scene(
+        &geometry,
+        scene_seed,
+        initial_strokes,
+        arguments.undo_storage,
+    )?;
     let initial_checksum = raster_checksum(&layer);
     layer.clear_history();
     layer.reset_stats();
@@ -295,7 +314,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let hot_start = Instant::now();
-    let hot_dabs_emitted = run_transactions(
+    let hot_transactions = run_transactions(
         &mut layer,
         target_brush,
         &hot_samples,
@@ -312,6 +331,10 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let hot_micros = duration_micros(hot_duration);
+    let hot_paint_micros = duration_micros(hot_transactions.paint);
+    let hot_undo_micros = duration_micros(hot_transactions.undo);
+    let hot_overhead_micros =
+        hot_micros.saturating_sub(hot_paint_micros.saturating_add(hot_undo_micros));
     let hot_strokes_per_second =
         arguments.hot_strokes as f64 / hot_duration.as_secs_f64().max(f64::EPSILON);
     let result = ProfileResult {
@@ -331,6 +354,7 @@ fn run() -> Result<(), Box<dyn Error>> {
         brush_diameter: target_brush.diameter(),
         brush_opacity: target_brush.opacity(),
         brush_spacing_fraction: BRUSH_SPACING_FRACTION,
+        undo_storage: undo_storage_name(arguments.undo_storage),
         oracle_batch_sizes,
         oracle_checkpoints: oracle
             .checkpoints
@@ -345,8 +369,11 @@ fn run() -> Result<(), Box<dyn Error>> {
         unique_hot_strokes: arguments.unique_strokes,
         hot_strokes: arguments.hot_strokes,
         hot_micros,
+        hot_paint_micros,
+        hot_undo_micros,
+        hot_overhead_micros,
         hot_strokes_per_second,
-        hot_dabs_emitted,
+        hot_dabs_emitted: hot_transactions.dabs_emitted,
         final_checksum: format!("{final_checksum:016x}"),
         counters,
     };
@@ -367,11 +394,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     output.write_all(b"\n")?;
     output.flush()?;
     eprintln!(
-        "profile-complete scene={} hot_ms={:.3} strokes_per_second={:.1} snapshots_mib={:.3} checksum={final_checksum:016x}",
+        "profile-complete scene={} undo={} hot_ms={:.3} strokes_per_second={:.1} snapshots_mib={:.3} swap_mib={:.3} checksum={final_checksum:016x}",
         result.scene,
+        result.undo_storage,
         result.hot_micros as f64 / 1_000.0,
         result.hot_strokes_per_second,
         result.counters.snapshot_bytes as f64 / (1024.0 * 1024.0),
+        result.counters.history_swap_bytes as f64 / (1024.0 * 1024.0),
     );
     Ok(())
 }
@@ -681,34 +710,52 @@ fn measure_shadow_blocks(
     })
 }
 
+struct TransactionRun {
+    dabs_emitted: u64,
+    paint: Duration,
+    undo: Duration,
+}
+
 fn run_transactions(
     layer: &mut RasterLayer,
     brush: HardRoundBrush,
     samples: &[Vec<ReplaySample>],
     stroke_count: usize,
-) -> Result<u64, ReplayError> {
+) -> Result<TransactionRun, ReplayError> {
     let mut dabs_emitted = 0_u64;
+    let mut paint = Duration::ZERO;
+    let mut undo = Duration::ZERO;
     for stroke_index in 0..stroke_count {
         let stroke_samples = &samples[stroke_index % samples.len()];
+        let paint_start = Instant::now();
         let outcome = paint_unpaced(layer, brush, stroke_samples)?;
+        paint += paint_start.elapsed();
         dabs_emitted = dabs_emitted.saturating_add(outcome.dabs_emitted);
+        let undo_start = Instant::now();
         if layer.undo().is_none() {
             return Err(ReplayError::Invalid(format!(
                 "hot transaction {stroke_index} produced no undo entry"
             )));
         }
         layer.clear_history();
+        undo += undo_start.elapsed();
     }
-    Ok(dabs_emitted)
+    Ok(TransactionRun {
+        dabs_emitted,
+        paint,
+        undo,
+    })
 }
 
 fn build_scene(
     geometry: &StrokeGeometry,
     seed: u64,
     stroke_count: usize,
+    undo_storage: UndoStorage,
 ) -> Result<RasterLayer, ReplayError> {
-    let mut layer = RasterLayer::new(CANVAS[0], CANVAS[1], DEFAULT_TILE_SIZE)
-        .map_err(|error| ReplayError::Invalid(error.to_string()))?;
+    let mut layer =
+        RasterLayer::new_with_undo_storage(CANVAS[0], CANVAS[1], DEFAULT_TILE_SIZE, undo_storage)
+            .map_err(|error| ReplayError::Invalid(error.to_string()))?;
     let seed_brush = HardRoundBrush::new([0.34, 0.08, 0.02], 36.0, 0.62, 0.18)?;
     let mut random = DeterministicRng::new(seed);
     for _ in 0..stroke_count {
@@ -744,6 +791,13 @@ fn brush_mode_name(mode: HardRoundMode) -> &'static str {
     }
 }
 
+fn undo_storage_name(storage: UndoStorage) -> &'static str {
+    match storage {
+        UndoStorage::WholeTile => "whole",
+        UndoStorage::Blocks16 => "blocks16",
+    }
+}
+
 fn resolved_batch_sizes(sample_count: usize) -> Vec<usize> {
     let mut sizes = vec![1, 2, 4, 8, sample_count];
     sizes.retain(|size| *size > 0 && *size <= sample_count);
@@ -774,6 +828,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut brush_mode = BrushMode::Trace;
     let mut brush_diameter = DEFAULT_BRUSH_DIAMETER;
     let mut brush_opacity = DEFAULT_BRUSH_OPACITY;
+    let mut undo_storage = UndoStorage::WholeTile;
     let mut start_delay_millis = 0;
     let mut seed = DEFAULT_SEED;
     let mut revision = env::var("SKETCHPAD_REVISION").unwrap_or_else(|_| "unknown".to_owned());
@@ -810,6 +865,10 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--brush-opacity" => {
                 brush_opacity = unit_f32(&mut arguments, "--brush-opacity")?;
             }
+            "--undo-storage" => {
+                undo_storage =
+                    parse_undo_storage(&string_argument(&mut arguments, "--undo-storage")?)?;
+            }
             "--start-delay-ms" => {
                 start_delay_millis = string_argument(&mut arguments, "--start-delay-ms")?
                     .parse()
@@ -830,6 +889,10 @@ fn parse_arguments() -> Result<Arguments, String> {
         }
     }
 
+    if shadow_strokes > 0 && undo_storage != UndoStorage::WholeTile {
+        return Err("--shadow-strokes requires --undo-storage whole".to_owned());
+    }
+
     Ok(Arguments {
         trace: trace.ok_or_else(|| "--trace is required".to_owned())?,
         output,
@@ -842,6 +905,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         brush_mode,
         brush_diameter,
         brush_opacity,
+        undo_storage,
         start_delay_millis,
         seed,
         revision,
@@ -910,6 +974,14 @@ fn unit_f32(arguments: &mut impl Iterator<Item = String>, option: &str) -> Resul
     }
 }
 
+fn parse_undo_storage(value: &str) -> Result<UndoStorage, String> {
+    match value {
+        "whole" => Ok(UndoStorage::WholeTile),
+        "blocks16" => Ok(UndoStorage::Blocks16),
+        _ => Err(format!("unknown undo storage: {value}")),
+    }
+}
+
 fn print_help() {
     println!(
         "usage: cpu_profile_replay --trace PATH [--output PATH]\n\
@@ -918,6 +990,7 @@ fn print_help() {
          \x20      [--warmup-strokes N] [--shadow-strokes N]\n\
          \x20      [--brush-mode trace|paint|erase]\n\
          \x20      [--brush-diameter PX] [--brush-opacity UNIT]\n\
+         \x20      [--undo-storage whole|blocks16]\n\
          \x20      [--start-delay-ms N]\n\
          \x20      [--seed N] [--revision REV]"
     );

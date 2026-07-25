@@ -176,9 +176,19 @@ pub struct RasterStats {
     pub bulk_tile_edits: u64,
     pub tiles_allocated: u64,
     pub before_images_recorded: u64,
+    pub snapshot_blocks: u64,
     pub snapshot_bytes: u64,
+    pub history_swap_blocks: u64,
+    pub history_swap_bytes: u64,
     pub conservatively_touched_pixels: u64,
     pub content_bound_pixels_scanned: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UndoStorage {
+    #[default]
+    WholeTile,
+    Blocks16,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,11 +389,278 @@ enum ContentChange {
 struct Tile {
     state: TileState,
     snapshot_gesture: u64,
+    snapshot_index: usize,
+}
+
+#[derive(Clone, Copy)]
+struct TileMetadata {
+    content_bounds: Option<RectU32>,
+    content_bounds_state: ContentBoundsState,
+}
+
+impl TileMetadata {
+    fn from_state(state: &TileState) -> Self {
+        Self {
+            content_bounds: state.content_bounds,
+            content_bounds_state: state.content_bounds_state,
+        }
+    }
+
+    fn apply(self, state: &mut TileState) {
+        state.content_bounds = self.content_bounds;
+        state.content_bounds_state = self.content_bounds_state;
+    }
+}
+
+struct BlockTileSnapshot {
+    target_metadata: Option<TileMetadata>,
+    block_indices: Vec<u32>,
+    pixels: Vec<LinearRgba>,
+    captured: Box<[u64]>,
+}
+
+impl BlockTileSnapshot {
+    const BLOCK_SIZE: u32 = 16;
+    const BLOCK_PIXELS: usize = (Self::BLOCK_SIZE * Self::BLOCK_SIZE) as usize;
+    const BLOCK_BYTES: u64 = Self::BLOCK_PIXELS as u64 * mem::size_of::<LinearRgba>() as u64;
+
+    fn new(target: Option<&TileState>, tile_size: u32) -> Self {
+        let blocks_wide = tile_size.div_ceil(Self::BLOCK_SIZE);
+        let block_count = blocks_wide
+            .checked_mul(blocks_wide)
+            .expect("validated tile storage also bounds block metadata");
+        Self {
+            target_metadata: target.map(TileMetadata::from_state),
+            block_indices: Vec::new(),
+            pixels: Vec::new(),
+            captured: vec![0; block_count.div_ceil(64) as usize].into_boxed_slice(),
+        }
+    }
+
+    fn capture_damage(
+        &mut self,
+        state: &TileState,
+        damage: RectU32,
+        tile_size: u32,
+        stats: &mut RasterStats,
+    ) {
+        let blocks_wide = tile_size.div_ceil(Self::BLOCK_SIZE);
+        let min_block_x = damage.min_x() / Self::BLOCK_SIZE;
+        let min_block_y = damage.min_y() / Self::BLOCK_SIZE;
+        let max_block_x = (damage.max_x() - 1) / Self::BLOCK_SIZE;
+        let max_block_y = (damage.max_y() - 1) / Self::BLOCK_SIZE;
+
+        for block_y in min_block_y..=max_block_y {
+            for block_x in min_block_x..=max_block_x {
+                let block_index = block_y * blocks_wide + block_x;
+                let word = block_index as usize / 64;
+                let bit = 1_u64 << (block_index % 64);
+                if self.captured[word] & bit != 0 {
+                    continue;
+                }
+                self.captured[word] |= bit;
+                self.block_indices.push(block_index);
+                stats.snapshot_blocks = stats.snapshot_blocks.saturating_add(1);
+                if self.target_metadata.is_some() {
+                    append_block(
+                        &mut self.pixels,
+                        &state.pixels,
+                        block_index,
+                        blocks_wide,
+                        tile_size,
+                    );
+                    stats.snapshot_bytes = stats.snapshot_bytes.saturating_add(Self::BLOCK_BYTES);
+                }
+            }
+        }
+    }
+
+    fn restore_target(
+        &self,
+        current: Option<TileState>,
+        tile_size: u32,
+        tile_pixel_count: usize,
+    ) -> Option<TileState> {
+        let metadata = self.target_metadata?;
+        let mut target = current.unwrap_or_else(|| TileState::empty(tile_pixel_count));
+        write_blocks(
+            &mut target.pixels,
+            &self.block_indices,
+            &self.pixels,
+            tile_size,
+        );
+        metadata.apply(&mut target);
+        Some(target)
+    }
+
+    fn swap_target(
+        &mut self,
+        mut current: Option<TileState>,
+        tile_size: u32,
+        tile_pixel_count: usize,
+        stats: &mut RasterStats,
+    ) -> Option<TileState> {
+        let current_was_present = current.is_some();
+        let current_metadata = current.as_ref().map(TileMetadata::from_state);
+        let target_metadata = mem::replace(&mut self.target_metadata, current_metadata);
+        let target_was_present = target_metadata.is_some();
+        let block_count = self.block_indices.len() as u64;
+
+        match (current.as_mut(), target_metadata) {
+            (Some(current_state), Some(metadata)) => {
+                swap_blocks(
+                    &mut current_state.pixels,
+                    &self.block_indices,
+                    &mut self.pixels,
+                    tile_size,
+                );
+                metadata.apply(current_state);
+            }
+            (Some(current_state), None) => {
+                debug_assert!(self.pixels.is_empty());
+                for &block_index in &self.block_indices {
+                    append_block(
+                        &mut self.pixels,
+                        &current_state.pixels,
+                        block_index,
+                        tile_size.div_ceil(Self::BLOCK_SIZE),
+                        tile_size,
+                    );
+                }
+                current = None;
+            }
+            (None, Some(metadata)) => {
+                let mut target = TileState::empty(tile_pixel_count);
+                write_blocks(
+                    &mut target.pixels,
+                    &self.block_indices,
+                    &self.pixels,
+                    tile_size,
+                );
+                self.pixels.clear();
+                metadata.apply(&mut target);
+                current = Some(target);
+            }
+            (None, None) => {}
+        }
+
+        if current_was_present || target_was_present {
+            stats.history_swap_blocks = stats.history_swap_blocks.saturating_add(block_count);
+            stats.history_swap_bytes = stats
+                .history_swap_bytes
+                .saturating_add(block_count.saturating_mul(Self::BLOCK_BYTES));
+        }
+        current
+    }
+}
+
+fn append_block(
+    destination: &mut Vec<LinearRgba>,
+    source: &[LinearRgba],
+    block_index: u32,
+    blocks_wide: u32,
+    tile_size: u32,
+) {
+    let block_x = block_index % blocks_wide;
+    let block_y = block_index / blocks_wide;
+    let origin_x = block_x * BlockTileSnapshot::BLOCK_SIZE;
+    let origin_y = block_y * BlockTileSnapshot::BLOCK_SIZE;
+    destination.reserve(BlockTileSnapshot::BLOCK_PIXELS);
+
+    for offset_y in 0..BlockTileSnapshot::BLOCK_SIZE {
+        let y = origin_y + offset_y;
+        let copy_width =
+            BlockTileSnapshot::BLOCK_SIZE.min(tile_size.saturating_sub(origin_x)) as usize;
+        if y < tile_size {
+            let start = y as usize * tile_size as usize + origin_x as usize;
+            destination.extend_from_slice(&source[start..start + copy_width]);
+        }
+        destination.extend(std::iter::repeat_n(
+            LinearRgba::TRANSPARENT,
+            BlockTileSnapshot::BLOCK_SIZE as usize - copy_width,
+        ));
+        if y >= tile_size {
+            destination.extend(std::iter::repeat_n(LinearRgba::TRANSPARENT, copy_width));
+        }
+    }
+}
+
+fn write_blocks(
+    destination: &mut [LinearRgba],
+    block_indices: &[u32],
+    source: &[LinearRgba],
+    tile_size: u32,
+) {
+    debug_assert_eq!(
+        source.len(),
+        block_indices.len() * BlockTileSnapshot::BLOCK_PIXELS
+    );
+    let blocks_wide = tile_size.div_ceil(BlockTileSnapshot::BLOCK_SIZE);
+    for (&block_index, block_pixels) in block_indices
+        .iter()
+        .zip(source.chunks_exact(BlockTileSnapshot::BLOCK_PIXELS))
+    {
+        let block_x = block_index % blocks_wide;
+        let block_y = block_index / blocks_wide;
+        let origin_x = block_x * BlockTileSnapshot::BLOCK_SIZE;
+        let origin_y = block_y * BlockTileSnapshot::BLOCK_SIZE;
+        for offset_y in 0..BlockTileSnapshot::BLOCK_SIZE {
+            let y = origin_y + offset_y;
+            if y >= tile_size {
+                continue;
+            }
+            let copy_width =
+                BlockTileSnapshot::BLOCK_SIZE.min(tile_size.saturating_sub(origin_x)) as usize;
+            let destination_start = y as usize * tile_size as usize + origin_x as usize;
+            let source_start = offset_y as usize * BlockTileSnapshot::BLOCK_SIZE as usize;
+            destination[destination_start..destination_start + copy_width]
+                .copy_from_slice(&block_pixels[source_start..source_start + copy_width]);
+        }
+    }
+}
+
+fn swap_blocks(
+    tile_pixels: &mut [LinearRgba],
+    block_indices: &[u32],
+    snapshot_pixels: &mut [LinearRgba],
+    tile_size: u32,
+) {
+    debug_assert_eq!(
+        snapshot_pixels.len(),
+        block_indices.len() * BlockTileSnapshot::BLOCK_PIXELS
+    );
+    let blocks_wide = tile_size.div_ceil(BlockTileSnapshot::BLOCK_SIZE);
+    for (&block_index, block_pixels) in block_indices
+        .iter()
+        .zip(snapshot_pixels.chunks_exact_mut(BlockTileSnapshot::BLOCK_PIXELS))
+    {
+        let block_x = block_index % blocks_wide;
+        let block_y = block_index / blocks_wide;
+        let origin_x = block_x * BlockTileSnapshot::BLOCK_SIZE;
+        let origin_y = block_y * BlockTileSnapshot::BLOCK_SIZE;
+        for offset_y in 0..BlockTileSnapshot::BLOCK_SIZE {
+            let y = origin_y + offset_y;
+            if y >= tile_size {
+                continue;
+            }
+            let copy_width =
+                BlockTileSnapshot::BLOCK_SIZE.min(tile_size.saturating_sub(origin_x)) as usize;
+            let tile_start = y as usize * tile_size as usize + origin_x as usize;
+            let block_start = offset_y as usize * BlockTileSnapshot::BLOCK_SIZE as usize;
+            tile_pixels[tile_start..tile_start + copy_width]
+                .swap_with_slice(&mut block_pixels[block_start..block_start + copy_width]);
+        }
+    }
+}
+
+enum TileSnapshotState {
+    Whole(Option<TileState>),
+    Blocks16(BlockTileSnapshot),
 }
 
 struct TileSnapshot {
     coord: TileCoord,
-    state: Option<TileState>,
+    state: TileSnapshotState,
 }
 
 struct HistoryEntry {
@@ -408,11 +685,21 @@ pub struct RasterLayer {
     redo: Vec<HistoryEntry>,
     next_gesture: u64,
     active_gesture: Option<ActiveGesture>,
+    undo_storage: UndoStorage,
     stats: RasterStats,
 }
 
 impl RasterLayer {
     pub fn new(width: u32, height: u32, tile_size: u32) -> Result<Self, RasterError> {
+        Self::new_with_undo_storage(width, height, tile_size, UndoStorage::WholeTile)
+    }
+
+    pub fn new_with_undo_storage(
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        undo_storage: UndoStorage,
+    ) -> Result<Self, RasterError> {
         if width == 0 || height == 0 {
             return Err(RasterError::EmptyCanvas);
         }
@@ -436,6 +723,7 @@ impl RasterLayer {
             redo: Vec::new(),
             next_gesture: 1,
             active_gesture: None,
+            undo_storage,
             stats: RasterStats::default(),
         })
     }
@@ -450,6 +738,10 @@ impl RasterLayer {
 
     pub fn tile_size(&self) -> u32 {
         self.tile_size
+    }
+
+    pub fn undo_storage(&self) -> UndoStorage {
+        self.undo_storage
     }
 
     pub fn tile_grid_extent(&self) -> [u32; 2] {
@@ -511,6 +803,7 @@ impl RasterLayer {
                 Tile {
                     state,
                     snapshot_gesture: 0,
+                    snapshot_index: 0,
                 },
             );
         }
@@ -732,7 +1025,9 @@ impl RasterLayer {
 
         let global_damage = local_damage.translated(tile_bounds.min_x(), tile_bounds.min_y());
         let tile_pixel_count = self.tile_pixel_count;
-        let tile_size = self.tile_size as usize;
+        let tile_size_u32 = self.tile_size;
+        let tile_size = tile_size_u32 as usize;
+        let undo_storage = self.undo_storage;
         let pixel_bytes = (tile_pixel_count * mem::size_of::<LinearRgba>()) as u64;
 
         let RasterLayer {
@@ -748,30 +1043,54 @@ impl RasterLayer {
         stats.bulk_tile_edits += 1;
         stats.conservatively_touched_pixels += local_damage.area();
 
-        let tile = match tiles.entry(coord) {
+        let (tile, snapshot_index) = match tiles.entry(coord) {
             Entry::Occupied(mut occupied) => {
                 if occupied.get().snapshot_gesture != gesture_id.0 {
-                    gesture.snapshots.push(TileSnapshot {
-                        coord,
-                        state: Some(occupied.get().state.clone()),
-                    });
+                    let snapshot_index = gesture.snapshots.len();
+                    let state = match undo_storage {
+                        UndoStorage::WholeTile => {
+                            stats.snapshot_bytes = stats.snapshot_bytes.saturating_add(pixel_bytes);
+                            TileSnapshotState::Whole(Some(occupied.get().state.clone()))
+                        }
+                        UndoStorage::Blocks16 => TileSnapshotState::Blocks16(
+                            BlockTileSnapshot::new(Some(&occupied.get().state), tile_size_u32),
+                        ),
+                    };
+                    gesture.snapshots.push(TileSnapshot { coord, state });
                     stats.before_images_recorded += 1;
-                    stats.snapshot_bytes += pixel_bytes;
-                    occupied.get_mut().snapshot_gesture = gesture_id.0;
+                    let tile = occupied.get_mut();
+                    tile.snapshot_gesture = gesture_id.0;
+                    tile.snapshot_index = snapshot_index;
                 }
-                occupied.into_mut()
+                let snapshot_index = occupied.get().snapshot_index;
+                (occupied.into_mut(), snapshot_index)
             }
             Entry::Vacant(vacant) => {
-                gesture.snapshots.push(TileSnapshot { coord, state: None });
+                let snapshot_index = gesture.snapshots.len();
+                let state = match undo_storage {
+                    UndoStorage::WholeTile => TileSnapshotState::Whole(None),
+                    UndoStorage::Blocks16 => {
+                        TileSnapshotState::Blocks16(BlockTileSnapshot::new(None, tile_size_u32))
+                    }
+                };
+                gesture.snapshots.push(TileSnapshot { coord, state });
                 stats.before_images_recorded += 1;
                 stats.tiles_allocated += 1;
-                vacant.insert(Tile {
-                    state: TileState::empty(tile_pixel_count),
-                    snapshot_gesture: gesture_id.0,
-                })
+                (
+                    vacant.insert(Tile {
+                        state: TileState::empty(tile_pixel_count),
+                        snapshot_gesture: gesture_id.0,
+                        snapshot_index,
+                    }),
+                    snapshot_index,
+                )
             }
         };
 
+        if let TileSnapshotState::Blocks16(snapshot) = &mut gesture.snapshots[snapshot_index].state
+        {
+            snapshot.capture_damage(&tile.state, local_damage, tile_size_u32, stats);
+        }
         gesture.damage.add(coord, global_damage);
         gesture.pending_damage.add(coord, global_damage);
         let mut tile_edit = TileEdit {
@@ -944,19 +1263,24 @@ impl RasterLayer {
 
     fn restore_snapshots(&mut self, snapshots: &mut [TileSnapshot]) {
         for snapshot in snapshots.iter_mut().rev() {
-            match snapshot.state.take() {
-                Some(state) => {
-                    self.tiles.insert(
-                        snapshot.coord,
-                        Tile {
-                            state,
-                            snapshot_gesture: 0,
-                        },
-                    );
+            let target = match &mut snapshot.state {
+                TileSnapshotState::Whole(state) => state.take(),
+                TileSnapshotState::Blocks16(blocks) => {
+                    let current = self.tiles.remove(&snapshot.coord).map(|tile| tile.state);
+                    blocks.restore_target(current, self.tile_size, self.tile_pixel_count)
                 }
-                None => {
-                    self.tiles.remove(&snapshot.coord);
-                }
+            };
+            if let Some(state) = target {
+                self.tiles.insert(
+                    snapshot.coord,
+                    Tile {
+                        state,
+                        snapshot_gesture: 0,
+                        snapshot_index: 0,
+                    },
+                );
+            } else {
+                self.tiles.remove(&snapshot.coord);
             }
         }
     }
@@ -964,7 +1288,15 @@ impl RasterLayer {
     fn swap_history_states(&mut self, entry: &mut HistoryEntry) {
         for snapshot in &mut entry.snapshots {
             let current = self.tiles.remove(&snapshot.coord).map(|tile| tile.state);
-            let target = mem::replace(&mut snapshot.state, current);
+            let target = match &mut snapshot.state {
+                TileSnapshotState::Whole(target) => mem::replace(target, current),
+                TileSnapshotState::Blocks16(blocks) => blocks.swap_target(
+                    current,
+                    self.tile_size,
+                    self.tile_pixel_count,
+                    &mut self.stats,
+                ),
+            };
 
             if let Some(state) = target {
                 self.tiles.insert(
@@ -972,6 +1304,7 @@ impl RasterLayer {
                     Tile {
                         state,
                         snapshot_gesture: 0,
+                        snapshot_index: 0,
                     },
                 );
             }
@@ -1140,7 +1473,10 @@ mod tests {
                 bulk_tile_edits: 1,
                 tiles_allocated: 1,
                 before_images_recorded: 1,
+                snapshot_blocks: 0,
                 snapshot_bytes: 0,
+                history_swap_blocks: 0,
+                history_swap_bytes: 0,
                 conservatively_touched_pixels: 44 * 72,
                 content_bound_pixels_scanned: 44 * 72,
             }
@@ -1169,6 +1505,117 @@ mod tests {
             128 * 128 * mem::size_of::<LinearRgba>() as u64
         );
         assert_eq!(layer.undo_depth(), 2);
+    }
+
+    #[test]
+    fn block_undo_captures_each_conservative_block_once() {
+        let mut layer =
+            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Blocks16).unwrap();
+        let seed = layer.begin_gesture().unwrap();
+        layer.set_pixel(seed, 1, 1, RED).unwrap();
+        layer.commit_gesture(seed).unwrap();
+        layer.clear_history();
+        layer.reset_stats();
+
+        let gesture = layer.begin_gesture().unwrap();
+        layer.set_pixel(gesture, 1, 1, BLUE).unwrap();
+        layer.set_pixel(gesture, 2, 2, RED).unwrap();
+        layer.set_pixel(gesture, 20, 2, RED).unwrap();
+        let damage = layer.commit_gesture(gesture).unwrap().unwrap();
+
+        assert_eq!(layer.stats().before_images_recorded, 1);
+        assert_eq!(layer.stats().snapshot_blocks, 2);
+        assert_eq!(
+            layer.stats().snapshot_bytes,
+            2 * 16 * 16 * mem::size_of::<LinearRgba>() as u64
+        );
+        assert_eq!(layer.pixel(1, 1), Some(BLUE));
+        assert_eq!(layer.pixel(20, 2), Some(RED));
+
+        assert_eq!(layer.undo(), Some(damage.clone()));
+        assert_eq!(layer.pixel(1, 1), Some(RED));
+        assert_eq!(layer.pixel(20, 2), Some(LinearRgba::TRANSPARENT));
+        assert_eq!(layer.stats().history_swap_blocks, 2);
+        assert_eq!(
+            layer.stats().history_swap_bytes,
+            2 * 16 * 16 * mem::size_of::<LinearRgba>() as u64
+        );
+
+        assert_eq!(layer.redo(), Some(damage));
+        assert_eq!(layer.pixel(1, 1), Some(BLUE));
+        assert_eq!(layer.pixel(20, 2), Some(RED));
+        assert_eq!(layer.stats().history_swap_blocks, 4);
+    }
+
+    #[test]
+    fn block_undo_swaps_new_tile_existence() {
+        let mut layer =
+            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Blocks16).unwrap();
+        let gesture = layer.begin_gesture().unwrap();
+        layer.set_pixel(gesture, 4, 4, RED).unwrap();
+        let damage = layer.commit_gesture(gesture).unwrap().unwrap();
+
+        assert_eq!(layer.allocated_tile_count(), 1);
+        assert_eq!(layer.stats().snapshot_blocks, 1);
+        assert_eq!(layer.stats().snapshot_bytes, 0);
+
+        assert_eq!(layer.undo(), Some(damage.clone()));
+        assert_eq!(layer.allocated_tile_count(), 0);
+        assert_eq!(layer.pixel(4, 4), Some(LinearRgba::TRANSPARENT));
+        assert_eq!(layer.stats().history_swap_blocks, 1);
+        assert_eq!(
+            layer.stats().history_swap_bytes,
+            16 * 16 * mem::size_of::<LinearRgba>() as u64
+        );
+
+        assert_eq!(layer.redo(), Some(damage));
+        assert_eq!(layer.allocated_tile_count(), 1);
+        assert_eq!(layer.pixel(4, 4), Some(RED));
+    }
+
+    #[test]
+    fn block_cancel_restores_existing_and_new_tiles() {
+        let mut layer =
+            RasterLayer::new_with_undo_storage(256, 128, 128, UndoStorage::Blocks16).unwrap();
+        let seed = layer.begin_gesture().unwrap();
+        layer.set_pixel(seed, 4, 4, RED).unwrap();
+        layer.commit_gesture(seed).unwrap();
+        layer.clear_history();
+
+        let gesture = layer.begin_gesture().unwrap();
+        layer.set_pixel(gesture, 4, 4, BLUE).unwrap();
+        layer.set_pixel(gesture, 200, 4, RED).unwrap();
+        layer.cancel_gesture(gesture).unwrap();
+
+        assert_eq!(layer.pixel(4, 4), Some(RED));
+        assert_eq!(layer.pixel(200, 4), Some(LinearRgba::TRANSPARENT));
+        assert_eq!(layer.allocated_tile_count(), 1);
+        assert_eq!(layer.undo_depth(), 0);
+    }
+
+    #[test]
+    fn block_undo_restores_a_reclaimed_tile() {
+        let mut layer =
+            RasterLayer::new_with_undo_storage(128, 128, 128, UndoStorage::Blocks16).unwrap();
+        let paint = layer.begin_gesture().unwrap();
+        layer.set_pixel(paint, 4, 4, RED).unwrap();
+        layer.commit_gesture(paint).unwrap();
+        layer.clear_history();
+
+        let erase = layer.begin_gesture().unwrap();
+        layer
+            .set_pixel(erase, 4, 4, LinearRgba::TRANSPARENT)
+            .unwrap();
+        let damage = layer.commit_gesture(erase).unwrap().unwrap();
+        assert_eq!(layer.allocated_tile_count(), 0);
+
+        assert_eq!(layer.undo(), Some(damage.clone()));
+        assert_eq!(layer.pixel(4, 4), Some(RED));
+        assert_eq!(layer.content_bounds(), Some(rect(4, 4, 5, 5)));
+
+        assert_eq!(layer.redo(), Some(damage));
+        assert_eq!(layer.pixel(4, 4), Some(LinearRgba::TRANSPARENT));
+        assert_eq!(layer.allocated_tile_count(), 0);
     }
 
     #[test]

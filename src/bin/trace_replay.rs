@@ -176,7 +176,10 @@ struct RasterCounters {
     bulk_tile_edits: u64,
     tiles_allocated: u64,
     before_images_recorded: u64,
+    snapshot_blocks: u64,
     snapshot_bytes: u64,
+    history_swap_blocks: u64,
+    history_swap_bytes: u64,
     conservatively_touched_pixels: u64,
     content_bound_pixels_scanned: u64,
 }
@@ -191,7 +194,14 @@ impl RasterCounters {
         self.before_images_recorded = self
             .before_images_recorded
             .saturating_add(stats.before_images_recorded);
+        self.snapshot_blocks = self.snapshot_blocks.saturating_add(stats.snapshot_blocks);
         self.snapshot_bytes = self.snapshot_bytes.saturating_add(stats.snapshot_bytes);
+        self.history_swap_blocks = self
+            .history_swap_blocks
+            .saturating_add(stats.history_swap_blocks);
+        self.history_swap_bytes = self
+            .history_swap_bytes
+            .saturating_add(stats.history_swap_bytes);
         self.conservatively_touched_pixels = self
             .conservatively_touched_pixels
             .saturating_add(stats.conservatively_touched_pixels);
@@ -208,7 +218,10 @@ impl From<RasterStats> for RasterCounters {
             bulk_tile_edits: stats.bulk_tile_edits,
             tiles_allocated: stats.tiles_allocated,
             before_images_recorded: stats.before_images_recorded,
+            snapshot_blocks: stats.snapshot_blocks,
             snapshot_bytes: stats.snapshot_bytes,
+            history_swap_blocks: stats.history_swap_blocks,
+            history_swap_bytes: stats.history_swap_bytes,
             conservatively_touched_pixels: stats.conservatively_touched_pixels,
             content_bound_pixels_scanned: stats.content_bound_pixels_scanned,
         }

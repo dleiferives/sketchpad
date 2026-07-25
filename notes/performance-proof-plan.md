@@ -291,6 +291,15 @@ Prototype 16×16 first, then compare 8×8 directly if record/copy overhead leave
 room. The 16×16 pixel payload is 4 KiB, but that convenient size is a layout
 hypothesis rather than a presumed performance win.
 
+The first `UndoStorage::Blocks16` implementation now exists behind
+`cpu_profile_replay --undo-storage blocks16`; whole-tile remains the default.
+It uses conservative edit bounds rather than the final-change lower bound,
+deduplicates blocks with a per-tile bitset, keeps payload pixels contiguous per
+tile, and row-copies/cross-swaps 16-pixel spans. Exact tests cover cancellation,
+allocation, reclamation, undo, redo, and the full recorded-trace checkpoint
+oracle. The profiler separately reports paint/capture time and undo time plus
+capture/swap blocks and bytes.
+
 ### 4. Transfer-path experiment
 
 Compare, with identical final readback:
