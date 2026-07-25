@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+SKETCHPAD_REMOTE_HOST="${SKETCHPAD_REMOTE_HOST:-apollo}" \
+SKETCHPAD_ZELLIJ_TAB="${SKETCHPAD_ZELLIJ_TAB:-apollo}" \
+SKETCHPAD_CARGO_BUILD_JOBS="${SKETCHPAD_CARGO_BUILD_JOBS:-2}" \
+  exec "$script_dir/zellij-remote" "$@"

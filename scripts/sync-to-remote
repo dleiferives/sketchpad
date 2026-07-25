@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+remote_host="${SKETCHPAD_REMOTE_HOST:?SKETCHPAD_REMOTE_HOST must name the target host}"
+remote_dir="${SKETCHPAD_REMOTE_DIR:-projs/sketchpad}"
+repo_root="$(git rev-parse --show-toplevel)"
+
+printf -v remote_dir_quoted '%q' "$remote_dir"
+ssh "$remote_host" "mkdir -p \"\$HOME\"/$remote_dir_quoted"
+
+rsync \
+  --archive \
+  --compress \
+  --delete \
+  --exclude='/.git/' \
+  --exclude='/.commandcode/' \
+  --exclude='/target/' \
+  --exclude='/.DS_Store' \
+  "$repo_root/" \
+  "$remote_host:$remote_dir/"

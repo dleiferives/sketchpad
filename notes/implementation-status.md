@@ -10,7 +10,13 @@ possibilities belong in the subject notes.
 Run on Atlas:
 
 ```text
-cargo run --release --bin sketchpad
+scripts/atlas run cargo run --release --bin sketchpad
+```
+
+Run the same build on the constrained Apollo target:
+
+```text
+scripts/apollo run cargo run --release --bin sketchpad
 ```
 
 The application now uses the sparse raster path rather than the original SDF

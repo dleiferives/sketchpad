@@ -10,7 +10,7 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 remote_host="${SKETCHPAD_REMOTE_HOST:-atlas}"
 remote_dir="${SKETCHPAD_REMOTE_DIR:-projs/sketchpad}"
 
-"$script_dir/sync-to-atlas"
+SKETCHPAD_REMOTE_HOST="$remote_host" "$script_dir/sync-to-remote"
 
 printf -v remote_dir_quoted '%q' "$remote_dir"
 remote_command=""
@@ -19,4 +19,5 @@ for argument in "$@"; do
   remote_command+="$argument_quoted "
 done
 
-ssh -t "$remote_host" "cd \"\$HOME\"/$remote_dir_quoted && exec $remote_command"
+ssh -t "$remote_host" \
+  "if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; cd \"\$HOME\"/$remote_dir_quoted && exec $remote_command"

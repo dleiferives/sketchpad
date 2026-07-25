@@ -3,5 +3,5 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-SKETCHPAD_REMOTE_HOST="${SKETCHPAD_REMOTE_HOST:-atlas}" \
+SKETCHPAD_REMOTE_HOST="${SKETCHPAD_REMOTE_HOST:-apollo}" \
   exec "$script_dir/sync-to-remote"

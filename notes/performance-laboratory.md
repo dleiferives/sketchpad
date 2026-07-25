@@ -760,6 +760,38 @@ Run the canonical and sweep suites on:
 Record the selected adapter explicitly. Never treat whichever adapter the
 runtime chose as an adequate result label.
 
+### Continuous constrained checks on Apollo
+
+Apollo is the lower-power x86/integrated-GPU target:
+
+- Intel Pentium Silver N6000, 4 cores, 1.10 GHz reported base;
+- Intel Jasper Lake UHD integrated graphics;
+- 7.5 GiB usable shared system memory;
+- Debian 13, Mesa 25.0.7, X11, and Vulkan through the Intel Mesa ICD;
+- `rustc 1.97.1` as of 2026-07-24.
+
+Use `scripts/apollo run ...`; it performs the same one-way synchronization and
+Zellij capture as `scripts/atlas`, but defaults Cargo compilation to two jobs
+so a cold wgpu build does not consume the machine's whole memory budget.
+Compilation throttling does not apply to the program being benchmarked.
+
+The initial setup passed all 42 tests and the offscreen GPU smoke test on the
+hardware adapter. The smoke result contained 15,178 dark pixels and 312 cursor
+pixels across eight resident tiles and four deliberately tiny cache pages.
+This proves functional wgpu/Vulkan rendering; it is not a performance result.
+
+Apollo should run short CPU kernels, offscreen GPU replays, and interactive
+latency captures for every performance-sensitive change. Before recording a
+number, close unrelated high-load applications and record load, memory, swap,
+temperature, and frequency state. The first setup found that an otherwise
+valid cold build could exhaust swap while unrelated desktop applications were
+active, which is exactly the interference the laboratory metadata must expose.
+
+Hardware-counter profiling is not ready on Apollo: the `perf` executable is
+absent and `perf_event_paranoid` is 3. Enabling it requires an explicit
+administrator-side setup; wall-clock benchmark and application tracing remain
+available without that change.
+
 ### Periodic device laboratory
 
 At minimum:
