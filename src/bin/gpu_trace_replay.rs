@@ -5,6 +5,7 @@ use sketchpad::{
     pipeline::{
         BrushCursorUniform, CanvasUniform, DamageCoalescing, RasterDisplayPipeline,
         RasterPresentationStats, TextureUploadMode, WorldRect, DEFAULT_DAMAGE_MERGE_COST_BYTES,
+        DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
     },
     raster::{RasterLayer, DEFAULT_TILE_SIZE},
     replay::{
@@ -993,7 +994,8 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut display_hz = Vec::new();
     let mut damage_coalescing = DamageCoalescing::CostAware;
     let mut damage_merge_cost_bytes = DEFAULT_DAMAGE_MERGE_COST_BYTES;
-    let mut upload_mode = TextureUploadMode::WriteTexture;
+    let mut damage_merge_cost_explicit = false;
+    let mut upload_mode = TextureUploadMode::StagingRing;
     let mut scenes = vec![Scene::Empty, Scene::Sparse, Scene::Dense, Scene::Stress];
     let mut include_unpaced = true;
     let mut stress_strokes = 1_000;
@@ -1020,6 +1022,7 @@ fn parse_arguments() -> Result<Arguments, String> {
             "--damage-merge-cost-kib" => {
                 damage_merge_cost_bytes =
                     u64_value(&mut arguments, "--damage-merge-cost-kib")?.saturating_mul(1024);
+                damage_merge_cost_explicit = true;
             }
             "--texture-upload" => {
                 upload_mode = match value(&mut arguments, "--texture-upload")?.as_str() {
@@ -1055,6 +1058,9 @@ fn parse_arguments() -> Result<Arguments, String> {
             }
             _ => return Err(format!("unknown argument: {argument}")),
         }
+    }
+    if !damage_merge_cost_explicit && upload_mode == TextureUploadMode::WriteTexture {
+        damage_merge_cost_bytes = DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES;
     }
     Ok(Arguments {
         trace: trace.ok_or_else(|| "--trace is required".to_owned())?,

@@ -8,7 +8,8 @@ use wgpu::util::DeviceExt;
 
 pub const DEFAULT_RESIDENT_TILE_CAPACITY: u32 = 256;
 pub const MAX_RESIDENT_TILES: u32 = 1_024;
-pub const DEFAULT_DAMAGE_MERGE_COST_BYTES: u64 = 64 * 1024;
+pub const DEFAULT_DAMAGE_MERGE_COST_BYTES: u64 = 0;
+pub const DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES: u64 = 64 * 1024;
 
 const PIXEL_BYTES: u64 = std::mem::size_of::<[f32; 4]>() as u64;
 const MAX_PENDING_REGIONS_PER_TILE: usize = 4;
@@ -331,7 +332,7 @@ impl RasterDisplayPipeline {
             MAX_RESIDENT_TILES,
             DamageCoalescing::CostAware,
             DEFAULT_DAMAGE_MERGE_COST_BYTES,
-            TextureUploadMode::WriteTexture,
+            TextureUploadMode::StagingRing,
         )
     }
 
@@ -389,7 +390,7 @@ impl RasterDisplayPipeline {
             page_capacity,
             max_resident_tiles,
             DamageCoalescing::CostAware,
-            DEFAULT_DAMAGE_MERGE_COST_BYTES,
+            DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
             TextureUploadMode::WriteTexture,
         )
     }
