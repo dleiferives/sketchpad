@@ -1018,6 +1018,25 @@ from the first implementation comparison because it is consistently
 byte-dominated by 16×16. Do not select 8×8 solely from this table; first measure
 the real capture/restore representation and add large-brush and eraser cases.
 
+Revision `158798b` added explicit mode/diameter controls and completed those
+rows on the stress scene:
+
+| Brush | Current whole tile | 8×8 | Reduction | 16×16 | Reduction | 32×32 | Reduction |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 48 px erase | 207.50 MiB | 41.40 MiB | 5.01× | 53.70 MiB | 3.86× | 77.88 MiB | 2.66× |
+| 192 px paint | 287.00 MiB | 123.03 MiB | 2.33× | 133.78 MiB | 2.15× | 155.11 MiB | 1.85× |
+
+The eraser agrees with ordinary 48 px paint. The large brush narrows the byte
+gap: 8×8 saves only 8.0% versus 16×16 while producing 125,944 payload blocks
+instead of 34,246, or 3.68 times as many records. A 16×16 canonical block also
+has a convenient 4 KiB pixel payload, although page-sized alignment is not
+itself evidence of speed.
+
+Implementation order: prototype 16×16 first, retain 8×8 as the direct
+challenger, and continue to exclude 32×32. The prototype must report actual
+allocated bytes and capture/undo/redo time; modeled traffic alone does not
+select the final representation.
+
 Hardware-counter profiling is ready on Apollo. `linux-perf` can capture
 per-process userspace cycles, instructions, branches, and cache events with
 `perf_event_paranoid=2`. `intel_gpu_top` has `CAP_PERFMON` and has been

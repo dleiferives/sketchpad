@@ -284,6 +284,13 @@ The profiler now accepts explicit brush mode, diameter, and opacity so the
 pending large-brush and eraser rows retain their workload configuration in the
 raw artifact.
 
+The completed rows keep 8×8 at about 5× and 16×16 at about 3.86× less modeled
+traffic for a 48 px eraser. At 192 px paint the candidates narrow to 2.33× and
+2.15× respectively, while 8×8 creates 3.68 times as many payload records.
+Prototype 16×16 first, then compare 8×8 directly if record/copy overhead leaves
+room. The 16×16 pixel payload is 4 KiB, but that convenient size is a layout
+hypothesis rather than a presumed performance win.
+
 ### 4. Transfer-path experiment
 
 Compare, with identical final readback:
@@ -415,8 +422,12 @@ Report before/after counts appropriate to the change:
 
 1. run the implemented 8×8, 16×16, and 32×32 shadow-block traffic measurement
    across empty, sparse, dense, stress, eraser, and large-brush traces;
-2. implement the best candidate behind the exact oracle;
-3. compare snapshot bytes, CPU time, undo time, and retained memory.
+2. implement 16×16 behind the exact oracle, retaining whole-tile undo as the
+   control;
+3. compare actual snapshot bytes, capture time, undo/redo time, and retained
+   memory;
+4. implement/retain 8×8 only if its lower traffic can overcome roughly
+   3.1–3.7 times as many block records in the relevant cases.
 
 ### Phase C — coalesce per-frame GPU work
 
