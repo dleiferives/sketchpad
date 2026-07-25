@@ -26,7 +26,7 @@ use std::{
 };
 
 const RESULT_FORMAT: &str = "sketchpad-gpu-replay-result";
-const RESULT_VERSION: u32 = 3;
+const RESULT_VERSION: u32 = 4;
 const CANVAS: [u32; 2] = [2048, 2048];
 const TARGET: [u32; 2] = [1280, 720];
 const LATE_THRESHOLD_MICROS: u64 = 250;
@@ -130,6 +130,7 @@ struct TimedGpuStroke {
     encode_submit_cpu_micros: Vec<u64>,
     app_to_submit_cpu_micros: Vec<u64>,
     schedule_lateness_micros: Vec<u64>,
+    sample_ready_wait_micros: Vec<u64>,
     gpu_render_pass_micros: Vec<u64>,
     outcome: StrokeOutcome,
     stats: GpuWork,
@@ -228,13 +229,14 @@ struct ResultRecord {
     run: usize,
     wall_micros: u64,
     late_threshold_micros: u64,
-    late_samples: usize,
+    late_opportunities: usize,
     input_processing: Distribution,
     damage_sync_cpu: Distribution,
     scene_prepare_cpu: Distribution,
     encode_submit_cpu: Distribution,
     app_to_submit_cpu: Distribution,
     schedule_lateness: Option<Distribution>,
+    sample_ready_wait: Option<Distribution>,
     gpu_render_pass: Option<Distribution>,
     dabs_emitted: u64,
     damaged_tiles: usize,
@@ -246,6 +248,7 @@ struct ResultRecord {
     raw_encode_submit_cpu_micros: Vec<u64>,
     raw_app_to_submit_cpu_micros: Vec<u64>,
     raw_schedule_lateness_micros: Vec<u64>,
+    raw_sample_ready_wait_micros: Vec<u64>,
     raw_gpu_render_pass_micros: Vec<u64>,
 }
 
@@ -333,7 +336,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         .into());
                     }
                 }
-                let late_samples = timed
+                let late_opportunities = timed
                     .schedule_lateness_micros
                     .iter()
                     .filter(|value| **value > LATE_THRESHOLD_MICROS)
@@ -367,7 +370,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     run: run_index,
                     wall_micros: duration_micros(timed.wall),
                     late_threshold_micros: LATE_THRESHOLD_MICROS,
-                    late_samples,
+                    late_opportunities,
                     input_processing: distribution(&timed.input_processing_micros),
                     damage_sync_cpu: distribution(&timed.damage_sync_cpu_micros),
                     scene_prepare_cpu: distribution(&timed.scene_prepare_cpu_micros),
@@ -375,6 +378,8 @@ fn run() -> Result<(), Box<dyn Error>> {
                     app_to_submit_cpu: distribution(&timed.app_to_submit_cpu_micros),
                     schedule_lateness: (!timed.schedule_lateness_micros.is_empty())
                         .then(|| distribution(&timed.schedule_lateness_micros)),
+                    sample_ready_wait: (!timed.sample_ready_wait_micros.is_empty())
+                        .then(|| distribution(&timed.sample_ready_wait_micros)),
                     gpu_render_pass: (!timed.gpu_render_pass_micros.is_empty())
                         .then(|| distribution(&timed.gpu_render_pass_micros)),
                     dabs_emitted: timed.outcome.dabs_emitted,
@@ -391,6 +396,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                     raw_encode_submit_cpu_micros: timed.encode_submit_cpu_micros,
                     raw_app_to_submit_cpu_micros: timed.app_to_submit_cpu_micros,
                     raw_schedule_lateness_micros: timed.schedule_lateness_micros,
+                    raw_sample_ready_wait_micros: timed.sample_ready_wait_micros,
                     raw_gpu_render_pass_micros: timed.gpu_render_pass_micros,
                 };
                 serde_json::to_writer(&mut output, &record)?;
@@ -414,7 +420,7 @@ fn run() -> Result<(), Box<dyn Error>> {
                         || "-".to_owned(),
                         |value| format!("{:.3}", value.p95 as f64 / 1_000.0)
                     ),
-                    record.late_samples,
+                    record.late_opportunities,
                     record.gpu_work.tile_uploads,
                     record.gpu_work.upload_bytes as f64 / (1024.0 * 1024.0)
                 );
@@ -615,6 +621,7 @@ fn play_gpu(
     let mut encode_submit_cpu_micros = Vec::with_capacity(samples.len());
     let mut app_to_submit_cpu_micros = Vec::with_capacity(samples.len());
     let mut schedule_lateness_micros = Vec::with_capacity(samples.len());
+    let mut sample_ready_wait_micros = Vec::with_capacity(samples.len());
     let mut outcome = None;
 
     for (frame_index, frame) in frame_groups.iter().copied().enumerate() {
@@ -622,13 +629,16 @@ fn play_gpu(
             if let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
                 thread::sleep(remaining);
             }
+            schedule_lateness_micros.push(duration_micros(
+                Instant::now().saturating_duration_since(deadline),
+            ));
         }
 
         let app_start = Instant::now();
         for &sample in &samples[frame.start..frame.end] {
             if let Some(rate) = timing.rate() {
                 let deadline = start + sample_deadline(sample, rate);
-                schedule_lateness_micros.push(duration_micros(
+                sample_ready_wait_micros.push(duration_micros(
                     Instant::now().saturating_duration_since(deadline),
                 ));
             }
@@ -748,6 +758,7 @@ fn play_gpu(
         encode_submit_cpu_micros,
         app_to_submit_cpu_micros,
         schedule_lateness_micros,
+        sample_ready_wait_micros,
         gpu_render_pass_micros,
         outcome,
         stats: GpuWork::between(stats_before, display.stats()),
