@@ -108,6 +108,27 @@ These are correctness and work-accounting findings, not throughput results.
 The next evidence step is a deterministic mixing corpus and Apollo release
 measurement against the hard-round control.
 
+### Deterministic performance corpus
+
+`mixing_bench` defines corpus version 1: one 256-input, pressure-varying,
+four-cycle stroke on a 2048×2048 canvas with 128×128 tiles. It runs the ordinary
+hard-round and linear-mixing engines over both transparency and a deterministic
+opaque six-color swatch field. The four initial/result raster checksums are
+saved as compile-time golden values. Every first and warm run must also agree
+on the complete raster and mixing work counters, and undo must restore the
+golden initial checksum.
+
+```text
+scripts/apollo run cargo run --locked --release --bin mixing_bench -- \
+  --warm-runs 7
+```
+
+The JSON Lines output separates first and warm latency distributions and
+reports transaction lookups, undo snapshots, conservative pixel bounds,
+mixing sample/deposit pixels, unique pickup snapshots, and pickup payload
+bytes. Timing excludes deterministic scene construction and post-stroke
+checksum/undo verification.
+
 ## Problem Being Addressed
 
 Straight interpolation between two RGB triples models a path through an RGB

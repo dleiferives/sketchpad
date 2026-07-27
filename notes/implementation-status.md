@@ -241,6 +241,21 @@ scripts/apollo run cargo run --locked --release --bin png_bench -- \
 The first controlled Apollo findings and their engineering consequence are
 recorded in [png-io-contract.md](png-io-contract.md#controlled-apollo-codec-baseline-2026-07-27).
 
+### Mixing-brush benchmark and oracle
+
+`mixing_bench` compares hard-round and version-1 linear-mixing strokes over
+transparent and opaque swatch scenes. Corpus geometry, input count, pressure,
+colors, recipe, and initial/result checksums are fixed. First and warm timings
+are separate; every run verifies exact counters and undo restoration.
+
+```text
+scripts/apollo run cargo run --locked --release --bin mixing_bench -- \
+  --warm-runs 7
+```
+
+The controlled findings and decisions belong in
+[pigment-mixing.md](pigment-mixing.md).
+
 ### Recorded tablet replay
 
 `traces/canonical-wacom-v1.json` is a real pen-down-through-pen-up gesture from
