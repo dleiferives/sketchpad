@@ -83,6 +83,7 @@ Controls:
 - Wacom eraser contact: pressure-sensitive coverage erase;
 - middle drag: pan;
 - wheel: zoom at cursor;
+- Home: center the canvas and fit it entirely in the viewport;
 - drop a PNG file on the window: import it as a new active layer;
 - Alt-left drag or Alt-Wacom contact: sample visible color without painting;
 - `[` / `]`: decrease/increase the hovered tool size;

@@ -63,6 +63,17 @@ struct Camera {
 }
 
 impl Camera {
+    fn fitted(canvas_size: [f32; 2], viewport_size: [f32; 2]) -> Self {
+        let canvas_aspect = canvas_size[0] / canvas_size[1];
+        let viewport_aspect = viewport_size[0] / viewport_size[1];
+        Self {
+            center: [canvas_size[0] * 0.5, canvas_size[1] * 0.5],
+            zoom: (viewport_aspect / canvas_aspect).min(1.0),
+            canvas_size,
+            viewport_size,
+        }
+    }
+
     fn view_size(self) -> [f32; 2] {
         let height = self.canvas_size[1] / self.zoom;
         [
@@ -1292,6 +1303,20 @@ impl App {
         }
     }
 
+    fn reset_view(&mut self) {
+        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
+            return;
+        }
+        let fitted = Camera::fitted(
+            [self.document.width() as f32, self.document.height() as f32],
+            self.viewport_size(),
+        );
+        self.center = fitted.center;
+        self.zoom = fitted.zoom;
+        self.panning = false;
+        self.request_redraw();
+    }
+
     fn pan_from_cursor(&mut self, previous: [f32; 2], current: [f32; 2]) {
         let camera = self.camera();
         let previous_world = camera.world_from_screen(previous);
@@ -1786,6 +1811,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     PhysicalKey::Code(KeyCode::PageDown) if command => self.move_active_layer(-1),
                     PhysicalKey::Code(KeyCode::PageUp) => self.select_relative_layer(1),
                     PhysicalKey::Code(KeyCode::PageDown) => self.select_relative_layer(-1),
+                    PhysicalKey::Code(KeyCode::Home) => self.reset_view(),
                     PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
                         self.adjust_brush_opacity(-BRUSH_OPACITY_STEP)
                     }
@@ -2186,6 +2212,21 @@ mod tests {
         let top_left = camera().world_from_screen([0.0, 0.0]);
         assert!((top_left[0] - (-1592.8889)).abs() < 0.01);
         assert!((top_left[1] - 4096.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn fitted_camera_contains_the_canvas_in_landscape_and_portrait_viewports() {
+        for viewport_size in [[1600.0, 900.0], [900.0, 1600.0]] {
+            let camera = Camera::fitted([4096.0, 4096.0], viewport_size);
+            let view = camera.view_size();
+
+            assert_eq!(camera.center, [2048.0, 2048.0]);
+            assert!(view[0] >= 4096.0);
+            assert!(view[1] >= 4096.0);
+            assert!(
+                (view[0] - 4096.0).abs() < f32::EPSILON || (view[1] - 4096.0).abs() < f32::EPSILON
+            );
+        }
     }
 
     #[test]

@@ -136,7 +136,8 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 - [ ] Minimal brush/preset selector.
 - [ ] Layer panel.
 - [ ] Open/import/export dialogs.
-- [ ] Canvas rotation and reset-view controls.
+- [ ] Canvas rotation controls.
+- [x] Reset-to-fit view control.
 - [ ] Save As and explicit native document paths.
 - [ ] Long-term versioned brush editor described in
   [first-usable-product.md](first-usable-product.md#long-term-todo--brush-editor).
