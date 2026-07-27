@@ -44,6 +44,9 @@ save, or hide unbounded work behind a convenient API.
   visible composite.
 - [x] Make structural layer changes produce explicit damage.
 - [ ] Add layer-aware semantic undo after the basic command path is stable.
+  The selected design is one 256-entry document sequence interleaving raster
+  memento references with reversible structural commands; it is not a second
+  per-feature stack.
 - [x] Measure recomposited tiles, pixels, and source layers visited.
 
 Acceptance: ordering, opacity, visibility, sparse allocation, and incremental

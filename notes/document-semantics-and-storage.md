@@ -249,6 +249,45 @@ The systems should be specified separately:
 | preview/recovery image | show/salvage appearance | merged raster and thumbnail |
 | render cache | reduce regeneration work | discardable versioned blobs |
 
+### First unified in-memory edit sequence
+
+The first layered implementation must not add an independent “layer undo”
+stack beside each raster layer. That would lose chronology. For example,
+paint-bottom → create-top → paint-top → hide-bottom must undo in exactly that
+reverse order regardless of which layer is active when the user presses Undo.
+
+The interim in-memory rule is:
+
+- the document owns one ordered edit sequence;
+- a raster entry names the stable layer whose existing tile memento must swap;
+- a structural entry carries the reversible state for create, imported-layer
+  insertion, duplicate, delete, rename, visibility, opacity, or reorder;
+- active-layer selection is navigation and is not an edit;
+- undo/redo of a structural command restores its declared before/after active
+  layer so selection remains valid;
+- every applied/undone command returns exact composite damage; metadata-only
+  commands may return an empty damage set while still counting as an edit;
+- any new edit clears redo for the entire document, including per-layer raster
+  redo entries;
+- imported rasters enter with no foreign local undo/redo history;
+- layer IDs remain monotonic and are not reused by undo;
+- history is bounded to the newest 256 semantic entries; evicting a raster
+  entry also evicts its corresponding oldest tile memento, including when a
+  later delete command temporarily owns that layer;
+- history is session state, not part of the current recovery checkpoint.
+
+This keeps the existing efficient tile swap mechanism for pixels while giving
+structural operations the same global order. It is still a count bound rather
+than the eventual byte budget. Commands that retain a deleted/imported raster
+can differ enormously in size, so later memory accounting must report raster
+payload, raster mementos, and structurally retained layers separately before a
+byte eviction policy is selected.
+
+The application registers a raster edit immediately after a successful
+stroke commit. Registration verifies that exactly one untracked local raster
+memento exists; a mismatch is an invariant failure rather than silently
+creating corrupt global history.
+
 Krita documents
 [autosave and backup behavior](https://docs.krita.org/en/user_manual/autosave.html).
 Its
