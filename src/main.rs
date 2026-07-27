@@ -10,7 +10,7 @@ use sketchpad::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
     },
-    raster::{Damage, GestureId, RasterLayer, DEFAULT_TILE_SIZE},
+    raster::{Damage, GestureId, LinearRgba, RasterLayer, DEFAULT_TILE_SIZE},
 };
 use std::{
     env, fmt, io, iter,
@@ -395,6 +395,7 @@ struct App {
     paint_engine: PaintEngine,
     active_stroke: Option<ActiveStroke>,
     active_pointer: Option<PointerOwner>,
+    sampling_pointer: Option<PointerOwner>,
     center: [f32; 2],
     zoom: f32,
     panning: bool,
@@ -443,6 +444,7 @@ impl App {
             paint_engine: PaintEngine::default(),
             active_stroke: None,
             active_pointer: None,
+            sampling_pointer: None,
             center: [CANVAS_WIDTH as f32 * 0.5, CANVAS_HEIGHT as f32 * 0.5],
             zoom: 1.0,
             panning: false,
@@ -600,6 +602,34 @@ impl App {
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
         self.cursor_pressure = 0.0;
+        self.cursor_contact = false;
+        self.update_window_title(None);
+        self.request_redraw();
+    }
+
+    fn pick_color(&mut self, screen: [f32; 2]) {
+        let world = self.camera().world_from_screen(screen);
+        if world[0] < 0.0
+            || world[1] < 0.0
+            || world[0] >= self.document.width() as f32
+            || world[1] >= self.document.height() as f32
+        {
+            return;
+        }
+        let pixel = self
+            .document
+            .composite()
+            .pixel(world[0].floor() as u32, world[1].floor() as u32)
+            .expect("the checked picker position lies inside the canvas");
+        let Some(color) = straight_rgb(pixel) else {
+            return;
+        };
+        self.paint_brush = self
+            .paint_brush
+            .with_color(color)
+            .expect("canonical composite pixels produce valid straight RGB");
+        self.mouse_tool = ToolKind::Pen;
+        self.cursor_tool = ToolKind::Pen;
         self.cursor_contact = false;
         self.update_window_title(None);
         self.request_redraw();
@@ -1114,6 +1144,24 @@ impl App {
             device_id: sample.device_id,
             tool: sample.tool,
         };
+        let continuing_sample = self.sampling_pointer == Some(owner);
+        let starting_sample = self.active_pointer.is_none()
+            && self.sampling_pointer.is_none()
+            && self.modifiers.alt_key()
+            && sample.pressure > 0.0
+            && matches!(phase, TabletPhase::Down | TabletPhase::Move);
+        if continuing_sample || starting_sample {
+            self.sampling_pointer = Some(owner);
+            self.cursor_contact = false;
+            if matches!(phase, TabletPhase::Up | TabletPhase::Hover) {
+                self.sampling_pointer = None;
+            } else {
+                self.pick_color(sample.position);
+            }
+            self.metrics.input_handling.record(handling_start.elapsed());
+            self.request_redraw();
+            return;
+        }
         match phase {
             TabletPhase::Hover => {}
             TabletPhase::Down => {
@@ -1566,6 +1614,10 @@ impl ApplicationHandler<TabletEvent> for App {
                         self.pan_from_cursor(previous, current);
                         self.request_redraw();
                     }
+                } else if self.sampling_pointer == Some(PointerOwner::Mouse) {
+                    let handling_start = Instant::now();
+                    self.pick_color(current);
+                    self.metrics.input_handling.record(handling_start.elapsed());
                 } else if self.active_pointer == Some(PointerOwner::Mouse) {
                     let handling_start = Instant::now();
                     self.update_stroke(current, 1.0);
@@ -1598,6 +1650,16 @@ impl ApplicationHandler<TabletEvent> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, _) if self.tablet_is_recent() => {}
+                (MouseButton::Left, ElementState::Pressed) if self.modifiers.alt_key() => {
+                    let handling_start = Instant::now();
+                    self.sampling_pointer = Some(PointerOwner::Mouse);
+                    self.cursor_pressure = 0.0;
+                    self.cursor_contact = false;
+                    if let Some(cursor) = self.cursor_pos {
+                        self.pick_color(cursor);
+                    }
+                    self.metrics.input_handling.record(handling_start.elapsed());
+                }
                 (MouseButton::Left, ElementState::Pressed) => {
                     let handling_start = Instant::now();
                     self.cursor_tool = self.mouse_tool;
@@ -1608,6 +1670,14 @@ impl ApplicationHandler<TabletEvent> for App {
                         self.start_stroke(cursor, 1.0, PointerOwner::Mouse);
                     }
                     self.metrics.input_handling.record(handling_start.elapsed());
+                }
+                (MouseButton::Left, ElementState::Released)
+                    if self.sampling_pointer == Some(PointerOwner::Mouse) =>
+                {
+                    self.sampling_pointer = None;
+                    self.cursor_pressure = 0.0;
+                    self.cursor_contact = false;
+                    self.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Released)
                     if self.active_pointer == Some(PointerOwner::Mouse) =>
@@ -1706,6 +1776,7 @@ impl ApplicationHandler<TabletEvent> for App {
             }
             WindowEvent::Focused(false) => {
                 self.panning = false;
+                self.sampling_pointer = None;
                 self.cursor_visible = false;
                 self.cursor_contact = false;
                 self.cancel_stroke();
@@ -2038,6 +2109,18 @@ fn mixing_brush_from_paint(paint: HardRoundBrush) -> MixingBrushV1 {
     .expect("the validated hard-round geometry is valid mixing-brush geometry")
 }
 
+fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {
+    if pixel.a <= f32::EPSILON {
+        return None;
+    }
+    let inverse_alpha = pixel.a.recip();
+    Some([
+        (pixel.r * inverse_alpha).clamp(0.0, 1.0),
+        (pixel.g * inverse_alpha).clamp(0.0, 1.0),
+        (pixel.b * inverse_alpha).clamp(0.0, 1.0),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2157,5 +2240,14 @@ mod tests {
         assert_eq!(mixing.recipe().foreground(), LinearRgb::new(0.3, 0.2, 0.1));
         assert_eq!(mixing.recipe().pickup(), MIXING_PICKUP);
         assert_eq!(mixing.recipe().color_rate(), MIXING_COLOR_RATE);
+    }
+
+    #[test]
+    fn picker_unpremultiplies_visible_linear_color_and_ignores_transparency() {
+        assert_eq!(
+            straight_rgb(LinearRgba::premultiplied(0.2, 0.1, 0.05, 0.5)),
+            Some([0.4, 0.2, 0.1])
+        );
+        assert_eq!(straight_rgb(LinearRgba::TRANSPARENT), None);
     }
 }

@@ -1,6 +1,6 @@
 # Implementation Status
 
-Status: live implementation ledger, 2026-07-24. This note records what the
+Status: live implementation ledger, 2026-07-27. This note records what the
 current executable actually does. Product intent remains in
 [first-usable-product.md](first-usable-product.md); research claims and future
 possibilities belong in the subject notes.
@@ -60,6 +60,8 @@ prototype:
   to premultiplied-linear conversion and explicit rejection of unsupported
   color metadata;
 - interactive file-drop PNG import as one undoable layer command;
+- mouse and Wacom Alt-contact visible-composite color sampling with correct
+  linear-premultiplied unassociation;
 - atomic streaming flattened PNG export of the visible composite as
   straight-alpha RGBA8 sRGB, for either the full canvas or exact content
   bounds;
@@ -79,6 +81,7 @@ Controls:
 - middle drag: pan;
 - wheel: zoom at cursor;
 - drop a PNG file on the window: import it as a new active layer;
+- Alt-left drag or Alt-Wacom contact: sample visible color without painting;
 - `[` / `]`: decrease/increase the hovered tool size;
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
 - E: toggle mouse pen/eraser mode;
@@ -482,15 +485,18 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - tilt and source timestamps are preserved but not yet consumed by the round
   brush;
 - no smoothing beyond constant-distance resampling;
-- only one layer, one hard-round brush family, six preset colors, and one
-  eraser mode;
+- layer operations are keyboard/file-drop driven; brush geometry remains one
+  hard-round family with an experimental linear-mixing engine, six preset
+  colors, visible-color sampling, and one coverage eraser;
 - no graphical brush/color UI, rotation, selection, or transforms;
-- the recovery checkpoint is a single-canvas interim raster snapshot, not the
-  future native semantic document; there is no Save As, file dialog, export,
-  embedded preview, or migration beyond strict version rejection;
+- the layered recovery checkpoint is still not the future named native
+  document; there is no Save As, file dialog, embedded preview, or serialized
+  undo history, and migration currently covers only the earlier flat
+  checkpoint;
 - checkpoint encoding and disk I/O are synchronous after the idle delay and
   still need large-document timing and disk-full/kill testing;
-- no color management beyond the stated linear working assumption;
+- PNG I/O has explicit sRGB transfer behavior, but there is no general ICC,
+  wide-gamut, or HDR color-management path;
 - `f32` RGBA costs 16 bytes per pixel and is explicitly a reference format;
 - each lazily allocated 256-tile GPU page reserves 64 MiB in the reference
   format, up to 256 MiB for all 1,024 tiles in the current canvas;
@@ -510,14 +516,19 @@ This is an architectural integration checkpoint, not yet the usable painter:
 
 ## Immediate Engineering Order
 
-The measured bottlenecks, exact-quality gates, and experiment definitions are
-now governed by
-[performance-proof-plan.md](performance-proof-plan.md). The immediate order is:
+The active delivery sequence is governed by
+[feature-roadmap.md](feature-roadmap.md); performance experiments remain
+defined in [performance-proof-plan.md](performance-proof-plan.md). The
+immediate order is:
 
-1. Add exact intermediate replay checkpoints, batch-schedule invariance, and a
-   region-dominated CPU profiling workload.
-2. Measure 8×8, 16×16, and 32×32 first-write undo shadow blocks, then implement
-   the best exact candidate.
+1. stop Apollo's root RustDesk service with fresh sudo, pass preflight, and
+   record the clean hard-round/mixing corpus;
+2. evaluate hard-round, mixing, cancellation, undo, file drop, and color
+   sampling with the physical Wacom setup;
+3. design the first graphical layer/brush/color surface over the now-proven
+   command semantics;
+4. add native open/import/export dialogs and an explicit Save As path;
+5. add canvas rotation/reset controls before broader selection/transform work.
 3. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
 4. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable

@@ -130,7 +130,8 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 
 ### 7. Usability follow-through
 
-- [ ] Color picker and recent colors.
+- [x] Visible-composite Alt-contact color picker for mouse and tablet.
+- [ ] Recent colors.
 - [ ] Minimal brush/preset selector.
 - [ ] Layer panel.
 - [ ] Open/import/export dialogs.
