@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum ToolKind {
     Pen,
@@ -28,6 +30,7 @@ pub enum TabletEvent {
     Sample {
         phase: TabletPhase,
         sample: TabletSample,
+        backend_received_at: Instant,
     },
     BackendError(String),
 }

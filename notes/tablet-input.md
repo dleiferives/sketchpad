@@ -101,8 +101,11 @@ near-zero or offset pressure can exist outside logical contact.
   first hardware test. Down/up summaries are logged without logging every
   sample.
 - Once per active second, the app logs mean/p95/max CPU input-handler and
-  frame-submit times plus upload and residency counters. These are internal CPU
-  timings, not input-to-photon measurements.
+  frame-submit times plus upload and residency counters. It now also separates
+  hover from contact for relative source-delivery excess, backend-to-event-loop
+  queue time, and latest-handler-to-submit time. These are internal timings,
+  not input-to-photon measurements; the boundaries and interpretation are
+  defined in [input-latency-investigation.md](input-latency-investigation.md).
 
 The eraser explicitly reduces premultiplied destination RGBA. Painting
 transparent color would not be equivalent. Empty-space erasing skips absent
@@ -185,14 +188,16 @@ explicit; they must not be fabricated merely to make every backend look alike.
 ## Immediate Follow-up
 
 1. Record the small trace family above and keep each recipe/version explicit.
-2. Add live input receipt, brush completion, upload, submit, and presentation
-   timestamps to measure the real latency chain; the offscreen runner now
-   covers the middle CPU stages and GPU render pass only.
-3. Consume event batches rather than one proxy wakeup per sample if profiling
-   shows dispatch overhead or backlog.
-4. Validate the new GPU brush cursor against pen hover, contact pressure,
+2. Run the new hover/contact latency probe on Apollo and preserve the physical
+   finding before changing input dispatch or presentation.
+3. Add the next missing timestamps selected by that result: detailed
+   paint/upload/submit stages, GPU completion, or platform presentation
+   feedback.
+4. Consume event batches rather than one proxy wakeup per sample only if the
+   probe shows dispatch overhead or backlog.
+5. Validate the new GPU brush cursor against pen hover, contact pressure,
    eraser proximity, zoom, and canvas edges.
-5. Decide pressure transfer curves from real use rather than hard-coding a
+6. Decide pressure transfer curves from real use rather than hard-coding a
    stylus-specific curve.
-6. Add side buttons and pad mappings only after the drawing path is reliable.
-7. Implement Wayland tablet-v2 before claiming general Linux tablet support.
+7. Add side buttons and pad mappings only after the drawing path is reliable.
+8. Implement Wayland tablet-v2 before claiming general Linux tablet support.

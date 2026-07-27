@@ -7,6 +7,7 @@ use std::{
     error::Error,
     fmt,
     thread::{self, JoinHandle},
+    time::Instant,
 };
 use winit::{event_loop::EventLoopProxy, window::Window};
 use x11rb::{
@@ -190,16 +191,29 @@ fn event_thread<C: Connection>(
                 break;
             }
         };
+        let backend_received_at = Instant::now();
         let event = match event {
-            Event::XinputMotion(event) => {
-                tablet_event(&mut states, &mut clock, &event, EventKind::Motion)
-            }
-            Event::XinputButtonPress(event) if event.detail == 1 => {
-                tablet_event(&mut states, &mut clock, &event, EventKind::ButtonPress)
-            }
-            Event::XinputButtonRelease(event) if event.detail == 1 => {
-                tablet_event(&mut states, &mut clock, &event, EventKind::ButtonRelease)
-            }
+            Event::XinputMotion(event) => tablet_event(
+                &mut states,
+                &mut clock,
+                &event,
+                EventKind::Motion,
+                backend_received_at,
+            ),
+            Event::XinputButtonPress(event) if event.detail == 1 => tablet_event(
+                &mut states,
+                &mut clock,
+                &event,
+                EventKind::ButtonPress,
+                backend_received_at,
+            ),
+            Event::XinputButtonRelease(event) if event.detail == 1 => tablet_event(
+                &mut states,
+                &mut clock,
+                &event,
+                EventKind::ButtonRelease,
+                backend_received_at,
+            ),
             _ => None,
         };
 
@@ -223,6 +237,7 @@ fn tablet_event(
     clock: &mut TimestampUnwrapper,
     event: &xinput::ButtonPressEvent,
     kind: EventKind,
+    backend_received_at: Instant,
 ) -> Option<TabletEvent> {
     let state = states.get_mut(&event.sourceid)?;
     let button_state = match kind {
@@ -256,7 +271,11 @@ fn tablet_event(
         state.down = false;
     }
 
-    Some(TabletEvent::Sample { phase, sample })
+    Some(TabletEvent::Sample {
+        phase,
+        sample,
+        backend_received_at,
+    })
 }
 
 struct DeviceState {

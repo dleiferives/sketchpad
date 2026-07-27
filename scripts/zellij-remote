@@ -7,6 +7,7 @@ zellij_session="${SKETCHPAD_ZELLIJ_SESSION:-dylan}"
 zellij_tab="${SKETCHPAD_ZELLIJ_TAB:-$remote_host}"
 remote_dir="${SKETCHPAD_REMOTE_DIR:-projs/sketchpad}"
 cargo_build_jobs="${SKETCHPAD_CARGO_BUILD_JOBS:-}"
+remote_display="${SKETCHPAD_REMOTE_DISPLAY:-}"
 lock_key="$(
   printf '%s-%s' "$zellij_session" "$zellij_tab" |
     tr -cs '[:alnum:]_.-' '_'
@@ -28,6 +29,7 @@ usage:
   scripts/$remote_host status
   scripts/$remote_host fetch <.artifacts/path> [local-path]
   scripts/$remote_host record [local-trace-path]
+  scripts/$remote_host latency [sketchpad-options...]
   scripts/$remote_host benchmark cpu [trace-replay-options...]
   scripts/$remote_host benchmark profile [cpu-profile-options...]
   scripts/$remote_host benchmark gpu <adapter-filter> [gpu-replay-options...]
@@ -192,6 +194,16 @@ record_stroke() {
   printf 'recorded_trace=%s\n' "$local_path"
 }
 
+run_latency_probe() {
+  if [[ -n "$remote_display" ]]; then
+    run_remote_command env DISPLAY="$remote_display" RUST_LOG=info \
+      cargo run --release --locked --bin sketchpad -- "$@"
+  else
+    run_remote_command env RUST_LOG=info \
+      cargo run --release --locked --bin sketchpad -- "$@"
+  fi
+}
+
 benchmark_suite() {
   if [[ "$#" -lt 1 ]]; then
     usage
@@ -296,6 +308,9 @@ case "$command" in
     ;;
   record)
     record_stroke "$@"
+    ;;
+  latency)
+    run_latency_probe "$@"
     ;;
   benchmark)
     benchmark_suite "$@"

@@ -1,3 +1,6 @@
+mod latency_probe;
+
+use latency_probe::{LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
@@ -37,7 +40,6 @@ const CANVAS_HEIGHT: u32 = 4096;
 const TABLET_MOUSE_SUPPRESSION: Duration = Duration::from_millis(250);
 const TABLET_TITLE_INTERVAL: Duration = Duration::from_millis(100);
 const PERF_REPORT_INTERVAL: Duration = Duration::from_secs(1);
-const PERF_SAMPLE_CAPACITY: usize = 2_048;
 const MIN_BRUSH_DIAMETER: f32 = 1.0;
 const MAX_BRUSH_DIAMETER: f32 = 512.0;
 const BRUSH_SIZE_STEP: f32 = std::f32::consts::SQRT_2;
@@ -232,73 +234,11 @@ impl From<MixingError> for ActiveStrokeError {
     }
 }
 
-struct LatencySeries {
-    values_micros: [u64; PERF_SAMPLE_CAPACITY],
-    retained: usize,
-    next: usize,
-    count: u64,
-    total_micros: u64,
-    max_micros: u64,
-}
-
-impl LatencySeries {
-    fn new() -> Self {
-        Self {
-            values_micros: [0; PERF_SAMPLE_CAPACITY],
-            retained: 0,
-            next: 0,
-            count: 0,
-            total_micros: 0,
-            max_micros: 0,
-        }
-    }
-
-    fn record(&mut self, elapsed: Duration) {
-        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        self.values_micros[self.next] = micros;
-        self.next = (self.next + 1) % PERF_SAMPLE_CAPACITY;
-        self.retained = (self.retained + 1).min(PERF_SAMPLE_CAPACITY);
-        self.count += 1;
-        self.total_micros = self.total_micros.saturating_add(micros);
-        self.max_micros = self.max_micros.max(micros);
-    }
-
-    fn summary(&self) -> LatencySummary {
-        if self.count == 0 {
-            return LatencySummary::default();
-        }
-        let mut retained = self.values_micros[..self.retained].to_vec();
-        retained.sort_unstable();
-        let p95_index = ((retained.len() * 95).div_ceil(100) - 1).min(retained.len() - 1);
-        LatencySummary {
-            count: self.count,
-            mean_micros: self.total_micros / self.count,
-            p95_micros: retained[p95_index],
-            max_micros: self.max_micros,
-        }
-    }
-
-    fn clear(&mut self) {
-        self.retained = 0;
-        self.next = 0;
-        self.count = 0;
-        self.total_micros = 0;
-        self.max_micros = 0;
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct LatencySummary {
-    count: u64,
-    mean_micros: u64,
-    p95_micros: u64,
-    max_micros: u64,
-}
-
 struct LiveMetrics {
     period_start: Instant,
     input_handling: LatencySeries,
     rendering: LatencySeries,
+    tablet_latency: TabletLatencyMetrics,
     gpu_baseline: RasterPresentationStats,
 }
 
@@ -308,6 +248,7 @@ impl LiveMetrics {
             period_start: Instant::now(),
             input_handling: LatencySeries::new(),
             rendering: LatencySeries::new(),
+            tablet_latency: TabletLatencyMetrics::new(),
             gpu_baseline: RasterPresentationStats::default(),
         }
     }
@@ -316,11 +257,12 @@ impl LiveMetrics {
         self.period_start = Instant::now();
         self.input_handling.clear();
         self.rendering.clear();
+        self.tablet_latency.clear_period();
         self.gpu_baseline = gpu_stats;
     }
 
     fn has_activity(&self) -> bool {
-        self.input_handling.count > 0 || self.rendering.count > 0
+        self.input_handling.has_samples() || self.rendering.has_samples()
     }
 
     fn report_deadline(&self) -> Instant {
@@ -1542,11 +1484,19 @@ impl App {
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
+        let refresh_millihertz = window
+            .current_monitor()
+            .and_then(|monitor| monitor.refresh_rate_millihertz());
         log::info!(
-            "GPU: {} ({:?}); tile array layers: {}",
+            "GPU: {} ({:?}); tile array layers: {}; present_request={:?} \
+             supported_present_modes={:?} max_frame_latency={} refresh_millihertz={:?}",
             adapter.get_info().name,
             adapter.get_info().backend,
-            device.limits().max_texture_array_layers
+            device.limits().max_texture_array_layers,
+            config.present_mode,
+            capabilities.present_modes,
+            config.desired_maximum_frame_latency,
+            refresh_millihertz
         );
 
         let canvas = RasterDisplayPipeline::new(&device, format, tile_size);
@@ -1645,6 +1595,7 @@ impl App {
         let submission = gpu.queue.submit(iter::once(encoder.finish()));
         gpu.canvas.uploads_submitted(submission);
         gpu.queue.present(output);
+        self.metrics.tablet_latency.observe_submit(Instant::now());
         self.metrics.rendering.record(render_start.elapsed());
     }
 
@@ -1659,6 +1610,14 @@ impl App {
             .unwrap_or_default();
         let input = self.metrics.input_handling.summary();
         let render = self.metrics.rendering.summary();
+        let tablet_latency = self.metrics.tablet_latency.summary();
+        let hover_source = tablet_latency.hover.source_excess;
+        let hover_queue = tablet_latency.hover.backend_to_handler;
+        let hover_submit = tablet_latency.hover.latest_to_submit;
+        let contact_source = tablet_latency.contact.source_excess;
+        let contact_queue = tablet_latency.contact.backend_to_handler;
+        let contact_submit = tablet_latency.contact.latest_to_submit;
+        let samples_per_submit = tablet_latency.samples_per_submit;
         let uploads = gpu_stats
             .tile_uploads
             .saturating_sub(self.metrics.gpu_baseline.tile_uploads);
@@ -1734,13 +1693,13 @@ impl App {
                  resident={} visible={} pages={} capacity={} \
                  deferred={} evictions={} cpu_tiles={}",
                 input.count,
-                input.mean_micros,
-                input.p95_micros,
-                input.max_micros,
+                input.mean,
+                input.p95,
+                input.maximum,
                 render.count,
-                render.mean_micros,
-                render.p95_micros,
-                render.max_micros,
+                render.mean,
+                render.p95,
+                render.maximum,
                 damage_regions,
                 coalesced_damage_regions,
                 forced_damage_region_merges,
@@ -1774,6 +1733,43 @@ impl App {
                     .iter()
                     .map(|layer| layer.raster().allocated_tile_count())
                     .sum::<usize>()
+            );
+        }
+        if hover_source.count > 0 || contact_source.count > 0 {
+            log::info!(
+                "latency hover_samples={} source_excess_us(mean/p95/max)={}/{}/{} \
+                 backend_queue_us(mean/p95/max)={}/{}/{} \
+                 latest_to_submit_us(count/mean/p95/max)={}/{}/{}/{} \
+                 contact_samples={} source_excess_us(mean/p95/max)={}/{}/{} \
+                 backend_queue_us(mean/p95/max)={}/{}/{} \
+                 latest_to_submit_us(count/mean/p95/max)={}/{}/{}/{} \
+                 samples_per_submit(count/mean/p95/max)={}/{}/{}/{}",
+                hover_source.count,
+                hover_source.mean,
+                hover_source.p95,
+                hover_source.maximum,
+                hover_queue.mean,
+                hover_queue.p95,
+                hover_queue.maximum,
+                hover_submit.count,
+                hover_submit.mean,
+                hover_submit.p95,
+                hover_submit.maximum,
+                contact_source.count,
+                contact_source.mean,
+                contact_source.p95,
+                contact_source.maximum,
+                contact_queue.mean,
+                contact_queue.p95,
+                contact_queue.maximum,
+                contact_submit.count,
+                contact_submit.mean,
+                contact_submit.p95,
+                contact_submit.maximum,
+                samples_per_submit.count,
+                samples_per_submit.mean,
+                samples_per_submit.p95,
+                samples_per_submit.maximum,
             );
         }
         self.metrics.reset(gpu_stats);
@@ -2035,7 +2031,18 @@ impl ApplicationHandler<TabletEvent> for App {
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: TabletEvent) {
         match event {
-            TabletEvent::Sample { phase, sample } => {
+            TabletEvent::Sample {
+                phase,
+                sample,
+                backend_received_at,
+            } => {
+                let handled_at = Instant::now();
+                self.metrics.tablet_latency.observe_sample(
+                    phase,
+                    sample,
+                    backend_received_at,
+                    handled_at,
+                );
                 let device_name = self.tablet_device_name(sample);
                 let viewport = self
                     .window
@@ -2046,7 +2053,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     })
                     .unwrap_or([1, 1]);
                 let completed_trace = self.stroke_recorder.as_mut().map(|recorder| {
-                    recorder.observe(Instant::now(), viewport, device_name, phase, sample)
+                    recorder.observe(handled_at, viewport, device_name, phase, sample)
                 });
                 self.handle_tablet_sample(phase, sample);
 
@@ -2461,26 +2468,6 @@ mod tests {
         let size = camera.view_size();
         assert!((bounds.max[0] - bounds.min[0] - size[0]).abs() < 0.01);
         assert!((bounds.max[1] - bounds.min[1] - size[1]).abs() < 0.01);
-    }
-
-    #[test]
-    fn latency_series_reports_distribution_and_resets() {
-        let mut series = LatencySeries::new();
-        for micros in 1..=100 {
-            series.record(Duration::from_micros(micros));
-        }
-        assert_eq!(
-            series.summary(),
-            LatencySummary {
-                count: 100,
-                mean_micros: 50,
-                p95_micros: 95,
-                max_micros: 100,
-            }
-        );
-
-        series.clear();
-        assert_eq!(series.summary(), LatencySummary::default());
     }
 
     #[test]

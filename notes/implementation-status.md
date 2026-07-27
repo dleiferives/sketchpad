@@ -537,10 +537,13 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - arbitrary general edits still use full-tile content-bound rescans;
 - brush work is CPU-only;
 - repeated dab/tile intersections are not yet coalesced;
-- offscreen GPU render passes and explicit staged upload copies have
-  timestamps, but `write_texture` transfer execution, display presentation,
-  and input-to-photon latency are not yet instrumented; current live-window
-  timings still end at CPU queue submission.
+- live physical-input diagnostics now separate hover and contact for relative
+  X-source delivery excess, backend-to-event-loop queueing, and newest handled
+  sample-to-submit delay; offscreen GPU render passes and explicit staged
+  upload copies have timestamps, but `write_texture` transfer execution,
+  display presentation, and input-to-photon latency are not yet instrumented.
+  The live-window timings still end at the CPU presentation call; see
+  [input-latency-investigation.md](input-latency-investigation.md).
 
 ## Immediate Engineering Order
 

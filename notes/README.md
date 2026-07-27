@@ -24,6 +24,9 @@ The notes are organized by purpose:
   and eraser path, verified device ranges, normalized event contract,
   correctness coverage, hardware test checklist, and Wayland/Windows/macOS
   portability boundary.
+- [Physical pen latency investigation](input-latency-investigation.md) —
+  Apollo hover/contact failure, live probe boundaries, interpretation, and
+  controlled capture procedure.
 - [Research synthesis](research-synthesis.md) — evidence ledger, definitions,
   comparison of architectures, corrected claims, and prioritized research
   agenda for both the first product and later work.
