@@ -6,6 +6,10 @@ The notes are organized by purpose:
   direction: a fast defined/resizeable canvas, sparse raster tiles, excellent
   input and brushes, brush-local color mixing, layers, undo, recovery, and
   explicit post-MVP boundaries. Start here for what to build.
+- [Product feature roadmap](feature-roadmap.md) — the active ordered delivery
+  queue for layers, native persistence, image import/export, painterly mixing,
+  UI follow-through, and the correctness/performance infrastructure shipped
+  with each slice.
 - [Implementation status](implementation-status.md) — what the current
   executable actually does, its controls, automated coverage, known
   limitations, and immediate engineering order.

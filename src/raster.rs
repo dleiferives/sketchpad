@@ -153,7 +153,7 @@ impl Damage {
         self.bounds.is_none()
     }
 
-    fn add(&mut self, tile: TileCoord, bounds: RectU32) {
+    pub(crate) fn add(&mut self, tile: TileCoord, bounds: RectU32) {
         self.bounds = Some(match self.bounds {
             Some(existing) => existing.union(bounds),
             None => bounds,
@@ -836,6 +836,8 @@ impl RasterLayer {
             if inserted {
                 self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
             }
+        } else if self.tiles.remove(&coord).is_some() {
+            self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
         }
         Ok(())
     }
