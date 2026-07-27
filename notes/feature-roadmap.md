@@ -120,7 +120,7 @@ untouched.
 - [ ] Define behavior across transparency, repeated passes, stroke start/end,
   undo, and deterministic replay.
 - [x] Add CPU reference tests before any GPU kernel.
-- [ ] Measure work per dab, affected pixels, sampled tiles, and temporary
+- [x] Measure work per dab, affected pixels, sampled tiles, and temporary
   reservoir storage.
 - [x] Expose the control in the live app as a temporary between-stroke keyboard
   toggle before designing brush UI.

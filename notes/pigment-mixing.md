@@ -129,18 +129,59 @@ mixing sample/deposit pixels, unique pickup snapshots, and pickup payload
 bytes. Timing excludes deterministic scene construction and post-stroke
 checksum/undo verification.
 
-The first controlled Apollo attempt on 2026-07-27 was rejected before
+The first attempted Apollo measurement on 2026-07-27 was rejected before
 measurement. Preflight found Java/Xic, Syncthing, ActivityWatch, FluidSynth,
-and RustDesk, with only 85% CPU idle. The user-level applications were stopped,
-but the root `rustdesk.service` immediately respawned its processes and needs a
-fresh sudo authorization to stop. Preflight continued to fail, so the
-exploratory one-warm-run output is intentionally not a baseline and no timing
-decision was accepted. The next controlled run starts with:
+and RustDesk, with only 85% CPU idle. The exploratory one-warm-run output is
+intentionally not a baseline. This rejection is retained because it is part of
+the measurement history: a benchmark result is not accepted merely because the
+binary completed.
 
-```text
-sudo systemctl stop rustdesk.service
-scripts/apollo run scripts/benchmark-preflight
-```
+### Controlled Apollo baseline, 2026-07-27
+
+Revision `57a6cf95d73c` was measured on Apollo's four-core Intel Pentium Silver
+N6000 under the `performance` profile, on AC power. The captured machine
+context reported a 41 °C package, 6,188–6,189 MiB available memory, and the
+preflight immediately before the run reported 98% CPU idle. The root
+`rustdesk.service` and the interfering user applications from the rejected run
+were stopped. The release binary ran the fixed corpus with seven warm
+repetitions per workload.
+
+| Engine | Scene | First (µs) | Warm min (µs) | Warm median (µs) | Warm p95/max (µs) |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Hard round | Empty | 11,145 | 9,297 | 9,506 | 10,782 |
+| Linear mixing v1 | Empty | 13,141 | 12,915 | 13,146 | 13,321 |
+| Hard round | Painted swatches | 8,002 | 7,507 | 7,844 | 8,126 |
+| Linear mixing v1 | Painted swatches | 21,105 | 17,093 | 17,145 | 17,515 |
+
+Within the same scene, mixing was 1.38× the hard-round warm median on
+transparency and 2.19× on painted swatches. First-run ratios were 1.18× and
+2.64× respectively. Comparing the empty and painted hard-round rows to each
+other would be misleading: the empty workload allocates 58 tiles while the
+painted workload allocates none.
+
+All four workloads made 905 write-tile lookups and bulk tile edits, traversed
+770,278 conservative footprint pixels, and finalized 58 raster before-images.
+Both mixing workloads emitted 537 dabs, visited 905 sampled tiles, and sampled
+and deposited exactly 574,790 coverage-positive pixels. Every repetition
+matched its compile-time result checksum, and undo restored the corresponding
+initial checksum.
+
+The empty mixing stroke records 58 transparent snapshot sentinels with no
+pixel payload. The painted mixing stroke copies 58 full pickup tiles:
+15,204,352 bytes (14.5 MiB). Its normal raster undo transaction separately
+stores 1,120 fixed blocks totaling 4,587,520 bytes (4.375 MiB). The combined
+temporary pixel payload is therefore 19,791,872 bytes (18.875 MiB) for this
+single stroke.
+
+This result narrows the next performance question. Stable sampling arithmetic
+adds moderate work on transparency, while cloning full pre-stroke pickup tiles
+adds a conspicuous painted-scene time and memory cost. The first measured
+optimization candidate is lazy fixed-size pickup blocks, preserving the exact
+golden pixels and stable pre-stroke semantics. Sharing storage with raster undo
+may be considered after that isolated representation change, but is not yet
+justified: the two consumers have different ownership and lifetime needs.
+Neither GPU migration nor reduced pixel precision follows from this CPU
+baseline.
 
 ### Temporary application control
 

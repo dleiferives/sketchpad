@@ -268,8 +268,13 @@ scripts/apollo run cargo run --locked --release --bin mixing_bench -- \
   --warm-runs 7
 ```
 
-The controlled findings and decisions belong in
-[pigment-mixing.md](pigment-mixing.md).
+The first controlled Apollo baseline is recorded in
+[pigment-mixing.md](pigment-mixing.md#controlled-apollo-baseline-2026-07-27).
+On the fixed corpus, linear mixing costs 1.38× the hard-round warm median over
+transparency and 2.19× over painted swatches. The painted mixing snapshot
+accounts for 14.5 MiB of the stroke's 18.875 MiB temporary pixel payload,
+making lazy fixed-size pickup blocks the next evidence-backed representation
+experiment.
 
 ### Recorded tablet replay
 
@@ -521,26 +526,24 @@ The active delivery sequence is governed by
 defined in [performance-proof-plan.md](performance-proof-plan.md). The
 immediate order is:
 
-1. stop Apollo's root RustDesk service with fresh sudo, pass preflight, and
-   record the clean hard-round/mixing corpus;
-2. evaluate hard-round, mixing, cancellation, undo, file drop, and color
+1. evaluate hard-round, mixing, cancellation, undo, file drop, and color
    sampling with the physical Wacom setup;
-3. design the first graphical layer/brush/color surface over the now-proven
+2. design the first graphical layer/brush/color surface over the now-proven
    command semantics;
-4. add native open/import/export dialogs and an explicit Save As path;
-5. add canvas rotation/reset controls before broader selection/transform work.
-3. Add frame-paced replay that processes every sample but coalesces GPU work to
+3. add native open/import/export dialogs and an explicit Save As path;
+4. add canvas rotation/reset controls before broader selection/transform work.
+5. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
-4. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
+6. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-5. Measure the exact `Rgba32Float` display cache against direct tiles without
+7. Measure the exact `Rgba32Float` display cache against direct tiles without
    changing image quality; keep reduced-precision formats out of the product
    path unless the quality policy explicitly changes.
-6. Profile the remaining CPU kernel and only then test scanline
+8. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
-7. Capture a physical trace family covering light pressure, fast motion, long
+9. Capture a physical trace family covering light pressure, fast motion, long
    curves, eraser use, and distinct drawing styles.
-8. Resume stable Atlas Intel/NVIDIA baselines only when that machine is idle;
+10. Resume stable Atlas Intel/NVIDIA baselines only when that machine is idle;
    use Apollo for the current constrained-hardware work.
-9. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
+11. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
    brush after the proof-system and hard-ink latency work.
