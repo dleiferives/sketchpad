@@ -243,6 +243,61 @@ impl TabletLatencyMetrics {
     }
 }
 
+pub(crate) struct FrameStageMetrics {
+    acquire: LatencySeries,
+    prepare: LatencySeries,
+    encode: LatencySeries,
+    submit: LatencySeries,
+}
+
+impl FrameStageMetrics {
+    pub(crate) fn new() -> Self {
+        Self {
+            acquire: LatencySeries::new(),
+            prepare: LatencySeries::new(),
+            encode: LatencySeries::new(),
+            submit: LatencySeries::new(),
+        }
+    }
+
+    pub(crate) fn record(
+        &mut self,
+        acquire: Duration,
+        prepare: Duration,
+        encode: Duration,
+        submit: Duration,
+    ) {
+        self.acquire.record(acquire);
+        self.prepare.record(prepare);
+        self.encode.record(encode);
+        self.submit.record(submit);
+    }
+
+    pub(crate) fn summary(&self) -> FrameStageSummary {
+        FrameStageSummary {
+            acquire: self.acquire.summary(),
+            prepare: self.prepare.summary(),
+            encode: self.encode.summary(),
+            submit: self.submit.summary(),
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.acquire.clear();
+        self.prepare.clear();
+        self.encode.clear();
+        self.submit.clear();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FrameStageSummary {
+    pub(crate) acquire: LatencySummary,
+    pub(crate) prepare: LatencySummary,
+    pub(crate) encode: LatencySummary,
+    pub(crate) submit: LatencySummary,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TabletLatencySummary {
     pub(crate) hover: TabletPhaseLatencySummary,
@@ -308,6 +363,26 @@ mod tests {
             alignment.relative_excess(1_030, start + Duration::from_millis(30)),
             Duration::from_micros(0)
         );
+    }
+
+    #[test]
+    fn frame_stage_metrics_keep_boundaries_independent() {
+        let mut metrics = FrameStageMetrics::new();
+        metrics.record(
+            Duration::from_millis(10),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_millis(1),
+        );
+
+        let summary = metrics.summary();
+        assert_eq!(summary.acquire.mean, 10_000);
+        assert_eq!(summary.prepare.mean, 2_000);
+        assert_eq!(summary.encode.mean, 3_000);
+        assert_eq!(summary.submit.mean, 1_000);
+
+        metrics.clear();
+        assert_eq!(metrics.summary(), FrameStageSummary::default());
     }
 
     #[test]

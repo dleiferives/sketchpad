@@ -1,6 +1,6 @@
 mod latency_probe;
 
-use latency_probe::{LatencySeries, TabletLatencyMetrics};
+use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
@@ -114,6 +114,21 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     canvas: RasterDisplayPipeline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentationOptions {
+    present_mode: wgpu::PresentMode,
+    maximum_frame_latency: u32,
+}
+
+impl Default for PresentationOptions {
+    fn default() -> Self {
+        Self {
+            present_mode: wgpu::PresentMode::AutoVsync,
+            maximum_frame_latency: 2,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -238,6 +253,7 @@ struct LiveMetrics {
     period_start: Instant,
     input_handling: LatencySeries,
     rendering: LatencySeries,
+    frame_stages: FrameStageMetrics,
     tablet_latency: TabletLatencyMetrics,
     gpu_baseline: RasterPresentationStats,
 }
@@ -248,6 +264,7 @@ impl LiveMetrics {
             period_start: Instant::now(),
             input_handling: LatencySeries::new(),
             rendering: LatencySeries::new(),
+            frame_stages: FrameStageMetrics::new(),
             tablet_latency: TabletLatencyMetrics::new(),
             gpu_baseline: RasterPresentationStats::default(),
         }
@@ -257,6 +274,7 @@ impl LiveMetrics {
         self.period_start = Instant::now();
         self.input_handling.clear();
         self.rendering.clear();
+        self.frame_stages.clear();
         self.tablet_latency.clear_period();
         self.gpu_baseline = gpu_stats;
     }
@@ -368,6 +386,7 @@ struct App {
     last_tablet_title_update: Option<Instant>,
     tablet_sample_count: u64,
     tablet_max_pressure: f32,
+    presentation: PresentationOptions,
     metrics: LiveMetrics,
     persistence: PersistenceState,
     recovery_due: Option<Instant>,
@@ -386,6 +405,7 @@ impl App {
         record_stroke: Option<PathBuf>,
         initially_dirty: bool,
         export_path: PathBuf,
+        presentation: PresentationOptions,
     ) -> Self {
         let persistence_enabled = record_stroke.is_none();
         if persistence_enabled && initially_dirty {
@@ -423,6 +443,7 @@ impl App {
             last_tablet_title_update: None,
             tablet_sample_count: 0,
             tablet_max_pressure: 0.0,
+            presentation,
             metrics: LiveMetrics::new(),
             persistence,
             recovery_due: recovery_dirty.then(|| Instant::now() + AUTOSAVE_DELAY),
@@ -1443,7 +1464,7 @@ impl App {
         self.center[1] += previous_world[1] - current_world[1];
     }
 
-    fn init(window: Arc<Window>, tile_size: u32) -> Gpu {
+    fn init(window: Arc<Window>, tile_size: u32, presentation: PresentationOptions) -> Gpu {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             flags: Default::default(),
@@ -1472,15 +1493,32 @@ impl App {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(capabilities.formats[0]);
+        let explicit_mode = !matches!(
+            presentation.present_mode,
+            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+        );
+        let present_mode = if !explicit_mode
+            || capabilities
+                .present_modes
+                .contains(&presentation.present_mode)
+        {
+            presentation.present_mode
+        } else {
+            log::warn!(
+                "requested present mode {:?} is unsupported; falling back to AutoVsync",
+                presentation.present_mode
+            );
+            wgpu::PresentMode::AutoVsync
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
-            present_mode: wgpu::PresentMode::AutoVsync,
+            present_mode,
             alpha_mode: capabilities.alpha_modes[0],
             view_formats: vec![],
-            desired_maximum_frame_latency: 2,
+            desired_maximum_frame_latency: presentation.maximum_frame_latency,
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
@@ -1488,11 +1526,12 @@ impl App {
             .current_monitor()
             .and_then(|monitor| monitor.refresh_rate_millihertz());
         log::info!(
-            "GPU: {} ({:?}); tile array layers: {}; present_request={:?} \
+            "GPU: {} ({:?}); tile array layers: {}; present_request={:?} present_configured={:?} \
              supported_present_modes={:?} max_frame_latency={} refresh_millihertz={:?}",
             adapter.get_info().name,
             adapter.get_info().backend,
             device.limits().max_texture_array_layers,
+            presentation.present_mode,
             config.present_mode,
             capabilities.present_modes,
             config.desired_maximum_frame_latency,
@@ -1547,6 +1586,7 @@ impl App {
             }
             wgpu::CurrentSurfaceTexture::Lost => return,
         };
+        let acquired_at = Instant::now();
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1572,6 +1612,7 @@ impl App {
             },
         );
         gpu.canvas.write_cursor(&gpu.queue, cursor);
+        let prepared_at = Instant::now();
         gpu.canvas.encode_uploads(&mut encoder);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1592,11 +1633,22 @@ impl App {
             });
             gpu.canvas.draw(&mut pass);
         }
-        let submission = gpu.queue.submit(iter::once(encoder.finish()));
+        let commands = encoder.finish();
+        let encoded_at = Instant::now();
+        let submission = gpu.queue.submit(iter::once(commands));
         gpu.canvas.uploads_submitted(submission);
         gpu.queue.present(output);
-        self.metrics.tablet_latency.observe_submit(Instant::now());
-        self.metrics.rendering.record(render_start.elapsed());
+        let submitted_at = Instant::now();
+        self.metrics.frame_stages.record(
+            acquired_at.saturating_duration_since(render_start),
+            prepared_at.saturating_duration_since(acquired_at),
+            encoded_at.saturating_duration_since(prepared_at),
+            submitted_at.saturating_duration_since(encoded_at),
+        );
+        self.metrics.tablet_latency.observe_submit(submitted_at);
+        self.metrics
+            .rendering
+            .record(submitted_at.saturating_duration_since(render_start));
     }
 
     fn report_live_metrics(&mut self) {
@@ -1610,6 +1662,7 @@ impl App {
             .unwrap_or_default();
         let input = self.metrics.input_handling.summary();
         let render = self.metrics.rendering.summary();
+        let frame_stages = self.metrics.frame_stages.summary();
         let tablet_latency = self.metrics.tablet_latency.summary();
         let hover_source = tablet_latency.hover.source_excess;
         let hover_queue = tablet_latency.hover.backend_to_handler;
@@ -1772,6 +1825,26 @@ impl App {
                 samples_per_submit.maximum,
             );
         }
+        if frame_stages.acquire.count > 0 {
+            log::info!(
+                "frame_stages count={} acquire_us(mean/p95/max)={}/{}/{} \
+                 prepare_us(mean/p95/max)={}/{}/{} encode_us(mean/p95/max)={}/{}/{} \
+                 submit_us(mean/p95/max)={}/{}/{}",
+                frame_stages.acquire.count,
+                frame_stages.acquire.mean,
+                frame_stages.acquire.p95,
+                frame_stages.acquire.maximum,
+                frame_stages.prepare.mean,
+                frame_stages.prepare.p95,
+                frame_stages.prepare.maximum,
+                frame_stages.encode.mean,
+                frame_stages.encode.p95,
+                frame_stages.encode.maximum,
+                frame_stages.submit.mean,
+                frame_stages.submit.p95,
+                frame_stages.submit.maximum,
+            );
+        }
         self.metrics.reset(gpu_stats);
     }
 }
@@ -1791,7 +1864,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 .unwrap(),
         );
 
-        let gpu = App::init(window.clone(), self.document.tile_size());
+        let gpu = App::init(window.clone(), self.document.tile_size(), self.presentation);
         #[cfg(target_os = "linux")]
         match x11_tablet::start(&window, self.tablet_proxy.clone()) {
             Ok(backend) => {
@@ -2127,6 +2200,7 @@ struct Startup {
     record_stroke: Option<PathBuf>,
     import_png: Vec<PathBuf>,
     export_png: Option<PathBuf>,
+    presentation: PresentationOptions,
 }
 
 fn parse_startup() -> Result<Startup, String> {
@@ -2138,6 +2212,9 @@ fn parse_startup_arguments(arguments: impl IntoIterator<Item = String>) -> Resul
     let mut record_stroke = None;
     let mut import_png = Vec::new();
     let mut export_png = None;
+    let mut presentation = PresentationOptions::default();
+    let mut present_mode_specified = false;
+    let mut frame_latency_specified = false;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--record-stroke" => {
@@ -2162,10 +2239,39 @@ fn parse_startup_arguments(arguments: impl IntoIterator<Item = String>) -> Resul
                     return Err("--export-png may only be specified once".to_owned());
                 }
             }
+            "--present-mode" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--present-mode requires a mode".to_owned())?;
+                if present_mode_specified {
+                    return Err("--present-mode may only be specified once".to_owned());
+                }
+                presentation.present_mode = parse_present_mode(&value)?;
+                present_mode_specified = true;
+            }
+            "--max-frame-latency" => {
+                let value = arguments
+                    .next()
+                    .ok_or_else(|| "--max-frame-latency requires 1, 2, or 3".to_owned())?;
+                if frame_latency_specified {
+                    return Err("--max-frame-latency may only be specified once".to_owned());
+                }
+                presentation.maximum_frame_latency = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|value| (1..=3).contains(value))
+                    .ok_or_else(|| "--max-frame-latency requires 1, 2, or 3".to_owned())?;
+                frame_latency_specified = true;
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: sketchpad [--import-png PATH]... [--export-png PATH] \
-                     [--record-stroke PATH]"
+                     [--record-stroke PATH] [--present-mode MODE] \
+                     [--max-frame-latency 1|2|3]"
+                );
+                println!(
+                    "       MODE: auto-vsync, auto-no-vsync, fifo, fifo-relaxed, \
+                     immediate, or mailbox"
                 );
                 println!(
                     "       recording mode starts blank, saves the next tablet stroke, and exits"
@@ -2187,7 +2293,23 @@ fn parse_startup_arguments(arguments: impl IntoIterator<Item = String>) -> Resul
         record_stroke,
         import_png,
         export_png,
+        presentation,
     })
+}
+
+fn parse_present_mode(value: &str) -> Result<wgpu::PresentMode, String> {
+    match value {
+        "auto-vsync" => Ok(wgpu::PresentMode::AutoVsync),
+        "auto-no-vsync" => Ok(wgpu::PresentMode::AutoNoVsync),
+        "fifo" => Ok(wgpu::PresentMode::Fifo),
+        "fifo-relaxed" => Ok(wgpu::PresentMode::FifoRelaxed),
+        "immediate" => Ok(wgpu::PresentMode::Immediate),
+        "mailbox" => Ok(wgpu::PresentMode::Mailbox),
+        _ => Err(format!(
+            "unknown present mode {value:?}; expected auto-vsync, auto-no-vsync, \
+             fifo, fifo-relaxed, immediate, or mailbox"
+        )),
+    }
 }
 
 fn main() {
@@ -2325,6 +2447,7 @@ fn main() {
             startup.record_stroke,
             imported_any,
             default_export_path(),
+            startup.presentation,
         ))
         .unwrap();
 }
@@ -2491,6 +2614,33 @@ mod tests {
         );
         assert_eq!(startup.export_png, Some(PathBuf::from("flattened.png")));
         assert!(startup.record_stroke.is_none());
+        assert_eq!(startup.presentation, PresentationOptions::default());
+    }
+
+    #[test]
+    fn startup_accepts_explicit_presentation_controls() {
+        let startup = parse_startup_arguments(
+            ["--present-mode", "mailbox", "--max-frame-latency", "1"].map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup.presentation,
+            PresentationOptions {
+                present_mode: wgpu::PresentMode::Mailbox,
+                maximum_frame_latency: 1,
+            }
+        );
+        assert!(
+            parse_startup_arguments(["--present-mode", "unknown"].map(str::to_owned))
+                .unwrap_err()
+                .contains("unknown present mode")
+        );
+        assert!(
+            parse_startup_arguments(["--max-frame-latency", "0"].map(str::to_owned))
+                .unwrap_err()
+                .contains("requires 1, 2, or 3")
+        );
     }
 
     #[test]

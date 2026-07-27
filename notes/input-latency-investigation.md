@@ -52,6 +52,10 @@ separately:
 | existing `input_us` | handler entry -> completed semantic input work | Cursor state update alone for hover; cursor plus painting/compositing for contact |
 | existing `frame_us` | redraw handler entry -> CPU present call | Surface acquisition, upload preparation/encoding, render encoding, and submission |
 
+`frame_stages` further divides `frame_us` into surface acquisition, visible
+scene/uniform preparation, command encoding, and queue submission/present-call
+CPU time.
+
 `Down`, `Move`, and `Up` are grouped as contact. `Hover` remains separate.
 Each series retains up to 2,048 recent samples and reports count, mean, p95,
 and maximum. Collection uses fixed storage and monotonic timestamps; it does
@@ -91,6 +95,18 @@ explicitly because that variable is absent from the Zellij SSH shell. Close
 the Sketchpad window to return the captured logs to the caller. The same
 output remains visible in the `apollo` Zellij tab while the application is
 running.
+
+Presentation experiments pass application options through the same launcher:
+
+```text
+scripts/apollo latency --present-mode mailbox --max-frame-latency 1
+scripts/apollo latency --present-mode immediate --max-frame-latency 1
+```
+
+Accepted modes are `auto-vsync`, `auto-no-vsync`, `fifo`, `fifo-relaxed`,
+`mailbox`, and `immediate`; requested frame latency is restricted to 1–3. An
+unsupported explicit mode falls back to `AutoVsync` with a warning rather than
+configuring an invalid surface.
 
 For a useful first capture:
 
