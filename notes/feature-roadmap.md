@@ -43,7 +43,7 @@ save, or hide unbounded work behind a convenient API.
 - [x] Paint and erase only the active layer; incrementally present the derived
   visible composite.
 - [x] Make structural layer changes produce explicit damage.
-- [ ] Add layer-aware semantic undo after the basic command path is stable.
+- [x] Add layer-aware semantic undo after the basic command path is stable.
   The selected design is one 256-entry document sequence interleaving raster
   memento references with reversible structural commands; it is not a second
   per-feature stack.
@@ -86,7 +86,7 @@ delete layers without corrupting active strokes or undo state.
   implicitly.
 - [x] Define placement for images smaller or larger than the canvas; begin with
   centered, clipped placement.
-- [ ] Make import one semantic undoable command.
+- [x] Make import one semantic undoable command.
 - [x] Add tiny golden fixtures covering opaque, translucent, grayscale, and
   malformed images.
 

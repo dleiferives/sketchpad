@@ -288,6 +288,16 @@ stroke commit. Registration verifies that exactly one untracked local raster
 memento exists; a mismatch is an invariant failure rather than silently
 creating corrupt global history.
 
+The implementation landed on 2026-07-27 with exact tests for interleaved
+raster/structural order, stable imported-layer identity, global redo
+invalidation, and matched 256-entry raster-memento eviction. One non-obvious
+bug was found during integration: undo paint → delete that layer moved the
+raster into the new delete command before redo cleanup scanned current layers.
+Undoing the deletion could therefore restore an orphaned local raster redo
+entry absent from document chronology. New presence commands now clear redo
+inside any retained layer before entering history. The regression test deletes
+such a layer, undoes deletion, and requires its local redo depth to be zero.
+
 Krita documents
 [autosave and backup behavior](https://docs.krita.org/en/user_manual/autosave.html).
 Its

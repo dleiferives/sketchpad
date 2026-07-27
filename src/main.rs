@@ -728,6 +728,9 @@ impl App {
                 let Some(damage) = finished.damage else {
                     return;
                 };
+                if let Err(error) = self.document.record_active_raster_edit() {
+                    log::error!("could not register committed stroke in document history: {error}");
+                }
                 if let Some(gpu) = &mut self.gpu {
                     gpu.canvas
                         .reconcile_committed_damage(self.document.composite(), &damage);
@@ -789,9 +792,15 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
-        if let Some(damage) = self.document.active_layer_mut().undo() {
-            self.sync_damage(&damage);
-            self.mark_document_dirty();
+        match self.document.undo() {
+            Ok(Some(damage)) => {
+                if !damage.is_empty() {
+                    self.sync_composite_damage(&damage);
+                }
+                self.mark_document_dirty();
+            }
+            Ok(None) => {}
+            Err(error) => log::error!("could not undo document edit: {error}"),
         }
     }
 
@@ -799,9 +808,15 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
-        if let Some(damage) = self.document.active_layer_mut().redo() {
-            self.sync_damage(&damage);
-            self.mark_document_dirty();
+        match self.document.redo() {
+            Ok(Some(damage)) => {
+                if !damage.is_empty() {
+                    self.sync_composite_damage(&damage);
+                }
+                self.mark_document_dirty();
+            }
+            Ok(None) => {}
+            Err(error) => log::error!("could not redo document edit: {error}"),
         }
     }
 

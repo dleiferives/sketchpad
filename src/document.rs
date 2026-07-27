@@ -640,8 +640,15 @@ impl Document {
         Ok(recomposed)
     }
 
-    fn record_edit(&mut self, edit: DocumentEdit) {
+    fn record_edit(&mut self, mut edit: DocumentEdit) {
         self.clear_document_redo();
+        if let DocumentEdit::LayerPresence {
+            stored: Some(stored),
+            ..
+        } = &mut edit
+        {
+            stored.raster.clear_redo_history();
+        }
         self.history_undo.push(edit);
         while self.history_undo.len() > MAX_DOCUMENT_HISTORY_ENTRIES {
             let evicted = self.history_undo.remove(0);
@@ -1212,6 +1219,22 @@ mod tests {
         assert_eq!(document.redo_depth(), 0);
         assert!(document.redo().unwrap().is_none());
         assert_eq!(document.layers().len(), 1);
+    }
+
+    #[test]
+    fn deleting_a_layer_also_clears_its_local_redo() {
+        let mut document = Document::new(16, 16, 8).unwrap();
+        let bottom = document.active_layer_id();
+        document.create_layer("Top").unwrap();
+        document.set_active_layer(bottom).unwrap();
+        paint_recorded(&mut document, 1, 1, color(1.0, 0.0, 0.0, 1.0));
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.layer(bottom).unwrap().raster().redo_depth(), 1);
+
+        document.delete_layer(bottom).unwrap();
+        document.undo().unwrap().unwrap();
+
+        assert_eq!(document.layer(bottom).unwrap().raster().redo_depth(), 0);
     }
 
     #[test]

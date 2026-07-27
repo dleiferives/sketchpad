@@ -50,7 +50,9 @@ prototype:
 - nearest-sampled instanced visible-tile rendering;
 - visible paper boundary and dark pasteboard;
 - pan and cursor-centered zoom;
-- undo and redo;
+- one chronological 256-entry undo/redo sequence spanning raster gestures,
+  layer insertion/import/duplicate/delete, rename, visibility, opacity, and
+  reorder;
 - versioned/checksummed layered recovery checkpoints with exact sparse `f32`
   pixels, legacy flat-checkpoint migration, atomic temporary-file replacement,
   and directory synchronization;
@@ -183,6 +185,10 @@ The current test suite covers:
 - exact shared round-dab coverage and distance-resampling behavior;
 - stable pre-stroke active-layer pickup, bounded uniform-reservoir mixing,
   exact hard-round control output, snapshot accounting, and mixing rollback;
+- globally ordered raster/layer undo, redo invalidation, imported-layer
+  restoration, and matched bounded raster-memento eviction;
+- redo cleanup for both present layers and rasters temporarily retained by
+  delete/create history commands;
 - camera mapping and view bounds.
 
 ### CPU brush replay
