@@ -604,6 +604,10 @@ impl App {
                 return;
             }
         };
+        self.sync_composite_damage(&damage);
+    }
+
+    fn sync_composite_damage(&mut self, damage: &Damage) {
         if let Some(gpu) = &mut self.gpu {
             gpu.canvas.sync_damage(self.document.composite(), &damage);
         }
@@ -627,6 +631,108 @@ impl App {
         if let Some(damage) = self.document.active_layer_mut().redo() {
             self.sync_damage(&damage);
             self.mark_document_dirty();
+        }
+    }
+
+    fn create_layer(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let name = format!("Layer {}", self.document.layers().len() + 1);
+        match self.document.create_layer(name) {
+            Ok(layer) => {
+                log::info!("created layer {}", layer.get());
+                self.mark_document_dirty();
+                self.update_window_title(None);
+            }
+            Err(error) => log::error!("could not create layer: {error}"),
+        }
+    }
+
+    fn duplicate_active_layer(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let source = self.document.active_layer_id();
+        match self.document.duplicate_layer(source) {
+            Ok((duplicate, damage)) => {
+                log::info!("duplicated layer {} as {}", source.get(), duplicate.get());
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+            }
+            Err(error) => log::error!("could not duplicate layer: {error}"),
+        }
+    }
+
+    fn delete_active_layer(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let layer = self.document.active_layer_id();
+        match self.document.delete_layer(layer) {
+            Ok(damage) => {
+                log::info!("deleted layer {}", layer.get());
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+            }
+            Err(error) => log::warn!("could not delete layer: {error}"),
+        }
+    }
+
+    fn toggle_active_layer_visibility(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let layer = self.document.active_layer_id();
+        let visible = self
+            .document
+            .layer(layer)
+            .expect("the active layer belongs to the document")
+            .visible();
+        match self.document.set_layer_visibility(layer, !visible) {
+            Ok(damage) => {
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+            }
+            Err(error) => log::error!("could not change layer visibility: {error}"),
+        }
+    }
+
+    fn select_relative_layer(&mut self, offset: isize) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let current = self.document.active_layer_index();
+        let destination = current
+            .saturating_add_signed(offset)
+            .min(self.document.layers().len() - 1);
+        let layer = self.document.layers()[destination].id();
+        if layer != self.document.active_layer_id() {
+            self.document
+                .set_active_layer(layer)
+                .expect("the selected layer belongs to the document");
+            self.update_window_title(None);
+        }
+    }
+
+    fn move_active_layer(&mut self, offset: isize) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let current = self.document.active_layer_index();
+        let destination = current
+            .saturating_add_signed(offset)
+            .min(self.document.layers().len() - 1);
+        if current == destination {
+            return;
+        }
+        let layer = self.document.active_layer_id();
+        match self.document.move_layer(layer, destination) {
+            Ok(damage) => {
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+            }
+            Err(error) => log::error!("could not reorder layer: {error}"),
         }
     }
 
@@ -1304,6 +1410,22 @@ impl ApplicationHandler<TabletEvent> for App {
                     PhysicalKey::Code(KeyCode::KeyY) if command => self.redo(),
                     PhysicalKey::Code(KeyCode::KeyS) if command => self.save_checkpoint(),
                     PhysicalKey::Code(KeyCode::KeyO) if command => self.load_checkpoint(),
+                    PhysicalKey::Code(KeyCode::KeyN) if command && self.modifiers.shift_key() => {
+                        self.create_layer()
+                    }
+                    PhysicalKey::Code(KeyCode::KeyD) if command && self.modifiers.shift_key() => {
+                        self.duplicate_active_layer()
+                    }
+                    PhysicalKey::Code(KeyCode::KeyH) if command && self.modifiers.shift_key() => {
+                        self.toggle_active_layer_visibility()
+                    }
+                    PhysicalKey::Code(KeyCode::Delete) if command && self.modifiers.shift_key() => {
+                        self.delete_active_layer()
+                    }
+                    PhysicalKey::Code(KeyCode::PageUp) if command => self.move_active_layer(1),
+                    PhysicalKey::Code(KeyCode::PageDown) if command => self.move_active_layer(-1),
+                    PhysicalKey::Code(KeyCode::PageUp) => self.select_relative_layer(1),
+                    PhysicalKey::Code(KeyCode::PageDown) => self.select_relative_layer(-1),
                     PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
                         self.adjust_brush_opacity(-BRUSH_OPACITY_STEP)
                     }

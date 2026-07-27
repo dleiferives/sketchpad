@@ -76,6 +76,13 @@ Controls:
 - Control/Command-Shift-Z or Control/Command-Y: redo;
 - Control/Command-S: force the recovery checkpoint;
 - Control/Command-O: reload the last recovery checkpoint;
+- Control/Command-Shift-N: create and activate a raster layer;
+- Control/Command-Shift-D: duplicate the active layer;
+- Control/Command-Shift-H: toggle active-layer visibility;
+- Control/Command-Shift-Delete: delete the active layer when it is not the
+  document's last layer;
+- Page Up / Page Down: select the layer above/below;
+- Control/Command-Page Up / Page Down: move the active layer above/below;
 - Escape while drawing: cancel the active stroke;
 - Escape while idle: exit.
 

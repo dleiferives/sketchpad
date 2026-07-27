@@ -60,9 +60,9 @@ restores a valid whole document or leaves the prior file intact.
 
 ### 3. Minimal layer controls
 
-- [ ] Add temporary keyboard commands before building the graphical panel.
-- [ ] Show active layer, layer count, and modified state in existing feedback.
-- [ ] Prevent structural commands during an active brush transaction.
+- [x] Add temporary keyboard commands before building the graphical panel.
+- [x] Show active layer, layer count, and modified state in existing feedback.
+- [x] Prevent structural commands during an active brush transaction.
 - [ ] Add the graphical layer panel after command semantics are proven.
 
 Acceptance: a user can create, select, reorder, hide, duplicate, rename, and
