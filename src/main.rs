@@ -6,6 +6,7 @@ use sketchpad::{
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
+    palette::RecentColors,
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
@@ -391,6 +392,7 @@ struct App {
     configured: bool,
     document: Document,
     paint_brush: HardRoundBrush,
+    recent_colors: RecentColors,
     eraser_brush: HardRoundBrush,
     paint_engine: PaintEngine,
     active_stroke: Option<ActiveStroke>,
@@ -434,12 +436,16 @@ impl App {
     ) -> Self {
         let persistence_enabled = record_stroke.is_none();
         let checkpoint_dirty = persistence_enabled && initially_dirty;
+        let paint_brush = HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap();
+        let recent_colors =
+            RecentColors::new(paint_brush.color()).expect("the default pen color is valid");
         Self {
             window: None,
             gpu: None,
             configured: false,
             document,
-            paint_brush: HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap(),
+            paint_brush,
+            recent_colors,
             eraser_brush: HardRoundBrush::eraser(64.0, 1.0, 0.18).unwrap(),
             paint_engine: PaintEngine::default(),
             active_stroke: None,
@@ -566,14 +572,42 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
+        self.set_paint_color(COLOR_PRESETS[preset], true);
+    }
+
+    fn select_recent_color(&mut self, newer: bool) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let color = if newer {
+            self.recent_colors.select_newer()
+        } else {
+            self.recent_colors.select_older()
+        };
+        self.set_paint_color(color, false);
+    }
+
+    fn set_paint_color(&mut self, color: [f32; 3], record_recent: bool) {
+        if record_recent {
+            self.recent_colors
+                .select(color)
+                .expect("application colors are canonical linear RGB");
+        }
         self.paint_brush = self
             .paint_brush
-            .with_color(COLOR_PRESETS[preset])
-            .expect("built-in colors are valid");
+            .with_color(color)
+            .expect("application colors are canonical linear RGB");
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
         self.update_window_title(None);
         self.request_redraw();
+    }
+
+    fn commit_picked_color(&mut self) {
+        self.recent_colors
+            .select(self.paint_brush.color())
+            .expect("picked composite colors are canonical linear RGB");
+        self.update_window_title(None);
     }
 
     fn toggle_mouse_tool(&mut self) {
@@ -624,15 +658,8 @@ impl App {
         let Some(color) = straight_rgb(pixel) else {
             return;
         };
-        self.paint_brush = self
-            .paint_brush
-            .with_color(color)
-            .expect("canonical composite pixels produce valid straight RGB");
-        self.mouse_tool = ToolKind::Pen;
-        self.cursor_tool = ToolKind::Pen;
+        self.set_paint_color(color, false);
         self.cursor_contact = false;
-        self.update_window_title(None);
-        self.request_redraw();
     }
 
     fn update_window_title(&self, pressure: Option<f32>) {
@@ -652,7 +679,8 @@ impl App {
             ToolKind::Eraser => "Eraser",
         };
         window.set_title(&format!(
-            "Sketchpad{}{} — {} ({}/{}) — {} {:.0}px {:.0}%{}",
+            "Sketchpad{}{} — {} ({}/{}) — {} {:.0}px {:.0}% — color {}/{} \
+             ({:.3},{:.3},{:.3}){}",
             dirty,
             recording,
             self.document.layers()[self.document.active_layer_index()].name(),
@@ -661,6 +689,11 @@ impl App {
             tool_label,
             brush.diameter(),
             brush.opacity() * 100.0,
+            self.recent_colors.selected_index() + 1,
+            self.recent_colors.colors().len(),
+            self.paint_brush.color()[0],
+            self.paint_brush.color()[1],
+            self.paint_brush.color()[2],
             pressure
         ));
     }
@@ -813,7 +846,7 @@ impl App {
 
     fn sync_composite_damage(&mut self, damage: &Damage) {
         if let Some(gpu) = &mut self.gpu {
-            gpu.canvas.sync_damage(self.document.composite(), &damage);
+            gpu.canvas.sync_damage(self.document.composite(), damage);
         }
         self.request_redraw();
     }
@@ -1155,6 +1188,7 @@ impl App {
             self.cursor_contact = false;
             if matches!(phase, TabletPhase::Up | TabletPhase::Hover) {
                 self.sampling_pointer = None;
+                self.commit_picked_color();
             } else {
                 self.pick_color(sample.position);
             }
@@ -1675,6 +1709,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     if self.sampling_pointer == Some(PointerOwner::Mouse) =>
                 {
                     self.sampling_pointer = None;
+                    self.commit_picked_color();
                     self.cursor_pressure = 0.0;
                     self.cursor_contact = false;
                     self.request_redraw();
@@ -1765,6 +1800,10 @@ impl ApplicationHandler<TabletEvent> for App {
                     }
                     PhysicalKey::Code(KeyCode::KeyE) => self.toggle_mouse_tool(),
                     PhysicalKey::Code(KeyCode::KeyM) => self.toggle_paint_engine(),
+                    PhysicalKey::Code(KeyCode::KeyX) if self.modifiers.shift_key() => {
+                        self.select_recent_color(true)
+                    }
+                    PhysicalKey::Code(KeyCode::KeyX) => self.select_recent_color(false),
                     PhysicalKey::Code(KeyCode::Digit1) => self.select_color(0),
                     PhysicalKey::Code(KeyCode::Digit2) => self.select_color(1),
                     PhysicalKey::Code(KeyCode::Digit3) => self.select_color(2),
@@ -1776,6 +1815,9 @@ impl ApplicationHandler<TabletEvent> for App {
             }
             WindowEvent::Focused(false) => {
                 self.panning = false;
+                if self.sampling_pointer.is_some() {
+                    self.commit_picked_color();
+                }
                 self.sampling_pointer = None;
                 self.cursor_visible = false;
                 self.cursor_contact = false;

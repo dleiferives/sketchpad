@@ -62,6 +62,9 @@ prototype:
 - interactive file-drop PNG import as one undoable layer command;
 - mouse and Wacom Alt-contact visible-composite color sampling with correct
   linear-premultiplied unassociation;
+- an eight-entry session-local recent-color history: presets and completed
+  picker gestures move one exact linear RGB value to the front, while picker
+  motion only previews;
 - atomic streaming flattened PNG export of the visible composite as
   straight-alpha RGBA8 sRGB, for either the full canvas or exact content
   bounds;
@@ -87,6 +90,7 @@ Controls:
 - E: toggle mouse pen/eraser mode;
 - M: toggle hard-round/linear-mixing pen mode;
 - 1–6: select a built-in pen color;
+- X / Shift-X: select the older/newer recent pen color;
 - Control/Command-Z: undo;
 - Control/Command-Shift-Z or Control/Command-Y: redo;
 - Control/Command-S: force the recovery checkpoint;
@@ -194,6 +198,8 @@ The current test suite covers:
   restoration, and matched bounded raster-memento eviction;
 - redo cleanup for both present layers and rasters temporarily retained by
   delete/create history commands;
+- fixed-capacity recent-color eviction, exact deduplication, validation, and
+  non-mutating wraparound traversal;
 - camera mapping and view bounds.
 
 ### CPU brush replay

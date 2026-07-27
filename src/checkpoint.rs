@@ -538,7 +538,7 @@ fn write_atomic(path: &Path, encoded: &[u8]) -> Result<(), CheckpointError> {
         temporary.ok_or_else(|| CheckpointError::invalid("could not reserve temporary file"))?;
 
     let write_result = (|| -> Result<(), CheckpointError> {
-        file.write_all(&encoded)?;
+        file.write_all(encoded)?;
         file.sync_all()?;
         drop(file);
         fs::rename(&temporary_path, path)?;

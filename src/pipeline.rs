@@ -368,17 +368,29 @@ pub struct RasterDisplayPipeline {
     stats: RasterPresentationStats,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RasterPipelineConfiguration {
+    tile_size: u32,
+    page_capacity: u32,
+    max_resident_tiles: u32,
+    damage_coalescing: DamageCoalescing,
+    damage_merge_cost_bytes: u64,
+    upload_mode: TextureUploadMode,
+}
+
 impl RasterDisplayPipeline {
     pub fn new(device: &wgpu::Device, surface_format: wgpu::TextureFormat, tile_size: u32) -> Self {
         Self::new_with_configuration(
             device,
             surface_format,
-            tile_size,
-            DEFAULT_RESIDENT_TILE_CAPACITY,
-            MAX_RESIDENT_TILES,
-            DamageCoalescing::CostAware,
-            DEFAULT_DAMAGE_MERGE_COST_BYTES,
-            TextureUploadMode::StagingRing,
+            RasterPipelineConfiguration {
+                tile_size,
+                page_capacity: DEFAULT_RESIDENT_TILE_CAPACITY,
+                max_resident_tiles: MAX_RESIDENT_TILES,
+                damage_coalescing: DamageCoalescing::CostAware,
+                damage_merge_cost_bytes: DEFAULT_DAMAGE_MERGE_COST_BYTES,
+                upload_mode: TextureUploadMode::StagingRing,
+            },
         )
     }
 
@@ -392,12 +404,14 @@ impl RasterDisplayPipeline {
         Self::new_with_configuration(
             device,
             surface_format,
-            tile_size,
-            DEFAULT_RESIDENT_TILE_CAPACITY,
-            MAX_RESIDENT_TILES,
-            damage_coalescing,
-            damage_merge_cost_bytes,
-            TextureUploadMode::WriteTexture,
+            RasterPipelineConfiguration {
+                tile_size,
+                page_capacity: DEFAULT_RESIDENT_TILE_CAPACITY,
+                max_resident_tiles: MAX_RESIDENT_TILES,
+                damage_coalescing,
+                damage_merge_cost_bytes,
+                upload_mode: TextureUploadMode::WriteTexture,
+            },
         )
     }
 
@@ -412,12 +426,14 @@ impl RasterDisplayPipeline {
         Self::new_with_configuration(
             device,
             surface_format,
-            tile_size,
-            DEFAULT_RESIDENT_TILE_CAPACITY,
-            MAX_RESIDENT_TILES,
-            damage_coalescing,
-            damage_merge_cost_bytes,
-            upload_mode,
+            RasterPipelineConfiguration {
+                tile_size,
+                page_capacity: DEFAULT_RESIDENT_TILE_CAPACITY,
+                max_resident_tiles: MAX_RESIDENT_TILES,
+                damage_coalescing,
+                damage_merge_cost_bytes,
+                upload_mode,
+            },
         )
     }
 
@@ -432,12 +448,14 @@ impl RasterDisplayPipeline {
         Self::new_with_configuration(
             device,
             surface_format,
-            tile_size,
-            page_capacity,
-            max_resident_tiles,
-            DamageCoalescing::CostAware,
-            DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
-            TextureUploadMode::WriteTexture,
+            RasterPipelineConfiguration {
+                tile_size,
+                page_capacity,
+                max_resident_tiles,
+                damage_coalescing: DamageCoalescing::CostAware,
+                damage_merge_cost_bytes: DEFAULT_WRITE_TEXTURE_MERGE_COST_BYTES,
+                upload_mode: TextureUploadMode::WriteTexture,
+            },
         )
     }
 
@@ -453,25 +471,30 @@ impl RasterDisplayPipeline {
         Self::new_with_configuration(
             device,
             surface_format,
-            tile_size,
-            page_capacity,
-            max_resident_tiles,
-            DamageCoalescing::CostAware,
-            DEFAULT_DAMAGE_MERGE_COST_BYTES,
-            upload_mode,
+            RasterPipelineConfiguration {
+                tile_size,
+                page_capacity,
+                max_resident_tiles,
+                damage_coalescing: DamageCoalescing::CostAware,
+                damage_merge_cost_bytes: DEFAULT_DAMAGE_MERGE_COST_BYTES,
+                upload_mode,
+            },
         )
     }
 
     fn new_with_configuration(
         device: &wgpu::Device,
         surface_format: wgpu::TextureFormat,
-        tile_size: u32,
-        page_capacity: u32,
-        max_resident_tiles: u32,
-        damage_coalescing: DamageCoalescing,
-        damage_merge_cost_bytes: u64,
-        upload_mode: TextureUploadMode,
+        configuration: RasterPipelineConfiguration,
     ) -> Self {
+        let RasterPipelineConfiguration {
+            tile_size,
+            page_capacity,
+            max_resident_tiles,
+            damage_coalescing,
+            damage_merge_cost_bytes,
+            upload_mode,
+        } = configuration;
         let page_capacity = page_capacity
             .min(device.limits().max_texture_array_layers)
             .max(1);

@@ -131,7 +131,8 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 ### 7. Usability follow-through
 
 - [x] Visible-composite Alt-contact color picker for mouse and tablet.
-- [ ] Recent colors.
+- [x] Eight-entry session-local recent colors with deterministic MRU behavior
+  and keyboard traversal.
 - [ ] Minimal brush/preset selector.
 - [ ] Layer panel.
 - [ ] Open/import/export dialogs.
