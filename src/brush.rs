@@ -12,7 +12,7 @@ impl BrushSample {
         Self { position, pressure }
     }
 
-    fn is_finite(self) -> bool {
+    pub(crate) fn is_finite(self) -> bool {
         self.position[0].is_finite() && self.position[1].is_finite() && self.pressure.is_finite()
     }
 }
@@ -155,17 +155,9 @@ impl HardRoundBrush {
                 let tile_bounds = layer
                     .tile_bounds(coord)
                     .expect("coordinates derived from clipped canvas bounds are valid");
-                let global_min_x = footprint.min_x.max(tile_bounds.min_x());
-                let global_min_y = footprint.min_y.max(tile_bounds.min_y());
-                let global_max_x = footprint.max_x.min(tile_bounds.max_x());
-                let global_max_y = footprint.max_y.min(tile_bounds.max_y());
-                let local_damage = RectU32::from_min_max(
-                    global_min_x - tile_bounds.min_x(),
-                    global_min_y - tile_bounds.min_y(),
-                    global_max_x - tile_bounds.min_x(),
-                    global_max_y - tile_bounds.min_y(),
-                )
-                .expect("the brush bounds intersect every enumerated tile");
+                let local_damage = footprint
+                    .local_damage(tile_bounds)
+                    .expect("the brush bounds intersect every enumerated tile");
                 let tile_origin = [tile_bounds.min_x(), tile_bounds.min_y()];
                 let kernel = DabKernel {
                     brush: self,
@@ -256,6 +248,19 @@ impl RoundDabFootprint {
             (self.max_x - 1) / tile_size,
             (self.max_y - 1) / tile_size,
         ]
+    }
+
+    pub(crate) fn local_damage(self, tile_bounds: RectU32) -> Option<RectU32> {
+        let global_min_x = self.min_x.max(tile_bounds.min_x());
+        let global_min_y = self.min_y.max(tile_bounds.min_y());
+        let global_max_x = self.max_x.min(tile_bounds.max_x());
+        let global_max_y = self.max_y.min(tile_bounds.max_y());
+        RectU32::from_min_max(
+            global_min_x.checked_sub(tile_bounds.min_x())?,
+            global_min_y.checked_sub(tile_bounds.min_y())?,
+            global_max_x.checked_sub(tile_bounds.min_x())?,
+            global_max_y.checked_sub(tile_bounds.min_y())?,
+        )
     }
 
     pub(crate) fn coverage(self, pixel_x: u32, pixel_y: u32) -> f32 {

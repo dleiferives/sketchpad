@@ -69,6 +69,45 @@ perceptual interpolation, and properly licensed pigment-like kernels can be
 judged. The uniform reservoir cannot preserve bristle streaks; a later fixed
 tip grid is the intended extension if the control proves artistically useful.
 
+## Implemented CPU Reference, 2026-07-27
+
+The first CPU reference now implements that control as `MixingBrushV1` and
+`MixingStrokeV1`. It shares the hard-round brush's exact pressure footprint and
+distance resampler. For every emitted dab it:
+
+1. enumerates only footprint-intersecting sparse tiles;
+2. lazily records each tile's pre-stroke pixels, or a zero-byte transparent
+   sentinel when the tile did not exist;
+3. computes coverage- and alpha-weighted straight linear RGB plus mean covered
+   alpha as sample strength;
+4. advances the uniform reservoir in the declared pickup-then-color-rate
+   order;
+5. source-overs the held color through the same analytic round coverage into
+   the live layer.
+
+The snapshot payload is deliberately simple: one full `f32` RGBA tile for each
+preexisting tile sampled by the stroke. This can coexist with the raster
+transaction's undo before-image, so it is a bounded but potentially duplicated
+temporary cost. Transparent tiles use a marker rather than allocating a pixel
+array. `MixingStats` exposes dabs, tile visits, coverage-positive sampled and
+deposited pixels, unique snapshot tiles, and snapshot payload bytes. This
+reference shape makes the cost visible; it does not prejudge whether a measured
+optimization should share undo storage or use smaller fixed blocks.
+
+The controlled tests establish:
+
+- transparent pickup is pixel-exact to the ordinary hard-round brush;
+- overlapping dabs continue to sample stable pre-stroke blue pixels rather
+  than their own newly deposited color;
+- collinear input batching preserves pixels, reservoir state, and counters;
+- cancel and undo restore exact pre-stroke pixels;
+- a four-tile footprint over one preexisting 64×64 tile reports four snapshot
+  entries but exactly 65,536 snapshot payload bytes.
+
+These are correctness and work-accounting findings, not throughput results.
+The next evidence step is a deterministic mixing corpus and Apollo release
+measurement against the hard-round control.
+
 ## Problem Being Addressed
 
 Straight interpolation between two RGB triples models a path through an RGB

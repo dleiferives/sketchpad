@@ -105,16 +105,16 @@ untouched.
 
 ### 6. Painterly color-mixing brush
 
-- [ ] Define a versioned brush recipe and bounded reservoir state.
-- [ ] Separate pickup, reservoir mixing, and deposition.
-- [ ] Begin with a conventional linear-RGB control.
+- [x] Define a versioned brush recipe and bounded reservoir state.
+- [x] Separate pickup, reservoir mixing, and deposition.
+- [x] Begin with a conventional linear-RGB control.
 - [ ] Add pigment-like candidates only against a saved swatch and stroke
   corpus with acceptable licensing.
-- [ ] Make pickup source explicit: active layer by default, visible composite
+- [x] Make pickup source explicit: active layer by default, visible composite
   only as an opt-in semantic mode.
 - [ ] Define behavior across transparency, repeated passes, stroke start/end,
   undo, and deterministic replay.
-- [ ] Add CPU reference tests before any GPU kernel.
+- [x] Add CPU reference tests before any GPU kernel.
 - [ ] Measure work per dab, affected pixels, sampled tiles, and temporary
   reservoir storage.
 

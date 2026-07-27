@@ -177,6 +177,8 @@ The current test suite covers:
 - one undo entry across many input updates;
 - independence from collinear event batching;
 - exact shared round-dab coverage and distance-resampling behavior;
+- stable pre-stroke active-layer pickup, bounded uniform-reservoir mixing,
+  exact hard-round control output, snapshot accounting, and mixing rollback;
 - camera mapping and view bounds.
 
 ### CPU brush replay
