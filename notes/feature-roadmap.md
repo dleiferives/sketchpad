@@ -138,7 +138,9 @@ Add infrastructure alongside the feature that needs it:
 
 - a layer/compositor microbenchmark with sparse and overlapping layer cases;
 - a versioned multi-layer replay scene used by CPU and GPU runners;
-- import/export golden images generated from tiny explicit pixel tables;
+- [x] import/export golden images generated from tiny explicit pixel tables;
+- [x] a versioned PNG first/warm codec runner with transparent, sparse, dense,
+  and high-entropy cases plus exact decode→export→decode checksums;
 - document round-trip and corruption tests with hard resource limits;
 - counters for composite tiles, pixels, source-layer visits, imported pixels,
   exported pixels, and mixing samples;

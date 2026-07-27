@@ -190,6 +190,23 @@ cargo run --release --bin brush_bench -- --runs 12
 The current provisional Atlas result is recorded in
 [performance-laboratory.md](performance-laboratory.md).
 
+### PNG codec benchmark and oracle
+
+`png_bench` creates controlled transparent, sparse, opaque-gradient, and
+translucent-noise sRGB sources. It reports first and warm import/export
+distributions, source/output bytes, decoded bytes, placed pixels, and sparse
+tile counts as versioned JSON Lines. Each repetition checks stable encoded and
+canonical-raster checksums; decode→export→decode must reproduce exact internal
+pixels.
+
+```text
+scripts/apollo run cargo run --locked --release --bin png_bench -- \
+  --size 2048 --warm-runs 7
+```
+
+The first controlled Apollo findings and their engineering consequence are
+recorded in [png-io-contract.md](png-io-contract.md#controlled-apollo-codec-baseline-2026-07-27).
+
 ### Recorded tablet replay
 
 `traces/canonical-wacom-v1.json` is a real pen-down-through-pen-up gesture from

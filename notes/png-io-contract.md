@@ -127,12 +127,54 @@ streaming or tile-row decoder experiment before substantially raising current
 limits. No default or optimization decision should be derived from the single
 timings.
 
+### Controlled Apollo codec baseline, 2026-07-27
+
+`png_bench` generates four deterministic sRGB RGBA8 sources outside the timed
+region, then measures one first and seven warm in-memory imports and exports
+per case. Every warm operation must retain the same checksum, and every
+decode→export→decode must reproduce the exact canonical `f32` raster checksum.
+The two independent release processes below used 2048×2048 images and an
+otherwise interactive Apollo environment; these are codec baselines, not
+isolated whole-application latency claims.
+
+Warm median ranges across the two processes:
+
+| Case | Source / output bytes | Tiles | Import | Export |
+| --- | ---: | ---: | ---: | ---: |
+| transparent | 21,154 | 0 | 95.3–99.1 ms | 58.6–65.4 ms |
+| sparse center | 21,259 | 4 | 99.9–101.0 ms | 65.4–66.9 ms |
+| opaque gradient | 176,364 | 256 | 378.1–380.5 ms | 546.9–566.3 ms |
+| translucent noise | 16,785,076 | 256 | 381.3–383.1 ms | 1,120.9–1,123.5 ms |
+
+All four cases decoded 16,777,216 source bytes and placed 4,194,304 pixels.
+Checksums and encoded byte counts were identical across every repetition and
+both processes.
+
+Interpretation:
+
+- Transparent and sparse imports still pay whole-frame inflate and placement
+  traversal, but sparse canonicalization prevents dense `f32` tile storage.
+- Dense import adds about 280 ms over transparent input. The current RGBA8
+  loop evaluates the same sRGB transfer for repeated byte values, making a
+  256-entry exact conversion table the first optimization to test.
+- Export cost is both per-pixel conversion and compression dependent. The
+  high-entropy translucent source roughly doubles gradient export time; that
+  is not evidence that sparse lookup or compositing is responsible.
+- The full-frame decoder uses 16 MiB here and 64 MiB at the current 4096²
+  canvas. Streaming would reduce peak temporary memory, but this bounded,
+  off-stroke operation does not justify delaying color-mixing work. Revisit
+  row/tile streaming before raising import limits or targeting tighter mobile
+  memory budgets.
+
+Engineering consequence: retain the bounded whole-frame decoder for the
+first product, test an exact RGBA8 sRGB lookup table as a separate
+before/after commit, and do not spend the painterly-brush schedule on a
+streaming decoder yet.
+
 Still required:
 
 - import as one document-level semantic undo command;
 - static indexed and 16-bit golden fixtures;
-- an Apollo cold/warm import and export timing utility with source bytes,
-  decoded bytes, placed/exported pixels, and sparse tile counts;
 - graphical open/import/export path selection;
 - eventual ICC/CICP support through a deliberate color-management dependency,
   not handwritten partial profile parsing.
