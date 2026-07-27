@@ -139,36 +139,15 @@ impl HardRoundBrush {
         }
 
         let radius = self.radius_for_pressure(pressure);
-        let fringe = 0.5;
-        let outer_radius = radius + fringe;
-        let outer_radius_squared = outer_radius * outer_radius;
-        let inner_radius = (radius - fringe).max(0.0);
-        let inner_radius_squared = inner_radius * inner_radius;
-        let min_x = (sample.position[0] - outer_radius)
-            .floor()
-            .max(0.0)
-            .min(layer.width() as f32) as u32;
-        let min_y = (sample.position[1] - outer_radius)
-            .floor()
-            .max(0.0)
-            .min(layer.height() as f32) as u32;
-        let max_x = (sample.position[0] + outer_radius)
-            .ceil()
-            .max(0.0)
-            .min(layer.width() as f32) as u32;
-        let max_y = (sample.position[1] + outer_radius)
-            .ceil()
-            .max(0.0)
-            .min(layer.height() as f32) as u32;
-        if min_x >= max_x || min_y >= max_y {
+        let Some(footprint) =
+            RoundDabFootprint::new(layer.width(), layer.height(), sample.position, radius)
+        else {
             return Ok(());
-        }
+        };
 
         let tile_size = layer.tile_size();
-        let min_tile_x = min_x / tile_size;
-        let min_tile_y = min_y / tile_size;
-        let max_tile_x = (max_x - 1) / tile_size;
-        let max_tile_y = (max_y - 1) / tile_size;
+        let [min_tile_x, min_tile_y, max_tile_x, max_tile_y] =
+            footprint.inclusive_tile_range(tile_size);
 
         for tile_y in min_tile_y..=max_tile_y {
             for tile_x in min_tile_x..=max_tile_x {
@@ -176,10 +155,10 @@ impl HardRoundBrush {
                 let tile_bounds = layer
                     .tile_bounds(coord)
                     .expect("coordinates derived from clipped canvas bounds are valid");
-                let global_min_x = min_x.max(tile_bounds.min_x());
-                let global_min_y = min_y.max(tile_bounds.min_y());
-                let global_max_x = max_x.min(tile_bounds.max_x());
-                let global_max_y = max_y.min(tile_bounds.max_y());
+                let global_min_x = footprint.min_x.max(tile_bounds.min_x());
+                let global_min_y = footprint.min_y.max(tile_bounds.min_y());
+                let global_max_x = footprint.max_x.min(tile_bounds.max_x());
+                let global_max_y = footprint.max_y.min(tile_bounds.max_y());
                 let local_damage = RectU32::from_min_max(
                     global_min_x - tile_bounds.min_x(),
                     global_min_y - tile_bounds.min_y(),
@@ -190,12 +169,9 @@ impl HardRoundBrush {
                 let tile_origin = [tile_bounds.min_x(), tile_bounds.min_y()];
                 let kernel = DabKernel {
                     brush: self,
-                    sample,
+                    footprint,
                     local_damage,
                     tile_origin,
-                    outer_radius,
-                    outer_radius_squared,
-                    inner_radius_squared,
                 };
 
                 match self.mode {
@@ -220,14 +196,87 @@ impl HardRoundBrush {
     }
 }
 
-struct DabKernel {
-    brush: HardRoundBrush,
-    sample: BrushSample,
-    local_damage: RectU32,
-    tile_origin: [u32; 2],
+#[derive(Clone, Copy)]
+pub(crate) struct RoundDabFootprint {
+    position: [f32; 2],
+    min_x: u32,
+    min_y: u32,
+    max_x: u32,
+    max_y: u32,
     outer_radius: f32,
     outer_radius_squared: f32,
     inner_radius_squared: f32,
+}
+
+impl RoundDabFootprint {
+    pub(crate) fn new(
+        canvas_width: u32,
+        canvas_height: u32,
+        position: [f32; 2],
+        radius: f32,
+    ) -> Option<Self> {
+        let fringe = 0.5;
+        let outer_radius = radius + fringe;
+        let min_x = (position[0] - outer_radius)
+            .floor()
+            .max(0.0)
+            .min(canvas_width as f32) as u32;
+        let min_y = (position[1] - outer_radius)
+            .floor()
+            .max(0.0)
+            .min(canvas_height as f32) as u32;
+        let max_x = (position[0] + outer_radius)
+            .ceil()
+            .max(0.0)
+            .min(canvas_width as f32) as u32;
+        let max_y = (position[1] + outer_radius)
+            .ceil()
+            .max(0.0)
+            .min(canvas_height as f32) as u32;
+        if min_x >= max_x || min_y >= max_y {
+            return None;
+        }
+        let inner_radius = (radius - fringe).max(0.0);
+        Some(Self {
+            position,
+            min_x,
+            min_y,
+            max_x,
+            max_y,
+            outer_radius,
+            outer_radius_squared: outer_radius * outer_radius,
+            inner_radius_squared: inner_radius * inner_radius,
+        })
+    }
+
+    pub(crate) fn inclusive_tile_range(self, tile_size: u32) -> [u32; 4] {
+        [
+            self.min_x / tile_size,
+            self.min_y / tile_size,
+            (self.max_x - 1) / tile_size,
+            (self.max_y - 1) / tile_size,
+        ]
+    }
+
+    pub(crate) fn coverage(self, pixel_x: u32, pixel_y: u32) -> f32 {
+        let dx = pixel_x as f32 + 0.5 - self.position[0];
+        let dy = pixel_y as f32 + 0.5 - self.position[1];
+        let distance_squared = dx * dx + dy * dy;
+        if distance_squared >= self.outer_radius_squared {
+            0.0
+        } else if distance_squared <= self.inner_radius_squared {
+            1.0
+        } else {
+            self.outer_radius - distance_squared.sqrt()
+        }
+    }
+}
+
+struct DabKernel {
+    brush: HardRoundBrush,
+    footprint: RoundDabFootprint,
+    local_damage: RectU32,
+    tile_origin: [u32; 2],
 }
 
 impl DabKernel {
@@ -241,21 +290,14 @@ impl DabKernel {
 
         for local_y in self.local_damage.min_y()..self.local_damage.max_y() {
             let world_y = self.tile_origin[1] + local_y;
-            let dy = world_y as f32 + 0.5 - self.sample.position[1];
             let row_start = local_y as usize * stride;
 
             for local_x in self.local_damage.min_x()..self.local_damage.max_x() {
                 let world_x = self.tile_origin[0] + local_x;
-                let dx = world_x as f32 + 0.5 - self.sample.position[0];
-                let distance_squared = dx * dx + dy * dy;
-                if distance_squared >= self.outer_radius_squared {
+                let coverage = self.footprint.coverage(world_x, world_y);
+                if coverage == 0.0 {
                     continue;
                 }
-                let coverage = if distance_squared <= self.inner_radius_squared {
-                    1.0
-                } else {
-                    self.outer_radius - distance_squared.sqrt()
-                };
                 let source_alpha = self.brush.opacity * coverage;
                 let keep_destination = 1.0 - source_alpha;
                 let pixel = &mut pixels[row_start + local_x as usize];
@@ -333,8 +375,7 @@ impl From<RasterError> for BrushError {
 pub struct HardRoundStroke {
     brush: HardRoundBrush,
     gesture: GestureId,
-    last_sample: BrushSample,
-    distance_to_next_dab: f32,
+    resampler: DistanceResampler,
     dabs_emitted: u64,
     finalized: bool,
 }
@@ -358,8 +399,7 @@ impl HardRoundStroke {
         Ok(Self {
             brush,
             gesture,
-            last_sample: sample,
-            distance_to_next_dab: brush.spacing(),
+            resampler: DistanceResampler::new(sample, brush.spacing()),
             dabs_emitted: 1,
             finalized: false,
         })
@@ -385,29 +425,11 @@ impl HardRoundStroke {
             return Err(BrushError::InvalidSample);
         }
 
-        let start = self.last_sample;
-        let dx = sample.position[0] - start.position[0];
-        let dy = sample.position[1] - start.position[1];
-        let segment_length = (dx * dx + dy * dy).sqrt();
-        if segment_length == 0.0 {
-            self.last_sample = sample;
-            return Ok(());
-        }
-
-        let mut distance = self.distance_to_next_dab;
-        while distance <= segment_length {
-            let t = distance / segment_length;
-            let dab = BrushSample {
-                position: [start.position[0] + dx * t, start.position[1] + dy * t],
-                pressure: start.pressure + (sample.pressure - start.pressure) * t,
-            };
-            self.brush.paint_dab(layer, self.gesture, dab)?;
-            self.dabs_emitted += 1;
-            distance += self.brush.spacing();
-        }
-
-        self.distance_to_next_dab = distance - segment_length;
-        self.last_sample = sample;
+        let brush = self.brush;
+        let gesture = self.gesture;
+        self.dabs_emitted += self
+            .resampler
+            .update(sample, |dab| brush.paint_dab(layer, gesture, dab))?;
         Ok(())
     }
 
@@ -415,12 +437,11 @@ impl HardRoundStroke {
         if self.finalized {
             return Ok(());
         }
-        let distance_since_last_dab = self.brush.spacing() - self.distance_to_next_dab;
-        if distance_since_last_dab > f32::EPSILON {
-            self.brush
-                .paint_dab(layer, self.gesture, self.last_sample)?;
-            self.dabs_emitted += 1;
-        }
+        let brush = self.brush;
+        let gesture = self.gesture;
+        self.dabs_emitted += self
+            .resampler
+            .finalize(|dab| brush.paint_dab(layer, gesture, dab))?;
         self.finalized = true;
         Ok(())
     }
@@ -432,6 +453,66 @@ impl HardRoundStroke {
 
     pub fn cancel(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
         Ok(layer.cancel_gesture(self.gesture)?)
+    }
+}
+
+pub(crate) struct DistanceResampler {
+    last_sample: BrushSample,
+    spacing: f32,
+    distance_to_next_dab: f32,
+}
+
+impl DistanceResampler {
+    pub(crate) const fn new(first_sample: BrushSample, spacing: f32) -> Self {
+        Self {
+            last_sample: first_sample,
+            spacing,
+            distance_to_next_dab: spacing,
+        }
+    }
+
+    pub(crate) fn update<E>(
+        &mut self,
+        sample: BrushSample,
+        mut emit: impl FnMut(BrushSample) -> Result<(), E>,
+    ) -> Result<u64, E> {
+        let start = self.last_sample;
+        let dx = sample.position[0] - start.position[0];
+        let dy = sample.position[1] - start.position[1];
+        let segment_length = (dx * dx + dy * dy).sqrt();
+        if segment_length == 0.0 {
+            self.last_sample = sample;
+            return Ok(0);
+        }
+
+        let mut emitted = 0;
+        let mut distance = self.distance_to_next_dab;
+        while distance <= segment_length {
+            let t = distance / segment_length;
+            emit(BrushSample {
+                position: [start.position[0] + dx * t, start.position[1] + dy * t],
+                pressure: start.pressure + (sample.pressure - start.pressure) * t,
+            })?;
+            emitted += 1;
+            distance += self.spacing;
+        }
+
+        self.distance_to_next_dab = distance - segment_length;
+        self.last_sample = sample;
+        Ok(emitted)
+    }
+
+    pub(crate) fn finalize<E>(
+        &mut self,
+        mut emit: impl FnMut(BrushSample) -> Result<(), E>,
+    ) -> Result<u64, E> {
+        let distance_since_last_dab = self.spacing - self.distance_to_next_dab;
+        if distance_since_last_dab <= f32::EPSILON {
+            return Ok(0);
+        }
+        emit(self.last_sample)?;
+        self.distance_to_next_dab = self.spacing;
+        Ok(1)
     }
 }
 
