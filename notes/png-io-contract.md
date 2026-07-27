@@ -167,9 +167,36 @@ Interpretation:
   memory budgets.
 
 Engineering consequence: retain the bounded whole-frame decoder for the
-first product, test an exact RGBA8 sRGB lookup table as a separate
-before/after commit, and do not spend the painterly-brush schedule on a
-streaming decoder yet.
+first product and do not spend the painterly-brush schedule on a streaming
+decoder yet.
+
+### Exact RGBA8 transfer lookup result, 2026-07-27
+
+Change: build a 256-entry `f32` table once per import using the same reference
+sRGB function, then index it for 8-bit color samples. Sixteen-bit input keeps
+the continuous transfer calculation. A unit test compares every table entry's
+bits with the reference function.
+
+The identical two-process 2048²/seven-warm-run protocol produced:
+
+| Case | Before import median | After import median | Improvement |
+| --- | ---: | ---: | ---: |
+| transparent | 95.3–99.1 ms | 57.8–58.0 ms | 1.64–1.71× |
+| sparse center | 99.9–101.0 ms | 56.7–58.2 ms | 1.72–1.78× |
+| opaque gradient | 378.1–380.5 ms | 101.1–102.7 ms | 3.68–3.77× |
+| translucent noise | 381.3–383.1 ms | 97.0–98.8 ms | 3.86–3.95× |
+
+All raster checksums, encoded PNG checksums, encoded byte counts, allocated
+tile counts, and decoded-byte counts remained identical to the baseline.
+Export timings remained in the prior ranges, which is expected because the
+change touches import only.
+
+Interpretation: repeated nonlinear transfer evaluation, not allocation alone,
+was the dominant dense RGBA8 import cost. The optimization removes redundant
+work while preserving the exact declared transfer and full-precision internal
+pixels. Further import tuning is not currently justified; the remaining
+~57–103 ms at 2048² is an off-stroke operation and the memory bound remains
+explicit.
 
 Still required:
 

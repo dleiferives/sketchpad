@@ -160,6 +160,10 @@ pub fn decode_png_centered<R: Read + Seek>(
     }
 
     let mut raster = RasterLayer::new(canvas_width, canvas_height, tile_size)?;
+    // PNG RGBA8 has only 256 encoded color values. Computing the reference
+    // transfer once preserves exact f32 results without three powf calls per
+    // placed pixel. Sixteen-bit input still evaluates the continuous transfer.
+    let srgb8_to_linear = std::array::from_fn(|sample| srgb_to_linear(sample as f32 / 255.0));
     let origin_x = (i64::from(canvas_width) - i64::from(source_width)).div_euclid(2);
     let origin_y = (i64::from(canvas_height) - i64::from(source_height)).div_euclid(2);
     let placed = intersect_placed_image(
@@ -209,6 +213,7 @@ pub fn decode_png_centered<R: Read + Seek>(
                             source_index as usize,
                             output.color_type,
                             output.bit_depth,
+                            &srgb8_to_linear,
                         )?;
                     }
                 }
@@ -335,6 +340,7 @@ fn decode_pixel(
     pixel_index: usize,
     color_type: png::ColorType,
     bit_depth: png::BitDepth,
+    srgb8_to_linear: &[f32; 256],
 ) -> Result<LinearRgba, ImageIoError> {
     let channels = match color_type {
         png::ColorType::Grayscale => 1,
@@ -363,7 +369,7 @@ fn decode_pixel(
     let samples = bytes
         .get(offset..offset + pixel_bytes)
         .ok_or_else(|| ImageIoError::invalid("decoded frame is shorter than declared"))?;
-    let sample = |channel: usize| -> f32 {
+    let encoded_sample = |channel: usize| -> f32 {
         let offset = channel * sample_bytes;
         match sample_bytes {
             1 => f32::from(samples[offset]) / 255.0,
@@ -371,25 +377,35 @@ fn decode_pixel(
             _ => unreachable!(),
         }
     };
+    let linear_sample = |channel: usize| -> f32 {
+        let offset = channel * sample_bytes;
+        match sample_bytes {
+            1 => srgb8_to_linear[samples[offset] as usize],
+            2 => srgb_to_linear(
+                f32::from(u16::from_be_bytes([samples[offset], samples[offset + 1]])) / 65_535.0,
+            ),
+            _ => unreachable!(),
+        }
+    };
     let (red, green, blue, alpha) = match color_type {
         png::ColorType::Grayscale => {
-            let gray = sample(0);
+            let gray = linear_sample(0);
             (gray, gray, gray, 1.0)
         }
-        png::ColorType::Rgb => (sample(0), sample(1), sample(2), 1.0),
+        png::ColorType::Rgb => (linear_sample(0), linear_sample(1), linear_sample(2), 1.0),
         png::ColorType::GrayscaleAlpha => {
-            let gray = sample(0);
-            (gray, gray, gray, sample(1))
+            let gray = linear_sample(0);
+            (gray, gray, gray, encoded_sample(1))
         }
-        png::ColorType::Rgba => (sample(0), sample(1), sample(2), sample(3)),
+        png::ColorType::Rgba => (
+            linear_sample(0),
+            linear_sample(1),
+            linear_sample(2),
+            encoded_sample(3),
+        ),
         png::ColorType::Indexed => unreachable!(),
     };
-    Ok(LinearRgba::from_straight(
-        srgb_to_linear(red),
-        srgb_to_linear(green),
-        srgb_to_linear(blue),
-        alpha,
-    ))
+    Ok(LinearRgba::from_straight(red, green, blue, alpha))
 }
 
 fn encode_row(raster: &RasterLayer, min_x: u32, max_x: u32, y: u32, output: &mut [u8]) {
@@ -573,6 +589,17 @@ mod tests {
         assert_eq!(pixel.a, alpha);
         assert_eq!(imported.summary.placed_pixels, 1);
         assert!(imported.summary.assumed_srgb);
+    }
+
+    #[test]
+    fn eight_bit_transfer_table_is_bit_exact_to_the_reference_function() {
+        let table: [f32; 256] = std::array::from_fn(|sample| srgb_to_linear(sample as f32 / 255.0));
+        for sample in 0_u16..=255 {
+            assert_eq!(
+                table[sample as usize].to_bits(),
+                srgb_to_linear(f32::from(sample) / 255.0).to_bits()
+            );
+        }
     }
 
     #[test]
