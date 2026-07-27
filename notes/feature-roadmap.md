@@ -117,6 +117,8 @@ untouched.
 - [x] Add CPU reference tests before any GPU kernel.
 - [ ] Measure work per dab, affected pixels, sampled tiles, and temporary
   reservoir storage.
+- [x] Expose the control in the live app as a temporary between-stroke keyboard
+  toggle before designing brush UI.
 
 Acceptance: the saved mixing corpus is deterministic, visually intentional,
 bounded to brush damage, and does not implicitly mix hidden layers.

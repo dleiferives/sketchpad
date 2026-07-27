@@ -27,7 +27,8 @@ prototype:
 - linear premultiplied `f32` RGBA reference pixels;
 - ordered sparse raster layers with stable IDs, names, visibility, opacity,
   active-layer editing, and an incremental premultiplied-linear composite;
-- hard round source-over brush;
+- hard-round source-over brush and an opt-in CPU linear-mixing control with
+  stable pre-stroke active-layer pickup;
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
 - normalized pressure, tilt, physical source ID, tool type, and source
@@ -77,6 +78,7 @@ Controls:
 - `[` / `]`: decrease/increase the hovered tool size;
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
 - E: toggle mouse pen/eraser mode;
+- M: toggle hard-round/linear-mixing pen mode;
 - 1–6: select a built-in pen color;
 - Control/Command-Z: undo;
 - Control/Command-Shift-Z or Control/Command-Y: redo;
@@ -116,7 +118,9 @@ exits nonzero.
 ```text
 window samples
     ↓
-HardRoundStroke resampler
+ActiveStroke hard-round/mixing dispatcher
+    ↓
+shared distance resampler
     ↓
 active RasterLayer gesture
     ├── one before-image on first tile write

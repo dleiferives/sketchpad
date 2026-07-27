@@ -129,6 +129,32 @@ mixing sample/deposit pixels, unique pickup snapshots, and pickup payload
 bytes. Timing excludes deterministic scene construction and post-stroke
 checksum/undo verification.
 
+The first controlled Apollo attempt on 2026-07-27 was rejected before
+measurement. Preflight found Java/Xic, Syncthing, ActivityWatch, FluidSynth,
+and RustDesk, with only 85% CPU idle. The user-level applications were stopped,
+but the root `rustdesk.service` immediately respawned its processes and needs a
+fresh sudo authorization to stop. Preflight continued to fail, so the
+exploratory one-warm-run output is intentionally not a baseline and no timing
+decision was accepted. The next controlled run starts with:
+
+```text
+sudo systemctl stop rustdesk.service
+scripts/apollo run scripts/benchmark-preflight
+```
+
+### Temporary application control
+
+The live application exposes the reference with `M`, which toggles pen strokes
+between ordinary hard-round paint and `LinearMixingV1`. The Wacom eraser and
+mouse eraser remain destination-out hard-round tools. The mixing recipe reuses
+the current pen's color, diameter, opacity, and relative spacing; its first
+fixed control parameters are pickup `0.65` and color rate `0.08`. The window
+title identifies `Pen`, `Mix`, or `Eraser`, and a completed mixing stroke logs
+its work counters and final held linear RGB.
+
+This keyboard toggle is an evaluation surface, not the future brush editor or
+a commitment to these parameter defaults.
+
 ## Problem Being Addressed
 
 Straight interpolation between two RGB triples models a path through an RGB

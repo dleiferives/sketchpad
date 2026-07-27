@@ -1,18 +1,19 @@
 use sketchpad::{
-    brush::{BrushSample, HardRoundBrush, HardRoundStroke},
+    brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
     document::Document,
     image_io::{self, ExportRegion},
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
+    mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
     },
-    raster::{Damage, DEFAULT_TILE_SIZE},
+    raster::{Damage, GestureId, RasterLayer, DEFAULT_TILE_SIZE},
 };
 use std::{
-    env, io, iter,
+    env, fmt, io, iter,
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -39,6 +40,8 @@ const MIN_BRUSH_DIAMETER: f32 = 1.0;
 const MAX_BRUSH_DIAMETER: f32 = 512.0;
 const BRUSH_SIZE_STEP: f32 = std::f32::consts::SQRT_2;
 const BRUSH_OPACITY_STEP: f32 = 0.1;
+const MIXING_PICKUP: f32 = 0.65;
+const MIXING_COLOR_RATE: f32 = 0.08;
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
 const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(10);
 const COLOR_PRESETS: [[f32; 3]; 6] = [
@@ -102,6 +105,118 @@ struct Gpu {
 enum PointerOwner {
     Mouse,
     Tablet { device_id: u16, tool: ToolKind },
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PaintEngine {
+    #[default]
+    HardRound,
+    LinearMixing,
+}
+
+impl PaintEngine {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::HardRound => "Pen",
+            Self::LinearMixing => "Mix",
+        }
+    }
+}
+
+enum ActiveStroke {
+    HardRound(HardRoundStroke),
+    LinearMixing(MixingStrokeV1),
+}
+
+impl ActiveStroke {
+    fn gesture_id(&self) -> GestureId {
+        match self {
+            Self::HardRound(stroke) => stroke.gesture_id(),
+            Self::LinearMixing(stroke) => stroke.gesture_id(),
+        }
+    }
+
+    fn update(
+        &mut self,
+        layer: &mut RasterLayer,
+        sample: BrushSample,
+    ) -> Result<(), ActiveStrokeError> {
+        match self {
+            Self::HardRound(stroke) => stroke.update(layer, sample).map_err(Into::into),
+            Self::LinearMixing(stroke) => stroke.update(layer, sample).map_err(Into::into),
+        }
+    }
+
+    fn finalize(&mut self, layer: &mut RasterLayer) -> Result<(), ActiveStrokeError> {
+        match self {
+            Self::HardRound(stroke) => stroke.finalize(layer).map_err(Into::into),
+            Self::LinearMixing(stroke) => stroke.finalize(layer).map_err(Into::into),
+        }
+    }
+
+    fn finish(self, layer: &mut RasterLayer) -> Result<FinishedStroke, ActiveStrokeError> {
+        match self {
+            Self::HardRound(stroke) => Ok(FinishedStroke {
+                damage: stroke.finish(layer)?,
+                mixing: None,
+            }),
+            Self::LinearMixing(stroke) => {
+                let result = stroke.finish(layer)?;
+                Ok(FinishedStroke {
+                    damage: result.damage,
+                    mixing: Some((result.stats, result.final_color)),
+                })
+            }
+        }
+    }
+
+    fn cancel(self, layer: &mut RasterLayer) -> Result<Option<Damage>, ActiveStrokeError> {
+        match self {
+            Self::HardRound(stroke) => stroke.cancel(layer).map_err(Into::into),
+            Self::LinearMixing(stroke) => stroke.cancel(layer).map_err(Into::into),
+        }
+    }
+}
+
+struct FinishedStroke {
+    damage: Option<Damage>,
+    mixing: Option<(MixingStats, LinearRgb)>,
+}
+
+#[derive(Debug)]
+enum ActiveStrokeError {
+    HardRound(BrushError),
+    LinearMixing(MixingError),
+}
+
+impl fmt::Display for ActiveStrokeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::HardRound(error) => error.fmt(formatter),
+            Self::LinearMixing(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ActiveStrokeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::HardRound(error) => Some(error),
+            Self::LinearMixing(error) => Some(error),
+        }
+    }
+}
+
+impl From<BrushError> for ActiveStrokeError {
+    fn from(value: BrushError) -> Self {
+        Self::HardRound(value)
+    }
+}
+
+impl From<MixingError> for ActiveStrokeError {
+    fn from(value: MixingError) -> Self {
+        Self::LinearMixing(value)
+    }
 }
 
 struct LatencySeries {
@@ -277,7 +392,8 @@ struct App {
     document: Document,
     paint_brush: HardRoundBrush,
     eraser_brush: HardRoundBrush,
-    active_stroke: Option<HardRoundStroke>,
+    paint_engine: PaintEngine,
+    active_stroke: Option<ActiveStroke>,
     active_pointer: Option<PointerOwner>,
     center: [f32; 2],
     zoom: f32,
@@ -324,6 +440,7 @@ impl App {
             document,
             paint_brush: HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap(),
             eraser_brush: HardRoundBrush::eraser(64.0, 1.0, 0.18).unwrap(),
+            paint_engine: PaintEngine::default(),
             active_stroke: None,
             active_pointer: None,
             center: [CANVAS_WIDTH as f32 * 0.5, CANVAS_HEIGHT as f32 * 0.5],
@@ -472,6 +589,22 @@ impl App {
         self.request_redraw();
     }
 
+    fn toggle_paint_engine(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        self.paint_engine = match self.paint_engine {
+            PaintEngine::HardRound => PaintEngine::LinearMixing,
+            PaintEngine::LinearMixing => PaintEngine::HardRound,
+        };
+        self.mouse_tool = ToolKind::Pen;
+        self.cursor_tool = ToolKind::Pen;
+        self.cursor_pressure = 0.0;
+        self.cursor_contact = false;
+        self.update_window_title(None);
+        self.request_redraw();
+    }
+
     fn update_window_title(&self, pressure: Option<f32>) {
         let Some(window) = &self.window else {
             return;
@@ -484,14 +617,18 @@ impl App {
         } else {
             ""
         };
+        let tool_label = match self.cursor_tool {
+            ToolKind::Pen => self.paint_engine.label(),
+            ToolKind::Eraser => "Eraser",
+        };
         window.set_title(&format!(
-            "Sketchpad{}{} — {} ({}/{}) — {:?} {:.0}px {:.0}%{}",
+            "Sketchpad{}{} — {} ({}/{}) — {} {:.0}px {:.0}%{}",
             dirty,
             recording,
             self.document.layers()[self.document.active_layer_index()].name(),
             self.document.active_layer_index() + 1,
             self.document.layers().len(),
-            self.cursor_tool,
+            tool_label,
             brush.diameter(),
             brush.opacity() * 100.0,
             pressure
@@ -512,11 +649,21 @@ impl App {
             PointerOwner::Mouse => self.mouse_tool,
         };
         let brush = self.brush_for_tool(tool);
-        match HardRoundStroke::begin(
-            self.document.active_layer_mut(),
-            brush,
-            BrushSample::new(world, pressure),
-        ) {
+        let sample = BrushSample::new(world, pressure);
+        let stroke = match (tool, self.paint_engine) {
+            (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
+                HardRoundStroke::begin(self.document.active_layer_mut(), brush, sample)
+                    .map(ActiveStroke::HardRound)
+                    .map_err(ActiveStrokeError::from)
+            }
+            (ToolKind::Pen, PaintEngine::LinearMixing) => {
+                let mixing = mixing_brush_from_paint(brush);
+                MixingStrokeV1::begin(self.document.active_layer_mut(), mixing, sample)
+                    .map(ActiveStroke::LinearMixing)
+                    .map_err(ActiveStrokeError::from)
+            }
+        };
+        match stroke {
             Ok(stroke) => {
                 self.active_stroke = Some(stroke);
                 self.active_pointer = Some(owner);
@@ -561,7 +708,26 @@ impl App {
         };
         self.active_pointer = None;
         match stroke.finish(self.document.active_layer_mut()) {
-            Ok(Some(damage)) => {
+            Ok(finished) => {
+                if let Some((stats, final_color)) = finished.mixing {
+                    log::info!(
+                        "mixing stroke: dabs={} sampled_tiles={} sampled_pixels={} \
+                         deposited_pixels={} snapshot_tiles={} snapshot_mib={:.3} \
+                         final_linear_rgb=({:.4},{:.4},{:.4})",
+                        stats.dabs,
+                        stats.sampled_tiles,
+                        stats.sampled_pixels,
+                        stats.deposited_pixels,
+                        stats.snapshot_tiles,
+                        stats.snapshot_bytes as f64 / (1024.0 * 1024.0),
+                        final_color.r,
+                        final_color.g,
+                        final_color.b,
+                    );
+                }
+                let Some(damage) = finished.damage else {
+                    return;
+                };
                 if let Some(gpu) = &mut self.gpu {
                     gpu.canvas
                         .reconcile_committed_damage(self.document.composite(), &damage);
@@ -569,7 +735,6 @@ impl App {
                 self.mark_document_dirty();
                 self.request_redraw();
             }
-            Ok(None) => {}
             Err(error) => log::error!("could not finish stroke: {error}"),
         }
     }
@@ -588,7 +753,7 @@ impl App {
     }
 
     fn flush_active_damage(&mut self) {
-        let Some(gesture) = self.active_stroke.as_ref().map(HardRoundStroke::gesture_id) else {
+        let Some(gesture) = self.active_stroke.as_ref().map(ActiveStroke::gesture_id) else {
             return;
         };
         match self
@@ -1472,6 +1637,7 @@ impl ApplicationHandler<TabletEvent> for App {
                         self.adjust_brush_size(BRUSH_SIZE_STEP)
                     }
                     PhysicalKey::Code(KeyCode::KeyE) => self.toggle_mouse_tool(),
+                    PhysicalKey::Code(KeyCode::KeyM) => self.toggle_paint_engine(),
                     PhysicalKey::Code(KeyCode::Digit1) => self.select_color(0),
                     PhysicalKey::Code(KeyCode::Digit2) => self.select_color(1),
                     PhysicalKey::Code(KeyCode::Digit3) => self.select_color(2),
@@ -1798,6 +1964,23 @@ fn export_path_for_region(path: &Path, region: ExportRegion) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+fn mixing_brush_from_paint(paint: HardRoundBrush) -> MixingBrushV1 {
+    let color = paint.color();
+    let recipe = MixingRecipeV1::new(
+        LinearRgb::new(color[0], color[1], color[2]),
+        MIXING_PICKUP,
+        MIXING_COLOR_RATE,
+    )
+    .expect("the validated paint color and built-in mixing parameters are valid");
+    MixingBrushV1::new(
+        recipe,
+        paint.diameter(),
+        paint.opacity(),
+        paint.spacing() / paint.diameter(),
+    )
+    .expect("the validated hard-round geometry is valid mixing-brush geometry")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1895,5 +2078,18 @@ mod tests {
             export_path_for_region(full, ExportRegion::ContentBounds),
             PathBuf::from("/tmp/drawing.final-cropped.png")
         );
+    }
+
+    #[test]
+    fn mixing_mode_reuses_the_live_pen_geometry_and_color() {
+        let paint = HardRoundBrush::new([0.3, 0.2, 0.1], 37.0, 0.6, 0.23).unwrap();
+        let mixing = mixing_brush_from_paint(paint);
+
+        assert_eq!(mixing.diameter(), paint.diameter());
+        assert_eq!(mixing.opacity(), paint.opacity());
+        assert_eq!(mixing.spacing(), paint.spacing());
+        assert_eq!(mixing.recipe().foreground(), LinearRgb::new(0.3, 0.2, 0.1));
+        assert_eq!(mixing.recipe().pickup(), MIXING_PICKUP);
+        assert_eq!(mixing.recipe().color_rate(), MIXING_COLOR_RATE);
     }
 }
