@@ -5,6 +5,70 @@ inside the painterly brush's bounded pickup/deposit reservoir. It is not the
 default layer compositor, and it does not determine the geometry architecture.
 See [first-usable-product.md](first-usable-product.md).
 
+## 2026 Reservoir and Smudge Findings
+
+The painterly problem is not only which color interpolation formula to use.
+Brush-to-canvas exchange, repeated sampling, spatial reservoir resolution, and
+edge selection can dominate the result.
+
+Chu et al.'s
+[Detail-Preserving Paint Modeling for 3D Brushes](https://www.microsoft.com/en-us/research/publication/detail-preserving-paint-modeling-for-3d-brushes/)
+describes smearing as simultaneous bidirectional pickup and deposition. It
+identifies two quality/performance failures in repeated exchange: paint that
+was just deposited is picked up and resampled again hundreds of times, and a
+brush representation sampled at a different resolution from the canvas loses
+detail. Its remedies are a canvas snapshot buffer and a 2D,
+resolution-matched pickup map under the brush.
+
+This matters even though Sketchpad's first control brush is 2D. Sampling the
+live output of every previous dab would bake excessive feedback and
+spacing-dependent blur into the reservoir before we have an artistic reason
+to want it.
+
+Krita's official
+[Color Smudge Brush Engine documentation](https://docs.krita.org/en/reference_manual/brushes/brush_engines/color_smudge_engine.html)
+separates color rate from smudge length/radius and reports that spacing affects
+trail length and, in dulling mode, effect strength. This is product evidence
+that “mix amount” is not one scalar and that a saved corpus must vary spacing.
+
+Jiang et al.'s 2024/2025
+[Region-Aware Color Smudging](https://yingjiang96.github.io/projects/smartsmudge/)
+shows a different limitation: uniformly smudging every color under a footprint
+can destroy intended boundaries or pull unwanted regions into a gradient.
+Real-time region selection is valuable later, but it is separate from the
+first reservoir and pigment questions.
+
+## First Conventional Control Decision
+
+Before selecting any pigment interpolation, implement and preserve a versioned
+linear-RGB control:
+
+- authoritative canvas pixels remain premultiplied linear RGBA;
+- pickup reads the active layer only;
+- each stroke lazily snapshots only sampled tiles before depositing into them;
+- a uniform three-`f32` reservoir starts at the foreground color;
+- alpha-weighted footprint sampling produces one straight linear-RGB color and
+  a sample-strength scalar;
+- pickup exponentially moves the held color toward that sample;
+- color rate independently moves it back toward fresh foreground color;
+- deposition source-overs the current held color into the live active layer;
+- transparent samples do not inject meaningless hidden RGB;
+- the reservoir and snapshots die at stroke end; finalized pixels and ordinary
+  tile undo remain authoritative.
+
+The exact ordered reservoir update is:
+
+```text
+held = lerp(held, sampled, pickup * sample_strength)
+held = lerp(held, foreground, color_rate)
+```
+
+This is not claimed to be physical pigment mixing. It is the deterministic
+control against which spatial tip reservoirs, current-canvas feedback,
+perceptual interpolation, and properly licensed pigment-like kernels can be
+judged. The uniform reservoir cannot preserve bristle streaks; a later fixed
+tip grid is the intended extension if the control proves artistically useful.
+
 ## Problem Being Addressed
 
 Straight interpolation between two RGB triples models a path through an RGB
