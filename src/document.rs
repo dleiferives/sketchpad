@@ -1,4 +1,6 @@
-use crate::raster::{Damage, LinearRgba, RasterError, RasterLayer, TileCoord};
+use crate::raster::{
+    Damage, DerivedContentChange, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord,
+};
 use std::{collections::HashSet, error::Error, fmt};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -369,55 +371,62 @@ impl Document {
             let local_min_y = global_region.min_y() - tile_bounds.min_y();
             let local_max_x = global_region.max_x() - tile_bounds.min_x();
             let local_max_y = global_region.max_y() - tile_bounds.min_y();
+            let local_region =
+                RectU32::from_min_max(local_min_x, local_min_y, local_max_x, local_max_y)
+                    .expect("nonempty global damage produces nonempty local damage");
             let stride = self.tile_size as usize;
-            let mut pixels = self.composite.tile(coord).map_or_else(
-                || vec![LinearRgba::TRANSPARENT; stride * stride],
-                |tile| tile.pixels().to_vec(),
-            );
-
-            {
-                let sources: Vec<_> = self
-                    .layers
-                    .iter()
-                    .filter(|layer| layer.visible && layer.opacity > 0.0)
-                    .filter_map(|layer| layer.raster.tile(coord).map(|tile| (layer.opacity, tile)))
-                    .collect();
-                self.composite_stats.source_tile_reads = self
-                    .composite_stats
-                    .source_tile_reads
-                    .saturating_add(sources.len() as u64);
-
-                for y in local_min_y..local_max_y {
-                    let row = y as usize * stride;
-                    for x in local_min_x..local_max_x {
-                        let index = row + x as usize;
-                        let mut destination = LinearRgba::TRANSPARENT;
-                        for (opacity, source_tile) in &sources {
-                            let source = source_tile.pixels()[index];
-                            let source_alpha = source.a * *opacity;
-                            let keep_destination = 1.0 - source_alpha;
-                            destination = LinearRgba::premultiplied(
-                                source.r * *opacity + destination.r * keep_destination,
-                                source.g * *opacity + destination.g * keep_destination,
-                                source.b * *opacity + destination.b * keep_destination,
-                                source_alpha + destination.a * keep_destination,
-                            );
-                        }
-                        pixels[index] = destination;
-                    }
-                }
-
-                let area = global_region.area();
-                self.composite_stats.pixels_composited =
-                    self.composite_stats.pixels_composited.saturating_add(area);
-                self.composite_stats.source_pixel_reads = self
-                    .composite_stats
-                    .source_pixel_reads
-                    .saturating_add(area.saturating_mul(sources.len() as u64));
-            }
-
+            let sources: Vec<_> = self
+                .layers
+                .iter()
+                .filter(|layer| layer.visible && layer.opacity > 0.0)
+                .filter_map(|layer| layer.raster.tile(coord).map(|tile| (layer.opacity, tile)))
+                .collect();
+            self.composite_stats.source_tile_reads = self
+                .composite_stats
+                .source_tile_reads
+                .saturating_add(sources.len() as u64);
             self.composite
-                .restore_tile(coord, pixels.into_boxed_slice())?;
+                .edit_tile_derived(coord, local_region, |tile| {
+                    let pixels = tile.pixels_mut();
+                    let mut added_bounds = None;
+                    let mut emptied_bounds = None;
+                    for y in local_min_y..local_max_y {
+                        let row = y as usize * stride;
+                        for x in local_min_x..local_max_x {
+                            let index = row + x as usize;
+                            let previous = pixels[index];
+                            let mut destination = LinearRgba::TRANSPARENT;
+                            for (opacity, source_tile) in &sources {
+                                let source = source_tile.pixels()[index];
+                                let source_alpha = source.a * *opacity;
+                                let keep_destination = 1.0 - source_alpha;
+                                destination = LinearRgba::premultiplied(
+                                    source.r * *opacity + destination.r * keep_destination,
+                                    source.g * *opacity + destination.g * keep_destination,
+                                    source.b * *opacity + destination.b * keep_destination,
+                                    source_alpha + destination.a * keep_destination,
+                                );
+                            }
+                            if previous.a == 0.0 && destination.a != 0.0 {
+                                include_pixel(&mut added_bounds, x, y);
+                            } else if previous.a != 0.0 && destination.a == 0.0 {
+                                include_pixel(&mut emptied_bounds, x, y);
+                            }
+                            pixels[index] = destination;
+                        }
+                    }
+                    DerivedContentChange {
+                        added_bounds,
+                        emptied_bounds,
+                    }
+                })?;
+            let area = global_region.area();
+            self.composite_stats.pixels_composited =
+                self.composite_stats.pixels_composited.saturating_add(area);
+            self.composite_stats.source_pixel_reads = self
+                .composite_stats
+                .source_pixel_reads
+                .saturating_add(area.saturating_mul(sources.len() as u64));
             self.composite_stats.tile_updates = self.composite_stats.tile_updates.saturating_add(1);
             recomposed.add(coord, global_region);
         }
@@ -456,6 +465,14 @@ impl Document {
         }
         damage
     }
+}
+
+fn include_pixel(bounds: &mut Option<RectU32>, x: u32, y: u32) {
+    let pixel = RectU32::from_xywh(x, y, 1, 1).expect("one pixel is a valid rectangle");
+    *bounds = Some(match *bounds {
+        Some(existing) => existing.union(pixel),
+        None => pixel,
+    });
 }
 
 fn coords_for_layer(layer: &RasterDocumentLayer) -> Vec<TileCoord> {

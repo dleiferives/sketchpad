@@ -1,13 +1,14 @@
 use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
+    document::Document,
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
     },
-    raster::{Damage, RasterLayer, DEFAULT_TILE_SIZE},
+    raster::{Damage, DEFAULT_TILE_SIZE},
 };
 use std::{
     env, io, iter,
@@ -272,7 +273,7 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
     configured: bool,
-    layer: RasterLayer,
+    document: Document,
     paint_brush: HardRoundBrush,
     eraser_brush: HardRoundBrush,
     active_stroke: Option<HardRoundStroke>,
@@ -306,7 +307,7 @@ struct App {
 impl App {
     fn new(
         tablet_proxy: EventLoopProxy<TabletEvent>,
-        layer: RasterLayer,
+        document: Document,
         checkpoint_path: PathBuf,
         record_stroke: Option<PathBuf>,
     ) -> Self {
@@ -315,7 +316,7 @@ impl App {
             window: None,
             gpu: None,
             configured: false,
-            layer,
+            document,
             paint_brush: HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap(),
             eraser_brush: HardRoundBrush::eraser(64.0, 1.0, 0.18).unwrap(),
             active_stroke: None,
@@ -478,9 +479,12 @@ impl App {
             ""
         };
         window.set_title(&format!(
-            "Sketchpad{}{} — {:?} {:.0}px {:.0}%{}",
+            "Sketchpad{}{} — {} ({}/{}) — {:?} {:.0}px {:.0}%{}",
             dirty,
             recording,
+            self.document.layers()[self.document.active_layer_index()].name(),
+            self.document.active_layer_index() + 1,
+            self.document.layers().len(),
             self.cursor_tool,
             brush.diameter(),
             brush.opacity() * 100.0,
@@ -502,7 +506,11 @@ impl App {
             PointerOwner::Mouse => self.mouse_tool,
         };
         let brush = self.brush_for_tool(tool);
-        match HardRoundStroke::begin(&mut self.layer, brush, BrushSample::new(world, pressure)) {
+        match HardRoundStroke::begin(
+            self.document.active_layer_mut(),
+            brush,
+            BrushSample::new(world, pressure),
+        ) {
             Ok(stroke) => {
                 self.active_stroke = Some(stroke);
                 self.active_pointer = Some(owner);
@@ -516,7 +524,7 @@ impl App {
         let world = self.camera().world_from_screen(screen);
         let result = match &mut self.active_stroke {
             Some(stroke) => stroke.update(
-                &mut self.layer,
+                self.document.active_layer_mut(),
                 BrushSample::new(world, pressure.clamp(0.0, 1.0)),
             ),
             None => return,
@@ -531,7 +539,7 @@ impl App {
 
     fn finish_stroke(&mut self) {
         let finalize_result = match &mut self.active_stroke {
-            Some(stroke) => stroke.finalize(&mut self.layer),
+            Some(stroke) => stroke.finalize(self.document.active_layer_mut()),
             None => return,
         };
         if let Err(error) = finalize_result {
@@ -546,10 +554,11 @@ impl App {
             return;
         };
         self.active_pointer = None;
-        match stroke.finish(&mut self.layer) {
+        match stroke.finish(self.document.active_layer_mut()) {
             Ok(Some(damage)) => {
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.canvas.reconcile_committed_damage(&self.layer, &damage);
+                    gpu.canvas
+                        .reconcile_committed_damage(self.document.composite(), &damage);
                 }
                 self.mark_document_dirty();
                 self.request_redraw();
@@ -565,7 +574,7 @@ impl App {
             return;
         };
         self.active_pointer = None;
-        match stroke.cancel(&mut self.layer) {
+        match stroke.cancel(self.document.active_layer_mut()) {
             Ok(Some(damage)) => self.sync_damage(&damage),
             Ok(None) => {}
             Err(error) => log::error!("could not cancel stroke: {error}"),
@@ -576,7 +585,11 @@ impl App {
         let Some(gesture) = self.active_stroke.as_ref().map(HardRoundStroke::gesture_id) else {
             return;
         };
-        match self.layer.take_gesture_damage(gesture) {
+        match self
+            .document
+            .active_layer_mut()
+            .take_gesture_damage(gesture)
+        {
             Ok(damage) if !damage.is_empty() => self.sync_damage(&damage),
             Ok(_) => {}
             Err(error) => log::error!("could not drain stroke damage: {error}"),
@@ -584,8 +597,15 @@ impl App {
     }
 
     fn sync_damage(&mut self, damage: &Damage) {
+        let damage = match self.document.recompose_damage(damage) {
+            Ok(damage) => damage,
+            Err(error) => {
+                log::error!("could not update layer composite: {error}");
+                return;
+            }
+        };
         if let Some(gpu) = &mut self.gpu {
-            gpu.canvas.sync_damage(&self.layer, damage);
+            gpu.canvas.sync_damage(self.document.composite(), &damage);
         }
         self.request_redraw();
     }
@@ -594,7 +614,7 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
-        if let Some(damage) = self.layer.undo() {
+        if let Some(damage) = self.document.active_layer_mut().undo() {
             self.sync_damage(&damage);
             self.mark_document_dirty();
         }
@@ -604,7 +624,7 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
-        if let Some(damage) = self.layer.redo() {
+        if let Some(damage) = self.document.active_layer_mut().redo() {
             self.sync_damage(&damage);
             self.mark_document_dirty();
         }
@@ -624,14 +644,15 @@ impl App {
             return;
         }
         let started = Instant::now();
-        match checkpoint::save_atomic(&self.checkpoint_path, &self.layer) {
+        match checkpoint::save_document_atomic(&self.checkpoint_path, &self.document) {
             Ok(summary) => {
                 self.checkpoint_dirty = false;
                 self.checkpoint_due = None;
                 log::info!(
-                    "checkpoint saved: path={:?} bytes={} tiles={} stored_pixels={} elapsed_ms={}",
+                    "checkpoint saved: path={:?} bytes={} layers={} tiles={} stored_pixels={} elapsed_ms={}",
                     self.checkpoint_path,
                     summary.encoded_bytes,
+                    summary.layer_count,
                     summary.tile_count,
                     summary.stored_pixels,
                     started.elapsed().as_millis()
@@ -653,14 +674,19 @@ impl App {
         if !self.persistence_enabled || self.active_stroke.is_some() {
             return;
         }
-        match checkpoint::load(&self.checkpoint_path) {
-            Ok(layer)
-                if layer.width() == CANVAS_WIDTH
-                    && layer.height() == CANVAS_HEIGHT
-                    && layer.tile_size() == self.layer.tile_size() =>
+        match checkpoint::load_document(&self.checkpoint_path) {
+            Ok(document)
+                if document.width() == CANVAS_WIDTH
+                    && document.height() == CANVAS_HEIGHT
+                    && document.tile_size() == self.document.tile_size() =>
             {
-                let tile_count = layer.allocated_tile_count();
-                self.layer = layer;
+                let layer_count = document.layers().len();
+                let tile_count: usize = document
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.raster().allocated_tile_count())
+                    .sum();
+                self.document = document;
                 if let Some(gpu) = &mut self.gpu {
                     gpu.canvas.clear_residency();
                 }
@@ -672,7 +698,7 @@ impl App {
                     .map(|gpu| gpu.canvas.stats())
                     .unwrap_or_default();
                 log::info!(
-                    "checkpoint loaded: path={:?} tiles={tile_count}",
+                    "checkpoint loaded: path={:?} layers={layer_count} tiles={tile_count}",
                     self.checkpoint_path
                 );
                 self.update_window_title(None);
@@ -944,8 +970,12 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Raster Frame"),
             });
-        gpu.canvas
-            .prepare_visible(&gpu.device, &gpu.queue, &self.layer, camera.view_bounds());
+        gpu.canvas.prepare_visible(
+            &gpu.device,
+            &gpu.queue,
+            self.document.composite(),
+            camera.view_bounds(),
+        );
         gpu.canvas.write_camera(
             &gpu.queue,
             CanvasUniform {
@@ -1104,7 +1134,11 @@ impl App {
                 gpu_stats.resident_capacity,
                 gpu_stats.deferred_visible_tiles,
                 evictions,
-                self.layer.allocated_tile_count()
+                self.document
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.raster().allocated_tile_count())
+                    .sum::<usize>()
             );
         }
         self.metrics.reset(gpu_stats);
@@ -1126,7 +1160,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 .unwrap(),
         );
 
-        let gpu = App::init(window.clone(), self.layer.tile_size());
+        let gpu = App::init(window.clone(), self.document.tile_size());
         #[cfg(target_os = "linux")]
         match x11_tablet::start(&window, self.tablet_proxy.clone()) {
             Ok(backend) => {
@@ -1421,40 +1455,46 @@ fn main() {
         process::exit(2);
     });
     let checkpoint_path = checkpoint::default_recovery_path();
-    let layer = if startup.record_stroke.is_some() {
+    let document = if startup.record_stroke.is_some() {
         log::info!("stroke recording mode: draw one tablet stroke in the blank window");
-        RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+        Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
     } else {
-        match checkpoint::load(&checkpoint_path) {
-            Ok(layer)
-                if layer.width() == CANVAS_WIDTH
-                    && layer.height() == CANVAS_HEIGHT
-                    && layer.tile_size() == DEFAULT_TILE_SIZE =>
+        match checkpoint::load_document(&checkpoint_path) {
+            Ok(document)
+                if document.width() == CANVAS_WIDTH
+                    && document.height() == CANVAS_HEIGHT
+                    && document.tile_size() == DEFAULT_TILE_SIZE =>
             {
+                let tile_count: usize = document
+                    .layers()
+                    .iter()
+                    .map(|layer| layer.raster().allocated_tile_count())
+                    .sum();
                 log::info!(
-                    "checkpoint recovered: path={:?} tiles={}",
+                    "checkpoint recovered: path={:?} layers={} tiles={}",
                     checkpoint_path,
-                    layer.allocated_tile_count()
+                    document.layers().len(),
+                    tile_count,
                 );
-                layer
+                document
             }
             Ok(_) => {
                 log::error!(
                     "checkpoint geometry is incompatible; starting blank without replacing it: {:?}",
                     checkpoint_path
                 );
-                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
             }
             Err(CheckpointError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 log::info!("no recovery checkpoint found: {:?}", checkpoint_path);
-                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
             }
             Err(error) => {
                 log::error!(
                     "checkpoint recovery failed; starting blank without replacing it: path={:?}: {error}",
                     checkpoint_path
                 );
-                RasterLayer::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
             }
         }
     };
@@ -1464,7 +1504,7 @@ fn main() {
     event_loop
         .run_app(&mut App::new(
             tablet_proxy,
-            layer,
+            document,
             checkpoint_path,
             startup.record_stroke,
         ))

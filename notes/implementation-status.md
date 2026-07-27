@@ -25,6 +25,8 @@ prototype:
 - 4096×4096 defined canvas;
 - 128×128 sparse canonical CPU tiles;
 - linear premultiplied `f32` RGBA reference pixels;
+- ordered sparse raster layers with stable IDs, names, visibility, opacity,
+  active-layer editing, and an incremental premultiplied-linear composite;
 - hard round source-over brush;
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
@@ -48,8 +50,9 @@ prototype:
 - visible paper boundary and dark pasteboard;
 - pan and cursor-centered zoom;
 - undo and redo;
-- versioned/checksummed sparse-raster recovery checkpoints with atomic
-  temporary-file replacement and directory synchronization;
+- versioned/checksummed layered recovery checkpoints with exact sparse `f32`
+  pixels, legacy flat-checkpoint migration, atomic temporary-file replacement,
+  and directory synchronization;
 - automatic recovery on startup and autosave two seconds after the last
   committed edit;
 - cancellation on focus loss or Escape during an active stroke;

@@ -34,7 +34,8 @@ save, or hide unbounded work behind a convenient API.
   media.
 - [x] Support create, activate, duplicate, delete, rename, and reorder.
 - [x] Maintain an incremental premultiplied-linear composite for presentation.
-- [ ] Paint and erase only the active layer.
+- [x] Paint and erase only the active layer; incrementally present the derived
+  visible composite.
 - [x] Make structural layer changes produce explicit damage.
 - [ ] Add layer-aware semantic undo after the basic command path is stable.
 - [x] Measure recomposited tiles, pixels, and source layers visited.

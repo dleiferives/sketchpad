@@ -710,6 +710,12 @@ pub struct RasterLayer {
     stats: RasterStats,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DerivedContentChange {
+    pub added_bounds: Option<RectU32>,
+    pub emptied_bounds: Option<RectU32>,
+}
+
 impl RasterLayer {
     pub fn new(width: u32, height: u32, tile_size: u32) -> Result<Self, RasterError> {
         Self::new_with_undo_storage(width, height, tile_size, UndoStorage::BrushAdaptive16)
@@ -837,6 +843,83 @@ impl RasterLayer {
                 self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
             }
         } else if self.tiles.remove(&coord).is_some() {
+            self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn edit_tile_derived(
+        &mut self,
+        coord: TileCoord,
+        local_damage: RectU32,
+        edit: impl FnOnce(&mut TileEdit<'_>) -> DerivedContentChange,
+    ) -> Result<(), RasterError> {
+        let tile_bounds = self
+            .tile_bounds(coord)
+            .ok_or(RasterError::TileOutOfBounds(coord))?;
+        let valid_width = tile_bounds.width();
+        let valid_height = tile_bounds.height();
+        if local_damage.max_x() > valid_width || local_damage.max_y() > valid_height {
+            return Err(RasterError::DamageOutsideTile {
+                tile: coord,
+                damage: local_damage,
+                valid_width,
+                valid_height,
+            });
+        }
+
+        let inserted = !self.tiles.contains_key(&coord);
+        let tile = self.tiles.entry(coord).or_insert_with(|| Tile {
+            state: TileState::empty(self.tile_pixel_count),
+            snapshot_gesture: 0,
+            snapshot_index: 0,
+        });
+        if inserted {
+            self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
+            self.stats.tiles_allocated = self.stats.tiles_allocated.saturating_add(1);
+        }
+        self.stats.write_tile_lookups = self.stats.write_tile_lookups.saturating_add(1);
+        self.stats.bulk_tile_edits = self.stats.bulk_tile_edits.saturating_add(1);
+        self.stats.conservatively_touched_pixels = self
+            .stats
+            .conservatively_touched_pixels
+            .saturating_add(local_damage.area());
+
+        let mut tile_edit = TileEdit {
+            pixels: &mut tile.state.pixels,
+            stride: self.tile_size as usize,
+            valid_width,
+            valid_height,
+        };
+        let change = edit(&mut tile_edit);
+        if let Some(added) = change.added_bounds {
+            debug_assert!(added.max_x() <= valid_width && added.max_y() <= valid_height);
+            tile.state.content_bounds = Some(match tile.state.content_bounds {
+                Some(existing) => existing.union(added),
+                None => added,
+            });
+        }
+        if let (Some(emptied), Some(content)) = (change.emptied_bounds, tile.state.content_bounds) {
+            debug_assert!(emptied.max_x() <= valid_width && emptied.max_y() <= valid_height);
+            let touches_boundary = emptied.min_x() <= content.min_x()
+                || emptied.min_y() <= content.min_y()
+                || emptied.max_x() >= content.max_x()
+                || emptied.max_y() >= content.max_y();
+            if touches_boundary {
+                tile.state.recompute_content_bounds(
+                    self.tile_size as usize,
+                    valid_width,
+                    valid_height,
+                );
+                self.stats.content_bound_pixels_scanned = self
+                    .stats
+                    .content_bound_pixels_scanned
+                    .saturating_add(u64::from(valid_width) * u64::from(valid_height));
+            }
+        }
+        tile.state.content_bounds_state = ContentBoundsState::Clean;
+        if tile.state.content_bounds.is_none() {
+            self.tiles.remove(&coord);
             self.allocation_generation = self.allocation_generation.wrapping_add(1).max(1);
         }
         Ok(())
