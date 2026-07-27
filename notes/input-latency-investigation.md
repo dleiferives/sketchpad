@@ -1,7 +1,7 @@
 # Physical Pen Latency Investigation
 
-Status: live internal latency probe implemented; physical Apollo capture
-pending, 2026-07-27.
+Status: live internal latency probe implemented; first physical Apollo capture
+recorded, 2026-07-27.
 
 ## Observed Failure
 
@@ -141,3 +141,93 @@ first physical result, the next measurement may need:
 Every change to present mode, queued-frame count, event batching, or cursor
 strategy requires an A/B physical capture. A visually plausible tweak is not
 evidence by itself.
+
+## First Apollo Capture: 2026-07-27
+
+The first optimized physical run used:
+
+- Intel UHD Graphics (Jasper Lake) through Vulkan;
+- a 60.076 Hz integrated display;
+- wgpu `AutoVsync` with desired maximum frame latency 2;
+- the integrated ELAN pen source, producing about 200 contact samples/second
+  and up to about 394 hover samples/second;
+- a recovered drawing containing 778 tiles before the test.
+
+Apollo reported support for `Immediate`, `Mailbox`, `Fifo`, and `FifoRelaxed`
+presentation. `AutoVsync` does not reveal which supported mode was selected.
+
+Representative steady one-second windows were:
+
+| Path | Samples/s | Source excess p95 | Backend queue p95 | Latest-to-submit p95 | Input handler p95 | Frame p95 | Samples/submit p95 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fast hover | 374–394 | 1.03–1.04 ms | 15.2–15.4 ms | 16.6–16.8 ms | 0.001 ms | 16.5–16.8 ms | 8 |
+| first contact stroke | 202–203 | 1.03–1.07 ms | 14.6–15.1 ms | 16.5–16.7 ms | 0.28–0.37 ms | 16.3–16.6 ms | 4 |
+| second contact stroke | 202–203 | 1.02–1.08 ms | 13.2–14.1 ms | 15.7–16.5 ms | 0.76–1.11 ms | 15.2–15.9 ms | 4 |
+
+The physical report remained “really laggy” for slow/fast hover and
+slow/fast drawing.
+
+### What the capture establishes
+
+The X source-to-backend progression is not accumulating material delay:
+steady p95 relative excess is about one millisecond. Hover input handling is
+effectively free. Contact handling is measurably more expensive but remains
+roughly 0.3–1.1 ms p95 in these strokes; it does not explain the large lag
+shared with hover.
+
+The dominant measured common path is frame-shaped:
+
+- the event-loop queue reaches almost one 60 Hz interval at p95;
+- a newest handled sample then reaches the CPU presentation call in about one
+  more 60 Hz interval at p95;
+- hover frames with no painting or tile uploads themselves take almost exactly
+  one display interval;
+- 4–8 real tablet packets are commonly accumulated per submitted frame.
+
+The stage probe does not yet split surface acquisition from render encoding,
+but an otherwise idle hover frame taking approximately 16.7 ms strongly points
+to blocking frame acquisition/presentation pacing in the common render path.
+The event loop cannot receive proxy events while blocked there. The
+app-rendered cursor then still has GPU queue, compositor, scanout, and panel
+latency after the measured CPU endpoint.
+
+The two p95 segments must not simply be added as an end-to-end percentile:
+`backend_queue_us` covers every packet, while `latest_to_submit_us` covers only
+the newest packet selected for each submitted frame. They do show two
+frame-sized scheduling effects in the pipeline.
+
+### Synchronous recovery stall
+
+The capture also exposed a separate severe bug. A recovery checkpoint after
+the first stroke took 474 ms on the event-loop thread. The following hover
+window recorded:
+
+```text
+backend_queue_us mean=172106 p95=456063 max=490586
+samples_per_submit mean=12 max=198
+```
+
+A later checkpoint took 669 ms. Synchronous checkpoint encoding and disk I/O
+can therefore freeze hover independently of brush rendering. Recovery must
+move off the interactive thread while snapshot semantics remain exact.
+
+The first frame's 778 cache-tile upload took 264 ms, including about 116 ms in
+fallback upload API calls. This startup/recovery cost was excluded from the
+steady hover/contact comparison.
+
+### Next controlled experiments
+
+1. Add runtime-selectable present mode and queued-frame count; compare the
+   current `AutoVsync`/2 baseline with `Mailbox`/1. Use `Immediate`/1 only as a
+   tearing diagnostic that tests whether synchronized presentation is the
+   dominant visible cost.
+2. Split live frame timing into surface acquisition, scene/upload
+   preparation, encoding, submission, and CPU present-call stages.
+3. Re-run the exact slow/fast hover and contact sequence for each presentation
+   configuration, preserving both the internal distributions and the physical
+   judgment.
+4. Design recovery around an immutable/snapshotted document state written by
+   a worker. Do not merely disable recovery to hide the stall.
+5. If low-latency presentation leaves substantial visible lag while internal
+   stages remain low, add an OS-cursor control and high-speed-camera
+   input-to-photon measurement.

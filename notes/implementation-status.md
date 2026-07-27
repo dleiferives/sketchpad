@@ -544,6 +544,10 @@ This is an architectural integration checkpoint, not yet the usable painter:
   display presentation, and input-to-photon latency are not yet instrumented.
   The live-window timings still end at the CPU presentation call; see
   [input-latency-investigation.md](input-latency-investigation.md).
+- the first Apollo physical capture found approximately one 60 Hz interval in
+  both hover frame construction/presentation pacing and p95 event-loop queue
+  delay, while hover handling itself was effectively free; synchronous
+  recovery also produced a measured 490 ms maximum input-queue stall.
 
 ## Immediate Engineering Order
 
