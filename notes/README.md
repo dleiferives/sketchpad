@@ -17,6 +17,9 @@ The notes are organized by purpose:
 - [Implementation status](implementation-status.md) — what the current
   executable actually does, its controls, automated coverage, known
   limitations, and immediate engineering order.
+- [Native UI and dialog boundary](native-ui.md) — the isolated native-dialog
+  decision, current wgpu compatibility findings, and invariants for a future
+  graphical control surface.
 - [Native tablet input](tablet-input.md) — the implemented Atlas/XInput2 pen
   and eraser path, verified device ranges, normalized event contract,
   correctness coverage, hardware test checklist, and Wayland/Windows/macOS

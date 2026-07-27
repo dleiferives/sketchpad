@@ -60,6 +60,8 @@ prototype:
   to premultiplied-linear conversion and explicit rejection of unsupported
   color metadata;
 - interactive file-drop PNG import as one undoable layer command;
+- parented native PNG import and export dialogs through the Linux XDG Desktop
+  Portal backend;
 - mouse and Wacom Alt-contact visible-composite color sampling with correct
   linear-premultiplied unassociation;
 - an eight-entry session-local recent-color history: presets and completed
@@ -85,6 +87,7 @@ Controls:
 - wheel: zoom at cursor;
 - Home: center the canvas and fit it entirely in the viewport;
 - drop a PNG file on the window: import it as a new active layer;
+- Control/Command-I: choose a PNG to import as a new active layer;
 - Alt-left drag or Alt-Wacom contact: sample visible color without painting;
 - `[` / `]`: decrease/increase the hovered tool size;
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
@@ -99,10 +102,9 @@ Controls:
 - Control/Command-Shift-N: create and activate a raster layer;
 - Control/Command-Shift-D: duplicate the active layer;
 - Control/Command-Shift-H: toggle active-layer visibility;
-- Control/Command-Shift-E: export the full visible composite to
-  `~/Pictures/sketchpad-export.png`;
-- Control/Command-Alt-Shift-E: export exact visible content bounds to
-  `~/Pictures/sketchpad-export-cropped.png`;
+- Control/Command-Shift-E: choose where to export the full visible composite;
+- Control/Command-Alt-Shift-E: choose where to export exact visible content
+  bounds;
 - Control/Command-Shift-Delete: delete the active layer when it is not the
   document's last layer;
 - Page Up / Page Down: select the layer above/below;
@@ -245,6 +247,14 @@ on normal exit or interruption. Parallel commands remain valid only when they
 target different panes. This preserves the single-writer invariant of an
 interactive terminal and prevents a verification harness failure from being
 mistaken for a project failure.
+
+Later on 2026-07-27, a transient missing-pane lookup exposed a second runner
+failure: the process-wide exit trap ran after the command function's local
+variables had gone out of scope, and strict unset-variable handling replaced
+the useful missing-pane error with `screen_file: unbound variable`. Cleanup now
+treats an out-of-scope or never-created capture path as empty while still
+releasing the pane lock. A forced nonexistent-tab invocation verifies the
+original error is reported without the cleanup cascade.
 
 ### PNG codec benchmark and oracle
 

@@ -1081,13 +1081,12 @@ impl App {
         }
     }
 
-    fn export_png(&self, region: ExportRegion) {
+    fn export_png_to(&self, path: &Path, region: ExportRegion) {
         if self.active_stroke.is_some() {
             return;
         }
-        let path = export_path_for_region(&self.export_path, region);
         let started = Instant::now();
-        match image_io::export_png_file_atomic(&path, self.document.composite(), region) {
+        match image_io::export_png_file_atomic(path, self.document.composite(), region) {
             Ok(summary) => log::info!(
                 "PNG exported: path={path:?} region={region:?} dimensions={}x{} pixels={} bytes={} elapsed_ms={}",
                 summary.width,
@@ -1097,6 +1096,43 @@ impl App {
                 started.elapsed().as_millis()
             ),
             Err(error) => log::error!("PNG export failed: path={path:?}: {error}"),
+        }
+    }
+
+    fn choose_png_import(&mut self) {
+        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
+            return;
+        }
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Import PNG as Layer")
+            .add_filter("PNG image", &["png"]);
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.import_png(&path);
+        }
+    }
+
+    fn choose_png_export(&self, region: ExportRegion) {
+        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
+            return;
+        }
+        let suggested = export_path_for_region(&self.export_path, region);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Export Visible Composite as PNG")
+            .add_filter("PNG image", &["png"]);
+        if let Some(parent) = suggested.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(file_name) = suggested.file_name() {
+            dialog = dialog.set_file_name(file_name.to_string_lossy());
+        }
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        if let Some(path) = dialog.save_file() {
+            self.export_png_to(&ensure_png_extension(path), region);
         }
     }
 
@@ -1787,6 +1823,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     PhysicalKey::Code(KeyCode::KeyY) if command => self.redo(),
                     PhysicalKey::Code(KeyCode::KeyS) if command => self.save_checkpoint(),
                     PhysicalKey::Code(KeyCode::KeyO) if command => self.load_checkpoint(),
+                    PhysicalKey::Code(KeyCode::KeyI) if command => self.choose_png_import(),
                     PhysicalKey::Code(KeyCode::KeyN) if command && self.modifiers.shift_key() => {
                         self.create_layer()
                     }
@@ -1799,10 +1836,10 @@ impl ApplicationHandler<TabletEvent> for App {
                     PhysicalKey::Code(KeyCode::KeyE)
                         if command && self.modifiers.shift_key() && self.modifiers.alt_key() =>
                     {
-                        self.export_png(ExportRegion::ContentBounds)
+                        self.choose_png_export(ExportRegion::ContentBounds)
                     }
                     PhysicalKey::Code(KeyCode::KeyE) if command && self.modifiers.shift_key() => {
-                        self.export_png(ExportRegion::FullCanvas)
+                        self.choose_png_export(ExportRegion::FullCanvas)
                     }
                     PhysicalKey::Code(KeyCode::Delete) if command && self.modifiers.shift_key() => {
                         self.delete_active_layer()
@@ -2160,6 +2197,16 @@ fn export_path_for_region(path: &Path, region: ExportRegion) -> PathBuf {
     path.with_file_name(file_name)
 }
 
+fn ensure_png_extension(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
+    {
+        path.as_mut_os_string().push(".png");
+    }
+    path
+}
+
 fn mixing_brush_from_paint(paint: HardRoundBrush) -> MixingBrushV1 {
     let color = paint.color();
     let recipe = MixingRecipeV1::new(
@@ -2300,6 +2347,22 @@ mod tests {
         assert_eq!(
             export_path_for_region(full, ExportRegion::ContentBounds),
             PathBuf::from("/tmp/drawing.final-cropped.png")
+        );
+    }
+
+    #[test]
+    fn dialog_export_path_has_one_png_extension() {
+        assert_eq!(
+            ensure_png_extension(PathBuf::from("/tmp/drawing")),
+            PathBuf::from("/tmp/drawing.png")
+        );
+        assert_eq!(
+            ensure_png_extension(PathBuf::from("/tmp/drawing.PNG")),
+            PathBuf::from("/tmp/drawing.PNG")
+        );
+        assert_eq!(
+            ensure_png_extension(PathBuf::from("/tmp/drawing.jpg")),
+            PathBuf::from("/tmp/drawing.jpg.png")
         );
     }
 

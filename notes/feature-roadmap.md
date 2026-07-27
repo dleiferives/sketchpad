@@ -135,7 +135,8 @@ bounded to brush damage, and does not implicitly mix hidden layers.
   and keyboard traversal.
 - [ ] Minimal brush/preset selector.
 - [ ] Layer panel.
-- [ ] Open/import/export dialogs.
+- [x] Native PNG import/export dialogs.
+- [ ] Native document open dialog.
 - [ ] Canvas rotation controls.
 - [x] Reset-to-fit view control.
 - [ ] Save As and explicit native document paths.
