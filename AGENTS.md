@@ -11,7 +11,8 @@ lower-power CPU/integrated-GPU test machine.
   the checkout to `<host>:~/projs/sketchpad`, discovers the terminal pane in
   the matching tab of the local `dylan` Zellij session, sends the command
   through its interactive SSH shell, captures output, and returns the remote
-  exit status.
+  exit status. Commands targeting the same pane are serialized locally; do not
+  bypass that lock by pasting a second automated command into the pane.
 - Use `scripts/{atlas,apollo} screen`, `interrupt`, `sync`, and `status` for
   the corresponding common operations.
 - Remote-generated files belong beneath `.artifacts/`, which source sync

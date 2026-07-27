@@ -7,6 +7,11 @@ zellij_session="${SKETCHPAD_ZELLIJ_SESSION:-dylan}"
 zellij_tab="${SKETCHPAD_ZELLIJ_TAB:-$remote_host}"
 remote_dir="${SKETCHPAD_REMOTE_DIR:-projs/sketchpad}"
 cargo_build_jobs="${SKETCHPAD_CARGO_BUILD_JOBS:-}"
+lock_key="$(
+  printf '%s-%s' "$zellij_session" "$zellij_tab" |
+    tr -cs '[:alnum:]_.-' '_'
+)"
+remote_pane_lock="${TMPDIR:-/tmp}/sketchpad-zellij-$(id -u)-${lock_key}.lock"
 
 if [[ -n "$cargo_build_jobs" && ! "$cargo_build_jobs" =~ ^[1-9][0-9]*$ ]]; then
   echo "SKETCHPAD_CARGO_BUILD_JOBS must be a positive integer." >&2
@@ -46,16 +51,48 @@ find_remote_pane() {
   printf '%s\n' "$pane"
 }
 
+acquire_remote_pane_lock() {
+  local owner
+  while ! mkdir "$remote_pane_lock" 2>/dev/null; do
+    if [[ -f "$remote_pane_lock/pid" ]]; then
+      owner="$(<"$remote_pane_lock/pid")"
+      if [[ "$owner" =~ ^[1-9][0-9]*$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+        rm -f "$remote_pane_lock/pid"
+        rmdir "$remote_pane_lock" 2>/dev/null || true
+        continue
+      fi
+    fi
+    sleep 0.1
+  done
+  printf '%d\n' "$$" >"$remote_pane_lock/pid"
+}
+
+release_remote_pane_lock() {
+  rm -f "$remote_pane_lock/pid"
+  rmdir "$remote_pane_lock" 2>/dev/null || true
+}
+
 run_remote_command() {
   if [[ "$#" -eq 0 ]]; then
     usage
   fi
 
-  SKETCHPAD_REMOTE_HOST="$remote_host" "$script_dir/sync-to-remote"
-
   local pane marker begin_marker end_marker remote_dir_quoted
   local remote_command argument argument_quoted payload cargo_jobs_export
-  local screen_file end_line status
+  local screen_file="" end_line status
+
+  acquire_remote_pane_lock
+
+  cleanup() {
+    if [[ -n "$screen_file" ]]; then
+      rm -f "$screen_file"
+    fi
+    release_remote_pane_lock
+  }
+
+  trap cleanup EXIT
+
+  SKETCHPAD_REMOTE_HOST="$remote_host" "$script_dir/sync-to-remote"
 
   pane="$(find_remote_pane)"
   marker="__SKETCHPAD_${remote_host}_${$}_${RANDOM}_${SECONDS}__"
@@ -76,17 +113,12 @@ run_remote_command() {
   payload="if [ -f \"\$HOME/.cargo/env\" ]; then . \"\$HOME/.cargo/env\"; fi; ${cargo_jobs_export}printf '%s\\n' '$begin_marker'; cd \"\$HOME\"/$remote_dir_quoted && $remote_command; __sketchpad_status=\$?; printf '%s:%d\\n' '$end_marker' \"\$__sketchpad_status\""
   screen_file="$(mktemp -t "sketchpad-${remote_host}-screen.XXXXXX")"
 
-  cleanup() {
-    rm -f "$screen_file"
-  }
-
   interrupt_remote() {
     zellij --session "$zellij_session" action send-keys \
       --pane-id "$pane" "ctrl c" || true
     exit 130
   }
 
-  trap cleanup EXIT
   trap interrupt_remote INT TERM
 
   zellij --session "$zellij_session" action paste \

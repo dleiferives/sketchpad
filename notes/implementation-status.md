@@ -176,6 +176,7 @@ The current test suite covers:
 - final stroke caps;
 - one undo entry across many input updates;
 - independence from collinear event batching;
+- exact shared round-dab coverage and distance-resampling behavior;
 - camera mapping and view bounds.
 
 ### CPU brush replay
@@ -189,6 +190,37 @@ cargo run --release --bin brush_bench -- --runs 12
 
 The current provisional Atlas result is recorded in
 [performance-laboratory.md](performance-laboratory.md).
+
+### Shared brush-kernel equivalence
+
+On 2026-07-27, the hard-round brush's round-dab coverage and distance
+resampling were extracted into shared internal primitives for the mixing-brush
+work. An Apollo release replay used the canonical Wacom trace, the empty scene,
+the 1× scheduled rate, and one stress/corpus stroke. Before and after the
+refactor it produced the exact same raster checksum (`5aa3f3b00ec18bec`), 450
+dabs, 45 damaged tiles, 44 resident tiles, 621 write lookups/bulk edits, and
+325,985 conservative pixels.
+
+This is an exact behavioral oracle rather than a timing claim: the extraction
+changed code ownership without changing coverage, spacing, damage, allocation,
+or final pixels. The shared primitives are therefore a safe geometric basis
+for comparing the hard-round control with the forthcoming mixing brush.
+
+### Serialized Zellij remote execution
+
+On 2026-07-27, launching the all-target test and Clippy commands concurrently
+through `scripts/apollo run` exposed a transport bug. Both helpers pasted into
+the same interactive SSH pane before either command completed. Bash received
+the concatenated payloads, reported a syntax error near `then`, and neither
+helper could observe its unique end marker, so both waited indefinitely.
+
+The runner now takes a process-owned local lock keyed by Zellij session and tab
+across synchronization, paste, capture, and exit-status collection. Concurrent
+callers serialize, dead owner PIDs are reclaimed, and cleanup releases the lock
+on normal exit or interruption. Parallel commands remain valid only when they
+target different panes. This preserves the single-writer invariant of an
+interactive terminal and prevents a verification harness failure from being
+mistaken for a project failure.
 
 ### PNG codec benchmark and oracle
 
