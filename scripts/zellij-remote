@@ -84,7 +84,7 @@ run_remote_command() {
   acquire_remote_pane_lock
 
   cleanup() {
-    if [[ -n "$screen_file" ]]; then
+    if [[ -n "${screen_file:-}" ]]; then
       rm -f "$screen_file"
     fi
     release_remote_pane_lock
