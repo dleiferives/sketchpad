@@ -1,7 +1,9 @@
 use crate::raster::{
     Damage, DerivedContentChange, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord,
 };
-use std::{collections::HashSet, error::Error, fmt};
+use std::{collections::HashSet, error::Error, fmt, mem};
+
+pub const MAX_DOCUMENT_HISTORY_ENTRIES: usize = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LayerId(u64);
@@ -63,6 +65,42 @@ pub struct Document {
     next_layer_id: u64,
     composite: RasterLayer,
     composite_stats: CompositeStats,
+    history_undo: Vec<DocumentEdit>,
+    history_redo: Vec<DocumentEdit>,
+}
+
+enum DocumentEdit {
+    Raster {
+        layer: LayerId,
+    },
+    LayerPresence {
+        layer: LayerId,
+        index: usize,
+        before_active: LayerId,
+        after_active: LayerId,
+        present_after: bool,
+        stored: Option<Box<RasterDocumentLayer>>,
+    },
+    Rename {
+        layer: LayerId,
+        before: String,
+        after: String,
+    },
+    Visibility {
+        layer: LayerId,
+        before: bool,
+        after: bool,
+    },
+    Opacity {
+        layer: LayerId,
+        before: f32,
+        after: f32,
+    },
+    Move {
+        layer: LayerId,
+        before: usize,
+        after: usize,
+    },
 }
 
 pub(crate) struct DocumentLayerParts {
@@ -91,6 +129,8 @@ impl Document {
             next_layer_id: 2,
             composite: RasterLayer::new(width, height, tile_size)?,
             composite_stats: CompositeStats::default(),
+            history_undo: Vec::new(),
+            history_redo: Vec::new(),
         })
     }
 
@@ -119,6 +159,8 @@ impl Document {
             next_layer_id: 2,
             composite,
             composite_stats: CompositeStats::default(),
+            history_undo: Vec::new(),
+            history_redo: Vec::new(),
         })
     }
 
@@ -173,6 +215,8 @@ impl Document {
             next_layer_id,
             composite: RasterLayer::new(width, height, tile_size)?,
             composite_stats: CompositeStats::default(),
+            history_undo: Vec::new(),
+            history_redo: Vec::new(),
         };
         document.recompose_all()?;
         document.reset_composite_stats();
@@ -229,6 +273,14 @@ impl Document {
         self.composite_stats = CompositeStats::default();
     }
 
+    pub fn undo_depth(&self) -> usize {
+        self.history_undo.len()
+    }
+
+    pub fn redo_depth(&self) -> usize {
+        self.history_redo.len()
+    }
+
     pub fn set_active_layer(&mut self, id: LayerId) -> Result<(), DocumentError> {
         self.require_layer(id)?;
         self.active_layer = id;
@@ -236,24 +288,35 @@ impl Document {
     }
 
     pub fn create_layer(&mut self, name: impl Into<String>) -> Result<LayerId, DocumentError> {
+        let name = validated_name(name.into())?;
+        let raster = RasterLayer::new(self.width, self.height, self.tile_size)?;
+        let before_active = self.active_layer;
         let id = self.allocate_layer_id();
         let layer = RasterDocumentLayer {
             id,
-            name: validated_name(name.into())?,
+            name,
             visible: true,
             opacity: 1.0,
-            raster: RasterLayer::new(self.width, self.height, self.tile_size)?,
+            raster,
         };
         let insertion = self.active_layer_index() + 1;
         self.layers.insert(insertion, layer);
         self.active_layer = id;
+        self.record_edit(DocumentEdit::LayerPresence {
+            layer: id,
+            index: insertion,
+            before_active,
+            after_active: id,
+            present_after: true,
+            stored: None,
+        });
         Ok(id)
     }
 
     pub fn insert_raster_layer(
         &mut self,
         name: impl Into<String>,
-        raster: RasterLayer,
+        mut raster: RasterLayer,
     ) -> Result<(LayerId, Damage), DocumentError> {
         if raster.width() != self.width
             || raster.height() != self.height
@@ -262,7 +325,9 @@ impl Document {
             return Err(DocumentError::ImportedLayerGeometryMismatch);
         }
         let name = validated_name(name.into())?;
+        raster.clear_history();
         let affected: Vec<_> = raster.allocated_tile_coords().collect();
+        let before_active = self.active_layer;
         let id = self.allocate_layer_id();
         let layer = RasterDocumentLayer {
             id,
@@ -276,25 +341,47 @@ impl Document {
         self.active_layer = id;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::LayerPresence {
+            layer: id,
+            index: insertion,
+            before_active,
+            after_active: id,
+            present_after: true,
+            stored: None,
+        });
         Ok((id, damage))
     }
 
     pub fn duplicate_layer(&mut self, id: LayerId) -> Result<(LayerId, Damage), DocumentError> {
         let source_index = self.require_layer(id)?;
-        let duplicate_id = self.allocate_layer_id();
         let source = &self.layers[source_index];
+        let name = format!("{} copy", source.name);
+        let visible = source.visible;
+        let opacity = source.opacity;
+        let raster = clone_raster(&source.raster)?;
+        let affected = coords_for_layer(source);
+        let before_active = self.active_layer;
+        let duplicate_id = self.allocate_layer_id();
         let duplicate = RasterDocumentLayer {
             id: duplicate_id,
-            name: format!("{} copy", source.name),
-            visible: source.visible,
-            opacity: source.opacity,
-            raster: clone_raster(&source.raster)?,
+            name,
+            visible,
+            opacity,
+            raster,
         };
-        let affected = coords_for_layer(source);
-        self.layers.insert(source_index + 1, duplicate);
+        let insertion = source_index + 1;
+        self.layers.insert(insertion, duplicate);
         self.active_layer = duplicate_id;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::LayerPresence {
+            layer: duplicate_id,
+            index: insertion,
+            before_active,
+            after_active: duplicate_id,
+            present_after: true,
+            stored: None,
+        });
         Ok((duplicate_id, damage))
     }
 
@@ -304,12 +391,22 @@ impl Document {
         }
         let index = self.require_layer(id)?;
         let affected = coords_for_layer(&self.layers[index]);
-        self.layers.remove(index);
+        let before_active = self.active_layer;
+        let removed = self.layers.remove(index);
         if self.active_layer == id {
             self.active_layer = self.layers[index.min(self.layers.len() - 1)].id;
         }
+        let after_active = self.active_layer;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::LayerPresence {
+            layer: id,
+            index,
+            before_active,
+            after_active,
+            present_after: false,
+            stored: Some(Box::new(removed)),
+        });
         Ok(damage)
     }
 
@@ -319,7 +416,16 @@ impl Document {
         name: impl Into<String>,
     ) -> Result<(), DocumentError> {
         let index = self.require_layer(id)?;
-        self.layers[index].name = validated_name(name.into())?;
+        let after = validated_name(name.into())?;
+        if self.layers[index].name == after {
+            return Ok(());
+        }
+        let before = mem::replace(&mut self.layers[index].name, after.clone());
+        self.record_edit(DocumentEdit::Rename {
+            layer: id,
+            before,
+            after,
+        });
         Ok(())
     }
 
@@ -333,9 +439,15 @@ impl Document {
             return Ok(Damage::default());
         }
         let affected = coords_for_layer(&self.layers[index]);
+        let before = self.layers[index].visible;
         self.layers[index].visible = visible;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::Visibility {
+            layer: id,
+            before,
+            after: visible,
+        });
         Ok(damage)
     }
 
@@ -352,9 +464,15 @@ impl Document {
             return Ok(Damage::default());
         }
         let affected = coords_for_layer(&self.layers[index]);
+        let before = self.layers[index].opacity;
         self.layers[index].opacity = opacity;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::Opacity {
+            layer: id,
+            before,
+            after: opacity,
+        });
         Ok(damage)
     }
 
@@ -375,7 +493,67 @@ impl Document {
         self.layers.insert(destination_index, layer);
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
+        self.record_edit(DocumentEdit::Move {
+            layer: id,
+            before: source_index,
+            after: destination_index,
+        });
         Ok(damage)
+    }
+
+    pub fn record_active_raster_edit(&mut self) -> Result<(), DocumentError> {
+        let layer = self.active_layer;
+        let index = self.require_layer(layer)?;
+        if self.layers[index].raster.active_gesture_id().is_some() {
+            return Err(DocumentError::RasterEditStillActive(layer));
+        }
+        let tracked = self
+            .history_undo
+            .iter()
+            .filter(|edit| matches!(edit, DocumentEdit::Raster { layer: edit_layer } if *edit_layer == layer))
+            .count();
+        let actual = self.layers[index].raster.undo_depth();
+        if actual != tracked + 1 {
+            return Err(DocumentError::RasterHistoryMismatch {
+                layer,
+                tracked,
+                actual,
+            });
+        }
+        self.record_edit(DocumentEdit::Raster { layer });
+        Ok(())
+    }
+
+    pub fn undo(&mut self) -> Result<Option<Damage>, DocumentError> {
+        let Some(mut edit) = self.history_undo.pop() else {
+            return Ok(None);
+        };
+        match self.apply_edit(&mut edit, false) {
+            Ok(damage) => {
+                self.history_redo.push(edit);
+                Ok(Some(damage))
+            }
+            Err(error) => {
+                self.history_undo.push(edit);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn redo(&mut self) -> Result<Option<Damage>, DocumentError> {
+        let Some(mut edit) = self.history_redo.pop() else {
+            return Ok(None);
+        };
+        match self.apply_edit(&mut edit, true) {
+            Ok(damage) => {
+                self.history_undo.push(edit);
+                Ok(Some(damage))
+            }
+            Err(error) => {
+                self.history_redo.push(edit);
+                Err(error)
+            }
+        }
     }
 
     pub fn recompose_all(&mut self) -> Result<Damage, DocumentError> {
@@ -462,6 +640,166 @@ impl Document {
         Ok(recomposed)
     }
 
+    fn record_edit(&mut self, edit: DocumentEdit) {
+        self.clear_document_redo();
+        self.history_undo.push(edit);
+        while self.history_undo.len() > MAX_DOCUMENT_HISTORY_ENTRIES {
+            let evicted = self.history_undo.remove(0);
+            if let DocumentEdit::Raster { layer } = evicted {
+                let raster = self
+                    .raster_mut_in_current_or_history(layer)
+                    .expect("a retained raster edit must retain its stable layer");
+                assert!(
+                    raster.discard_oldest_undo(),
+                    "a retained raster edit must own one local memento"
+                );
+            }
+        }
+    }
+
+    fn clear_document_redo(&mut self) {
+        for layer in &mut self.layers {
+            layer.raster.clear_redo_history();
+        }
+        self.history_redo.clear();
+    }
+
+    fn apply_edit(
+        &mut self,
+        edit: &mut DocumentEdit,
+        apply_after: bool,
+    ) -> Result<Damage, DocumentError> {
+        match edit {
+            DocumentEdit::Raster { layer } => {
+                let index = self.require_layer(*layer)?;
+                let damage = if apply_after {
+                    self.layers[index].raster.redo()
+                } else {
+                    self.layers[index].raster.undo()
+                }
+                .ok_or(DocumentError::RasterHistoryMismatch {
+                    layer: *layer,
+                    tracked: 1,
+                    actual: 0,
+                })?;
+                self.recompose_damage(&damage)
+            }
+            DocumentEdit::LayerPresence {
+                layer,
+                index,
+                before_active,
+                after_active,
+                present_after,
+                stored,
+            } => {
+                let should_be_present = if apply_after {
+                    *present_after
+                } else {
+                    !*present_after
+                };
+                let target_active = if apply_after {
+                    *after_active
+                } else {
+                    *before_active
+                };
+                let affected = if should_be_present {
+                    let restored = stored
+                        .take()
+                        .expect("an absent history layer must retain its raster");
+                    if restored.id != *layer || *index > self.layers.len() {
+                        return Err(DocumentError::HistoryInvariant);
+                    }
+                    let affected = coords_for_layer(&restored);
+                    self.layers.insert(*index, *restored);
+                    affected
+                } else {
+                    let current = self.require_layer(*layer)?;
+                    if current != *index {
+                        return Err(DocumentError::HistoryInvariant);
+                    }
+                    let removed = self.layers.remove(current);
+                    let affected = coords_for_layer(&removed);
+                    *stored = Some(Box::new(removed));
+                    affected
+                };
+                self.require_layer(target_active)?;
+                self.active_layer = target_active;
+                let damage = self.damage_for_coords(affected);
+                self.recompose_damage(&damage)
+            }
+            DocumentEdit::Rename {
+                layer,
+                before,
+                after,
+            } => {
+                let index = self.require_layer(*layer)?;
+                self.layers[index].name = if apply_after {
+                    after.clone()
+                } else {
+                    before.clone()
+                };
+                Ok(Damage::default())
+            }
+            DocumentEdit::Visibility {
+                layer,
+                before,
+                after,
+            } => {
+                let index = self.require_layer(*layer)?;
+                let affected = coords_for_layer(&self.layers[index]);
+                self.layers[index].visible = if apply_after { *after } else { *before };
+                let damage = self.damage_for_coords(affected);
+                self.recompose_damage(&damage)
+            }
+            DocumentEdit::Opacity {
+                layer,
+                before,
+                after,
+            } => {
+                let index = self.require_layer(*layer)?;
+                let affected = coords_for_layer(&self.layers[index]);
+                self.layers[index].opacity = if apply_after { *after } else { *before };
+                let damage = self.damage_for_coords(affected);
+                self.recompose_damage(&damage)
+            }
+            DocumentEdit::Move {
+                layer,
+                before,
+                after,
+            } => {
+                let source = self.require_layer(*layer)?;
+                let target = if apply_after { *after } else { *before };
+                if target >= self.layers.len() {
+                    return Err(DocumentError::HistoryInvariant);
+                }
+                let affected = self.all_content_coords();
+                let layer = self.layers.remove(source);
+                self.layers.insert(target, layer);
+                let damage = self.damage_for_coords(affected);
+                self.recompose_damage(&damage)
+            }
+        }
+    }
+
+    fn raster_mut_in_current_or_history(&mut self, id: LayerId) -> Option<&mut RasterLayer> {
+        if let Some(index) = self.layer_index(id) {
+            return Some(&mut self.layers[index].raster);
+        }
+        for edit in &mut self.history_undo {
+            if let DocumentEdit::LayerPresence {
+                layer,
+                stored: Some(stored),
+                ..
+            } = edit
+            {
+                if *layer == id {
+                    return Some(&mut stored.raster);
+                }
+            }
+        }
+        None
+    }
+
     fn allocate_layer_id(&mut self) -> LayerId {
         let id = LayerId(self.next_layer_id);
         self.next_layer_id = self.next_layer_id.wrapping_add(1).max(1);
@@ -543,6 +881,13 @@ pub enum DocumentError {
     LayerIdExhausted,
     LayerGeometryMismatch(LayerId),
     ImportedLayerGeometryMismatch,
+    RasterEditStillActive(LayerId),
+    RasterHistoryMismatch {
+        layer: LayerId,
+        tracked: usize,
+        actual: usize,
+    },
+    HistoryInvariant,
 }
 
 impl fmt::Display for DocumentError {
@@ -570,6 +915,23 @@ impl fmt::Display for DocumentError {
                     "imported raster has incompatible document geometry"
                 )
             }
+            Self::RasterEditStillActive(layer) => {
+                write!(
+                    formatter,
+                    "layer {} raster edit is still active",
+                    layer.get()
+                )
+            }
+            Self::RasterHistoryMismatch {
+                layer,
+                tracked,
+                actual,
+            } => write!(
+                formatter,
+                "layer {} has {actual} local undo entries but {tracked} tracked document edits",
+                layer.get()
+            ),
+            Self::HistoryInvariant => write!(formatter, "document history invariant failed"),
         }
     }
 }
@@ -602,6 +964,12 @@ mod tests {
         gesture.set_pixel(x, y, value).unwrap();
         let damage = gesture.commit().unwrap().unwrap();
         document.recompose_damage(&damage).unwrap()
+    }
+
+    fn paint_recorded(document: &mut Document, x: u32, y: u32, value: LinearRgba) -> Damage {
+        let damage = paint_pixel(document, x, y, value);
+        document.record_active_raster_edit().unwrap();
+        damage
     }
 
     #[test]
@@ -762,5 +1130,109 @@ mod tests {
             document.composite().pixel(9, 7),
             document.active_layer().pixel(9, 7)
         );
+    }
+
+    #[test]
+    fn one_history_orders_raster_and_structural_edits() {
+        let mut document = Document::new(16, 16, 8).unwrap();
+        let bottom = document.active_layer_id();
+        let red = color(1.0, 0.0, 0.0, 1.0);
+        let blue = color(0.0, 0.0, 1.0, 1.0);
+        paint_recorded(&mut document, 3, 4, red);
+        let top = document.create_layer("Top").unwrap();
+        paint_recorded(&mut document, 3, 4, blue);
+        document.set_layer_visibility(bottom, false).unwrap();
+        assert_eq!(document.undo_depth(), 4);
+        assert_eq!(document.composite().pixel(3, 4), Some(blue));
+
+        document.undo().unwrap().unwrap();
+        assert!(document.layer(bottom).unwrap().visible());
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.active_layer_id(), top);
+        assert_eq!(
+            document.active_layer().pixel(3, 4),
+            Some(LinearRgba::TRANSPARENT)
+        );
+        assert_eq!(document.composite().pixel(3, 4), Some(red));
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.layers().len(), 1);
+        assert_eq!(document.active_layer_id(), bottom);
+        document.undo().unwrap().unwrap();
+        assert_eq!(
+            document.composite().pixel(3, 4),
+            Some(LinearRgba::TRANSPARENT)
+        );
+        assert!(document.undo().unwrap().is_none());
+
+        for _ in 0..4 {
+            document.redo().unwrap().unwrap();
+        }
+        assert_eq!(document.layers().len(), 2);
+        assert!(!document.layer(bottom).unwrap().visible());
+        assert_eq!(document.composite().pixel(3, 4), Some(blue));
+    }
+
+    #[test]
+    fn imported_layer_is_one_undoable_command_with_stable_identity() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let previous = document.active_layer_id();
+        let mut imported = RasterLayer::new(32, 32, 8).unwrap();
+        let gesture = imported.begin_gesture().unwrap();
+        imported
+            .set_pixel(gesture, 17, 9, color(0.2, 0.4, 0.6, 0.8))
+            .unwrap();
+        imported.commit_gesture(gesture).unwrap();
+
+        let (imported_id, _) = document.insert_raster_layer("Imported", imported).unwrap();
+        assert_eq!(document.undo_depth(), 1);
+        assert_eq!(document.active_layer().undo_depth(), 0);
+
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.layers().len(), 1);
+        assert_eq!(document.active_layer_id(), previous);
+        document.redo().unwrap().unwrap();
+        assert_eq!(document.active_layer_id(), imported_id);
+        assert_eq!(
+            document.active_layer().pixel(17, 9),
+            Some(color(0.2, 0.4, 0.6, 0.8))
+        );
+    }
+
+    #[test]
+    fn new_raster_edit_clears_document_wide_redo() {
+        let mut document = Document::new(16, 16, 8).unwrap();
+        let bottom = document.active_layer_id();
+        document.create_layer("Temporary").unwrap();
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.redo_depth(), 1);
+        assert_eq!(document.active_layer_id(), bottom);
+
+        paint_recorded(&mut document, 1, 1, color(1.0, 0.0, 0.0, 1.0));
+
+        assert_eq!(document.redo_depth(), 0);
+        assert!(document.redo().unwrap().is_none());
+        assert_eq!(document.layers().len(), 1);
+    }
+
+    #[test]
+    fn history_bound_evicts_the_matching_oldest_raster_mementos() {
+        let mut document = Document::new(8, 8, 8).unwrap();
+        let red = color(1.0, 0.0, 0.0, 1.0);
+        let blue = color(0.0, 0.0, 1.0, 1.0);
+        for index in 0..(MAX_DOCUMENT_HISTORY_ENTRIES + 4) {
+            let value = if index % 2 == 0 { red } else { blue };
+            paint_recorded(&mut document, 2, 2, value);
+        }
+
+        assert_eq!(document.undo_depth(), MAX_DOCUMENT_HISTORY_ENTRIES);
+        assert_eq!(
+            document.active_layer().undo_depth(),
+            MAX_DOCUMENT_HISTORY_ENTRIES
+        );
+        for _ in 0..MAX_DOCUMENT_HISTORY_ENTRIES {
+            document.undo().unwrap().unwrap();
+        }
+        assert_eq!(document.composite().pixel(2, 2), Some(blue));
+        assert!(document.undo().unwrap().is_none());
     }
 }

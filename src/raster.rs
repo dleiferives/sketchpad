@@ -946,6 +946,18 @@ impl RasterLayer {
         self.redo.clear();
     }
 
+    pub(crate) fn clear_redo_history(&mut self) {
+        self.redo.clear();
+    }
+
+    pub(crate) fn discard_oldest_undo(&mut self) -> bool {
+        if self.undo.is_empty() {
+            return false;
+        }
+        self.undo.remove(0);
+        true
+    }
+
     pub fn tile_bounds(&self, coord: TileCoord) -> Option<RectU32> {
         let [tiles_wide, tiles_high] = self.tile_grid_extent();
         if coord.x >= tiles_wide || coord.y >= tiles_high {
