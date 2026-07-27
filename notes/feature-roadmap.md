@@ -45,14 +45,14 @@ declared canvas or unrelated tiles.
 
 ### 2. Layer-aware native save and recovery
 
-- [ ] Version the native checkpoint/document container for multiple layers.
-- [ ] Preserve IDs, names, order, visibility, opacity, active layer, canvas
+- [x] Version the native checkpoint/document container for multiple layers.
+- [x] Preserve IDs, names, order, visibility, opacity, active layer, canvas
   geometry, and exact sparse `f32` pixels.
-- [ ] Reject corrupt, truncated, oversized, duplicate-ID, and incompatible
+- [x] Reject corrupt, truncated, oversized, duplicate-ID, and incompatible
   documents.
-- [ ] Keep atomic replacement and recovery behavior.
-- [ ] Decide migration behavior for the existing flat version-1 checkpoint.
-- [ ] Add multi-layer deterministic round-trip and failure-injection tests.
+- [x] Keep atomic replacement and recovery behavior.
+- [x] Migrate the existing flat version-1 checkpoint as one recovered layer.
+- [x] Add multi-layer deterministic round-trip and corruption tests.
 
 Acceptance: save/reopen never flattens editable layers and recovery either
 restores a valid whole document or leaves the prior file intact.

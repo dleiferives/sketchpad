@@ -1,4 +1,7 @@
-use crate::raster::{LinearRgba, RasterError, RasterLayer, TileCoord};
+use crate::{
+    document::{Document, DocumentError, DocumentLayerParts, LayerId},
+    raster::{LinearRgba, RasterError, RasterLayer, TileCoord},
+};
 use std::{
     collections::HashSet,
     env,
@@ -12,16 +15,21 @@ use std::{
 
 const MAGIC: [u8; 8] = *b"SKPRASTR";
 const VERSION: u32 = 1;
+const DOCUMENT_MAGIC: [u8; 8] = *b"SKPDOC02";
+const DOCUMENT_VERSION: u32 = 1;
 const FLAGS: u32 = 0;
 const HEADER_SIZE: usize = 32;
 const MAX_CANVAS_DIMENSION: u32 = 1_048_576;
 const MAX_TILE_SIZE: u32 = 1_024;
 const MAX_TILE_COUNT: u32 = 1_000_000;
+const MAX_LAYER_COUNT: u32 = 1_024;
+const MAX_LAYER_NAME_BYTES: usize = 4_096;
 const MAX_CHECKPOINT_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CheckpointSummary {
     pub encoded_bytes: u64,
+    pub layer_count: u32,
     pub tile_count: u32,
     pub stored_pixels: u64,
 }
@@ -31,6 +39,7 @@ pub enum CheckpointError {
     Io(io::Error),
     Invalid(String),
     Raster(RasterError),
+    Document(DocumentError),
 }
 
 impl CheckpointError {
@@ -43,8 +52,9 @@ impl fmt::Display for CheckpointError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => error.fmt(f),
-            Self::Invalid(message) => write!(f, "invalid raster checkpoint: {message}"),
+            Self::Invalid(message) => write!(f, "invalid Sketchpad checkpoint: {message}"),
             Self::Raster(error) => error.fmt(f),
+            Self::Document(error) => error.fmt(f),
         }
     }
 }
@@ -54,6 +64,7 @@ impl Error for CheckpointError {
         match self {
             Self::Io(error) => Some(error),
             Self::Raster(error) => Some(error),
+            Self::Document(error) => Some(error),
             Self::Invalid(_) => None,
         }
     }
@@ -68,6 +79,12 @@ impl From<io::Error> for CheckpointError {
 impl From<RasterError> for CheckpointError {
     fn from(value: RasterError) -> Self {
         Self::Raster(value)
+    }
+}
+
+impl From<DocumentError> for CheckpointError {
+    fn from(value: DocumentError) -> Self {
+        Self::Document(value)
     }
 }
 
@@ -181,10 +198,193 @@ pub fn encode(layer: &RasterLayer) -> Result<(Vec<u8>, CheckpointSummary), Check
         encoded,
         CheckpointSummary {
             encoded_bytes: encoded_len,
+            layer_count: 1,
             tile_count,
             stored_pixels,
         },
     ))
+}
+
+pub fn encode_document(
+    document: &Document,
+) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    validate_geometry(document.width(), document.height(), document.tile_size())?;
+    let layer_count = u32::try_from(document.layers().len())
+        .map_err(|_| CheckpointError::invalid("layer count does not fit u32"))?;
+    if layer_count == 0 || layer_count > MAX_LAYER_COUNT {
+        return Err(CheckpointError::invalid("layer count is outside limits"));
+    }
+
+    let mut payload = Vec::new();
+    push_u32(&mut payload, document.width());
+    push_u32(&mut payload, document.height());
+    push_u32(&mut payload, document.tile_size());
+    push_u32(&mut payload, layer_count);
+    push_u64(&mut payload, document.active_layer_id().get());
+
+    let mut tile_count = 0_u32;
+    let mut stored_pixels = 0_u64;
+    for layer in document.layers() {
+        let name = layer.name().as_bytes();
+        if name.is_empty() || name.len() > MAX_LAYER_NAME_BYTES {
+            return Err(CheckpointError::invalid(
+                "layer name length is outside limits",
+            ));
+        }
+        let (encoded_raster, summary) = encode(layer.raster())?;
+        tile_count = tile_count
+            .checked_add(summary.tile_count)
+            .ok_or_else(|| CheckpointError::invalid("document tile count overflow"))?;
+        if tile_count > MAX_TILE_COUNT {
+            return Err(CheckpointError::invalid(
+                "document tile count exceeds limit",
+            ));
+        }
+        stored_pixels = stored_pixels
+            .checked_add(summary.stored_pixels)
+            .ok_or_else(|| CheckpointError::invalid("stored pixel count overflow"))?;
+
+        push_u64(&mut payload, layer.id().get());
+        push_u32(&mut payload, u32::from(layer.visible()));
+        push_u32(&mut payload, layer.opacity().to_bits());
+        push_u32(
+            &mut payload,
+            u32::try_from(name.len())
+                .map_err(|_| CheckpointError::invalid("layer name length does not fit u32"))?,
+        );
+        payload.extend_from_slice(name);
+        push_u64(
+            &mut payload,
+            u64::try_from(encoded_raster.len())
+                .map_err(|_| CheckpointError::invalid("layer payload length does not fit u64"))?,
+        );
+        payload.extend_from_slice(&encoded_raster);
+    }
+
+    let payload_len = u64::try_from(payload.len())
+        .map_err(|_| CheckpointError::invalid("payload length does not fit u64"))?;
+    let encoded_len = payload_len
+        .checked_add(HEADER_SIZE as u64)
+        .ok_or_else(|| CheckpointError::invalid("checkpoint length overflow"))?;
+    if encoded_len > MAX_CHECKPOINT_BYTES {
+        return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
+    }
+    let mut encoded = Vec::with_capacity(HEADER_SIZE + payload.len());
+    encoded.extend_from_slice(&DOCUMENT_MAGIC);
+    push_u32(&mut encoded, DOCUMENT_VERSION);
+    push_u32(&mut encoded, FLAGS);
+    push_u64(&mut encoded, payload_len);
+    push_u64(&mut encoded, checksum(&payload));
+    encoded.extend_from_slice(&payload);
+    Ok((
+        encoded,
+        CheckpointSummary {
+            encoded_bytes: encoded_len,
+            layer_count,
+            tile_count,
+            stored_pixels,
+        },
+    ))
+}
+
+pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
+    let encoded_len = u64::try_from(encoded.len())
+        .map_err(|_| CheckpointError::invalid("file length does not fit u64"))?;
+    if encoded_len > MAX_CHECKPOINT_BYTES {
+        return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
+    }
+
+    let mut header = Reader::new(encoded);
+    if header.take(DOCUMENT_MAGIC.len())? != DOCUMENT_MAGIC {
+        return Err(CheckpointError::invalid(
+            "document checkpoint magic does not match",
+        ));
+    }
+    if header.u32()? != DOCUMENT_VERSION {
+        return Err(CheckpointError::invalid(
+            "unsupported document checkpoint version",
+        ));
+    }
+    if header.u32()? != FLAGS {
+        return Err(CheckpointError::invalid(
+            "unsupported document feature flags",
+        ));
+    }
+    let payload_len = usize::try_from(header.u64()?)
+        .map_err(|_| CheckpointError::invalid("payload length does not fit usize"))?;
+    let expected_checksum = header.u64()?;
+    if payload_len != encoded.len().saturating_sub(HEADER_SIZE) {
+        return Err(CheckpointError::invalid(
+            "payload length does not match file",
+        ));
+    }
+    let payload = header.take(payload_len)?;
+    header.finish()?;
+    if checksum(payload) != expected_checksum {
+        return Err(CheckpointError::invalid("payload checksum does not match"));
+    }
+
+    let mut reader = Reader::new(payload);
+    let width = reader.u32()?;
+    let height = reader.u32()?;
+    let tile_size = reader.u32()?;
+    validate_geometry(width, height, tile_size)?;
+    let layer_count = reader.u32()?;
+    if layer_count == 0 || layer_count > MAX_LAYER_COUNT {
+        return Err(CheckpointError::invalid("layer count is outside limits"));
+    }
+    let active_layer = LayerId::from_raw(reader.u64()?);
+    let mut parts = Vec::with_capacity(layer_count as usize);
+    let mut total_tiles = 0_u32;
+
+    for _ in 0..layer_count {
+        let id = LayerId::from_raw(reader.u64()?);
+        let layer_flags = reader.u32()?;
+        if layer_flags & !1 != 0 {
+            return Err(CheckpointError::invalid("unsupported layer flags"));
+        }
+        let visible = layer_flags & 1 != 0;
+        let opacity = f32::from_bits(reader.u32()?);
+        let name_len = reader.u32()? as usize;
+        if name_len == 0 || name_len > MAX_LAYER_NAME_BYTES {
+            return Err(CheckpointError::invalid(
+                "layer name length is outside limits",
+            ));
+        }
+        let name = std::str::from_utf8(reader.take(name_len)?)
+            .map_err(|_| CheckpointError::invalid("layer name is not UTF-8"))?
+            .to_owned();
+        let raster_len = usize::try_from(reader.u64()?)
+            .map_err(|_| CheckpointError::invalid("layer payload length does not fit usize"))?;
+        let raster_bytes = reader.take(raster_len)?;
+        let raster = decode(raster_bytes)?;
+        total_tiles = total_tiles
+            .checked_add(
+                u32::try_from(raster.allocated_tile_count())
+                    .map_err(|_| CheckpointError::invalid("layer tile count does not fit u32"))?,
+            )
+            .ok_or_else(|| CheckpointError::invalid("document tile count overflow"))?;
+        if total_tiles > MAX_TILE_COUNT {
+            return Err(CheckpointError::invalid(
+                "document tile count exceeds limit",
+            ));
+        }
+        parts.push(DocumentLayerParts {
+            id,
+            name,
+            visible,
+            opacity,
+            raster,
+        });
+    }
+    reader.finish()?;
+    Ok(Document::from_layer_parts(
+        width,
+        height,
+        tile_size,
+        active_layer,
+        parts,
+    )?)
 }
 
 pub fn decode(encoded: &[u8]) -> Result<RasterLayer, CheckpointError> {
@@ -294,6 +494,20 @@ pub fn decode(encoded: &[u8]) -> Result<RasterLayer, CheckpointError> {
 
 pub fn save_atomic(path: &Path, layer: &RasterLayer) -> Result<CheckpointSummary, CheckpointError> {
     let (encoded, summary) = encode(layer)?;
+    write_atomic(path, &encoded)?;
+    Ok(summary)
+}
+
+pub fn save_document_atomic(
+    path: &Path,
+    document: &Document,
+) -> Result<CheckpointSummary, CheckpointError> {
+    let (encoded, summary) = encode_document(document)?;
+    write_atomic(path, &encoded)?;
+    Ok(summary)
+}
+
+fn write_atomic(path: &Path, encoded: &[u8]) -> Result<(), CheckpointError> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -335,10 +549,26 @@ pub fn save_atomic(path: &Path, layer: &RasterLayer) -> Result<CheckpointSummary
         let _ = fs::remove_file(&temporary_path);
     }
     write_result?;
-    Ok(summary)
+    Ok(())
 }
 
 pub fn load(path: &Path) -> Result<RasterLayer, CheckpointError> {
+    let encoded = read_checkpoint(path)?;
+    decode(&encoded)
+}
+
+pub fn load_document(path: &Path) -> Result<Document, CheckpointError> {
+    let encoded = read_checkpoint(path)?;
+    if encoded.starts_with(&DOCUMENT_MAGIC) {
+        decode_document(&encoded)
+    } else if encoded.starts_with(&MAGIC) {
+        Ok(Document::from_flattened(decode(&encoded)?, "Recovered")?)
+    } else {
+        Err(CheckpointError::invalid("checkpoint magic does not match"))
+    }
+}
+
+fn read_checkpoint(path: &Path) -> Result<Vec<u8>, CheckpointError> {
     let file = File::open(path)?;
     let declared_length = file.metadata()?.len();
     if declared_length > MAX_CHECKPOINT_BYTES {
@@ -352,7 +582,7 @@ pub fn load(path: &Path) -> Result<RasterLayer, CheckpointError> {
     if encoded.len() as u64 > MAX_CHECKPOINT_BYTES {
         return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
     }
-    decode(&encoded)
+    Ok(encoded)
 }
 
 fn validate_geometry(width: u32, height: u32, tile_size: u32) -> Result<(), CheckpointError> {
@@ -510,6 +740,33 @@ mod tests {
         layer
     }
 
+    fn sample_document() -> Document {
+        let mut document = Document::from_flattened(sample_layer(), "Paint").unwrap();
+        let paint = document.active_layer_id();
+        let highlights = document.create_layer("Highlights").unwrap();
+        {
+            let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+            gesture
+                .set_pixel(42, 43, LinearRgba::from_straight(0.9, 0.8, 0.2, 0.4))
+                .unwrap();
+            let damage = gesture.commit().unwrap().unwrap();
+            document.recompose_damage(&damage).unwrap();
+        }
+        document.set_layer_opacity(highlights, 0.625).unwrap();
+        let hidden = document.create_layer("Reference").unwrap();
+        {
+            let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+            gesture
+                .set_pixel(7, 8, LinearRgba::from_straight(0.1, 0.9, 0.7, 1.0))
+                .unwrap();
+            let damage = gesture.commit().unwrap().unwrap();
+            document.recompose_damage(&damage).unwrap();
+        }
+        document.set_layer_visibility(hidden, false).unwrap();
+        document.set_active_layer(paint).unwrap();
+        document
+    }
+
     #[test]
     fn sparse_checkpoint_round_trip_is_exact_and_deterministic() {
         let layer = sample_layer();
@@ -572,6 +829,109 @@ mod tests {
         save_atomic(&path, &layer).unwrap();
         let restored = load(&path).unwrap();
         assert_eq!(restored.allocated_tile_count(), 3);
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn layered_document_round_trip_is_exact_and_deterministic() {
+        let document = sample_document();
+        let (first, summary) = encode_document(&document).unwrap();
+        let (second, _) = encode_document(&document).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(summary.layer_count, 3);
+        assert_eq!(summary.tile_count, 5);
+        assert_eq!(summary.stored_pixels, 6);
+
+        let restored = decode_document(&first).unwrap();
+        assert_eq!(restored.width(), document.width());
+        assert_eq!(restored.height(), document.height());
+        assert_eq!(restored.tile_size(), document.tile_size());
+        assert_eq!(
+            restored.active_layer_id().get(),
+            document.active_layer_id().get()
+        );
+        assert_eq!(restored.layers().len(), document.layers().len());
+        for (expected, actual) in document.layers().iter().zip(restored.layers()) {
+            assert_eq!(actual.id(), expected.id());
+            assert_eq!(actual.name(), expected.name());
+            assert_eq!(actual.visible(), expected.visible());
+            assert_eq!(actual.opacity(), expected.opacity());
+            assert_eq!(
+                actual.raster().allocated_tile_count(),
+                expected.raster().allocated_tile_count()
+            );
+            for coord in expected.raster().allocated_tile_coords() {
+                assert_eq!(
+                    actual.raster().tile(coord).unwrap().pixels(),
+                    expected.raster().tile(coord).unwrap().pixels()
+                );
+            }
+        }
+        for coord in document.composite().allocated_tile_coords() {
+            assert_eq!(
+                restored.composite().tile(coord).unwrap().pixels(),
+                document.composite().tile(coord).unwrap().pixels()
+            );
+        }
+        assert_eq!(restored.composite_stats(), Default::default());
+    }
+
+    #[test]
+    fn document_checksum_rejects_corruption() {
+        let (mut encoded, _) = encode_document(&sample_document()).unwrap();
+        *encoded.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(
+            decode_document(&encoded),
+            Err(CheckpointError::Invalid(message)) if message.contains("checksum")
+        ));
+    }
+
+    #[test]
+    fn document_loader_migrates_flat_checkpoint_without_changing_pixels() {
+        let unique = format!(
+            "sketchpad-document-migration-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        );
+        let directory = env::temp_dir().join(unique);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("recovery.skpr");
+        let layer = sample_layer();
+        save_atomic(&path, &layer).unwrap();
+
+        let restored = load_document(&path).unwrap();
+        assert_eq!(restored.layers().len(), 1);
+        assert_eq!(restored.layers()[0].name(), "Recovered");
+        for coord in layer.allocated_tile_coords() {
+            assert_eq!(
+                restored.active_layer().tile(coord).unwrap().pixels(),
+                layer.tile(coord).unwrap().pixels()
+            );
+        }
+
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn atomic_document_save_replaces_previous_document() {
+        let unique = format!(
+            "sketchpad-document-checkpoint-test-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        );
+        let directory = env::temp_dir().join(unique);
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("recovery.skpr");
+        let document = sample_document();
+        save_document_atomic(&path, &document).unwrap();
+        save_document_atomic(&path, &document).unwrap();
+
+        let restored = load_document(&path).unwrap();
+        assert_eq!(restored.layers().len(), 3);
+        assert_eq!(restored.active_layer_id(), document.active_layer_id());
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();

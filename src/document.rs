@@ -8,6 +8,10 @@ impl LayerId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 pub struct RasterDocumentLayer {
@@ -59,6 +63,14 @@ pub struct Document {
     composite_stats: CompositeStats,
 }
 
+pub(crate) struct DocumentLayerParts {
+    pub id: LayerId,
+    pub name: String,
+    pub visible: bool,
+    pub opacity: f32,
+    pub raster: RasterLayer,
+}
+
 impl Document {
     pub fn new(width: u32, height: u32, tile_size: u32) -> Result<Self, DocumentError> {
         let first_id = LayerId(1);
@@ -106,6 +118,63 @@ impl Document {
             composite,
             composite_stats: CompositeStats::default(),
         })
+    }
+
+    pub(crate) fn from_layer_parts(
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        active_layer: LayerId,
+        parts: Vec<DocumentLayerParts>,
+    ) -> Result<Self, DocumentError> {
+        if parts.is_empty() {
+            return Err(DocumentError::NoLayers);
+        }
+        let mut ids = HashSet::new();
+        let mut layers = Vec::with_capacity(parts.len());
+        let mut max_id = 0;
+        for part in parts {
+            if part.id.get() == 0 || !ids.insert(part.id) {
+                return Err(DocumentError::InvalidLayerId(part.id));
+            }
+            if part.raster.width() != width
+                || part.raster.height() != height
+                || part.raster.tile_size() != tile_size
+            {
+                return Err(DocumentError::LayerGeometryMismatch(part.id));
+            }
+            let name = validated_name(part.name)?;
+            if !part.opacity.is_finite() || !(0.0..=1.0).contains(&part.opacity) {
+                return Err(DocumentError::InvalidOpacity(part.opacity));
+            }
+            max_id = max_id.max(part.id.get());
+            layers.push(RasterDocumentLayer {
+                id: part.id,
+                name,
+                visible: part.visible,
+                opacity: part.opacity,
+                raster: part.raster,
+            });
+        }
+        if !ids.contains(&active_layer) {
+            return Err(DocumentError::LayerNotFound(active_layer));
+        }
+        let next_layer_id = max_id
+            .checked_add(1)
+            .ok_or(DocumentError::LayerIdExhausted)?;
+        let mut document = Self {
+            width,
+            height,
+            tile_size,
+            layers,
+            active_layer,
+            next_layer_id,
+            composite: RasterLayer::new(width, height, tile_size)?,
+            composite_stats: CompositeStats::default(),
+        };
+        document.recompose_all()?;
+        document.reset_composite_stats();
+        Ok(document)
     }
 
     pub const fn width(&self) -> u32 {
@@ -423,6 +492,10 @@ pub enum DocumentError {
     CannotDeleteLastLayer,
     InvalidOpacity(f32),
     EmptyLayerName,
+    NoLayers,
+    InvalidLayerId(LayerId),
+    LayerIdExhausted,
+    LayerGeometryMismatch(LayerId),
 }
 
 impl fmt::Display for DocumentError {
@@ -436,6 +509,14 @@ impl fmt::Display for DocumentError {
             Self::CannotDeleteLastLayer => write!(formatter, "the last layer cannot be deleted"),
             Self::InvalidOpacity(opacity) => write!(formatter, "invalid layer opacity {opacity}"),
             Self::EmptyLayerName => write!(formatter, "layer names cannot be empty"),
+            Self::NoLayers => write!(formatter, "a document must contain at least one layer"),
+            Self::InvalidLayerId(id) => {
+                write!(formatter, "invalid or duplicate layer ID {}", id.get())
+            }
+            Self::LayerIdExhausted => write!(formatter, "layer IDs are exhausted"),
+            Self::LayerGeometryMismatch(id) => {
+                write!(formatter, "layer {} has incompatible geometry", id.get())
+            }
         }
     }
 }
