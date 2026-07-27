@@ -89,6 +89,8 @@ delete layers without corrupting active strokes or undo state.
 - [x] Make import one semantic undoable command.
 - [x] Add tiny golden fixtures covering opaque, translucent, grayscale, and
   malformed images.
+- [x] Accept native window file-drop import through the same bounded codec and
+  one-command document insertion.
 
 Acceptance: known input pixels produce the declared working values and a
 failed import leaves the document unchanged.

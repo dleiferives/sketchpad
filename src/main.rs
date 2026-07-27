@@ -1026,6 +1026,47 @@ impl App {
         }
     }
 
+    fn import_png(&mut self, path: &Path) {
+        if self.active_stroke.is_some() {
+            log::warn!("cannot import PNG during an active stroke: {path:?}");
+            return;
+        }
+        let started = Instant::now();
+        let imported = match image_io::import_png_file(
+            path,
+            self.document.width(),
+            self.document.height(),
+            self.document.tile_size(),
+        ) {
+            Ok(imported) => imported,
+            Err(error) => {
+                log::error!("PNG import failed: path={path:?}: {error}");
+                return;
+            }
+        };
+        let summary = imported.summary;
+        let name = import_layer_name(path);
+        match self.document.insert_raster_layer(name, imported.raster) {
+            Ok((layer, damage)) => {
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+                log::info!(
+                    "PNG imported: path={path:?} layer={} source={}x{} decoded_bytes={} \
+                     placed_pixels={} allocated_tiles={} assumed_srgb={} elapsed_ms={}",
+                    layer.get(),
+                    summary.source_width,
+                    summary.source_height,
+                    summary.decoded_bytes,
+                    summary.placed_pixels,
+                    summary.allocated_tiles,
+                    summary.assumed_srgb,
+                    started.elapsed().as_millis()
+                );
+            }
+            Err(error) => log::error!("could not insert imported PNG {path:?}: {error}"),
+        }
+    }
+
     fn maybe_autosave(&mut self) {
         if self.persistence_enabled
             && self.checkpoint_dirty
@@ -1515,6 +1556,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 }
                 event_loop.exit();
             }
+            WindowEvent::DroppedFile(path) => self.import_png(&path),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -2093,6 +2135,15 @@ mod tests {
             export_path_for_region(full, ExportRegion::ContentBounds),
             PathBuf::from("/tmp/drawing.final-cropped.png")
         );
+    }
+
+    #[test]
+    fn import_layer_names_use_the_file_stem_with_a_safe_fallback() {
+        assert_eq!(
+            import_layer_name(Path::new("/tmp/reference.final.png")),
+            "reference.final"
+        );
+        assert_eq!(import_layer_name(Path::new("/")), "Imported image");
     }
 
     #[test]

@@ -59,6 +59,7 @@ prototype:
 - bounded static-PNG import into a new centered/clipped sparse layer, with sRGB
   to premultiplied-linear conversion and explicit rejection of unsupported
   color metadata;
+- interactive file-drop PNG import as one undoable layer command;
 - atomic streaming flattened PNG export of the visible composite as
   straight-alpha RGBA8 sRGB, for either the full canvas or exact content
   bounds;
@@ -77,6 +78,7 @@ Controls:
 - Wacom eraser contact: pressure-sensitive coverage erase;
 - middle drag: pan;
 - wheel: zoom at cursor;
+- drop a PNG file on the window: import it as a new active layer;
 - `[` / `]`: decrease/increase the hovered tool size;
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
 - E: toggle mouse pen/eraser mode;
