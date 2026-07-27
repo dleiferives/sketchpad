@@ -56,6 +56,10 @@ prototype:
 - versioned/checksummed layered recovery checkpoints with exact sparse `f32`
   pixels, legacy flat-checkpoint migration, atomic temporary-file replacement,
   and directory synchronization;
+- named `.sketchpad` document Open, Save, and Save As through parented native
+  dialogs, using the same exact layered container as recovery;
+- independent explicit-document modification and recovery-freshness state, so
+  autosave never clears the user-visible unsaved marker;
 - bounded static-PNG import into a new centered/clipped sparse layer, with sRGB
   to premultiplied-linear conversion and explicit rejection of unsupported
   color metadata;
@@ -97,8 +101,10 @@ Controls:
 - X / Shift-X: select the older/newer recent pen color;
 - Control/Command-Z: undo;
 - Control/Command-Shift-Z or Control/Command-Y: redo;
-- Control/Command-S: force the recovery checkpoint;
-- Control/Command-O: reload the last recovery checkpoint;
+- Control/Command-S: save to the active `.sketchpad` path, or choose one for an
+  untitled/recovered document;
+- Control/Command-Shift-S: choose a new `.sketchpad` document path;
+- Control/Command-O: choose and open a `.sketchpad` document;
 - Control/Command-Shift-N: create and activate a raster layer;
 - Control/Command-Shift-D: duplicate the active layer;
 - Control/Command-Shift-H: toggle active-layer visibility;
@@ -511,10 +517,10 @@ This is an architectural integration checkpoint, not yet the usable painter:
   hard-round family with an experimental linear-mixing engine, six preset
   colors, visible-color sampling, and one coverage eraser;
 - no graphical brush/color UI, rotation, selection, or transforms;
-- the layered recovery checkpoint is still not the future named native
-  document; there is no Save As, file dialog, embedded preview, or serialized
-  undo history, and migration currently covers only the earlier flat
-  checkpoint;
+- the current named `.sketchpad` document is the exact layered snapshot
+  container proven by recovery, not the eventual scalable schema: it has no
+  embedded preview or serialized undo history, and the active named path is
+  session-local rather than restored from recovery after restart;
 - checkpoint encoding and disk I/O are synchronous after the idle delay and
   still need large-document timing and disk-full/kill testing;
 - PNG I/O has explicit sRGB transfer behavior, but there is no general ICC,
@@ -547,20 +553,19 @@ immediate order is:
    sampling with the physical Wacom setup;
 2. design the first graphical layer/brush/color surface over the now-proven
    command semantics;
-3. add native open/import/export dialogs and an explicit Save As path;
-4. add canvas rotation/reset controls before broader selection/transform work.
-5. Add frame-paced replay that processes every sample but coalesces GPU work to
+3. add canvas rotation controls before broader selection/transform work.
+4. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
-6. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
+5. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-7. Measure the exact `Rgba32Float` display cache against direct tiles without
+6. Measure the exact `Rgba32Float` display cache against direct tiles without
    changing image quality; keep reduced-precision formats out of the product
    path unless the quality policy explicitly changes.
-8. Profile the remaining CPU kernel and only then test scanline
+7. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
-9. Capture a physical trace family covering light pressure, fast motion, long
+8. Capture a physical trace family covering light pressure, fast motion, long
    curves, eraser use, and distinct drawing styles.
-10. Resume stable Atlas Intel/NVIDIA baselines only when that machine is idle;
+9. Resume stable Atlas Intel/NVIDIA baselines only when that machine is idle;
    use Apollo for the current constrained-hardware work.
-11. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
+10. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
    brush after the proof-system and hard-ink latency work.

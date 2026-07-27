@@ -103,3 +103,25 @@ isolated `rfd 0.17.2`; the dialog work did not introduce wgpu 29. Automated
 coverage proves path normalization and the existing codec/document paths.
 Physical interaction, focus return, and tablet-event behavior around an open
 modal dialog remain a live-app checklist rather than a headless claim.
+
+### Native document workflow
+
+The same dialog boundary now exposes the exact layered container as named
+`.sketchpad` documents:
+
+- Control/Command-S saves the active path or opens Save As when no path exists;
+- Control/Command-Shift-S always chooses a new path;
+- Control/Command-O chooses and opens a document;
+- the title shows the active file name and a star only for explicit-document
+  modifications;
+- save-before-open and save-before-close prompts run only after recovery is
+  current;
+- choosing “No” may leave the named document unchanged, but it cannot discard
+  the recoverable committed drawing;
+- opening a document marks recovery stale without marking the named document
+  modified, so autosave captures the new session without lying about Save.
+
+Dialog cancellation and failed decoding leave the current document, path, and
+modified state unchanged. Paths without the declared suffix gain
+`.sketchpad`. The active native path is session state for now; a recovered
+startup deliberately has no assumed named path and therefore uses Save As.

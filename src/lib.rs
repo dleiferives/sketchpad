@@ -6,6 +6,7 @@ pub mod input;
 pub mod input_trace;
 pub mod mixing;
 pub mod palette;
+pub mod persistence;
 pub mod pipeline;
 pub mod raster;
 pub mod replay;

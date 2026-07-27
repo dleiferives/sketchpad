@@ -7,6 +7,7 @@ use sketchpad::{
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
     palette::RecentColors,
+    persistence::PersistenceState,
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
         WorldRect,
@@ -426,9 +427,8 @@ struct App {
     tablet_sample_count: u64,
     tablet_max_pressure: f32,
     metrics: LiveMetrics,
-    checkpoint_path: PathBuf,
-    checkpoint_dirty: bool,
-    checkpoint_due: Option<Instant>,
+    persistence: PersistenceState,
+    recovery_due: Option<Instant>,
     export_path: PathBuf,
     stroke_recorder: Option<StrokeRecorder>,
     persistence_enabled: bool,
@@ -440,13 +440,16 @@ impl App {
     fn new(
         tablet_proxy: EventLoopProxy<TabletEvent>,
         document: Document,
-        checkpoint_path: PathBuf,
+        mut persistence: PersistenceState,
         record_stroke: Option<PathBuf>,
         initially_dirty: bool,
         export_path: PathBuf,
     ) -> Self {
         let persistence_enabled = record_stroke.is_none();
-        let checkpoint_dirty = persistence_enabled && initially_dirty;
+        if persistence_enabled && initially_dirty {
+            persistence.document_changed();
+        }
+        let recovery_dirty = persistence_enabled && persistence.recovery_dirty();
         let paint_brush = HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap();
         let recent_colors =
             RecentColors::new(paint_brush.color()).expect("the default pen color is valid");
@@ -479,9 +482,8 @@ impl App {
             tablet_sample_count: 0,
             tablet_max_pressure: 0.0,
             metrics: LiveMetrics::new(),
-            checkpoint_path,
-            checkpoint_dirty,
-            checkpoint_due: checkpoint_dirty.then(|| Instant::now() + AUTOSAVE_DELAY),
+            persistence,
+            recovery_due: recovery_dirty.then(|| Instant::now() + AUTOSAVE_DELAY),
             export_path,
             stroke_recorder: record_stroke.map(StrokeRecorder::new),
             persistence_enabled,
@@ -679,7 +681,11 @@ impl App {
         };
         let brush = self.brush_for_tool(self.cursor_tool);
         let pressure = pressure.map_or_else(String::new, |value| format!(" p={value:.3}"));
-        let dirty = if self.checkpoint_dirty { " *" } else { "" };
+        let dirty = if self.persistence.document_modified() {
+            " *"
+        } else {
+            ""
+        };
         let recording = if self.stroke_recorder.is_some() {
             " [RECORD NEXT STROKE]"
         } else {
@@ -689,9 +695,16 @@ impl App {
             ToolKind::Pen => self.paint_engine.label(),
             ToolKind::Eraser => "Eraser",
         };
+        let document_name = self
+            .persistence
+            .document_path()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            .unwrap_or("Untitled");
         window.set_title(&format!(
-            "Sketchpad{}{} — {} ({}/{}) — {} {:.0}px {:.0}% — color {}/{} \
+            "Sketchpad — {}{}{} — {} ({}/{}) — {} {:.0}px {:.0}% — color {}/{} \
              ({:.3},{:.3},{:.3}){}",
+            document_name,
             dirty,
             recording,
             self.document.layers()[self.document.active_layer_index()].name(),
@@ -1000,47 +1013,177 @@ impl App {
         if !self.persistence_enabled {
             return;
         }
-        self.checkpoint_dirty = true;
-        self.checkpoint_due = Some(Instant::now() + AUTOSAVE_DELAY);
+        self.persistence.document_changed();
+        self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
         self.update_window_title(None);
     }
 
-    fn save_checkpoint(&mut self) {
+    fn save_recovery_checkpoint(&mut self) -> bool {
         if !self.persistence_enabled || self.active_stroke.is_some() {
-            return;
+            return false;
         }
+        let path = self.persistence.recovery_path().to_owned();
         let started = Instant::now();
-        match checkpoint::save_document_atomic(&self.checkpoint_path, &self.document) {
+        match checkpoint::save_document_atomic(&path, &self.document) {
             Ok(summary) => {
-                self.checkpoint_dirty = false;
-                self.checkpoint_due = None;
+                self.persistence.recovery_saved();
+                self.recovery_due = None;
                 log::info!(
                     "checkpoint saved: path={:?} bytes={} layers={} tiles={} stored_pixels={} elapsed_ms={}",
-                    self.checkpoint_path,
+                    path,
                     summary.encoded_bytes,
                     summary.layer_count,
                     summary.tile_count,
                     summary.stored_pixels,
                     started.elapsed().as_millis()
                 );
+                self.update_window_title(None);
+                true
             }
             Err(error) => {
-                self.checkpoint_dirty = true;
-                self.checkpoint_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
-                log::error!(
-                    "checkpoint save failed: path={:?}: {error}",
-                    self.checkpoint_path
-                );
+                self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                log::error!("checkpoint save failed: path={:?}: {error}", path);
+                self.update_window_title(None);
+                false
             }
         }
-        self.update_window_title(None);
     }
 
-    fn load_checkpoint(&mut self) {
+    fn save_document_to(&mut self, path: PathBuf) -> bool {
         if !self.persistence_enabled || self.active_stroke.is_some() {
+            return false;
+        }
+        let path = ensure_sketchpad_extension(path);
+        let started = Instant::now();
+        match checkpoint::save_document_atomic(&path, &self.document) {
+            Ok(summary) => {
+                self.persistence.document_saved(path.clone());
+                log::info!(
+                    "document saved: path={path:?} bytes={} layers={} tiles={} \
+                     stored_pixels={} elapsed_ms={}",
+                    summary.encoded_bytes,
+                    summary.layer_count,
+                    summary.tile_count,
+                    summary.stored_pixels,
+                    started.elapsed().as_millis()
+                );
+                self.update_window_title(None);
+                true
+            }
+            Err(error) => {
+                log::error!("document save failed: path={path:?}: {error}");
+                false
+            }
+        }
+    }
+
+    fn save_document(&mut self) -> bool {
+        match self.persistence.document_path().map(Path::to_owned) {
+            Some(path) => self.save_document_to(path),
+            None => self.choose_document_save_as(),
+        }
+    }
+
+    fn choose_document_save_as(&mut self) -> bool {
+        if !self.persistence_enabled
+            || self.active_stroke.is_some()
+            || self.sampling_pointer.is_some()
+        {
+            return false;
+        }
+        let suggested = self
+            .persistence
+            .document_path()
+            .map(Path::to_owned)
+            .unwrap_or_else(default_document_path);
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Save Sketchpad Document")
+            .add_filter("Sketchpad document", &["sketchpad"]);
+        if let Some(parent) = suggested.parent() {
+            dialog = dialog.set_directory(parent);
+        }
+        if let Some(file_name) = suggested.file_name() {
+            dialog = dialog.set_file_name(file_name.to_string_lossy());
+        }
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        dialog
+            .save_file()
+            .is_some_and(|path| self.save_document_to(path))
+    }
+
+    fn confirm_save_before_replacing(&mut self) -> bool {
+        if !self.persistence.document_modified() {
+            return true;
+        }
+        if self.persistence.recovery_dirty() && !self.save_recovery_checkpoint() {
+            return false;
+        }
+        let mut dialog = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Save changes before opening?")
+            .set_description(
+                "The current drawing has changes that are not saved to its document file. \
+                 The recovery checkpoint is current.",
+            )
+            .set_buttons(rfd::MessageButtons::YesNoCancel);
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        match dialog.show() {
+            rfd::MessageDialogResult::Yes => self.save_document(),
+            rfd::MessageDialogResult::No => true,
+            _ => false,
+        }
+    }
+
+    fn confirm_close(&mut self) -> bool {
+        if self.persistence.recovery_dirty() && !self.save_recovery_checkpoint() {
+            return false;
+        }
+        if !self.persistence.document_modified() {
+            return true;
+        }
+        let mut dialog = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Save changes before closing?")
+            .set_description(
+                "The drawing is current in recovery but has changes that are not saved to its \
+                 document file.",
+            )
+            .set_buttons(rfd::MessageButtons::YesNoCancel);
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        match dialog.show() {
+            rfd::MessageDialogResult::Yes => self.save_document(),
+            rfd::MessageDialogResult::No => true,
+            _ => false,
+        }
+    }
+
+    fn choose_document_open(&mut self) {
+        if !self.persistence_enabled
+            || self.active_stroke.is_some()
+            || self.sampling_pointer.is_some()
+            || !self.confirm_save_before_replacing()
+        {
             return;
         }
-        match checkpoint::load_document(&self.checkpoint_path) {
+        let mut dialog = rfd::FileDialog::new()
+            .set_title("Open Sketchpad Document")
+            .add_filter("Sketchpad document", &["sketchpad"]);
+        if let Some(window) = &self.window {
+            dialog = dialog.set_parent(window.as_ref());
+        }
+        if let Some(path) = dialog.pick_file() {
+            self.open_document(path);
+        }
+    }
+
+    fn open_document(&mut self, path: PathBuf) {
+        match checkpoint::load_document(&path) {
             Ok(document)
                 if document.width() == CANVAS_WIDTH
                     && document.height() == CANVAS_HEIGHT
@@ -1056,28 +1199,25 @@ impl App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.canvas.clear_residency();
                 }
-                self.checkpoint_dirty = false;
-                self.checkpoint_due = None;
+                self.persistence.document_opened(path.clone());
+                self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
                 self.metrics.gpu_baseline = self
                     .gpu
                     .as_ref()
                     .map(|gpu| gpu.canvas.stats())
                     .unwrap_or_default();
                 log::info!(
-                    "checkpoint loaded: path={:?} layers={layer_count} tiles={tile_count}",
-                    self.checkpoint_path
+                    "document opened: path={:?} layers={layer_count} tiles={tile_count}",
+                    path
                 );
                 self.update_window_title(None);
                 self.request_redraw();
             }
             Ok(_) => log::error!(
-                "checkpoint geometry is incompatible with the running canvas: {:?}",
-                self.checkpoint_path
+                "document geometry is incompatible with the running canvas: {:?}",
+                path
             ),
-            Err(error) => log::error!(
-                "checkpoint load failed: path={:?}: {error}",
-                self.checkpoint_path
-            ),
+            Err(error) => log::error!("document open failed: path={:?}: {error}", path),
         }
     }
 
@@ -1179,13 +1319,13 @@ impl App {
 
     fn maybe_autosave(&mut self) {
         if self.persistence_enabled
-            && self.checkpoint_dirty
+            && self.persistence.recovery_dirty()
             && self.active_stroke.is_none()
             && self
-                .checkpoint_due
+                .recovery_due
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.save_checkpoint();
+            self.save_recovery_checkpoint();
         }
     }
 
@@ -1694,10 +1834,9 @@ impl ApplicationHandler<TabletEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.cancel_stroke();
-                if self.checkpoint_dirty {
-                    self.save_checkpoint();
+                if self.confirm_close() {
+                    event_loop.exit();
                 }
-                event_loop.exit();
             }
             WindowEvent::DroppedFile(path) => self.import_png(&path),
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
@@ -1811,18 +1950,22 @@ impl ApplicationHandler<TabletEvent> for App {
                         self.cancel_stroke()
                     }
                     PhysicalKey::Code(KeyCode::Escape) => {
-                        if self.checkpoint_dirty {
-                            self.save_checkpoint();
+                        if self.confirm_close() {
+                            event_loop.exit();
                         }
-                        event_loop.exit();
                     }
                     PhysicalKey::Code(KeyCode::KeyZ) if command && self.modifiers.shift_key() => {
                         self.redo()
                     }
                     PhysicalKey::Code(KeyCode::KeyZ) if command => self.undo(),
                     PhysicalKey::Code(KeyCode::KeyY) if command => self.redo(),
-                    PhysicalKey::Code(KeyCode::KeyS) if command => self.save_checkpoint(),
-                    PhysicalKey::Code(KeyCode::KeyO) if command => self.load_checkpoint(),
+                    PhysicalKey::Code(KeyCode::KeyS) if command && self.modifiers.shift_key() => {
+                        self.choose_document_save_as();
+                    }
+                    PhysicalKey::Code(KeyCode::KeyS) if command => {
+                        self.save_document();
+                    }
+                    PhysicalKey::Code(KeyCode::KeyO) if command => self.choose_document_open(),
                     PhysicalKey::Code(KeyCode::KeyI) if command => self.choose_png_import(),
                     PhysicalKey::Code(KeyCode::KeyN) if command && self.modifiers.shift_key() => {
                         self.create_layer()
@@ -1956,8 +2099,8 @@ impl ApplicationHandler<TabletEvent> for App {
             .metrics
             .has_activity()
             .then(|| self.metrics.report_deadline());
-        if self.checkpoint_dirty && self.active_stroke.is_none() {
-            if let Some(checkpoint_due) = self.checkpoint_due {
+        if self.persistence.recovery_dirty() && self.active_stroke.is_none() {
+            if let Some(checkpoint_due) = self.recovery_due {
                 deadline = Some(
                     deadline
                         .map(|existing| existing.min(checkpoint_due))
@@ -2047,9 +2190,12 @@ fn main() {
         process::exit(2);
     });
     let checkpoint_path = checkpoint::default_recovery_path();
-    let mut document = if startup.record_stroke.is_some() {
+    let (mut document, recovered) = if startup.record_stroke.is_some() {
         log::info!("stroke recording mode: draw one tablet stroke in the blank window");
-        Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+        (
+            Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
+            false,
+        )
     } else {
         match checkpoint::load_document(&checkpoint_path) {
             Ok(document)
@@ -2068,25 +2214,34 @@ fn main() {
                     document.layers().len(),
                     tile_count,
                 );
-                document
+                (document, true)
             }
             Ok(_) => {
                 log::error!(
                     "checkpoint geometry is incompatible; starting blank without replacing it: {:?}",
                     checkpoint_path
                 );
-                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                (
+                    Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
+                    false,
+                )
             }
             Err(CheckpointError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 log::info!("no recovery checkpoint found: {:?}", checkpoint_path);
-                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                (
+                    Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
+                    false,
+                )
             }
             Err(error) => {
                 log::error!(
                     "checkpoint recovery failed; starting blank without replacing it: path={:?}: {error}",
                     checkpoint_path
                 );
-                Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
+                (
+                    Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
+                    false,
+                )
             }
         }
     };
@@ -2155,7 +2310,11 @@ fn main() {
         .run_app(&mut App::new(
             tablet_proxy,
             document,
-            checkpoint_path,
+            if recovered {
+                PersistenceState::recovered(checkpoint_path)
+            } else {
+                PersistenceState::fresh(checkpoint_path)
+            },
             startup.record_stroke,
             imported_any,
             default_export_path(),
@@ -2181,6 +2340,15 @@ fn default_export_path() -> PathBuf {
         .join("sketchpad-export.png")
 }
 
+fn default_document_path() -> PathBuf {
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("Documents")
+        .join("Untitled.sketchpad")
+}
+
 fn export_path_for_region(path: &Path, region: ExportRegion) -> PathBuf {
     if region == ExportRegion::FullCanvas {
         return path.to_owned();
@@ -2203,6 +2371,16 @@ fn ensure_png_extension(mut path: PathBuf) -> PathBuf {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
     {
         path.as_mut_os_string().push(".png");
+    }
+    path
+}
+
+fn ensure_sketchpad_extension(mut path: PathBuf) -> PathBuf {
+    if !path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("sketchpad"))
+    {
+        path.as_mut_os_string().push(".sketchpad");
     }
     path
 }
@@ -2363,6 +2541,22 @@ mod tests {
         assert_eq!(
             ensure_png_extension(PathBuf::from("/tmp/drawing.jpg")),
             PathBuf::from("/tmp/drawing.jpg.png")
+        );
+    }
+
+    #[test]
+    fn dialog_document_path_has_one_sketchpad_extension() {
+        assert_eq!(
+            ensure_sketchpad_extension(PathBuf::from("/tmp/drawing")),
+            PathBuf::from("/tmp/drawing.sketchpad")
+        );
+        assert_eq!(
+            ensure_sketchpad_extension(PathBuf::from("/tmp/drawing.SKETCHPAD")),
+            PathBuf::from("/tmp/drawing.SKETCHPAD")
+        );
+        assert_eq!(
+            ensure_sketchpad_extension(PathBuf::from("/tmp/drawing.bin")),
+            PathBuf::from("/tmp/drawing.bin.sketchpad")
         );
     }
 

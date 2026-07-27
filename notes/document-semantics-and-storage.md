@@ -321,15 +321,16 @@ Required failure tests:
 The recovery guarantee should say exactly whether the last sample, last
 gesture, or last checkpoint may be lost.
 
-### Current interim raster checkpoint
+### Current layered snapshot document and recovery
 
-The executable now has a deliberately narrower recovery mechanism while the
-native schema remains under research. It is not called the Sketchpad document
-format.
+The executable now uses one deliberately bounded layered snapshot container
+for named `.sketchpad` documents and automatic recovery while a more scalable
+native schema remains under research.
 
-- The checkpoint owns only the current defined canvas geometry and canonical
+- The container owns defined canvas geometry, ordered layer IDs/names,
+  visibility, opacity, active-layer identity, and exact canonical
   premultiplied raster pixels.
-- Only committed gestures, undo, and redo states mark it dirty. An active
+- Only committed document commands mark persistence state dirty. An active
   half-stroke is never serialized.
 - Nontransparent pixels are encoded as deterministic ordered row runs inside
   sorted sparse tiles; transparent tile storage is not written.
@@ -344,16 +345,28 @@ format.
   checkout, so development rsync cannot delete it.
 - Startup corruption or incompatible geometry produces a blank canvas without
   replacing the suspect file. A later intentional edit may create a new
-  checkpoint.
+  recovery snapshot.
+- Named Save/Save As uses the same atomic encoder at an explicit `.sketchpad`
+  path. Open accepts a whole valid document or leaves the current document
+  untouched.
+- Explicit-document modification and recovery freshness are independent.
+  Autosave clears only recovery dirtiness; it cannot clear the title's unsaved
+  marker. Opening a named document makes recovery stale without marking the
+  named document modified.
+- Before replacing or closing modified work, recovery is made current first.
+  The user may then save the named file, continue without changing it, or
+  cancel.
 
 The current recovery guarantee is therefore “the most recent successfully
 checkpointed committed state.” The application schedules a checkpoint two
 seconds after the last committed edit and attempts one on ordinary shutdown.
 A process kill during the delay can lose those latest committed gestures.
 Encoding and I/O are still synchronous and must be measured on dense content.
-The format contains no layers, semantic strokes, brush resources, color
-profile, history, preview, or migration machinery, so it must be replaced or
-explicitly imported by the eventual native document implementation.
+The format contains no semantic strokes, brush resources, color profile,
+history, or preview. Its active named path is not persisted inside recovery,
+so a recovered startup intentionally has no assumed Save target. These limits
+must be addressed or explicitly migrated by the eventual scalable native
+document implementation.
 
 ## Coordinate and Serialization Model
 
