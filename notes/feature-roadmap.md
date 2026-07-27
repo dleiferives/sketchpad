@@ -79,9 +79,8 @@ delete layers without corrupting active strokes or undo state.
 - [x] Decode PNG with strict dimension, decoded-byte, and pixel-count limits.
 - [x] Convert declared sRGB input into the named linear working representation.
 - [x] Preserve alpha correctly as premultiplied linear RGBA.
-- [ ] Import into a new named layer without resizing or replacing the document
-  implicitly. The mutation-safe document insertion API is implemented; app
-  wiring remains.
+- [x] Import into a new named layer without resizing or replacing the document
+  implicitly.
 - [x] Define placement for images smaller or larger than the canvas; begin with
   centered, clipped placement.
 - [ ] Make import one semantic undoable command.
@@ -93,12 +92,11 @@ failed import leaves the document unchanged.
 
 ### 5. PNG flattened export
 
-- [ ] Export the visible composite, not the active layer.
+- [x] Export the visible composite, not the active layer.
 - [x] Convert linear premultiplied working pixels to straight-alpha sRGB
   correctly.
 - [x] Support full canvas and content-bounds export explicitly.
-- [x] Write atomically and report dimensions and encoded bytes; application
-  elapsed-time logging remains.
+- [x] Write atomically and report dimensions, encoded bytes, and elapsed time.
 - [x] Add deterministic decode-after-export image checks.
 
 Acceptance: exported transparency and color match reference swatches within

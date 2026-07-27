@@ -53,6 +53,12 @@ prototype:
 - versioned/checksummed layered recovery checkpoints with exact sparse `f32`
   pixels, legacy flat-checkpoint migration, atomic temporary-file replacement,
   and directory synchronization;
+- bounded static-PNG import into a new centered/clipped sparse layer, with sRGB
+  to premultiplied-linear conversion and explicit rejection of unsupported
+  color metadata;
+- atomic streaming flattened PNG export of the visible composite as
+  straight-alpha RGBA8 sRGB, for either the full canvas or exact content
+  bounds;
 - automatic recovery on startup and autosave two seconds after the last
   committed edit;
 - cancellation on focus loss or Escape during an active stroke;
@@ -79,12 +85,31 @@ Controls:
 - Control/Command-Shift-N: create and activate a raster layer;
 - Control/Command-Shift-D: duplicate the active layer;
 - Control/Command-Shift-H: toggle active-layer visibility;
+- Control/Command-Shift-E: export the full visible composite to
+  `~/Pictures/sketchpad-export.png`;
+- Control/Command-Alt-Shift-E: export exact visible content bounds to
+  `~/Pictures/sketchpad-export-cropped.png`;
 - Control/Command-Shift-Delete: delete the active layer when it is not the
   document's last layer;
 - Page Up / Page Down: select the layer above/below;
 - Control/Command-Page Up / Page Down: move the active layer above/below;
 - Escape while drawing: cancel the active stroke;
 - Escape while idle: exit.
+
+Command-line image I/O:
+
+```text
+sketchpad --import-png reference.png
+sketchpad --import-png bottom.png --import-png top.png
+sketchpad --export-png flattened.png
+sketchpad --import-png reference.png --export-png converted.png
+```
+
+`--import-png` may repeat; files are inserted in argument order above the
+current active layer, and an interactive import enters normal autosave.
+`--export-png` writes the recovered/imported visible full-canvas composite and
+exits without opening a window. A failed decode, layer insertion, or export
+exits nonzero.
 
 ## Ownership Path
 
@@ -142,6 +167,9 @@ The current test suite covers:
   content hashing;
 - deterministic seeded replay transforms and pixel-identical repeated replay;
 - deterministic checkpoint encoding and exact sparse-raster round trips;
+- PNG straight-alpha/sRGB conversion, grayscale alpha, centered clipping,
+  resource/metadata limits, malformed input, content-bounds export, and
+  decode-after-export quantization;
 - checksum, truncation, trailing-data, and atomic replacement rejection/tests;
 - destination-out erasing and undo restoration;
 - no tile allocation when erasing empty space;

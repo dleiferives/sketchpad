@@ -2,6 +2,7 @@ use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
     document::Document,
+    image_io::{self, ExportRegion},
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     pipeline::{
@@ -12,7 +13,7 @@ use sketchpad::{
 };
 use std::{
     env, io, iter,
-    path::PathBuf,
+    path::{Path, PathBuf},
     process,
     sync::Arc,
     time::{Duration, Instant},
@@ -298,6 +299,7 @@ struct App {
     checkpoint_path: PathBuf,
     checkpoint_dirty: bool,
     checkpoint_due: Option<Instant>,
+    export_path: PathBuf,
     stroke_recorder: Option<StrokeRecorder>,
     persistence_enabled: bool,
     #[cfg(target_os = "linux")]
@@ -310,8 +312,11 @@ impl App {
         document: Document,
         checkpoint_path: PathBuf,
         record_stroke: Option<PathBuf>,
+        initially_dirty: bool,
+        export_path: PathBuf,
     ) -> Self {
         let persistence_enabled = record_stroke.is_none();
+        let checkpoint_dirty = persistence_enabled && initially_dirty;
         Self {
             window: None,
             gpu: None,
@@ -339,8 +344,9 @@ impl App {
             tablet_max_pressure: 0.0,
             metrics: LiveMetrics::new(),
             checkpoint_path,
-            checkpoint_dirty: false,
-            checkpoint_due: None,
+            checkpoint_dirty,
+            checkpoint_due: checkpoint_dirty.then(|| Instant::now() + AUTOSAVE_DELAY),
+            export_path,
             stroke_recorder: record_stroke.map(StrokeRecorder::new),
             persistence_enabled,
             #[cfg(target_os = "linux")]
@@ -818,6 +824,25 @@ impl App {
                 "checkpoint load failed: path={:?}: {error}",
                 self.checkpoint_path
             ),
+        }
+    }
+
+    fn export_png(&self, region: ExportRegion) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        let path = export_path_for_region(&self.export_path, region);
+        let started = Instant::now();
+        match image_io::export_png_file_atomic(&path, self.document.composite(), region) {
+            Ok(summary) => log::info!(
+                "PNG exported: path={path:?} region={region:?} dimensions={}x{} pixels={} bytes={} elapsed_ms={}",
+                summary.width,
+                summary.height,
+                summary.pixels,
+                summary.encoded_bytes,
+                started.elapsed().as_millis()
+            ),
+            Err(error) => log::error!("PNG export failed: path={path:?}: {error}"),
         }
     }
 
@@ -1419,6 +1444,14 @@ impl ApplicationHandler<TabletEvent> for App {
                     PhysicalKey::Code(KeyCode::KeyH) if command && self.modifiers.shift_key() => {
                         self.toggle_active_layer_visibility()
                     }
+                    PhysicalKey::Code(KeyCode::KeyE)
+                        if command && self.modifiers.shift_key() && self.modifiers.alt_key() =>
+                    {
+                        self.export_png(ExportRegion::ContentBounds)
+                    }
+                    PhysicalKey::Code(KeyCode::KeyE) if command && self.modifiers.shift_key() => {
+                        self.export_png(ExportRegion::FullCanvas)
+                    }
                     PhysicalKey::Code(KeyCode::Delete) if command && self.modifiers.shift_key() => {
                         self.delete_active_layer()
                     }
@@ -1540,13 +1573,22 @@ impl ApplicationHandler<TabletEvent> for App {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 struct Startup {
     record_stroke: Option<PathBuf>,
+    import_png: Vec<PathBuf>,
+    export_png: Option<PathBuf>,
 }
 
 fn parse_startup() -> Result<Startup, String> {
-    let mut arguments = env::args().skip(1);
+    parse_startup_arguments(env::args().skip(1))
+}
+
+fn parse_startup_arguments(arguments: impl IntoIterator<Item = String>) -> Result<Startup, String> {
+    let mut arguments = arguments.into_iter();
     let mut record_stroke = None;
+    let mut import_png = Vec::new();
+    let mut export_png = None;
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "--record-stroke" => {
@@ -1557,17 +1599,46 @@ fn parse_startup() -> Result<Startup, String> {
                     return Err("--record-stroke may only be specified once".to_owned());
                 }
             }
+            "--import-png" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--import-png requires an input path".to_owned())?;
+                import_png.push(PathBuf::from(path));
+            }
+            "--export-png" => {
+                let path = arguments
+                    .next()
+                    .ok_or_else(|| "--export-png requires an output path".to_owned())?;
+                if export_png.replace(PathBuf::from(path)).is_some() {
+                    return Err("--export-png may only be specified once".to_owned());
+                }
+            }
             "-h" | "--help" => {
-                println!("usage: sketchpad [--record-stroke PATH]");
+                println!(
+                    "usage: sketchpad [--import-png PATH]... [--export-png PATH] \
+                     [--record-stroke PATH]"
+                );
                 println!(
                     "       recording mode starts blank, saves the next tablet stroke, and exits"
+                );
+                println!(
+                    "       export mode writes the recovered/imported visible composite and exits"
                 );
                 process::exit(0);
             }
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
-    Ok(Startup { record_stroke })
+    if record_stroke.is_some() && (!import_png.is_empty() || export_png.is_some()) {
+        return Err(
+            "--record-stroke cannot be combined with --import-png or --export-png".to_owned(),
+        );
+    }
+    Ok(Startup {
+        record_stroke,
+        import_png,
+        export_png,
+    })
 }
 
 fn main() {
@@ -1577,7 +1648,7 @@ fn main() {
         process::exit(2);
     });
     let checkpoint_path = checkpoint::default_recovery_path();
-    let document = if startup.record_stroke.is_some() {
+    let mut document = if startup.record_stroke.is_some() {
         log::info!("stroke recording mode: draw one tablet stroke in the blank window");
         Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap()
     } else {
@@ -1620,6 +1691,64 @@ fn main() {
             }
         }
     };
+    let mut imported_any = false;
+    for path in &startup.import_png {
+        let started = Instant::now();
+        let imported = image_io::import_png_file(
+            path,
+            document.width(),
+            document.height(),
+            document.tile_size(),
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("PNG import failed for {path:?}: {error}");
+            process::exit(1);
+        });
+        let layer_name = import_layer_name(path);
+        let summary = imported.summary;
+        document
+            .insert_raster_layer(layer_name, imported.raster)
+            .unwrap_or_else(|error| {
+                eprintln!("could not insert imported PNG {path:?}: {error}");
+                process::exit(1);
+            });
+        imported_any = true;
+        log::info!(
+            "PNG imported: path={path:?} source={}x{} decoded_bytes={} placed_pixels={} \
+             allocated_tiles={} assumed_srgb={} elapsed_ms={}",
+            summary.source_width,
+            summary.source_height,
+            summary.decoded_bytes,
+            summary.placed_pixels,
+            summary.allocated_tiles,
+            summary.assumed_srgb,
+            started.elapsed().as_millis()
+        );
+    }
+    if let Some(path) = startup.export_png {
+        let started = Instant::now();
+        match image_io::export_png_file_atomic(
+            &path,
+            document.composite(),
+            ExportRegion::FullCanvas,
+        ) {
+            Ok(summary) => {
+                log::info!(
+                    "PNG exported: path={path:?} dimensions={}x{} pixels={} bytes={} elapsed_ms={}",
+                    summary.width,
+                    summary.height,
+                    summary.pixels,
+                    summary.encoded_bytes,
+                    started.elapsed().as_millis()
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("PNG export failed for {path:?}: {error}");
+                process::exit(1);
+            }
+        }
+    }
     let event_loop = EventLoop::<TabletEvent>::with_user_event().build().unwrap();
     let tablet_proxy = event_loop.create_proxy();
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1629,8 +1758,44 @@ fn main() {
             document,
             checkpoint_path,
             startup.record_stroke,
+            imported_any,
+            default_export_path(),
         ))
         .unwrap();
+}
+
+fn import_layer_name(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .map(str::trim)
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("Imported image")
+        .to_owned()
+}
+
+fn default_export_path() -> PathBuf {
+    env::var_os("HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(env::temp_dir)
+        .join("Pictures")
+        .join("sketchpad-export.png")
+}
+
+fn export_path_for_region(path: &Path, region: ExportRegion) -> PathBuf {
+    if region == ExportRegion::FullCanvas {
+        return path.to_owned();
+    }
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("sketchpad-export");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    let file_name = match extension {
+        Some(extension) => format!("{stem}-cropped.{extension}"),
+        None => format!("{stem}-cropped"),
+    };
+    path.with_file_name(file_name)
 }
 
 #[cfg(test)]
@@ -1685,5 +1850,50 @@ mod tests {
 
         series.clear();
         assert_eq!(series.summary(), LatencySummary::default());
+    }
+
+    #[test]
+    fn startup_accepts_ordered_imports_and_one_export() {
+        let startup = parse_startup_arguments(
+            [
+                "--import-png",
+                "bottom.png",
+                "--import-png",
+                "top.png",
+                "--export-png",
+                "flattened.png",
+            ]
+            .map(str::to_owned),
+        )
+        .unwrap();
+
+        assert_eq!(
+            startup.import_png,
+            [PathBuf::from("bottom.png"), PathBuf::from("top.png")]
+        );
+        assert_eq!(startup.export_png, Some(PathBuf::from("flattened.png")));
+        assert!(startup.record_stroke.is_none());
+    }
+
+    #[test]
+    fn recording_mode_rejects_image_io_and_missing_paths() {
+        assert!(parse_startup_arguments(
+            ["--record-stroke", "trace.json", "--import-png", "image.png"].map(str::to_owned)
+        )
+        .unwrap_err()
+        .contains("cannot be combined"));
+        assert!(parse_startup_arguments(["--export-png"].map(str::to_owned))
+            .unwrap_err()
+            .contains("requires an output path"));
+    }
+
+    #[test]
+    fn cropped_export_path_is_distinct_and_preserves_extension() {
+        let full = Path::new("/tmp/drawing.final.png");
+        assert_eq!(export_path_for_region(full, ExportRegion::FullCanvas), full);
+        assert_eq!(
+            export_path_for_region(full, ExportRegion::ContentBounds),
+            PathBuf::from("/tmp/drawing.final-cropped.png")
+        );
     }
 }

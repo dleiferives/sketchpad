@@ -1,7 +1,7 @@
 # PNG Import and Export Contract
 
-Status: implemented codec foundation, 2026-07-27. Application commands and
-semantic document undo remain to be wired.
+Status: implemented codec and temporary application surface, 2026-07-27.
+Semantic document undo and graphical dialogs remain to be wired.
 
 This note fixes the color, alpha, placement, failure, and bounded-work
 semantics for the first PNG slice. The narrow contract is intentional: an
@@ -100,12 +100,39 @@ and unsupported transfer metadata. Document tests prove successful raster
 insertion becomes a distinct active layer and failed geometry validation does
 not mutate the document.
 
+### Apollo release smoke, 2026-07-27
+
+Setup: release build on Apollo, no recovery checkpoint, full 4096×4096
+transparent document. The first command exported the visible composite. The
+second command imported that PNG into a new layer and exported the resulting
+visible composite. This is an integration smoke run, not a performance
+baseline: it was not isolated or repeated, and the first command included a
+fresh release build.
+
+Observed application counters:
+
+- first export: 16,777,216 pixels, 75,598 encoded bytes, 224 ms;
+- import: 67,108,864 decoded bytes, 16,777,216 placed pixels, zero allocated
+  sparse tiles, 397 ms;
+- second export: 16,777,216 pixels, 75,598 encoded bytes, 231 ms;
+- both PNG files had the identical SHA-256
+  `36149bcbe783a9e6e5858431fd728b550ffa0e93149828d10e5ed74dbb67cd14`.
+
+Interpretation: the no-window CLI traverses recovery, export, decode,
+centered placement, layer insertion, compositing, and atomic export
+successfully. A fully transparent decoded frame is canonicalized back to zero
+CPU tiles, and the static encoder is byte-deterministic for this controlled
+case. The 64 MiB decoded-frame allocation also confirms why import needs a
+streaming or tile-row decoder experiment before substantially raising current
+limits. No default or optimization decision should be derived from the single
+timings.
+
 Still required:
 
-- application import/export commands and path selection;
 - import as one document-level semantic undo command;
 - static indexed and 16-bit golden fixtures;
 - an Apollo cold/warm import and export timing utility with source bytes,
   decoded bytes, placed/exported pixels, and sparse tile counts;
+- graphical open/import/export path selection;
 - eventual ICC/CICP support through a deliberate color-management dependency,
   not handwritten partial profile parsing.
