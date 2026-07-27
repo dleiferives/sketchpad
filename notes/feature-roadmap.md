@@ -20,6 +20,12 @@ Every shipped slice must define:
 - counters or a benchmark case for work that can scale with pixels, tiles, or
   layers.
 
+When a benchmark or hardware run changes a decision, establishes a reusable
+baseline, or exposes a nontrivial bug, record the setup, evidence,
+interpretation, and engineering consequence in the relevant note and commit
+history. Routine green verification belongs in the commit message or status
+note; it should not bury durable findings in documentation noise.
+
 The first implementation may be deliberately narrow. It must not silently
 create a second incompatible document model, flatten editable data during
 save, or hide unbounded work behind a convenient API.
@@ -70,15 +76,16 @@ delete layers without corrupting active strokes or undo state.
 
 ### 4. PNG image import
 
-- [ ] Decode PNG with strict dimension, decoded-byte, and pixel-count limits.
-- [ ] Convert declared sRGB input into the named linear working representation.
-- [ ] Preserve alpha correctly as premultiplied linear RGBA.
+- [x] Decode PNG with strict dimension, decoded-byte, and pixel-count limits.
+- [x] Convert declared sRGB input into the named linear working representation.
+- [x] Preserve alpha correctly as premultiplied linear RGBA.
 - [ ] Import into a new named layer without resizing or replacing the document
-  implicitly.
-- [ ] Define placement for images smaller or larger than the canvas; begin with
+  implicitly. The mutation-safe document insertion API is implemented; app
+  wiring remains.
+- [x] Define placement for images smaller or larger than the canvas; begin with
   centered, clipped placement.
 - [ ] Make import one semantic undoable command.
-- [ ] Add tiny golden fixtures covering opaque, translucent, grayscale, and
+- [x] Add tiny golden fixtures covering opaque, translucent, grayscale, and
   malformed images.
 
 Acceptance: known input pixels produce the declared working values and a
@@ -87,11 +94,12 @@ failed import leaves the document unchanged.
 ### 5. PNG flattened export
 
 - [ ] Export the visible composite, not the active layer.
-- [ ] Convert linear premultiplied working pixels to straight-alpha sRGB
+- [x] Convert linear premultiplied working pixels to straight-alpha sRGB
   correctly.
-- [ ] Support full canvas and content-bounds export explicitly.
-- [ ] Write atomically and report dimensions, encoded bytes, and elapsed time.
-- [ ] Add deterministic decode-after-export image checks.
+- [x] Support full canvas and content-bounds export explicitly.
+- [x] Write atomically and report dimensions and encoded bytes; application
+  elapsed-time logging remains.
+- [x] Add deterministic decode-after-export image checks.
 
 Acceptance: exported transparency and color match reference swatches within
 the format’s declared 8-bit quantization contract; editable layers remain

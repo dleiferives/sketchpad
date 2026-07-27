@@ -250,6 +250,35 @@ impl Document {
         Ok(id)
     }
 
+    pub fn insert_raster_layer(
+        &mut self,
+        name: impl Into<String>,
+        raster: RasterLayer,
+    ) -> Result<(LayerId, Damage), DocumentError> {
+        if raster.width() != self.width
+            || raster.height() != self.height
+            || raster.tile_size() != self.tile_size
+        {
+            return Err(DocumentError::ImportedLayerGeometryMismatch);
+        }
+        let name = validated_name(name.into())?;
+        let affected: Vec<_> = raster.allocated_tile_coords().collect();
+        let id = self.allocate_layer_id();
+        let layer = RasterDocumentLayer {
+            id,
+            name,
+            visible: true,
+            opacity: 1.0,
+            raster,
+        };
+        let insertion = self.active_layer_index() + 1;
+        self.layers.insert(insertion, layer);
+        self.active_layer = id;
+        let damage = self.damage_for_coords(affected);
+        self.recompose_damage(&damage)?;
+        Ok((id, damage))
+    }
+
     pub fn duplicate_layer(&mut self, id: LayerId) -> Result<(LayerId, Damage), DocumentError> {
         let source_index = self.require_layer(id)?;
         let duplicate_id = self.allocate_layer_id();
@@ -513,6 +542,7 @@ pub enum DocumentError {
     InvalidLayerId(LayerId),
     LayerIdExhausted,
     LayerGeometryMismatch(LayerId),
+    ImportedLayerGeometryMismatch,
 }
 
 impl fmt::Display for DocumentError {
@@ -533,6 +563,12 @@ impl fmt::Display for DocumentError {
             Self::LayerIdExhausted => write!(formatter, "layer IDs are exhausted"),
             Self::LayerGeometryMismatch(id) => {
                 write!(formatter, "layer {} has incompatible geometry", id.get())
+            }
+            Self::ImportedLayerGeometryMismatch => {
+                write!(
+                    formatter,
+                    "imported raster has incompatible document geometry"
+                )
             }
         }
     }
@@ -652,6 +688,46 @@ mod tests {
             document.composite().pixel(1, 1).unwrap(),
             color(1.0, 0.0, 0.0, 0.5)
         );
+    }
+
+    #[test]
+    fn inserted_raster_becomes_active_without_copying_or_flattening() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let mut imported = RasterLayer::new(32, 32, 8).unwrap();
+        let gesture = imported.begin_gesture().unwrap();
+        imported
+            .set_pixel(gesture, 17, 9, color(0.2, 0.4, 0.6, 0.8))
+            .unwrap();
+        imported.commit_gesture(gesture).unwrap();
+
+        let (id, damage) = document.insert_raster_layer("Imported", imported).unwrap();
+
+        assert_eq!(document.active_layer_id(), id);
+        assert_eq!(document.layers().len(), 2);
+        assert_eq!(document.layer(id).unwrap().name(), "Imported");
+        assert_eq!(
+            document.active_layer().pixel(17, 9),
+            Some(color(0.2, 0.4, 0.6, 0.8))
+        );
+        assert_eq!(
+            document.composite().pixel(17, 9),
+            Some(color(0.2, 0.4, 0.6, 0.8))
+        );
+        assert_eq!(damage.tiles(), &[TileCoord::new(2, 1)]);
+    }
+
+    #[test]
+    fn incompatible_insert_leaves_document_unchanged() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let imported = RasterLayer::new(16, 32, 8).unwrap();
+        let active = document.active_layer_id();
+
+        assert!(matches!(
+            document.insert_raster_layer("Wrong size", imported),
+            Err(DocumentError::ImportedLayerGeometryMismatch)
+        ));
+        assert_eq!(document.layers().len(), 1);
+        assert_eq!(document.active_layer_id(), active);
     }
 
     #[test]

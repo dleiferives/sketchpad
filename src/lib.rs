@@ -1,6 +1,7 @@
 pub mod brush;
 pub mod checkpoint;
 pub mod document;
+pub mod image_io;
 pub mod input;
 pub mod input_trace;
 pub mod pipeline;

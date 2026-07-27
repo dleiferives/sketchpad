@@ -10,6 +10,10 @@ The notes are organized by purpose:
   queue for layers, native persistence, image import/export, painterly mixing,
   UI follow-through, and the correctness/performance infrastructure shipped
   with each slice.
+- [PNG import and export contract](png-io-contract.md) — the implemented
+  bounded static-PNG codec contract: straight/sRGB interchange,
+  premultiplied-linear working pixels, centered clipping, atomic streaming
+  export, explicit unsupported metadata, and remaining application wiring.
 - [Implementation status](implementation-status.md) — what the current
   executable actually does, its controls, automated coverage, known
   limitations, and immediate engineering order.
