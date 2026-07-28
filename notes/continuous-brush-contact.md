@@ -306,6 +306,47 @@ force continuous brushes through this path.
 The first experiment is a fixed-color `f32` palette-knife sweep rendered
 offscreen on Apollo.
 
+### Rejected CPU incremental prototypes — 2026-07-28
+
+Three continuous CPU raster variants were implemented and measured against the
+same `2048 × 2048`, 256-sample, `512 px` palette-knife workload on Apollo.
+They were removed rather than allowed to replace the live brush:
+
+| Variant | Empty median | Painted median | Result |
+|---|---:|---:|---|
+| Existing oriented-dab control | 263.544 ms | 260.293 ms | baseline |
+| Full old/new hull per load lane | 608.612 ms | 589.448 ms | rejected |
+| Boundary-only sweep per load lane | 561.706 ms | 574.492 ms | rejected |
+| One boundary sweep with transverse profile | 1073.741 ms | 1049.711 ms | rejected |
+
+The full-hull version still rasterized most of a large contact at every input
+update. Boundary-only geometry reduced geometric overlap but twelve separately
+scanned load bands retained high scan-conversion cost. Replacing those bands
+with one transverse-profile lookup increased conservative tile damage from
+18.9 to 33.676 million pixels on the rotating trace and failed the collinear
+packet-batching fixture when the blade moved along its own major axis.
+
+The broader finding is that “continuous geometry” alone is insufficient inside
+the current synchronous CPU mutation path. Every input update still performs
+some combination of tile lookup, undo capture, conservative damage,
+scan conversion, active-layer mutation, layer recomposition, and CPU-to-GPU
+upload scheduling. A rotating `512 px` blade produces large conservative
+axis-aligned regions even when only its boundary is new.
+
+Consequences:
+
+- Keep the pure `BladePose`/convex-envelope geometry and its deterministic
+  tests as backend-neutral groundwork.
+- Do not integrate either rejected CPU rasterizer.
+- Preserve the old knife as the live control until another path passes both
+  performance and packet-invariance gates.
+- Advance the offscreen full-float GPU proof next.
+- A future live GPU path must batch contact work for one presentation
+  opportunity and avoid readback; it must not write directly into the
+  flattened display cache.
+- If GPU live presentation proves necessary, define correct active-layer
+  ownership or below/active/above composition before integration.
+
 ### Capability probe
 
 Record, rather than assume:

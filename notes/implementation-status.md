@@ -610,30 +610,35 @@ immediate order is:
 
 1. Add an Apollo capability report for `Rgba32Float` render attachment,
    blending/storage, and GPU timestamps.
-2. Define deterministic transient contact poses and blade-sweep commands; they
-   remain derived renderer input rather than document operations.
-3. Benchmark a connected, fixed-color `512 px` palette-knife sweep offscreen
-   on the GPU and compare it with a CPU span backend and the old dab control.
-4. Integrate the validated continuous-contact path without live readback, then
+2. [Complete] Define deterministic transient contact poses and convex
+   blade-sweep geometry; they remain derived renderer input rather than
+   document operations.
+3. [Rejected] The incremental CPU continuous-contact variants were slower than
+   the old dab control at `512 px`; retain their evidence, not their product
+   code. See the rejected-prototype table in
+   [Continuous brush contact and physical paint](continuous-brush-contact.md).
+4. Benchmark a connected, fixed-color `512 px` palette-knife sweep offscreen
+   on the GPU and compare it with the old dab control.
+5. Integrate a validated continuous-contact path without live readback, then
    extend it to flat, pencil, and bounded-strand marks. The design and quality
    gates are in
    [Continuous brush contact and physical paint](continuous-brush-contact.md).
-5. Validate the Wacom tilt mapping with a labeled calibration view.
-6. Continue turning the proven toolbar, layer, file, color, and keybinding
+6. Validate the Wacom tilt mapping with a labeled calibration view.
+7. Continue turning the proven toolbar, layer, file, color, and keybinding
    surfaces into a coherent usable drawing workflow.
-7. Add canvas rotation controls before broader selection/transform work.
-8. Add frame-paced replay that processes every sample but coalesces GPU work to
+8. Add canvas rotation controls before broader selection/transform work.
+9. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
-9. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
+10. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-10. Measure the exact `Rgba32Float` display cache against direct tiles without
+11. Measure the exact `Rgba32Float` display cache against direct tiles without
    changing image quality; keep reduced-precision formats out of the product
    path unless the quality policy explicitly changes.
-11. Profile the remaining CPU kernel and only then test scanline
+12. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
-12. Capture a physical trace family covering light pressure, fast motion, long
+13. Capture a physical trace family covering light pressure, fast motion, long
    curves, eraser use, and distinct drawing styles.
-13. Keep hardware runs on Apollo for the current constrained-device work; do
-    not run the present brush campaign on Atlas.
-14. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
+14. Keep hardware runs on Apollo for the current constrained-device work; do
+   not run the present brush campaign on Atlas.
+15. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
    brush after the proof-system and hard-ink latency work.
