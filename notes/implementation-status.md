@@ -39,8 +39,8 @@ prototype:
   contact pressure;
 - a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
   surface texture, command encoder, and render pass;
-- a compact first toolbar for pen/eraser/mixing selection, brush diameter,
-  current color/opacity preview, undo/redo, and interface hiding;
+- a compact first toolbar for pen/eraser/mixing selection, brush diameter and
+  opacity adjustment, current color preview, undo/redo, and interface hiding;
 - typed UI actions that invoke the same application command methods as
   keyboard controls rather than owning document state;
 - explicit mouse and direct-XInput tablet UI capture, with ownership fixed

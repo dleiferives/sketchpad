@@ -471,9 +471,11 @@ measured input-path and GPU cost decides.
   UI snapshot or routed UI input is dirty. Canvas-only frames draw the retained
   paint jobs from the already prepared renderer buffers.
 - The first custom-painted toolbar exercises typed actions, selected tool
-  state, a logarithmic brush-diameter slider, linear-to-sRGB color display,
-  undo/redo, and hide behavior. It is an integration scaffold, not a final
-  product layout.
+  state, logarithmic brush-diameter control, brush-opacity control,
+  linear-to-sRGB color display, undo/redo, and hide behavior. Its custom
+  buttons and sliders publish egui widget semantics, and focused sliders accept
+  arrow-key adjustment. It is an integration scaffold, not a final product
+  layout.
 
 The first runtime attempt exposed an idle-loop integration trap:
 `egui_winit::State::on_window_event` reports `repaint: true` for

@@ -1,6 +1,6 @@
 use egui::{
-    Align, Align2, Color32, FontId, Id, Layout, Order, Pos2, Rect, Sense, Stroke, StrokeKind,
-    TextureId, Vec2,
+    Align, Align2, Color32, FontId, Id, Key, Layout, Order, Pos2, Rect, Sense, Stroke, StrokeKind,
+    TextureId, Vec2, WidgetInfo, WidgetType,
 };
 use sketchpad::input::{TabletPhase, TabletSample};
 use std::{
@@ -45,6 +45,7 @@ pub enum UiAction {
     SetVisible(bool),
     SelectTool(UiTool),
     SetBrushDiameter(f32),
+    SetBrushOpacity(f32),
     Undo,
     Redo,
 }
@@ -550,6 +551,21 @@ fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiA
                                 .font(FontId::monospace(12.0))
                                 .color(TEXT),
                         );
+                        separator(ui);
+                        ui.label(
+                            egui::RichText::new("FLOW")
+                                .font(FontId::monospace(11.0))
+                                .color(TEXT_MUTED),
+                        );
+                        if let Some(value) = opacity_slider(ui, snapshot.brush_opacity) {
+                            actions.push(UiAction::SetBrushOpacity(value));
+                        }
+                        let value = format!("{:.0}%", snapshot.brush_opacity * 100.0);
+                        ui.label(
+                            egui::RichText::new(value)
+                                .font(FontId::monospace(12.0))
+                                .color(TEXT),
+                        );
                         color_swatch(ui, snapshot.color, snapshot.brush_opacity);
                         separator(ui);
                         if icon_button(ui, "×", "Hide interface (F1)", false).clicked() {
@@ -566,6 +582,7 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, description: &str, selected: bool)
         ui,
         Vec2::new(CONTROL_HEIGHT, CONTROL_HEIGHT),
         selected,
+        description,
         |ui, rect, color| {
             ui.painter().text(
                 rect.center(),
@@ -584,6 +601,7 @@ fn text_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response 
         ui,
         Vec2::new(TOOL_BUTTON_WIDTH, CONTROL_HEIGHT),
         selected,
+        text,
         |ui, rect, color| {
             ui.painter().text(
                 rect.center(),
@@ -600,9 +618,12 @@ fn custom_button(
     ui: &mut egui::Ui,
     size: Vec2,
     selected: bool,
+    label: &str,
     paint_contents: impl FnOnce(&egui::Ui, Rect, Color32),
 ) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    response
+        .widget_info(|| WidgetInfo::selected(WidgetType::Button, ui.is_enabled(), selected, label));
     let fill = if selected {
         CONTROL_ACTIVE
     } else if response.is_pointer_button_down_on() {
@@ -625,13 +646,34 @@ fn custom_button(
 }
 
 fn diameter_slider(ui: &mut egui::Ui, value: f32) -> Option<f32> {
-    let (rect, response) = ui.allocate_exact_size(
+    unit_slider(
+        ui,
+        diameter_to_unit(value),
+        value,
+        "Brush diameter",
+        1.0 / 64.0,
+    )
+    .map(unit_to_diameter)
+}
+
+fn opacity_slider(ui: &mut egui::Ui, value: f32) -> Option<f32> {
+    unit_slider(ui, value.clamp(0.0, 1.0), value, "Brush opacity", 0.05)
+}
+
+fn unit_slider(
+    ui: &mut egui::Ui,
+    unit: f32,
+    semantic_value: f32,
+    label: &str,
+    keyboard_step: f32,
+) -> Option<f32> {
+    let (rect, mut response) = ui.allocate_exact_size(
         Vec2::new(SLIDER_WIDTH, CONTROL_HEIGHT),
         Sense::click_and_drag(),
     );
     let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 16.0, 4.0));
-    let normalized = diameter_to_unit(value);
-    let knob_x = egui::lerp(track.x_range(), normalized);
+    let unit = unit.clamp(0.0, 1.0);
+    let knob_x = egui::lerp(track.x_range(), unit);
     let fill = Rect::from_min_max(track.left_top(), Pos2::new(knob_x, track.bottom()));
     ui.painter().rect_filled(track, 2, CONTROL);
     ui.painter().rect_filled(fill, 2, CONTROL_ACTIVE);
@@ -643,13 +685,28 @@ fn diameter_slider(ui: &mut egui::Ui, value: f32) -> Option<f32> {
         Stroke::new(1.0, BORDER),
     );
 
+    let keyboard_delta = if response.has_focus() {
+        ui.input(|input| {
+            let positive = input.key_pressed(Key::ArrowRight) || input.key_pressed(Key::ArrowUp);
+            let negative = input.key_pressed(Key::ArrowLeft) || input.key_pressed(Key::ArrowDown);
+            positive as i8 - negative as i8
+        })
+    } else {
+        0
+    };
+    let mut changed = None;
     if response.dragged() || response.clicked() {
         if let Some(pointer) = response.interact_pointer_pos() {
-            let unit = ((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0);
-            return Some(unit_to_diameter(unit));
+            changed = Some(((pointer.x - track.left()) / track.width()).clamp(0.0, 1.0));
         }
+    } else if keyboard_delta != 0 {
+        changed = Some((unit + keyboard_delta as f32 * keyboard_step).clamp(0.0, 1.0));
     }
-    None
+    if changed.is_some() {
+        response.mark_changed();
+    }
+    response.widget_info(|| WidgetInfo::slider(ui.is_enabled(), f64::from(semantic_value), label));
+    changed
 }
 
 fn diameter_to_unit(value: f32) -> f32 {

@@ -544,6 +544,7 @@ impl App {
             }
             UiAction::SelectTool(tool) => self.select_ui_tool(tool),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
+            UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
             UiAction::Undo => self.undo(),
             UiAction::Redo => self.redo(),
         }
@@ -580,6 +581,19 @@ impl App {
         *self.brush_for_tool_mut(tool) = brush
             .with_diameter(diameter.clamp(MIN_BRUSH_DIAMETER, MAX_BRUSH_DIAMETER))
             .expect("the clamped UI brush diameter is valid");
+        self.update_window_title(None);
+        self.request_redraw();
+    }
+
+    fn set_brush_opacity(&mut self, opacity: f32) {
+        if self.active_stroke.is_some() || !opacity.is_finite() {
+            return;
+        }
+        let tool = self.mouse_tool;
+        let brush = self.brush_for_tool(tool);
+        *self.brush_for_tool_mut(tool) = brush
+            .with_opacity(opacity.clamp(0.0, 1.0))
+            .expect("the clamped UI brush opacity is valid");
         self.update_window_title(None);
         self.request_redraw();
     }
