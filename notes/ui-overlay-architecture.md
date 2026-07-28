@@ -481,9 +481,21 @@ The first runtime attempt exposed an idle-loop integration trap:
 calling `Window::request_redraw` again produced a self-sustaining loop at
 roughly 180 debug frames per second on Apollo. The adapter now excludes
 redraw, close, destroy, move, and occlusion notifications from UI
-invalidation. A regression test records the redraw rule. After the fix, the
-Apollo Vulkan smoke run rendered one startup frame and then remained idle for
-the observed five-second interval.
+invalidation. A regression test records the redraw rule.
+
+The initial fix was too aggressive in the other direction: it also ignored
+egui's explicit root-viewport `repaint_delay`. The first pass can be a sizing
+pass with no paint jobs, so the toolbar sometimes stayed blank until unrelated
+input arrived. `UiOverlay` now reports egui's next deadline to Sketchpad's
+existing `ControlFlow::WaitUntil` scheduler. A due deadline marks only the UI
+preparation dirty and requests one redraw. This preserves delayed UI work
+without polling.
+
+Egui's default `Area` fade-in requested approximately 24 debug redraws on
+Apollo. Sketchpad's fixed tool surface does not need that animation, so it
+disables the fade explicitly. The corrected startup performs three egui
+settling passes, produces one paint job, and then sleeps; no additional frames
+occurred during the remainder of the observed four-second smoke run.
 
 Apollo also reports egui's warning that `Bgra8UnormSrgb` is an sRGB-aware
 framebuffer while egui prefers an unorm framebuffer. The pinned renderer
@@ -530,8 +542,44 @@ validation error on every run. After the patch, Apollo idled for eight seconds
 and then processed a 271-sample, 108-present physical stroke without a Vulkan
 validation error.
 
-These smoke runs used debug builds and cold initialization, so their frame
-timings are not performance results.
+### Prepared-overlay measurement, 2026-07-28
+
+The live metrics now keep UI work separate from canvas and presentation work:
+
+- routed winit and direct-tablet event counts;
+- declaration/tessellation count, cache hits, mean, and maximum CPU time;
+- texture-delta count;
+- `egui-wgpu` buffer-preparation count, cache hits, mean, and maximum CPU time;
+- overlay draw-encoding count, mean, and maximum CPU time;
+- retained paint-job count.
+
+The first controlled Apollo cache smoke used a debug binary and an automated
+11-sample mouse stroke outside the tool strip. During the stroke frame:
+
+- UI declaration/tessellation: `0` calls, `1` cache hit;
+- UI texture updates: `0`;
+- UI GPU buffer preparation: `0` calls, `1` cache hit;
+- retained overlay draw encoding: `17.6 µs`;
+- canvas work still processed all 11 samples and uploaded 16 changed tiles.
+
+This proves the intended ownership property: unchanged UI does not put layout,
+tessellation, texture upload, or buffer preparation on the canvas-only frame.
+It does not yet quantify GPU execution time.
+
+The same test exposed two Linux event-filtering leaks. Raw winit
+`AxisMotion` events have no UI position and duplicated the XInput/cursor
+streams, while repeated no-op `ModifiersChanged(0)` notifications invalidated
+the UI around synthetic clicks. The adapter now ignores raw axis motion and
+deduplicates modifier state. Direct tablet position/contact remains the
+authoritative pen-to-UI path.
+
+Warm dirty debug passes for this one-control-strip scaffold were roughly
+`1.4–1.8 ms` for egui declaration/tessellation, `0.17–0.36 ms` for
+`egui-wgpu` buffer preparation, and `14–18 µs` for overlay draw encoding on
+Apollo. Cold font/device startup was much larger. These debug smoke numbers
+are diagnostic scale indicators, not release benchmarks or adoption results.
+The remaining gate still requires release-mode distributions, GPU timestamps
+where supported, memory/geometry counts, and a physical pen comparison.
 
 ## Custom Fallback
 

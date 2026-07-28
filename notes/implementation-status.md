@@ -89,6 +89,8 @@ prototype:
 - one-second live mean/p95/max CPU input-handler and frame-submit timing,
   upload traffic, page/capacity/residency, deferred-visible, eviction, and CPU
   tile counters;
+- separate live UI event, declaration/tessellation, texture-update,
+  GPU-buffer-preparation, prepared-cache-hit, and overlay-encoding counters;
 - event-loop sleep while no redraw is requested.
 
 Controls:
@@ -220,6 +222,10 @@ The current test suite covers:
 - fixed-capacity recent-color eviction, exact deduplication, validation, and
   non-mutating wraparound traversal;
 - camera mapping and view bounds.
+- logarithmic UI brush-diameter mapping and linear-to-sRGB swatch conversion;
+- redraw/raw-axis UI invalidation filtering;
+- UI-origin tablet capture through release, canvas-origin ownership exclusion,
+  and hover-boundary forwarding.
 
 ### CPU brush replay
 

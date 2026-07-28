@@ -1902,6 +1902,11 @@ impl App {
         let render = self.metrics.rendering.summary();
         let frame_stages = self.metrics.frame_stages.summary();
         let tablet_latency = self.metrics.tablet_latency.summary();
+        let ui_stats = self
+            .ui
+            .as_mut()
+            .map(UiOverlay::take_stats)
+            .unwrap_or_default();
         let hover_source = tablet_latency.hover.source_excess;
         let hover_queue = tablet_latency.hover.backend_to_handler;
         let hover_submit = tablet_latency.hover.latest_to_submit;
@@ -2081,6 +2086,40 @@ impl App {
                 frame_stages.submit.mean,
                 frame_stages.submit.p95,
                 frame_stages.submit.maximum,
+            );
+        }
+        if ui_stats.cpu_prepares > 0
+            || ui_stats.cpu_cache_hits > 0
+            || ui_stats.window_events > 0
+            || ui_stats.tablet_events > 0
+        {
+            let mean_us = |nanos: u64, count: u64| {
+                if count == 0 {
+                    0.0
+                } else {
+                    nanos as f64 / count as f64 / 1_000.0
+                }
+            };
+            log::info!(
+                "ui events(window/tablet)={}/{} paint_jobs={} texture_updates={} \
+                 cpu_prepare(count/cache/mean_us/max_us)={}/{}/{:.1}/{:.1} \
+                 gpu_prepare(count/cache/mean_us/max_us)={}/{}/{:.1}/{:.1} \
+                 draw(count/mean_us/max_us)={}/{:.1}/{:.1}",
+                ui_stats.window_events,
+                ui_stats.tablet_events,
+                ui_stats.paint_jobs,
+                ui_stats.texture_updates,
+                ui_stats.cpu_prepares,
+                ui_stats.cpu_cache_hits,
+                mean_us(ui_stats.cpu_prepare_nanos, ui_stats.cpu_prepares),
+                ui_stats.cpu_prepare_max_nanos as f64 / 1_000.0,
+                ui_stats.gpu_prepares,
+                ui_stats.gpu_cache_hits,
+                mean_us(ui_stats.gpu_prepare_nanos, ui_stats.gpu_prepares),
+                ui_stats.gpu_prepare_max_nanos as f64 / 1_000.0,
+                ui_stats.draws,
+                mean_us(ui_stats.draw_nanos, ui_stats.draws),
+                ui_stats.draw_max_nanos as f64 / 1_000.0,
             );
         }
         self.metrics.reset(gpu_stats);
@@ -2470,10 +2509,26 @@ impl ApplicationHandler<TabletEvent> for App {
         self.report_live_metrics();
         self.maybe_autosave();
 
+        let now = Instant::now();
+        let ui_repaint_due = self
+            .ui
+            .as_mut()
+            .is_some_and(|ui| ui.consume_due_repaint(now));
+        if ui_repaint_due {
+            self.request_redraw();
+        }
+
         let mut deadline = self
             .metrics
             .has_activity()
             .then(|| self.metrics.report_deadline());
+        if let Some(ui_deadline) = self.ui.as_ref().and_then(UiOverlay::repaint_deadline) {
+            deadline = Some(
+                deadline
+                    .map(|existing| existing.min(ui_deadline))
+                    .unwrap_or(ui_deadline),
+            );
+        }
         if self.persistence.recovery_dirty() && self.active_stroke.is_none() {
             if let Some(checkpoint_due) = self.recovery_due {
                 deadline = Some(

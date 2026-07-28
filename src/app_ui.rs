@@ -3,7 +3,10 @@ use egui::{
     TextureId, Vec2,
 };
 use sketchpad::input::{TabletPhase, TabletSample};
-use std::mem;
+use std::{
+    mem,
+    time::{Duration, Instant},
+};
 use winit::{event::WindowEvent, keyboard::ModifiersState, window::Window};
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
@@ -50,6 +53,25 @@ pub enum UiAction {
 pub struct UiEventResponse {
     pub consumed: bool,
     pub repaint: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct UiOverlayStats {
+    pub window_events: u64,
+    pub tablet_events: u64,
+    pub cpu_prepares: u64,
+    pub cpu_cache_hits: u64,
+    pub cpu_prepare_nanos: u64,
+    pub cpu_prepare_max_nanos: u64,
+    pub gpu_prepares: u64,
+    pub gpu_cache_hits: u64,
+    pub gpu_prepare_nanos: u64,
+    pub gpu_prepare_max_nanos: u64,
+    pub texture_updates: u64,
+    pub draws: u64,
+    pub draw_nanos: u64,
+    pub draw_max_nanos: u64,
+    pub paint_jobs: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -132,9 +154,12 @@ pub struct UiOverlay {
     mouse_capture: bool,
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
+    modifiers: ModifiersState,
     cpu_dirty: bool,
     gpu_dirty: bool,
     last_snapshot: Option<UiSnapshot>,
+    repaint_deadline: Option<Instant>,
+    stats: UiOverlayStats,
 }
 
 impl UiOverlay {
@@ -162,9 +187,12 @@ impl UiOverlay {
             mouse_capture: false,
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
+            modifiers: ModifiersState::empty(),
             cpu_dirty: true,
             gpu_dirty: false,
             last_snapshot: None,
+            repaint_deadline: None,
+            stats: UiOverlayStats::default(),
         }
     }
 
@@ -177,6 +205,13 @@ impl UiOverlay {
     ) -> UiEventResponse {
         if !platform_event_can_invalidate_ui(event) {
             return UiEventResponse::default();
+        }
+        if let WindowEvent::ModifiersChanged(modifiers) = event {
+            let modifiers = modifiers.state();
+            if modifiers == self.modifiers {
+                return UiEventResponse::default();
+            }
+            self.modifiers = modifiers;
         }
         let pointer_event = matches!(
             event,
@@ -211,10 +246,12 @@ impl UiOverlay {
         }
 
         let response = self.platform.on_window_event(window, event);
+        self.stats.window_events = self.stats.window_events.saturating_add(1);
         if response.repaint {
             self.cpu_dirty = true;
         }
         if matches!(event, WindowEvent::Focused(false)) {
+            self.modifiers = ModifiersState::empty();
             self.cancel_pointer_capture();
         }
 
@@ -248,9 +285,11 @@ impl UiOverlay {
             self.cpu_dirty = true;
         }
         if !self.cpu_dirty {
+            self.stats.cpu_cache_hits = self.stats.cpu_cache_hits.saturating_add(1);
             return Vec::new();
         }
 
+        let started = Instant::now();
         let input = self.platform.take_egui_input(window);
         let context = self.context.clone();
         let mut actions = Vec::new();
@@ -260,6 +299,10 @@ impl UiOverlay {
                 interactive_rect = show_toolbar(root, snapshot, &mut actions);
             }
         });
+        let repaint_delay = output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |viewport| viewport.repaint_delay);
         self.platform
             .handle_platform_output(window, output.platform_output);
         self.paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
@@ -269,6 +312,15 @@ impl UiOverlay {
         self.last_snapshot = Some(snapshot);
         self.cpu_dirty = false;
         self.gpu_dirty = true;
+        self.repaint_deadline = if repaint_delay == Duration::MAX {
+            None
+        } else {
+            Instant::now().checked_add(repaint_delay)
+        };
+        let elapsed = elapsed_nanos(started);
+        self.stats.cpu_prepares = self.stats.cpu_prepares.saturating_add(1);
+        self.stats.cpu_prepare_nanos = self.stats.cpu_prepare_nanos.saturating_add(elapsed);
+        self.stats.cpu_prepare_max_nanos = self.stats.cpu_prepare_max_nanos.max(elapsed);
         actions
     }
 
@@ -280,8 +332,14 @@ impl UiOverlay {
         screen: &egui_wgpu::ScreenDescriptor,
     ) -> Vec<wgpu::CommandBuffer> {
         if !self.gpu_dirty {
+            self.stats.gpu_cache_hits = self.stats.gpu_cache_hits.saturating_add(1);
             return Vec::new();
         }
+        let started = Instant::now();
+        self.stats.texture_updates = self
+            .stats
+            .texture_updates
+            .saturating_add(self.textures_to_set.len() as u64);
         for (id, delta) in self.textures_to_set.drain(..) {
             self.renderer.update_texture(device, queue, id, &delta);
         }
@@ -289,16 +347,25 @@ impl UiOverlay {
             self.renderer
                 .update_buffers(device, queue, encoder, &self.paint_jobs, screen);
         self.gpu_dirty = false;
+        let elapsed = elapsed_nanos(started);
+        self.stats.gpu_prepares = self.stats.gpu_prepares.saturating_add(1);
+        self.stats.gpu_prepare_nanos = self.stats.gpu_prepare_nanos.saturating_add(elapsed);
+        self.stats.gpu_prepare_max_nanos = self.stats.gpu_prepare_max_nanos.max(elapsed);
         commands
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         render_pass: &mut wgpu::RenderPass<'static>,
         screen: &egui_wgpu::ScreenDescriptor,
     ) {
         if !self.paint_jobs.is_empty() {
+            let started = Instant::now();
             self.renderer.render(render_pass, &self.paint_jobs, screen);
+            let elapsed = elapsed_nanos(started);
+            self.stats.draws = self.stats.draws.saturating_add(1);
+            self.stats.draw_nanos = self.stats.draw_nanos.saturating_add(elapsed);
+            self.stats.draw_max_nanos = self.stats.draw_max_nanos.max(elapsed);
         }
     }
 
@@ -310,6 +377,29 @@ impl UiOverlay {
 
     pub fn mark_dirty(&mut self) {
         self.cpu_dirty = true;
+    }
+
+    pub fn repaint_deadline(&self) -> Option<Instant> {
+        self.repaint_deadline
+    }
+
+    pub fn consume_due_repaint(&mut self, now: Instant) -> bool {
+        if self
+            .repaint_deadline
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.repaint_deadline = None;
+            self.cpu_dirty = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn take_stats(&mut self) -> UiOverlayStats {
+        let mut stats = mem::take(&mut self.stats);
+        stats.paint_jobs = self.paint_jobs.len();
+        stats
     }
 
     pub fn cancel_pointer_capture(&mut self) {
@@ -362,6 +452,7 @@ impl UiOverlay {
             return UiEventResponse::default();
         }
 
+        self.stats.tablet_events = self.stats.tablet_events.saturating_add(1);
         self.tablet_position = Some(position);
         let input = self.platform.egui_input_mut();
         input.events.push(egui::Event::PointerMoved(position));
@@ -382,6 +473,10 @@ impl UiOverlay {
     }
 }
 
+fn elapsed_nanos(started: Instant) -> u64 {
+    started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+}
+
 fn platform_event_can_invalidate_ui(event: &WindowEvent) -> bool {
     !matches!(
         event,
@@ -390,6 +485,7 @@ fn platform_event_can_invalidate_ui(event: &WindowEvent) -> bool {
             | WindowEvent::Destroyed
             | WindowEvent::Moved(_)
             | WindowEvent::Occluded(_)
+            | WindowEvent::AxisMotion { .. }
     )
 }
 
@@ -413,6 +509,7 @@ fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiA
         .fixed_pos(TOOLBAR_POSITION)
         .order(Order::Foreground)
         .movable(false)
+        .fade_in(false)
         .show(root.ctx(), |ui| {
             egui::Frame::new()
                 .fill(PANEL)
@@ -625,6 +722,13 @@ mod tests {
         ));
         assert!(!platform_event_can_invalidate_ui(
             &WindowEvent::CloseRequested
+        ));
+        assert!(!platform_event_can_invalidate_ui(
+            &WindowEvent::AxisMotion {
+                device_id: winit::event::DeviceId::dummy(),
+                axis: 0,
+                value: 1.0,
+            }
         ));
     }
 
