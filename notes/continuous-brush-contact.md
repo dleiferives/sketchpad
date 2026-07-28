@@ -449,6 +449,58 @@ display-paced incremental batches, and measure new geometry only. Live
 integration must then give the active layer an explicit GPU/CPU ownership and
 undo contract; writing into the flattened visible composite remains invalid.
 
+### Incremental GPU result — 2026-07-28
+
+Version 2 of `gpu_brush_bench` retains the target across a stroke, clears it
+once, partitions the mesh at input-sample boundaries, and draws only each new
+range. Each batch is submitted and drained before the next measurement so
+queue backlog cannot contaminate CPU submit or GPU timestamp distributions.
+Every partition produced the same final changed-pixel count and checksum as
+the one-batch render.
+
+The following Apollo captures used the same trace, format, shader, and
+single-sample hard-edge quality. Values are GPU time for one incremental
+presentation batch:
+
+| Samples per batch | Batches per stroke | Empty median / p95 / max | Painted median / p95 / max |
+|---:|---:|---:|---:|
+| 1 | 256 | 0.057 / 0.206 / 0.230 ms | 0.057 / 0.205 / 0.227 ms |
+| 2 | 128 | 0.328 / 0.396 / 0.417 ms | 0.313 / 0.394 / 0.421 ms |
+| 4 | 64 | 0.162 / 0.417 / 0.731 ms | 0.169 / 0.519 / 0.634 ms |
+| 8 | 32 | 0.299 / 0.774 / 1.419 ms | 0.320 / 0.682 / 1.482 ms |
+| 16 | 16 | 0.603 / 1.264 / 1.616 ms | 0.602 / 1.419 / 2.262 ms |
+
+For the plausible four-sample group, CPU encode/submit was 0.147 ms median
+and 0.238 ms p95 empty, and 0.142 ms median and 0.228 ms p95 painted. Its
+complete 256-sample stroke consumed 11.822 ms and 13.021 ms median GPU time,
+spread over 64 presentation opportunities. The non-monotonic total at the
+two-sample partition—about 40.5 ms—must not be explained away; it may reflect
+render-pass load/store behavior, integrated-GPU power state, or this synthetic
+drain protocol. It is a reason to retain the matrix and measure physically
+paced batches, not a reason to choose a magic hard-coded sample count.
+
+This result supports the intended live scheduling model:
+
+- collect every semantic input sample;
+- construct new connected contact geometry once;
+- append only work received since the last presentation opportunity;
+- submit one brush batch per opportunity;
+- keep prior pixels resident instead of redrawing the stroke;
+- make adaptive batching a scheduling consequence, not a brush-quality knob.
+
+It does not imply that input should be artificially delayed until four samples
+arrive. With one sample ready, submit one; with several accumulated before the
+next display opportunity, batch all of them.
+
+#### Timestamp-query limit found and fixed
+
+The first eight-run, one-sample capture requested 4,112 timestamp entries in
+one query set and triggered wgpu's 4,096-query validation limit. The harness
+now calculates the safe run-group capacity, resolves multiple bounded query
+sets when necessary, and has a regression test for the 256-batch case. This
+was a benchmark-infrastructure failure; no brush result from the failed run
+was retained.
+
 ### GPU path
 
 For the initial render path:
@@ -600,8 +652,9 @@ should only begin after:
 4. [Rejected] Add a CPU span implementation consuming the same commands; the
    measured prototypes were slower than the existing dab control, so retain
    the evidence rather than their product code.
-5. Compare GPU, CPU span, and old dab prototype on performance and visual
-   continuity.
+5. [Performance complete, visual pending] Compare GPU, CPU span, and old dab
+   prototype. Whole-stroke and incremental GPU timing pass; antialiasing and
+   material appearance still require visual validation.
 6. Integrate the winning path as an active fixed-color palette knife without
    live readback.
 7. Validate Wacom orientation with a labeled calibration view.

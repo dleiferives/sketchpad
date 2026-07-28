@@ -7,6 +7,7 @@ use std::{
     env,
     error::Error,
     iter,
+    ops::Range,
     sync::mpsc,
     time::{Duration, Instant},
 };
@@ -22,6 +23,7 @@ const MAXIMUM_SUBDIVISIONS: usize = 24;
 const PAINT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 const PIXEL_BYTES: u32 = 16;
 const QUERY_BYTES: u64 = std::mem::size_of::<u64>() as u64;
+const MAXIMUM_QUERIES_PER_SET: u32 = 4096;
 const PAINT_COLOR: [f32; 4] = [0.04, 0.08, 0.20, 1.0];
 
 #[repr(C)]
@@ -70,12 +72,31 @@ struct Arguments {
     diameter: f32,
     runs: usize,
     warmups: usize,
+    batch_samples: usize,
 }
 
 struct Geometry {
     vertices: Vec<Vertex>,
+    sample_vertex_ends: Vec<u32>,
     sweeps: usize,
     conservative_pixels: f64,
+}
+
+impl Geometry {
+    fn draw_ranges(&self, batch_samples: usize) -> Vec<Range<u32>> {
+        assert!(batch_samples > 0);
+        let mut ranges = Vec::with_capacity(self.sample_vertex_ends.len().div_ceil(batch_samples));
+        let mut vertex_start = 0;
+        let mut sample_start = 0;
+        while sample_start < self.sample_vertex_ends.len() {
+            let sample_end = (sample_start + batch_samples).min(self.sample_vertex_ends.len()) - 1;
+            let vertex_end = self.sample_vertex_ends[sample_end];
+            ranges.push(vertex_start..vertex_end);
+            vertex_start = vertex_end;
+            sample_start += batch_samples;
+        }
+        ranges
+    }
 }
 
 struct Gpu {
@@ -89,8 +110,10 @@ struct Gpu {
 
 struct StateResult {
     cpu_encode_submit_micros: Vec<f64>,
+    cpu_stroke_micros: Vec<f64>,
     gpu_reset_micros: Vec<f64>,
     gpu_brush_micros: Vec<f64>,
+    gpu_stroke_micros: Vec<f64>,
     readback: ReadbackResult,
 }
 
@@ -105,6 +128,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     let geometry_start = Instant::now();
     let geometry = build_geometry(arguments.diameter)?;
     let geometry_elapsed = geometry_start.elapsed();
+    let draw_ranges = geometry.draw_ranges(arguments.batch_samples);
+    let query_sets_per_state = arguments
+        .runs
+        .div_ceil(query_group_capacity(draw_ranges.len()));
     let gpu = create_gpu(arguments.adapter_filter.as_deref())?;
     let vertex_buffer = gpu
         .device
@@ -115,13 +142,16 @@ fn main() -> Result<(), Box<dyn Error>> {
         });
 
     println!(
-        "gpu_continuous_blade version=1 canvas={}x{} input_samples={} diameter={} runs={} warmups={} format={:?} blend=source-over edge=single-sample",
+        "gpu_continuous_blade version=2 canvas={}x{} input_samples={} batch_samples={} batches_per_stroke={} diameter={} runs={} warmups={} timestamp_query_sets_per_state={} format={:?} blend=source-over edge=single-sample",
         CANVAS_SIZE,
         CANVAS_SIZE,
         INPUT_SAMPLES,
+        arguments.batch_samples,
+        draw_ranges.len(),
         arguments.diameter,
         arguments.runs,
         arguments.warmups,
+        query_sets_per_state,
         PAINT_FORMAT
     );
     println!(
@@ -146,7 +176,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let result = run_state(
             &gpu,
             &vertex_buffer,
-            geometry.vertices.len() as u32,
+            &draw_ranges,
             state,
             arguments.warmups,
             arguments.runs,
@@ -156,8 +186,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             "cpu_encode_submit_us",
             &result.cpu_encode_submit_micros,
         );
+        print_distribution(state, "cpu_stroke_us", &result.cpu_stroke_micros);
         print_distribution(state, "gpu_reset_us", &result.gpu_reset_micros);
         print_distribution(state, "gpu_brush_us", &result.gpu_brush_micros);
+        print_distribution(state, "gpu_stroke_us", &result.gpu_stroke_micros);
         println!(
             "validation state={} changed_pixels={} checksum={:.9} readback_us={:.3}",
             state.name(),
@@ -174,6 +206,7 @@ fn parse_arguments() -> Result<Arguments, Box<dyn Error>> {
     let mut diameter = DEFAULT_DIAMETER;
     let mut runs = DEFAULT_RUNS;
     let mut warmups = DEFAULT_WARMUPS;
+    let mut batch_samples = INPUT_SAMPLES as usize;
     let mut arguments = env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -208,10 +241,23 @@ fn parse_arguments() -> Result<Arguments, Box<dyn Error>> {
                     .parse()
                     .map_err(|_| format!("invalid --warmups value: {value}"))?;
             }
+            "--batch-samples" => {
+                let value = arguments
+                    .next()
+                    .ok_or("--batch-samples requires an integer")?;
+                batch_samples = value
+                    .parse()
+                    .map_err(|_| format!("invalid --batch-samples value: {value}"))?;
+                if batch_samples == 0 || batch_samples > INPUT_SAMPLES as usize {
+                    return Err(
+                        format!("--batch-samples must be between 1 and {INPUT_SAMPLES}").into(),
+                    );
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: gpu_brush_bench [--adapter NAME] [--diameter PX] \
-                     [--runs N] [--warmups N]"
+                     [--runs N] [--warmups N] [--batch-samples N]"
                 );
                 std::process::exit(0);
             }
@@ -223,6 +269,7 @@ fn parse_arguments() -> Result<Arguments, Box<dyn Error>> {
         diameter,
         runs,
         warmups,
+        batch_samples,
     })
 }
 
@@ -233,6 +280,7 @@ fn build_geometry(diameter: f32) -> Result<Geometry, Box<dyn Error>> {
         1.0,
     )?;
     let mut vertices = Vec::with_capacity(INPUT_SAMPLES as usize * 18);
+    let mut sample_vertex_ends = Vec::with_capacity(INPUT_SAMPLES as usize);
     let mut sweeps = 0;
     let mut conservative_pixels = 0.0;
     let mut previous = trace_pose(brush, 0)?;
@@ -243,6 +291,7 @@ fn build_geometry(diameter: f32) -> Result<Geometry, Box<dyn Error>> {
         &mut conservative_pixels,
     );
     sweeps += 1;
+    sample_vertex_ends.push(vertices.len() as u32);
     for index in 1..INPUT_SAMPLES {
         let current = trace_pose(brush, index)?;
         sweeps += for_each_subdivided_sweep(
@@ -252,11 +301,13 @@ fn build_geometry(diameter: f32) -> Result<Geometry, Box<dyn Error>> {
             MAXIMUM_SUBDIVISIONS,
             |sweep| append_sweep(sweep, &mut vertices, &mut conservative_pixels),
         );
+        sample_vertex_ends.push(vertices.len() as u32);
         previous = current;
     }
 
     Ok(Geometry {
         vertices,
+        sample_vertex_ends,
         sweeps,
         conservative_pixels,
     })
@@ -439,109 +490,144 @@ fn create_gpu(adapter_filter: Option<&str>) -> Result<Gpu, Box<dyn Error>> {
 fn run_state(
     gpu: &Gpu,
     vertex_buffer: &wgpu::Buffer,
-    vertex_count: u32,
+    draw_ranges: &[Range<u32>],
     state: InitialState,
     warmups: usize,
     runs: usize,
 ) -> Result<StateResult, Box<dyn Error>> {
-    let mut final_warmup = None;
     for _ in 0..warmups {
-        let (submission, _) = submit_run(gpu, vertex_buffer, vertex_count, state, None);
-        final_warmup = Some(submission);
-    }
-    if let Some(submission) = final_warmup {
+        let mut submission = submit_reset(gpu, state, None);
+        for range in draw_ranges {
+            (submission, _) = submit_draw(gpu, vertex_buffer, range.clone(), None);
+        }
         gpu.device.poll(wgpu::PollType::Wait {
             submission_index: Some(submission),
             timeout: None,
         })?;
     }
 
-    let queries_per_run = 4;
-    let query_count = runs as u32 * queries_per_run;
-    let query_set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
-        label: Some("Continuous Blade Timestamps"),
-        ty: wgpu::QueryType::Timestamp,
-        count: query_count,
-    });
-    let query_size = u64::from(query_count) * QUERY_BYTES;
-    let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Continuous Blade Timestamp Resolve"),
-        size: query_size,
-        usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("Continuous Blade Timestamp Readback"),
-        size: query_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    let mut cpu_encode_submit_micros = Vec::with_capacity(runs);
-    for index in 0..runs {
-        let (submission, elapsed) = submit_run(
-            gpu,
-            vertex_buffer,
-            vertex_count,
-            state,
-            Some((&query_set, index as u32 * queries_per_run)),
-        );
-        cpu_encode_submit_micros.push(duration_micros(elapsed));
-        gpu.device.poll(wgpu::PollType::Wait {
-            submission_index: Some(submission),
-            timeout: None,
-        })?;
-    }
-
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Continuous Blade Timestamp Readback"),
-        });
-    encoder.resolve_query_set(&query_set, 0..query_count, &resolve, 0);
-    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, query_size);
-    let submission = gpu.queue.submit(iter::once(encoder.finish()));
-    let timestamps = map_u64_buffer(&gpu.device, &readback, submission)?;
+    let queries_per_run = (draw_ranges.len() as u32 + 1) * 2;
+    let runs_per_query_set = query_group_capacity(draw_ranges.len());
+    let mut cpu_encode_submit_micros = Vec::with_capacity(runs * draw_ranges.len());
+    let mut cpu_stroke_micros = Vec::with_capacity(runs);
     let timestamp_period = f64::from(gpu.queue.get_timestamp_period());
     let gpu_duration =
         |start: u64, end: u64| end.saturating_sub(start) as f64 * timestamp_period / 1_000.0;
     let mut gpu_reset_micros = Vec::with_capacity(runs);
-    let mut gpu_brush_micros = Vec::with_capacity(runs);
-    for timestamps in timestamps.chunks_exact(queries_per_run as usize) {
-        gpu_reset_micros.push(gpu_duration(timestamps[0], timestamps[1]));
-        gpu_brush_micros.push(gpu_duration(timestamps[2], timestamps[3]));
+    let mut gpu_brush_micros = Vec::with_capacity(runs * draw_ranges.len());
+    let mut gpu_stroke_micros = Vec::with_capacity(runs);
+    let mut measured_runs = 0;
+    while measured_runs < runs {
+        let group_runs = (runs - measured_runs).min(runs_per_query_set);
+        let query_count = group_runs as u32 * queries_per_run;
+        let query_set = gpu.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("Continuous Blade Timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count: query_count,
+        });
+        let query_size = u64::from(query_count) * QUERY_BYTES;
+        let resolve = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Continuous Blade Timestamp Resolve"),
+            size: query_size,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Continuous Blade Timestamp Readback"),
+            size: query_size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+
+        let mut query_base = 0;
+        for _ in 0..group_runs {
+            let submission = submit_reset(gpu, state, Some((&query_set, query_base)));
+            gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: Some(submission),
+                timeout: None,
+            })?;
+            query_base += 2;
+
+            let mut stroke_micros = 0.0;
+            for range in draw_ranges {
+                let (submission, elapsed) = submit_draw(
+                    gpu,
+                    vertex_buffer,
+                    range.clone(),
+                    Some((&query_set, query_base)),
+                );
+                let elapsed = duration_micros(elapsed);
+                cpu_encode_submit_micros.push(elapsed);
+                stroke_micros += elapsed;
+                gpu.device.poll(wgpu::PollType::Wait {
+                    submission_index: Some(submission),
+                    timeout: None,
+                })?;
+                query_base += 2;
+            }
+            cpu_stroke_micros.push(stroke_micros);
+        }
+        debug_assert_eq!(query_base, query_count);
+
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Continuous Blade Timestamp Readback"),
+            });
+        encoder.resolve_query_set(&query_set, 0..query_count, &resolve, 0);
+        encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, query_size);
+        let submission = gpu.queue.submit(iter::once(encoder.finish()));
+        let timestamps = map_u64_buffer(&gpu.device, &readback, submission)?;
+        let mut timestamps = timestamps.chunks_exact(2);
+        for _ in 0..group_runs {
+            let reset = timestamps
+                .next()
+                .expect("every run has one reset query pair");
+            gpu_reset_micros.push(gpu_duration(reset[0], reset[1]));
+            let mut stroke_micros = 0.0;
+            for _ in draw_ranges {
+                let brush = timestamps
+                    .next()
+                    .expect("every draw batch has one query pair");
+                let elapsed = gpu_duration(brush[0], brush[1]);
+                gpu_brush_micros.push(elapsed);
+                stroke_micros += elapsed;
+            }
+            gpu_stroke_micros.push(stroke_micros);
+        }
+        debug_assert!(timestamps.next().is_none());
+        measured_runs += group_runs;
     }
+
     let readback = readback_target(gpu, state)?;
     Ok(StateResult {
         cpu_encode_submit_micros,
+        cpu_stroke_micros,
         gpu_reset_micros,
         gpu_brush_micros,
+        gpu_stroke_micros,
         readback,
     })
 }
 
-fn submit_run(
+fn submit_reset(
     gpu: &Gpu,
-    vertex_buffer: &wgpu::Buffer,
-    vertex_count: u32,
     state: InitialState,
     timestamps: Option<(&wgpu::QuerySet, u32)>,
-) -> (wgpu::SubmissionIndex, Duration) {
-    let start = Instant::now();
+) -> wgpu::SubmissionIndex {
     let mut encoder = gpu
         .device
         .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Continuous Blade Run"),
+            label: Some("Continuous Blade Reset"),
         });
-    let reset_timestamp_writes =
-        timestamps.map(|(query_set, base)| wgpu::RenderPassTimestampWrites {
-            query_set,
-            beginning_of_pass_write_index: Some(base),
-            end_of_pass_write_index: Some(base + 1),
-        });
+    let timestamp_writes = timestamps.map(|(query_set, base)| wgpu::RenderPassTimestampWrites {
+        query_set,
+        beginning_of_pass_write_index: Some(base),
+        end_of_pass_write_index: Some(base + 1),
+    });
     {
         let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("Continuous Blade Untimed Reset"),
+            label: Some("Continuous Blade Reset"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &gpu.target_view,
                 resolve_target: None,
@@ -552,15 +638,30 @@ fn submit_run(
                 depth_slice: None,
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: reset_timestamp_writes,
+            timestamp_writes,
             occlusion_query_set: None,
             multiview_mask: None,
         });
     }
+    gpu.queue.submit(iter::once(encoder.finish()))
+}
+
+fn submit_draw(
+    gpu: &Gpu,
+    vertex_buffer: &wgpu::Buffer,
+    vertex_range: Range<u32>,
+    timestamps: Option<(&wgpu::QuerySet, u32)>,
+) -> (wgpu::SubmissionIndex, Duration) {
+    let start = Instant::now();
+    let mut encoder = gpu
+        .device
+        .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("Continuous Blade Draw"),
+        });
     let timestamp_writes = timestamps.map(|(query_set, base)| wgpu::RenderPassTimestampWrites {
         query_set,
-        beginning_of_pass_write_index: Some(base + 2),
-        end_of_pass_write_index: Some(base + 3),
+        beginning_of_pass_write_index: Some(base),
+        end_of_pass_write_index: Some(base + 1),
     });
     {
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -581,7 +682,7 @@ fn submit_run(
         });
         pass.set_pipeline(&gpu.pipeline);
         pass.set_vertex_buffer(0, vertex_buffer.slice(..));
-        pass.draw(0..vertex_count, 0..1);
+        pass.draw(vertex_range, 0..1);
     }
     let submission = gpu.queue.submit(iter::once(encoder.finish()));
     (submission, start.elapsed())
@@ -722,6 +823,12 @@ fn percentile(sorted: &[f64], percentage: usize) -> f64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
+fn query_group_capacity(draw_batches: usize) -> usize {
+    let queries_per_run = (draw_batches as u32 + 1) * 2;
+    assert!(queries_per_run <= MAXIMUM_QUERIES_PER_SET);
+    (MAXIMUM_QUERIES_PER_SET / queries_per_run) as usize
+}
+
 fn duration_micros(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1_000_000.0
 }
@@ -736,6 +843,12 @@ mod tests {
         let second = build_geometry(DEFAULT_DIAMETER).unwrap();
         assert_eq!(first.vertices, second.vertices);
         assert_eq!(first.sweeps, second.sweeps);
+        assert_eq!(first.sample_vertex_ends, second.sample_vertex_ends);
+        assert_eq!(first.sample_vertex_ends.len(), INPUT_SAMPLES as usize);
+        assert_eq!(
+            first.sample_vertex_ends.last().copied(),
+            Some(first.vertices.len() as u32)
+        );
         assert!(first.sweeps >= INPUT_SAMPLES as usize);
         assert!(first
             .vertices
@@ -746,9 +859,35 @@ mod tests {
     }
 
     #[test]
+    fn incremental_ranges_partition_the_vertex_batch() {
+        let geometry = build_geometry(DEFAULT_DIAMETER).unwrap();
+        for batch_samples in [1, 2, 4, 7, 16, INPUT_SAMPLES as usize] {
+            let ranges = geometry.draw_ranges(batch_samples);
+            assert_eq!(
+                ranges.len(),
+                (INPUT_SAMPLES as usize).div_ceil(batch_samples)
+            );
+            assert_eq!(ranges.first().unwrap().start, 0);
+            assert_eq!(ranges.last().unwrap().end, geometry.vertices.len() as u32);
+            assert!(ranges.windows(2).all(|pair| pair[0].end == pair[1].start));
+            assert!(ranges.iter().all(|range| !range.is_empty()));
+        }
+    }
+
+    #[test]
     fn percentile_uses_nearest_rank() {
         let values = [1.0, 2.0, 3.0, 4.0, 5.0];
         assert_eq!(percentile(&values, 50), 3.0);
         assert_eq!(percentile(&values, 95), 5.0);
+    }
+
+    #[test]
+    fn timestamp_queries_are_chunked_below_the_wgpu_limit() {
+        assert_eq!(query_group_capacity(1), 1024);
+        assert_eq!(query_group_capacity(INPUT_SAMPLES as usize), 7);
+        assert!(
+            query_group_capacity(INPUT_SAMPLES as usize) * (INPUT_SAMPLES as usize + 1) * 2
+                <= MAXIMUM_QUERIES_PER_SET as usize
+        );
     }
 }

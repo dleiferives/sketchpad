@@ -625,26 +625,31 @@ immediate order is:
    8.366 ms empty and 8.353 ms painted versus 263.544 ms and 260.293 ms for
    the retained CPU control—approximately 31× faster. Readback is measured
    separately and remains forbidden from the live stroke path.
-5. Integrate a validated continuous-contact path without live readback, then
+5. [Complete] Measure persistent-target incremental batches. Four new input
+   samples cost 0.162 ms median / 0.417 ms p95 empty and 0.169 ms median /
+   0.519 ms p95 painted on Apollo; all batch partitions produced identical
+   final validation pixels for the opaque geometry proof.
+6. Define active-layer GPU/CPU ownership, below/active/above composition,
+   cancel, undo, save, and recovery semantics before any live GPU mutation.
+7. Integrate a validated continuous-contact path without live readback, then
    extend it to flat, pencil, and bounded-strand marks. The design and quality
    gates are in
    [Continuous brush contact and physical paint](continuous-brush-contact.md).
-6. Validate the Wacom tilt mapping with a labeled calibration view.
-7. Continue turning the proven toolbar, layer, file, color, and keybinding
+8. Validate the Wacom tilt mapping with a labeled calibration view.
+9. Continue turning the proven toolbar, layer, file, color, and keybinding
    surfaces into a coherent usable drawing workflow.
-8. Add canvas rotation controls before broader selection/transform work.
-9. Add frame-paced replay that processes every sample but coalesces GPU work to
+10. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
-10. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
+11. Compare per-damage `write_texture`, per-frame dirty coalescing, and reusable
    staging-ring transfers with copy timing and exact GPU readback.
-11. Measure the exact `Rgba32Float` display cache against direct tiles without
+12. Measure the exact `Rgba32Float` display cache against direct tiles without
    changing image quality; keep reduced-precision formats out of the product
    path unless the quality policy explicitly changes.
-12. Profile the remaining CPU kernel and only then test scanline
+13. Profile the remaining CPU kernel and only then test scanline
    specialization, SIMD dispatch, LTO, and PGO.
-13. Capture a physical trace family covering light pressure, fast motion, long
+14. Capture a physical trace family covering light pressure, fast motion, long
    curves, eraser use, and distinct drawing styles.
-14. Keep hardware runs on Apollo for the current constrained-device work; do
+15. Keep hardware runs on Apollo for the current constrained-device work; do
    not run the present brush campaign on Atlas.
-15. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
+16. Add Wayland tablet-v2, filtering/mip experiments, and a second textured
    brush after the proof-system and hard-ink latency work.
