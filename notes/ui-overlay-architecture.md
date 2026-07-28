@@ -1,16 +1,23 @@
 # Immediate-Mode UI Overlay Architecture
 
-Status: research recommendation and bounded integration experiment, 2026-07-28.
-No UI dependency has been added yet.
+Status: architecture accepted and first integration slice in progress,
+2026-07-28.
+
+The dependency compatibility gate has passed on Apollo. Sketchpad pins egui,
+`egui-winit`, and `egui-wgpu` to revision
+`2cb071f7f6d71e0f888ba31bec9b3eb5ed5428fe`, which uses the same `wgpu` 30 and
+`winit` 0.30 versions as the application. `cargo check --bin sketchpad`
+completed successfully with that exact revision on 2026-07-28.
 
 ## Recommendation
 
 Use an immediate-mode UI over Sketchpad's existing canvas, but do not build a
 complete widget system first.
 
-The first implementation should be a time-boxed embedded `egui` experiment:
+Implement an embedded egui overlay behind a narrow Sketchpad-owned boundary:
 
-- pin one exact development revision whose workspace uses `wgpu` 30;
+- keep the exact compatible development revision pinned until a compatible
+  release is available;
 - depend on `egui`, `egui-winit`, and `egui-wgpu`, not `eframe`;
 - retain Sketchpad's existing `winit` event loop, `wgpu` instance/device/queue,
   surface, present mode, and command encoder;
@@ -19,9 +26,9 @@ The first implementation should be a time-boxed embedded `egui` experiment:
 - turn widget results into existing application commands rather than allowing
   widgets to own document state;
 - preserve event-loop sleep and cache unchanged prepared UI work;
-- measure the experiment on Apollo before declaring the toolkit permanent.
+- measure each integration slice on Apollo before expanding the UI surface.
 
-If the experiment cannot preserve one `wgpu` version, low pen latency, idle
+If the integration cannot preserve one `wgpu` version, low pen latency, idle
 sleep, predictable input capture, or a suitably custom visual result, remove
 it and implement the deliberately narrow overlay described in
 [Custom fallback](#custom-fallback). The experiment must leave the document
@@ -85,8 +92,65 @@ Risks:
 - direct XInput2 tablet events require deliberate integration rather than
   assuming synthesized mouse events are authoritative.
 
-These are reasons to measure a small integration, not reasons to fork the
-canvas architecture around egui.
+The exact pinned revision passed the initial dependency and type-compatibility
+check on Apollo. The remaining adoption gates are input ownership, UI work
+caching, visual control, idle behavior, and measured drawing latency. These are
+reasons to keep the integration narrow, not reasons to fork the canvas
+architecture around egui.
+
+## Portability Boundary
+
+The same egui declarations and custom components can be used on Linux,
+Windows, macOS, Android, and iOS/iPadOS. Egui is not the portable application
+shell:
+
+- `winit` and `wgpu` provide the platform window and graphics backends;
+- Sketchpad supplies platform packaging, lifecycle, file integration, safe
+  areas, and keyboard/IME details;
+- native Wacom, Apple Pencil, and Android stylus paths remain Sketchpad input
+  backends so drawing samples do not acquire UI latency;
+- egui receives the minimal position/contact events needed when a pen is
+  interacting with UI rather than the canvas.
+
+Use one in-window overlay and responsive panels. Do not make the product
+depend on secondary native viewports, hover-only controls, right-click, or
+desktop-sized hit targets. Those are the least portable parts of a desktop UI.
+Desktop integration comes first; Android and iOS application shells follow
+after the interaction and rendering boundary is stable.
+
+The current `egui-winit` dependency features are intentionally the Linux
+desktop features needed by Apollo and Atlas. Before another platform build,
+move platform features into target-specific dependency sections and select the
+appropriate Android activity backend. A successful Linux dependency check is
+not presented as a mobile application build.
+
+## Visual Design Boundary
+
+Egui supplies interaction, layout, clipping, text, focus, scrolling, and
+accessibility semantics. It does not define Sketchpad's visual identity.
+
+Avoid assembling the product from default-themed widgets. Build a small
+Sketchpad component set using egui allocation and response semantics with
+custom painting:
+
+- icon/tool button;
+- segmented tool selector;
+- continuous slider and numeric readout;
+- color swatch;
+- panel and popover;
+- label, separator, and tooltip;
+- layer row and scrollable layer list.
+
+Central design tokens define color, spacing, type scale, corner radius,
+borders, control size, and interaction states. Components must expose normal
+egui semantic labels and focus behavior even when their pixels are fully
+custom. Canvas overlays, brush previews, unusual blend effects, and other
+latency-sensitive or graphics-specific visuals may stay in Sketchpad's direct
+`wgpu` renderer.
+
+This makes the UI visually unrestricted while avoiding ownership of text
+editing, IME, focus traversal, clipping, and touch interaction. The structure
+is immediate-mode; the appearance is Sketchpad's.
 
 ### Other candidates
 
@@ -258,25 +322,111 @@ and UI uploads on the latency-critical sample path.
 Hidden panels are simply not declared. Their remembered session state may
 remain, but they produce no hit regions or paint jobs.
 
+## Implementation Plan
+
+The UI is divided into independently reviewable and measurable slices. A
+functional scaffold is not a commitment to the final layout.
+
+### Slice 1: overlay foundation
+
+1. Add a small `UiOverlay` that owns the egui context, `egui-winit` state,
+   renderer, prepared paint jobs, and UI-only session state.
+2. Feed it immutable `UiSnapshot` values and collect `UiAction` values.
+3. Use Sketchpad's existing surface texture, device, queue, encoder, and
+   surface format.
+4. Draw the canvas first and transparent UI geometry last.
+5. Rebuild disposable UI GPU resources after device/surface recreation.
+
+Commit this slice only after the application builds, opens, draws, resizes,
+and presents with the overlay both visible and hidden.
+
+### Slice 2: input ownership
+
+1. Route `winit` mouse/keyboard/touch events through the UI adapter before
+   canvas commands.
+2. Translate direct XInput2 tablet position/down/up events only while UI hover
+   or capture requires them.
+3. Select one owner on contact: UI, canvas drawing, color sampling, or panning.
+4. Hold that owner through release, cancel, or focus loss.
+5. Suppress duplicate synthesized mouse input after native tablet samples.
+6. Keep pressure and high-rate drawing samples on the native canvas path.
+
+Commit this slice after synthetic routing tests and physical Wacom tests prove
+that UI presses never paint and strokes never activate controls.
+
+### Slice 3: repaint and prepared-data caching
+
+Track UI invalidation separately from canvas invalidation:
+
+- UI input, UI-visible application state, resize/DPI, texture changes, and
+  animation make UI preparation dirty;
+- canvas-only input reuses the last prepared UI paint jobs and GPU buffers;
+- hidden UI skips its pass;
+- idle requests no redraw.
+
+Instrument UI declaration/layout, tessellation, texture update, buffer update,
+and overlay encoding separately. Verify and document the `egui-wgpu` prepared
+buffer reuse behavior rather than assuming it.
+
+### Slice 4: custom component foundation
+
+Define design tokens and implement the minimal Sketchpad components: tool
+button, segmented selector, slider, swatch, panel, popover, label, tooltip, and
+layer row. Use custom painter output while retaining semantic labels, keyboard
+focus, and appropriate touch target sizes.
+
+### Slice 5: first usable controls
+
+Create a neutral temporary layout:
+
+- compact tool selection for pen, eraser, and mixing;
+- brush diameter and opacity controls;
+- active/recent color controls;
+- undo and redo;
+- hide/show UI;
+- a collapsible layer panel.
+
+These controls must call the same application command methods as keyboard
+shortcuts. There is no second UI-owned copy of document or brush state.
+
+### Slice 6: product panels
+
+Expand through existing behavior before inventing new document semantics:
+
+- layer selection, visibility, create, duplicate, delete, order, and opacity;
+- open, save, import, and export actions;
+- richer color and mixing controls;
+- presets, followed later by the planned brush editor.
+
+Inline layer rename, thumbnails, drag-and-drop polish, and animation follow
+only when the basic controls and input latency are accepted.
+
+### Slice 7: platform shells
+
+After the desktop interaction boundary is stable, factor Cargo features and
+platform adapters for Windows and macOS, then Android and iOS/iPadOS. Reuse the
+same `UiSnapshot`, `UiAction`, design tokens, and component declarations.
+Platform-specific stylus backends and lifecycle code remain outside egui.
+
 ## First Vertical Slice
 
-The spike should prove the integration, not design the whole product:
+The first implementation milestone combines slices 1 through 3. Rendering UI
+without correct pointer ownership and caching would validate the wrong
+architecture. It should visibly prove:
 
-1. a fixed anchored panel with custom colors and spacing;
-2. a label and one icon/image;
-3. one button that changes an existing session-local setting;
-4. one toggle that shows and hides a second rectangle/panel;
-5. one slider backed by a brush setting;
-6. mouse and direct-pen hover/contact ownership;
-7. correct DPI scaling and resize;
-8. event-loop sleep when idle;
+1. a fixed custom-painted control surface;
+2. a label, vector icon, and custom button;
+3. hide/show behavior that removes paint and hit regions;
+4. a brush-diameter slider backed by the real brush setting;
+5. mouse and direct-pen hover/contact ownership;
+6. correct DPI scaling and resize;
+7. event-loop sleep when idle;
+8. canvas-only frames with no UI declaration, tessellation, or buffer upload;
 9. canvas drawing underneath without changed canonical pixels;
 10. UI, canvas, and presentation timings reported separately.
 
-The first real product slice after the spike is the layer panel because layer
-commands, IDs, order, visibility, opacity, undo, save, and recovery semantics
-already exist. Start with select, visibility, add, delete, and reorder. Inline
-rename, thumbnails, drag-and-drop polish, and animated transitions can follow.
+The next product slice is the layer panel because layer commands, IDs, order,
+visibility, opacity, undo, save, and recovery semantics already exist.
 
 ## Performance and Correctness Gate
 
@@ -379,6 +529,9 @@ Promote it when:
 - the dependency and upgrade cost is lower than owning the missing widget
   semantics.
 
-Otherwise remove it and implement the glyphon-backed custom fallback using the
-same `UiAction` and input ownership rules.
-
+The exact-revision dependency gate has promoted the work from research to the
+first integration milestone. Egui becomes permanent only after input
+ownership, cached canvas-only drawing, idle behavior, custom appearance, and
+Apollo latency pass their gates. If those fail, remove the integration and
+implement the glyphon-backed custom fallback using the same `UiAction` and
+input ownership rules.
