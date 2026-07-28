@@ -14,6 +14,11 @@ const KNIFE_LANE_COUNT: usize = 12;
 const KNIFE_SPACING_FRACTION: f32 = 0.06;
 const KNIFE_PICKUP: f32 = 0.24;
 const KNIFE_LOAD_USE: f32 = 0.0075;
+const BRISTLE_COUNT: usize = 24;
+const BRISTLE_SPACING_FRACTION: f32 = 0.035;
+const BRISTLE_PICKUP: f32 = 0.16;
+const BRISTLE_LOAD_USE: f32 = 0.004;
+const BRISTLE_CONTACT_FRACTION: f32 = 0.42;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatBrush {
@@ -417,6 +422,8 @@ impl PaletteKnifeBrush {
                 let kernel = LaneDabKernel {
                     footprint,
                     deposits,
+                    contact_fraction: 1.0,
+                    lane_offset: 0.0,
                     local_damage,
                     tile_origin: [tile_bounds.min_x(), tile_bounds.min_y()],
                 };
@@ -539,6 +546,221 @@ impl PaletteKnifeStroke {
         let lanes = &mut self.lanes;
         self.state
             .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, lanes))
+    }
+
+    pub fn finish(mut self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
+        self.finalize(layer)?;
+        Ok(layer.commit_gesture(self.state.gesture)?)
+    }
+
+    pub fn cancel(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
+        Ok(layer.cancel_gesture(self.state.gesture)?)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BristleBrush {
+    color: [f32; 3],
+    diameter: f32,
+    opacity: f32,
+    spacing: f32,
+}
+
+impl BristleBrush {
+    pub fn new(color: [f32; 3], diameter: f32, opacity: f32) -> Result<Self, BrushError> {
+        if color
+            .iter()
+            .any(|channel| !channel.is_finite() || !(0.0..=1.0).contains(channel))
+        {
+            return Err(BrushError::InvalidColor);
+        }
+        if !diameter.is_finite() || diameter <= 0.0 {
+            return Err(BrushError::InvalidDiameter);
+        }
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(BrushError::InvalidOpacity);
+        }
+        Ok(Self {
+            color,
+            diameter,
+            opacity,
+            spacing: (diameter * BRISTLE_SPACING_FRACTION).max(0.4),
+        })
+    }
+
+    pub const fn color(self) -> [f32; 3] {
+        self.color
+    }
+
+    pub const fn diameter(self) -> f32 {
+        self.diameter
+    }
+
+    pub const fn opacity(self) -> f32 {
+        self.opacity
+    }
+
+    pub const fn spacing(self) -> f32 {
+        self.spacing
+    }
+
+    fn half_extents(self, pressure: f32) -> [f32; 2] {
+        let pressure = pressure.clamp(0.0, 1.0);
+        [
+            self.diameter * 0.5 * (0.55 + 0.45 * pressure.sqrt()),
+            self.diameter * 0.5 * (0.12 + 0.2 * pressure),
+        ]
+    }
+
+    fn paint_dab(
+        self,
+        layer: &mut RasterLayer,
+        gesture: GestureId,
+        sample: BrushSample,
+        direction: [f32; 2],
+        bristles: &mut [PaintLane; BRISTLE_COUNT],
+    ) -> Result<(), BrushError> {
+        if !sample.is_finite() {
+            return Err(BrushError::InvalidSample);
+        }
+        let pressure = sample.pressure.clamp(0.0, 1.0);
+        if pressure == 0.0 || self.opacity == 0.0 {
+            return Ok(());
+        }
+        let half_extents = self.half_extents(pressure);
+        let Some(footprint) = OrientedBoxFootprint::new(
+            layer.width(),
+            layer.height(),
+            sample.position,
+            direction,
+            half_extents,
+        ) else {
+            return Ok(());
+        };
+
+        let mut deposits = [LaneDeposit::default(); BRISTLE_COUNT];
+        for (index, bristle) in bristles.iter_mut().enumerate() {
+            let lane_t = (index as f32 + 0.5) / BRISTLE_COUNT as f32;
+            let offset = (lane_t * 2.0 - 1.0) * half_extents[0] * 0.95;
+            let source_position = [
+                sample.position[0] + direction[0] * offset,
+                sample.position[1] + direction[1] * offset,
+            ];
+            if let Some(source) = sample_straight(layer, source_position) {
+                let pickup = BRISTLE_PICKUP * source.alpha;
+                for channel in 0..3 {
+                    bristle.color[channel] +=
+                        (source.color[channel] - bristle.color[channel]) * pickup;
+                }
+                bristle.load += (1.0 - bristle.load) * pickup;
+            }
+            deposits[index] = LaneDeposit {
+                color: bristle.color,
+                alpha: self.opacity * bristle.strength * (0.1 + 0.72 * bristle.load),
+            };
+            bristle.load =
+                (bristle.load - BRISTLE_LOAD_USE * (0.25 + 0.75 * pressure)).clamp(0.02, 1.0);
+        }
+
+        let wobble = ((sample.position[0] * 0.071 + sample.position[1] * 0.053).sin() * 0.22)
+            / BRISTLE_COUNT as f32;
+        let tile_size = layer.tile_size();
+        let [min_tile_x, min_tile_y, max_tile_x, max_tile_y] =
+            footprint.inclusive_tile_range(tile_size);
+        for tile_y in min_tile_y..=max_tile_y {
+            for tile_x in min_tile_x..=max_tile_x {
+                let coord = TileCoord::new(tile_x, tile_y);
+                let tile_bounds = layer
+                    .tile_bounds(coord)
+                    .expect("coordinates derived from clipped canvas bounds are valid");
+                let local_damage = footprint
+                    .local_damage(tile_bounds)
+                    .expect("the bristle bounds intersect every enumerated tile");
+                let kernel = LaneDabKernel {
+                    footprint,
+                    deposits,
+                    contact_fraction: BRISTLE_CONTACT_FRACTION,
+                    lane_offset: wobble,
+                    local_damage,
+                    tile_origin: [tile_bounds.min_x(), tile_bounds.min_y()],
+                };
+                layer.edit_tile_additive(gesture, coord, local_damage, |tile| {
+                    ((), kernel.run(tile))
+                })?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl PaintLane {
+    fn bristle(index: usize, color: [f32; 3]) -> Self {
+        let variation = hash_unit(index as u32, 0, 0x73f4_a821);
+        Self {
+            color,
+            load: 0.7 + variation * 0.3,
+            strength: 0.48 + variation * 0.52,
+        }
+    }
+}
+
+pub struct BristleStroke {
+    brush: BristleBrush,
+    bristles: [PaintLane; BRISTLE_COUNT],
+    state: OrientedStrokeState,
+}
+
+impl BristleStroke {
+    pub fn begin(
+        layer: &mut RasterLayer,
+        brush: BristleBrush,
+        sample: BrushSample,
+    ) -> Result<Self, BrushError> {
+        if !sample.is_finite() {
+            return Err(BrushError::InvalidSample);
+        }
+        let gesture = layer.begin_brush_gesture(brush.diameter())?;
+        let mut state = OrientedStrokeState::new(gesture, sample, brush.spacing());
+        let direction = state.orientation.resolve(sample);
+        let mut bristles = std::array::from_fn(|index| PaintLane::bristle(index, brush.color()));
+        if let Err(error) = brush.paint_dab(layer, gesture, sample, direction, &mut bristles) {
+            let _ = layer.cancel_gesture(gesture);
+            return Err(error);
+        }
+        Ok(Self {
+            brush,
+            bristles,
+            state,
+        })
+    }
+
+    pub const fn gesture_id(&self) -> GestureId {
+        self.state.gesture
+    }
+
+    pub const fn dabs_emitted(&self) -> u64 {
+        self.state.dabs_emitted
+    }
+
+    pub fn update(
+        &mut self,
+        layer: &mut RasterLayer,
+        sample: BrushSample,
+    ) -> Result<(), BrushError> {
+        let brush = self.brush;
+        let gesture = self.state.gesture;
+        let bristles = &mut self.bristles;
+        self.state.update(sample, |dab, direction| {
+            brush.paint_dab(layer, gesture, dab, direction, bristles)
+        })
+    }
+
+    pub fn finalize(&mut self, layer: &mut RasterLayer) -> Result<(), BrushError> {
+        let brush = self.brush;
+        let gesture = self.state.gesture;
+        let bristles = &mut self.bristles;
+        self.state
+            .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, bristles))
     }
 
     pub fn finish(mut self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
@@ -841,14 +1063,16 @@ impl FlatDabKernel {
     }
 }
 
-struct LaneDabKernel {
+struct LaneDabKernel<const LANE_COUNT: usize> {
     footprint: OrientedBoxFootprint,
-    deposits: [LaneDeposit; KNIFE_LANE_COUNT],
+    deposits: [LaneDeposit; LANE_COUNT],
+    contact_fraction: f32,
+    lane_offset: f32,
     local_damage: RectU32,
     tile_origin: [u32; 2],
 }
 
-impl LaneDabKernel {
+impl<const LANE_COUNT: usize> LaneDabKernel<LANE_COUNT> {
     fn run(self, tile: &mut TileEdit<'_>) -> Option<RectU32> {
         let stride = tile.stride();
         let pixels = tile.pixels_mut();
@@ -867,10 +1091,21 @@ impl LaneDabKernel {
                 }
                 let local = self.footprint.local_coordinates(world_x, world_y);
                 let lane_position =
-                    (local[0] / self.footprint.half_extents[0] * 0.5 + 0.5).clamp(0.0, 0.999_999);
-                let lane_index = (lane_position * KNIFE_LANE_COUNT as f32) as usize;
+                    (local[0] / self.footprint.half_extents[0] * 0.5 + 0.5 + self.lane_offset)
+                        .clamp(0.0, 0.999_999);
+                let lane_coordinate = lane_position * LANE_COUNT as f32;
+                let lane_index = lane_coordinate as usize;
+                let distance_from_center = (lane_coordinate.fract() - 0.5).abs() * 2.0;
+                let strand_coverage = ((self.contact_fraction - distance_from_center)
+                    * self.footprint.half_extents[0]
+                    / LANE_COUNT as f32
+                    + 0.5)
+                    .clamp(0.0, 1.0);
+                if strand_coverage == 0.0 {
+                    continue;
+                }
                 let deposit = self.deposits[lane_index];
-                let source_alpha = (coverage * deposit.alpha).clamp(0.0, 1.0);
+                let source_alpha = (coverage * strand_coverage * deposit.alpha).clamp(0.0, 1.0);
                 if source_alpha <= f32::EPSILON {
                     continue;
                 }
@@ -1311,6 +1546,73 @@ mod tests {
         assert_eq!(
             std::mem::size_of::<[PaintLane; KNIFE_LANE_COUNT]>(),
             std::mem::size_of::<PaintLane>() * KNIFE_LANE_COUNT
+        );
+    }
+
+    #[test]
+    fn bristle_contact_contains_painted_strands_and_real_gaps() {
+        let brush = BristleBrush::new([0.6, 0.2, 0.05], 96.0, 1.0).unwrap();
+        let mut layer = layer();
+        BristleStroke::begin(
+            &mut layer,
+            brush,
+            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.9, 0.0]),
+        )
+        .unwrap()
+        .finish(&mut layer)
+        .unwrap();
+
+        let mut painted = 0;
+        let mut gaps = 0;
+        for x in 82..174 {
+            if layer.pixel(x, 128).unwrap().a > 0.0 {
+                painted += 1;
+            } else {
+                gaps += 1;
+            }
+        }
+        assert!(painted > 24);
+        assert!(gaps > 8);
+    }
+
+    #[test]
+    fn bristles_pick_up_color_without_collapsing_to_one_reservoir() {
+        let mut layer = layer();
+        let red = HardRoundBrush::new([1.0, 0.0, 0.0], 52.0, 1.0, 0.15).unwrap();
+        HardRoundStroke::begin(&mut layer, red, BrushSample::new([190.0, 128.0], 1.0))
+            .unwrap()
+            .finish(&mut layer)
+            .unwrap();
+
+        let brush = BristleBrush::new([0.0, 0.0, 1.0], 64.0, 0.8).unwrap();
+        let mut stroke = BristleStroke::begin(
+            &mut layer,
+            brush,
+            BrushSample::with_tilt([60.0, 128.0], 1.0, [0.0, 0.8]),
+        )
+        .unwrap();
+        stroke
+            .update(
+                &mut layer,
+                BrushSample::with_tilt([190.0, 128.0], 1.0, [0.0, 0.8]),
+            )
+            .unwrap();
+
+        let red_channels: [f32; BRISTLE_COUNT] =
+            std::array::from_fn(|index| stroke.bristles[index].color[0]);
+        assert!(red_channels.iter().any(|red| *red > 0.05));
+        assert!(red_channels
+            .windows(2)
+            .any(|pair| (pair[0] - pair[1]).abs() > 0.001));
+        stroke.cancel(&mut layer).unwrap();
+    }
+
+    #[test]
+    fn bristle_state_is_inline_and_bounded() {
+        assert_eq!(BRISTLE_COUNT, 24);
+        assert_eq!(
+            std::mem::size_of::<[PaintLane; BRISTLE_COUNT]>(),
+            std::mem::size_of::<PaintLane>() * BRISTLE_COUNT
         );
     }
 }

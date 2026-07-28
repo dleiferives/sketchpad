@@ -14,7 +14,8 @@ use sketchpad::{
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
     natural::{
-        FlatBrush, FlatStroke, PaletteKnifeBrush, PaletteKnifeStroke, PencilBrush, PencilStroke,
+        BristleBrush, BristleStroke, FlatBrush, FlatStroke, PaletteKnifeBrush, PaletteKnifeStroke,
+        PencilBrush, PencilStroke,
     },
     palette::{RecentColors, MAX_RECENT_COLORS},
     persistence::PersistenceState,
@@ -172,6 +173,7 @@ enum PaintEngine {
     Flat,
     Pencil,
     PaletteKnife,
+    Bristle,
 }
 
 impl PaintEngine {
@@ -182,16 +184,21 @@ impl PaintEngine {
             Self::Flat => "Flat",
             Self::Pencil => "Pencil",
             Self::PaletteKnife => "Knife",
+            Self::Bristle => "Brush",
         }
     }
 }
 
+// The largest variant is 568 bytes because natural brushes keep bounded paint
+// reservoirs inline. Avoid a heap allocation on every pointer contact.
+#[allow(clippy::large_enum_variant)]
 enum ActiveStroke {
     HardRound(HardRoundStroke),
     LinearMixing(MixingStrokeV1),
     Flat(FlatStroke),
     Pencil(PencilStroke),
     PaletteKnife(PaletteKnifeStroke),
+    Bristle(BristleStroke),
 }
 
 impl ActiveStroke {
@@ -202,6 +209,7 @@ impl ActiveStroke {
             Self::Flat(stroke) => stroke.gesture_id(),
             Self::Pencil(stroke) => stroke.gesture_id(),
             Self::PaletteKnife(stroke) => stroke.gesture_id(),
+            Self::Bristle(stroke) => stroke.gesture_id(),
         }
     }
 
@@ -216,6 +224,7 @@ impl ActiveStroke {
             Self::Flat(stroke) => stroke.update(layer, sample).map_err(Into::into),
             Self::Pencil(stroke) => stroke.update(layer, sample).map_err(Into::into),
             Self::PaletteKnife(stroke) => stroke.update(layer, sample).map_err(Into::into),
+            Self::Bristle(stroke) => stroke.update(layer, sample).map_err(Into::into),
         }
     }
 
@@ -226,6 +235,7 @@ impl ActiveStroke {
             Self::Flat(stroke) => stroke.finalize(layer).map_err(Into::into),
             Self::Pencil(stroke) => stroke.finalize(layer).map_err(Into::into),
             Self::PaletteKnife(stroke) => stroke.finalize(layer).map_err(Into::into),
+            Self::Bristle(stroke) => stroke.finalize(layer).map_err(Into::into),
         }
     }
 
@@ -254,6 +264,10 @@ impl ActiveStroke {
                 damage: stroke.finish(layer)?,
                 mixing: None,
             }),
+            Self::Bristle(stroke) => Ok(FinishedStroke {
+                damage: stroke.finish(layer)?,
+                mixing: None,
+            }),
         }
     }
 
@@ -264,6 +278,7 @@ impl ActiveStroke {
             Self::Flat(stroke) => stroke.cancel(layer).map_err(Into::into),
             Self::Pencil(stroke) => stroke.cancel(layer).map_err(Into::into),
             Self::PaletteKnife(stroke) => stroke.cancel(layer).map_err(Into::into),
+            Self::Bristle(stroke) => stroke.cancel(layer).map_err(Into::into),
         }
     }
 }
@@ -587,6 +602,7 @@ impl App {
             (ToolKind::Pen, PaintEngine::Flat) => UiTool::Flat,
             (ToolKind::Pen, PaintEngine::Pencil) => UiTool::Pencil,
             (ToolKind::Pen, PaintEngine::PaletteKnife) => UiTool::PaletteKnife,
+            (ToolKind::Pen, PaintEngine::Bristle) => UiTool::Bristle,
         };
         let brush = self.brush_for_tool(self.mouse_tool);
         let mut recent_colors = [[0.0; 3]; MAX_RECENT_COLORS];
@@ -768,6 +784,10 @@ impl App {
                 self.mouse_tool = ToolKind::Pen;
                 self.paint_engine = PaintEngine::PaletteKnife;
             }
+            UiTool::Bristle => {
+                self.mouse_tool = ToolKind::Pen;
+                self.paint_engine = PaintEngine::Bristle;
+            }
         }
         self.cursor_tool = self.mouse_tool;
         self.cursor_pressure = 0.0;
@@ -933,7 +953,8 @@ impl App {
             PaintEngine::LinearMixing
             | PaintEngine::Flat
             | PaintEngine::Pencil
-            | PaintEngine::PaletteKnife => PaintEngine::HardRound,
+            | PaintEngine::PaletteKnife
+            | PaintEngine::Bristle => PaintEngine::HardRound,
         };
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
@@ -1060,6 +1081,12 @@ impl App {
                 let knife = palette_knife_from_paint(brush);
                 PaletteKnifeStroke::begin(self.document.active_layer_mut(), knife, sample)
                     .map(ActiveStroke::PaletteKnife)
+                    .map_err(ActiveStrokeError::from)
+            }
+            (ToolKind::Pen, PaintEngine::Bristle) => {
+                let bristle = bristle_brush_from_paint(brush);
+                BristleStroke::begin(self.document.active_layer_mut(), bristle, sample)
+                    .map(ActiveStroke::Bristle)
                     .map_err(ActiveStrokeError::from)
             }
         };
@@ -3153,6 +3180,11 @@ fn pencil_brush_from_paint(paint: HardRoundBrush) -> PencilBrush {
 fn palette_knife_from_paint(paint: HardRoundBrush) -> PaletteKnifeBrush {
     PaletteKnifeBrush::new(paint.color(), paint.diameter(), paint.opacity())
         .expect("validated hard-round values are valid palette-knife values")
+}
+
+fn bristle_brush_from_paint(paint: HardRoundBrush) -> BristleBrush {
+    BristleBrush::new(paint.color(), paint.diameter(), paint.opacity())
+        .expect("validated hard-round values are valid bristle-brush values")
 }
 
 fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {

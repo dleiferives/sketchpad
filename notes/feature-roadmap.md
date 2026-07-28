@@ -138,7 +138,7 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 - [x] Add a tilt-oriented flat rectangular nib.
 - [x] Add a graphite pencil with deterministic canvas-anchored paper tooth.
 - [x] Add a palette knife with persistent cross-blade paint lanes.
-- [ ] Add a separated-bristle paint brush with per-strand paint load.
+- [x] Add a separated-bristle paint brush with per-strand paint load.
 - [ ] Preserve one undoable gesture, bounded damage, deterministic replay, and
   allocation-free dab loops for every brush.
 - [ ] Add brush-specific replay scenes and Apollo CPU measurements.

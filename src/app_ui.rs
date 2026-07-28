@@ -55,6 +55,7 @@ pub enum UiTool {
     Flat,
     Pencil,
     PaletteKnife,
+    Bristle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -843,6 +844,9 @@ fn show_toolbar(
                         if text_button(ui, "KNIFE", snapshot.tool == UiTool::PaletteKnife).clicked()
                         {
                             actions.push(UiAction::SelectTool(UiTool::PaletteKnife));
+                        }
+                        if text_button(ui, "BRUSH", snapshot.tool == UiTool::Bristle).clicked() {
+                            actions.push(UiAction::SelectTool(UiTool::Bristle));
                         }
                         separator(ui);
                         ui.label(
