@@ -751,6 +751,10 @@ impl PendingStrokeReadback {
         self.buffer.size()
     }
 
+    pub fn map_started(&self) -> bool {
+        self.receiver.is_some() || self.complete
+    }
+
     pub fn begin_map(&mut self) -> Result<(), StrokeTargetError> {
         if self.complete || self.receiver.is_some() {
             return Err(StrokeTargetError::ReadbackAlreadyStarted);

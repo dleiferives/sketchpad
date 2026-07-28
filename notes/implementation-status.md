@@ -33,8 +33,10 @@ prototype:
   fixed in canvas coordinates;
 - a shared tilt dead zone, motion-direction mouse/upright fallback, and
   interpolated tilt for oriented natural brushes;
-- a palette knife with twelve fixed inline deposit lanes, cross-blade streak
-  variation, selected-color output, and no dab-time lane allocation;
+- an opaque palette knife on a visible topmost active layer uses connected
+  continuous-contact geometry rendered into sparse full-float GPU scratch
+  tiles; unsupported layer/opacity/GPU cases retain the older twelve-lane CPU
+  implementation as a correctness fallback;
 - a twenty-four-strand bristle brush with visible strand gaps, fixed
   per-strand deposition strength, selected-color output, and deterministic
   low-amplitude bundle wobble;
@@ -587,8 +589,11 @@ This is an architectural integration checkpoint, not yet the usable painter:
   diameter boundary; more brush families and devices require their own
   footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
-- brush work is CPU-only;
-- repeated dab/tile intersections are not yet coalesced;
+- hard round, eraser, flat, pencil, bristle, and fallback palette-knife work
+  remains CPU-only; the eligible palette knife has a GPU-owned live
+  transaction and one asynchronous full-float commit at pen-up;
+- repeated dab/tile intersections are not yet coalesced in the retained CPU
+  brush paths;
 - live physical-input diagnostics now separate hover and contact for relative
   X-source delivery excess, backend-to-event-loop queueing, and newest handled
   sample-to-submit delay; offscreen GPU render passes and explicit staged
@@ -629,12 +634,13 @@ immediate order is:
    samples cost 0.162 ms median / 0.417 ms p95 empty and 0.169 ms median /
    0.519 ms p95 painted on Apollo; all batch partitions produced identical
    final validation pixels for the opaque geometry proof.
-6. Define active-layer GPU/CPU ownership, below/active/above composition,
+6. [Complete] Define active-layer GPU/CPU ownership, below/active/above composition,
    cancel, undo, save, and recovery semantics before any live GPU mutation.
-   [Complete] The selected sparse scratch-tile transaction and tested
-   source-over readback commit boundary are defined in
+   The selected sparse scratch-tile transaction and tested source-over
+   readback commit boundary are defined in
    [GPU active-stroke architecture](gpu-active-stroke-architecture.md).
-7. Integrate a validated continuous-contact path without live readback, then
+7. [Live integration complete; physical validation next] Integrate a validated
+   continuous-contact path, then
    extend it to flat, pencil, and bounded-strand marks. The design and quality
    gates are in
    [Continuous brush contact and physical paint](continuous-brush-contact.md).
@@ -643,7 +649,11 @@ immediate order is:
    are complete. Sparse presentation now reproduces the exact smoke fixture,
    the retained canvas exposes separate canvas/cursor stages, and the
    packet-persistent continuous-blade generator has batching-invariant
-   geometry/damage tests. Live presentation/input wiring is next.
+   geometry/damage tests. The executable now drives that generator from live
+   input, presents scratch tiles between the canvas and cursor, retains them
+   during asynchronous readback, and commits the result as one undoable CPU
+   document edit. Apollo Wacom feel, visual continuity, cancel, and pen-up
+   latency still require physical validation before removing the CPU fallback.
 8. Validate the Wacom tilt mapping with a labeled calibration view.
 9. Continue turning the proven toolbar, layer, file, color, and keybinding
    surfaces into a coherent usable drawing workflow.

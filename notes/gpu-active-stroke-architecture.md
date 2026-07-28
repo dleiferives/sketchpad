@@ -225,6 +225,49 @@ The initial implementation may serialize stroke commits. Double-buffered
 scratch transactions are a later optimization only if physical testing shows
 pen-up-to-next-pen-down blocking.
 
+### Live application integration, 2026-07-28
+
+The executable now implements the first deliberately narrow transaction:
+
+- opaque palette-knife source-over only;
+- a visible, fully opaque active layer;
+- no contributing visible layer above it;
+- `Rgba32Float` render attachment and full-float blending support.
+
+On contact, `ContinuousBladeStroke` begins a packet-persistent geometry stream
+and `SparseStrokeTarget` clears only layers lazily assigned to touched tiles.
+Every redraw drains only newly generated triangles, clips the same batch
+against its damaged tile attachments, and presents the retained scratch
+instances between the flattened canvas and cursor. No document pixels are
+changed while contact remains active.
+
+Pen-up emits the final geometry, records row-aligned copies for all touched
+tiles, submits once, and begins `map_async`. The event loop polls completion
+without a blocking wait. Until completion the scratch overlay remains visible
+and the active-stroke guard prevents save, recovery, undo, layer edits, and a
+second stroke from observing a half transaction. A successful map is validated
+and committed through `commit_source_over_tiles` as one adaptive raster
+gesture; the ordinary damage/composite/upload path then becomes authoritative.
+Cancel or any render/map failure discards the scratch target without mutating
+the CPU document.
+
+The direct overlay is mathematically valid only under the restrictions above.
+Translucent brush/layer cases, a contributing layer above, or missing GPU
+features route to the retained CPU palette knife. This fallback is intentional
+until bottom-to-top GPU layer composition can insert the scratch transaction
+at an arbitrary layer position.
+
+Release-mode validation on Apollo after integration:
+
+- 174 unit tests across the library, application, and support binaries pass;
+- `cargo clippy --release --all-targets -- -D warnings` passes;
+- the six-tile sparse smoke retains two four-layer pages, copies 1,572,864
+  bytes, presents and commits exactly 24,576 pixels, and undoes exactly.
+
+The remaining gate is physical Wacom testing of live continuity, visual blade
+orientation, contact latency, and the pen-up readback/commit pause. Those
+observations must be written here before widening the brush or layer modes.
+
 ## Correctness Gates
 
 - one CPU undo restores every touched active-layer tile exactly;
@@ -245,13 +288,14 @@ pen-up-to-next-pen-down blocking.
    tile-origin dynamic uniform contract.
 2. [Complete] Add an offscreen multi-tile render/readback test using the exact
    `SourceOverTile` commit boundary.
-3. [Foundation complete] Split canvas/cursor presentation stages and prove the
-   sparse scratch display shader. Wire it between canvas and cursor in the app
-   only when the active layer is topmost.
-4. [Generator complete] Drive connected knife geometry from physical input
-   into the scratch tiles. The packet-persistent generator and batching
-   invariance tests are complete; app event/render wiring remains.
-5. Make finish asynchronous and connect mapped tiles to one document commit.
-6. Validate cancel, undo, save blocking, device loss, and exact final pixels.
+3. [Complete] Split canvas/cursor presentation stages, prove the sparse scratch
+   display shader, and wire it between the canvas and cursor for the validated
+   direct-overlay case.
+4. [Complete] Drive packet-persistent connected knife geometry from live input
+   into the scratch tiles with batching-invariant geometry and damage.
+5. [Complete] Make finish asynchronous and connect mapped tiles to one
+   document commit.
+6. Validate physical cancel, undo, save blocking, device loss, visual
+   continuity, and exact live final pixels.
 7. Replace the top-layer restriction with bottom-to-top layer-aware GPU tile
    composition.

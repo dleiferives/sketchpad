@@ -9,6 +9,8 @@ use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
     document::{Document, LayerId},
+    gpu_stroke::{commit_source_over_tiles, ContinuousBladeStroke},
+    gpu_stroke_target::{PendingStrokeReadback, SparseStrokeTarget},
     image_io::{self, ExportRegion},
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
@@ -124,6 +126,7 @@ struct Gpu {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     canvas: RasterDisplayPipeline,
+    stroke_target: Option<SparseStrokeTarget>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,26 +198,46 @@ enum ActiveStroke {
     Flat(FlatStroke),
     Pencil(PencilStroke),
     PaletteKnife(PaletteKnifeStroke),
+    GpuPaletteKnife(GpuPaletteKnifeStroke),
     Bristle(BristleStroke),
 }
 
+struct GpuPaletteKnifeStroke {
+    blade: ContinuousBladeStroke,
+    phase: GpuStrokePhase,
+}
+
+enum GpuStrokePhase {
+    Drawing,
+    FinishRequested,
+    ReadbackPending(PendingStrokeReadback),
+}
+
 impl ActiveStroke {
-    fn gesture_id(&self) -> GestureId {
+    fn gesture_id(&self) -> Option<GestureId> {
         match self {
-            Self::HardRound(stroke) => stroke.gesture_id(),
-            Self::Flat(stroke) => stroke.gesture_id(),
-            Self::Pencil(stroke) => stroke.gesture_id(),
-            Self::PaletteKnife(stroke) => stroke.gesture_id(),
-            Self::Bristle(stroke) => stroke.gesture_id(),
+            Self::HardRound(stroke) => Some(stroke.gesture_id()),
+            Self::Flat(stroke) => Some(stroke.gesture_id()),
+            Self::Pencil(stroke) => Some(stroke.gesture_id()),
+            Self::PaletteKnife(stroke) => Some(stroke.gesture_id()),
+            Self::GpuPaletteKnife(_) => None,
+            Self::Bristle(stroke) => Some(stroke.gesture_id()),
         }
     }
 
-    fn update(&mut self, layer: &mut RasterLayer, sample: BrushSample) -> Result<(), BrushError> {
+    fn update_cpu(
+        &mut self,
+        layer: &mut RasterLayer,
+        sample: BrushSample,
+    ) -> Result<(), BrushError> {
         match self {
             Self::HardRound(stroke) => stroke.update(layer, sample),
             Self::Flat(stroke) => stroke.update(layer, sample),
             Self::Pencil(stroke) => stroke.update(layer, sample),
             Self::PaletteKnife(stroke) => stroke.update(layer, sample),
+            Self::GpuPaletteKnife(_) => {
+                unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.update(layer, sample),
         }
     }
@@ -225,36 +248,46 @@ impl ActiveStroke {
             Self::Flat(stroke) => stroke.dabs_emitted(),
             Self::Pencil(stroke) => stroke.dabs_emitted(),
             Self::PaletteKnife(stroke) => stroke.dabs_emitted(),
+            Self::GpuPaletteKnife(stroke) => stroke.blade.total_sweeps(),
             Self::Bristle(stroke) => stroke.dabs_emitted(),
         }
     }
 
-    fn finalize(&mut self, layer: &mut RasterLayer) -> Result<(), BrushError> {
+    fn finalize_cpu(&mut self, layer: &mut RasterLayer) -> Result<(), BrushError> {
         match self {
             Self::HardRound(stroke) => stroke.finalize(layer),
             Self::Flat(stroke) => stroke.finalize(layer),
             Self::Pencil(stroke) => stroke.finalize(layer),
             Self::PaletteKnife(stroke) => stroke.finalize(layer),
+            Self::GpuPaletteKnife(_) => {
+                unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.finalize(layer),
         }
     }
 
-    fn finish(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
+    fn finish_cpu(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
         match self {
             Self::HardRound(stroke) => stroke.finish(layer),
             Self::Flat(stroke) => stroke.finish(layer),
             Self::Pencil(stroke) => stroke.finish(layer),
             Self::PaletteKnife(stroke) => stroke.finish(layer),
+            Self::GpuPaletteKnife(_) => {
+                unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.finish(layer),
         }
     }
 
-    fn cancel(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
+    fn cancel_cpu(self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
         match self {
             Self::HardRound(stroke) => stroke.cancel(layer),
             Self::Flat(stroke) => stroke.cancel(layer),
             Self::Pencil(stroke) => stroke.cancel(layer),
             Self::PaletteKnife(stroke) => stroke.cancel(layer),
+            Self::GpuPaletteKnife(_) => {
+                unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.cancel(layer),
         }
     }
@@ -1044,40 +1077,86 @@ impl App {
         };
         let brush = self.brush_for_tool(tool);
         let sample = BrushSample::with_tilt(world, pressure, tilt);
-        let stroke: Result<ActiveStroke, BrushError> = match (tool, self.paint_engine) {
+        let gpu_palette_knife = tool == ToolKind::Pen
+            && self.paint_engine == PaintEngine::PaletteKnife
+            && self.gpu_palette_knife_eligible(brush);
+        let stroke: Result<ActiveStroke, String> = match (tool, self.paint_engine) {
             (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
                 HardRoundStroke::begin(self.document.active_layer_mut(), brush, sample)
                     .map(ActiveStroke::HardRound)
+                    .map_err(|error| error.to_string())
             }
             (ToolKind::Pen, PaintEngine::Flat) => {
                 let flat = flat_brush_from_paint(brush);
                 FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
                     .map(ActiveStroke::Flat)
+                    .map_err(|error| error.to_string())
             }
             (ToolKind::Pen, PaintEngine::Pencil) => {
                 let pencil = pencil_brush_from_paint(brush);
                 PencilStroke::begin(self.document.active_layer_mut(), pencil, sample)
                     .map(ActiveStroke::Pencil)
+                    .map_err(|error| error.to_string())
             }
+            (ToolKind::Pen, PaintEngine::PaletteKnife) if gpu_palette_knife => (|| {
+                let knife = palette_knife_from_paint(brush);
+                let blade = ContinuousBladeStroke::begin(
+                    knife,
+                    [self.document.width(), self.document.height()],
+                    self.document.tile_size(),
+                    sample,
+                )
+                .map_err(|error| error.to_string())?;
+                let target = self
+                    .gpu
+                    .as_mut()
+                    .and_then(|gpu| gpu.stroke_target.as_mut())
+                    .expect("GPU knife eligibility requires a sparse stroke target");
+                target
+                    .begin(blade.color())
+                    .map_err(|error| error.to_string())?;
+                Ok(ActiveStroke::GpuPaletteKnife(GpuPaletteKnifeStroke {
+                    blade,
+                    phase: GpuStrokePhase::Drawing,
+                }))
+            })(),
             (ToolKind::Pen, PaintEngine::PaletteKnife) => {
                 let knife = palette_knife_from_paint(brush);
                 PaletteKnifeStroke::begin(self.document.active_layer_mut(), knife, sample)
                     .map(ActiveStroke::PaletteKnife)
+                    .map_err(|error| error.to_string())
             }
             (ToolKind::Pen, PaintEngine::Bristle) => {
                 let bristle = bristle_brush_from_paint(brush);
                 BristleStroke::begin(self.document.active_layer_mut(), bristle, sample)
                     .map(ActiveStroke::Bristle)
+                    .map_err(|error| error.to_string())
             }
         };
         match stroke {
             Ok(stroke) => {
+                let gpu_stroke = matches!(&stroke, ActiveStroke::GpuPaletteKnife(_));
                 self.active_stroke = Some(stroke);
                 self.active_pointer = Some(owner);
                 self.flush_active_damage();
+                if gpu_stroke {
+                    self.request_redraw();
+                }
             }
             Err(error) => log::error!("could not start stroke: {error}"),
         }
+    }
+
+    fn gpu_palette_knife_eligible(&self, brush: HardRoundBrush) -> bool {
+        if brush.opacity() != 1.0
+            || !self
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.stroke_target.is_some())
+        {
+            return false;
+        }
+        active_layer_supports_direct_overlay(&self.document)
     }
 
     fn update_stroke(&mut self, screen: [f32; 2], pressure: f32, tilt: [f32; 2]) {
@@ -1086,10 +1165,21 @@ impl App {
         let (result, emitted_dabs) = match &mut self.active_stroke {
             Some(stroke) => {
                 let before = stroke.dabs_emitted();
-                let result = stroke.update(
-                    self.document.active_layer_mut(),
-                    BrushSample::with_tilt(world, pressure.clamp(0.0, 1.0), tilt),
-                );
+                let sample = BrushSample::with_tilt(world, pressure.clamp(0.0, 1.0), tilt);
+                let result = match &mut *stroke {
+                    ActiveStroke::GpuPaletteKnife(stroke) => match stroke.phase {
+                        GpuStrokePhase::Drawing => stroke
+                            .blade
+                            .update(sample)
+                            .map_err(|error| error.to_string()),
+                        GpuStrokePhase::FinishRequested | GpuStrokePhase::ReadbackPending(_) => {
+                            Err("GPU stroke received input after pen-up".to_owned())
+                        }
+                    },
+                    stroke => stroke
+                        .update_cpu(self.document.active_layer_mut(), sample)
+                        .map_err(|error| error.to_string()),
+                };
                 (result, stroke.dabs_emitted().saturating_sub(before))
             }
             None => return,
@@ -1104,11 +1194,28 @@ impl App {
             return;
         }
         self.flush_active_damage();
+        if matches!(&self.active_stroke, Some(ActiveStroke::GpuPaletteKnife(_))) {
+            self.request_redraw();
+        }
     }
 
     fn finish_stroke(&mut self) {
+        if let Some(ActiveStroke::GpuPaletteKnife(stroke)) = &mut self.active_stroke {
+            if !matches!(&stroke.phase, GpuStrokePhase::Drawing) {
+                return;
+            }
+            if let Err(error) = stroke.blade.finish() {
+                log::error!("could not finalize GPU stroke: {error}");
+                self.cancel_stroke();
+                return;
+            }
+            stroke.phase = GpuStrokePhase::FinishRequested;
+            self.active_pointer = None;
+            self.request_redraw();
+            return;
+        }
         let finalize_result = match &mut self.active_stroke {
-            Some(stroke) => stroke.finalize(self.document.active_layer_mut()),
+            Some(stroke) => stroke.finalize_cpu(self.document.active_layer_mut()),
             None => return,
         };
         if let Err(error) = finalize_result {
@@ -1123,7 +1230,7 @@ impl App {
             return;
         };
         self.active_pointer = None;
-        match stroke.finish(self.document.active_layer_mut()) {
+        match stroke.finish_cpu(self.document.active_layer_mut()) {
             Ok(damage) => {
                 let Some(damage) = damage else {
                     return;
@@ -1148,15 +1255,102 @@ impl App {
             return;
         };
         self.active_pointer = None;
-        match stroke.cancel(self.document.active_layer_mut()) {
+        if matches!(&stroke, ActiveStroke::GpuPaletteKnife(_)) {
+            if let Some(target) = self.gpu.as_mut().and_then(|gpu| gpu.stroke_target.as_mut()) {
+                if let Err(error) = target.begin([0.0; 4]) {
+                    log::error!("could not clear canceled GPU stroke: {error}");
+                }
+            }
+            self.request_redraw();
+            return;
+        }
+        match stroke.cancel_cpu(self.document.active_layer_mut()) {
             Ok(Some(damage)) => self.sync_damage(&damage),
             Ok(None) => {}
             Err(error) => log::error!("could not cancel stroke: {error}"),
         }
     }
 
+    fn poll_gpu_stroke_commit(&mut self) {
+        let pending = matches!(
+            &self.active_stroke,
+            Some(ActiveStroke::GpuPaletteKnife(GpuPaletteKnifeStroke {
+                phase: GpuStrokePhase::ReadbackPending(_),
+                ..
+            }))
+        );
+        if !pending {
+            return;
+        }
+        if let Some(gpu) = &self.gpu {
+            if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
+                log::error!("could not poll GPU stroke readback: {error}");
+                self.cancel_stroke();
+                return;
+            }
+        }
+        let mapped = match &mut self.active_stroke {
+            Some(ActiveStroke::GpuPaletteKnife(stroke)) => match &mut stroke.phase {
+                GpuStrokePhase::ReadbackPending(readback) => {
+                    readback.try_finish().map_err(|error| error.to_string())
+                }
+                _ => return,
+            },
+            _ => return,
+        };
+        let tiles = match mapped {
+            Ok(Some(tiles)) => tiles,
+            Ok(None) => return,
+            Err(error) => {
+                log::error!("GPU stroke readback failed without changing the document: {error}");
+                self.cancel_stroke();
+                return;
+            }
+        };
+        let diameter = match self.active_stroke.take() {
+            Some(ActiveStroke::GpuPaletteKnife(stroke)) => stroke.blade.diameter(),
+            _ => unreachable!("a completed GPU readback retains its active stroke"),
+        };
+        if let Some(target) = self.gpu.as_mut().and_then(|gpu| gpu.stroke_target.as_mut()) {
+            if let Err(error) = target.begin([0.0; 4]) {
+                log::error!("could not retire committed GPU stroke tiles: {error}");
+            }
+        }
+
+        let commit_started = Instant::now();
+        match commit_source_over_tiles(self.document.active_layer_mut(), diameter, &tiles) {
+            Ok(Some(damage)) => {
+                if let Err(error) = self.document.record_active_raster_edit() {
+                    log::error!("could not register GPU stroke in document history: {error}");
+                }
+                self.sync_damage(&damage);
+                self.mark_document_dirty();
+                log::info!(
+                    "GPU stroke committed: tiles={} readback_bytes={} commit_ms={:.3}",
+                    tiles.len(),
+                    tiles.len()
+                        * self.document.tile_size() as usize
+                        * self.document.tile_size() as usize
+                        * std::mem::size_of::<LinearRgba>(),
+                    commit_started.elapsed().as_secs_f64() * 1_000.0
+                );
+            }
+            Ok(None) => self.request_redraw(),
+            Err(error) => {
+                log::error!(
+                    "GPU stroke commit rejected without partial document mutation: {error}"
+                );
+                self.request_redraw();
+            }
+        }
+    }
+
     fn flush_active_damage(&mut self) {
-        let Some(gesture) = self.active_stroke.as_ref().map(ActiveStroke::gesture_id) else {
+        let Some(gesture) = self
+            .active_stroke
+            .as_ref()
+            .and_then(ActiveStroke::gesture_id)
+        else {
             return;
         };
         let drain_started = Instant::now();
@@ -2018,8 +2212,28 @@ impl App {
             apply_limit_buckets: true,
         }))
         .unwrap();
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let paint_format = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba32Float);
+        let paint_usages = wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC;
+        let gpu_strokes_supported = adapter
+            .features()
+            .contains(wgpu::Features::FLOAT32_BLENDABLE)
+            && paint_format.allowed_usages.contains(paint_usages)
+            && paint_format
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::BLENDABLE);
+        let required_features = if gpu_strokes_supported {
+            wgpu::Features::FLOAT32_BLENDABLE
+        } else {
+            wgpu::Features::empty()
+        };
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("Sketchpad Device"),
+            required_features,
+            ..Default::default()
+        }))
+        .unwrap();
 
         let size = window.inner_size();
         let capabilities = surface.get_capabilities(&adapter);
@@ -2055,7 +2269,7 @@ impl App {
             .and_then(|monitor| monitor.refresh_rate_millihertz());
         log::info!(
             "GPU: {} ({:?}); tile array layers: {}; present_request={:?} present_configured={:?} \
-             supported_present_modes={:?} max_frame_latency={} refresh_millihertz={:?}",
+            supported_present_modes={:?} max_frame_latency={} refresh_millihertz={:?}",
             adapter.get_info().name,
             adapter.get_info().backend,
             device.limits().max_texture_array_layers,
@@ -2065,14 +2279,26 @@ impl App {
             config.desired_maximum_frame_latency,
             refresh_millihertz
         );
+        log::info!(
+            "sparse GPU source-over strokes: supported={} format={:?} usages={:?} flags={:?}",
+            gpu_strokes_supported,
+            wgpu::TextureFormat::Rgba32Float,
+            paint_format.allowed_usages,
+            paint_format.flags
+        );
 
         let canvas = RasterDisplayPipeline::new(&device, format, tile_size);
+        let stroke_target = gpu_strokes_supported.then(|| {
+            SparseStrokeTarget::new(&device, CANVAS_WIDTH, CANVAS_HEIGHT, tile_size, 16, format)
+                .expect("a reported full-float stroke path must create its sparse target")
+        });
         Gpu {
             surface,
             device,
             queue,
             config,
             canvas,
+            stroke_target,
         }
     }
 
@@ -2149,6 +2375,57 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Raster Frame"),
             });
+        let mut retire_empty_gpu_stroke = false;
+        let gpu_stroke_result: Result<(), String> =
+            match (&mut self.active_stroke, gpu.stroke_target.as_mut()) {
+                (Some(ActiveStroke::GpuPaletteKnife(stroke)), Some(target)) => {
+                    (|| match &stroke.phase {
+                        GpuStrokePhase::Drawing | GpuStrokePhase::FinishRequested => {
+                            let batch = stroke.blade.take_batch();
+                            if !batch.is_empty() {
+                                target
+                                    .encode_batch(
+                                        &gpu.device,
+                                        &gpu.queue,
+                                        &mut encoder,
+                                        batch.vertices(),
+                                        batch.touched_tiles(),
+                                    )
+                                    .map_err(|error| error.to_string())?;
+                            }
+                            if matches!(&stroke.phase, GpuStrokePhase::FinishRequested) {
+                                if target.touched_tile_count() == 0 {
+                                    retire_empty_gpu_stroke = true;
+                                } else {
+                                    let readback = target
+                                        .encode_readback(&gpu.device, &mut encoder)
+                                        .map_err(|error| error.to_string())?;
+                                    stroke.phase = GpuStrokePhase::ReadbackPending(readback);
+                                }
+                            }
+                            Ok(())
+                        }
+                        GpuStrokePhase::ReadbackPending(_) => Ok(()),
+                    })()
+                }
+                (Some(ActiveStroke::GpuPaletteKnife(_)), None) => {
+                    Err("active GPU stroke lost its sparse target".to_owned())
+                }
+                _ => Ok(()),
+            };
+        if let Err(error) = gpu_stroke_result {
+            log::error!("GPU stroke frame failed without changing the document: {error}");
+            self.active_stroke = None;
+            self.active_pointer = None;
+            if let Some(target) = &mut gpu.stroke_target {
+                let _ = target.begin([0.0; 4]);
+            }
+        } else if retire_empty_gpu_stroke {
+            self.active_stroke = None;
+            if let Some(target) = &mut gpu.stroke_target {
+                let _ = target.begin([0.0; 4]);
+            }
+        }
         let screen = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [gpu.config.width, gpu.config.height],
             pixels_per_point: self
@@ -2162,16 +2439,17 @@ impl App {
             self.document.composite(),
             camera.view_bounds(),
         );
-        gpu.canvas.write_camera(
-            &gpu.queue,
-            CanvasUniform {
-                center: camera.center,
-                zoom: camera.zoom,
-                _padding: 0.0,
-                viewport_size: [gpu.config.width as f32, gpu.config.height as f32],
-                canvas_size: camera.canvas_size,
-            },
-        );
+        let canvas_uniform = CanvasUniform {
+            center: camera.center,
+            zoom: camera.zoom,
+            _padding: 0.0,
+            viewport_size: [gpu.config.width as f32, gpu.config.height as f32],
+            canvas_size: camera.canvas_size,
+        };
+        gpu.canvas.write_camera(&gpu.queue, canvas_uniform);
+        if let Some(target) = &mut gpu.stroke_target {
+            target.prepare_presentation(&gpu.queue, canvas_uniform);
+        }
         gpu.canvas.write_cursor(&gpu.queue, cursor);
         let prepared_at = Instant::now();
         gpu.canvas.encode_uploads(&mut encoder);
@@ -2193,12 +2471,34 @@ impl App {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            gpu.canvas.draw(&mut pass);
+            gpu.canvas.draw_canvas(&mut pass);
+            if let Some(target) = &gpu.stroke_target {
+                target.draw(&mut pass);
+            }
+            gpu.canvas.draw_cursor(&mut pass);
             ui.draw(&mut pass.forget_lifetime(), &screen);
         }
         commands.push(encoder.finish());
         let encoded_at = Instant::now();
         let submission = gpu.queue.submit(commands);
+        let mut gpu_stroke_map_error = None;
+        if let Some(ActiveStroke::GpuPaletteKnife(stroke)) = &mut self.active_stroke {
+            if let GpuStrokePhase::ReadbackPending(readback) = &mut stroke.phase {
+                if !readback.map_started() {
+                    if let Err(error) = readback.begin_map() {
+                        gpu_stroke_map_error = Some(error);
+                    }
+                }
+            }
+        }
+        if let Some(error) = gpu_stroke_map_error.as_ref() {
+            log::error!("could not begin GPU stroke readback; document remains unchanged: {error}");
+            self.active_stroke = None;
+            self.active_pointer = None;
+            if let Some(target) = &mut gpu.stroke_target {
+                let _ = target.begin([0.0; 4]);
+            }
+        }
         gpu.canvas.uploads_submitted(submission);
         ui.finish_submit();
         gpu.queue.present(output);
@@ -2216,6 +2516,9 @@ impl App {
         self.metrics
             .rendering
             .record(submitted_at.saturating_duration_since(render_start));
+        if gpu_stroke_map_error.is_some() {
+            self.request_redraw();
+        }
     }
 
     fn report_live_metrics(&mut self) {
@@ -2808,6 +3111,7 @@ impl ApplicationHandler<TabletEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.report_live_metrics();
+        self.poll_gpu_stroke_commit();
         self.maybe_autosave();
 
         let now = Instant::now();
@@ -2841,6 +3145,20 @@ impl ApplicationHandler<TabletEvent> for App {
         }
         if self.recovery_job.is_some() {
             let poll_due = Instant::now() + AUTOSAVE_POLL_INTERVAL;
+            deadline = Some(
+                deadline
+                    .map(|existing| existing.min(poll_due))
+                    .unwrap_or(poll_due),
+            );
+        }
+        if matches!(
+            &self.active_stroke,
+            Some(ActiveStroke::GpuPaletteKnife(GpuPaletteKnifeStroke {
+                phase: GpuStrokePhase::ReadbackPending(_),
+                ..
+            }))
+        ) {
+            let poll_due = Instant::now() + Duration::from_millis(1);
             deadline = Some(
                 deadline
                     .map(|existing| existing.min(poll_due))
@@ -3194,6 +3512,17 @@ fn bristle_brush_from_paint(paint: HardRoundBrush) -> BristleBrush {
         .expect("validated hard-round values are valid bristle-brush values")
 }
 
+fn active_layer_supports_direct_overlay(document: &Document) -> bool {
+    let active = document.active_layer_index();
+    let layers = document.layers();
+    let layer = &layers[active];
+    layer.visible()
+        && layer.opacity() == 1.0
+        && layers[active + 1..]
+            .iter()
+            .all(|layer| !layer.visible() || layer.opacity() == 0.0)
+}
+
 fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {
     if pixel.a <= f32::EPSILON {
         return None;
@@ -3401,5 +3730,34 @@ mod tests {
             Some([0.4, 0.2, 0.1])
         );
         assert_eq!(straight_rgb(LinearRgba::TRANSPARENT), None);
+    }
+
+    #[test]
+    fn direct_gpu_overlay_requires_an_opaque_visible_active_layer() {
+        let mut document = Document::new(64, 64, 16).unwrap();
+        let active = document.layers()[document.active_layer_index()].id();
+        assert!(active_layer_supports_direct_overlay(&document));
+
+        document.set_layer_opacity(active, 0.5).unwrap();
+        assert!(!active_layer_supports_direct_overlay(&document));
+        document.set_layer_opacity(active, 1.0).unwrap();
+
+        document.set_layer_visibility(active, false).unwrap();
+        assert!(!active_layer_supports_direct_overlay(&document));
+    }
+
+    #[test]
+    fn direct_gpu_overlay_rejects_only_contributing_layers_above() {
+        let mut document = Document::new(64, 64, 16).unwrap();
+        let bottom = document.layers()[document.active_layer_index()].id();
+        let top = document.create_layer("Top").unwrap();
+        document.set_active_layer(bottom).unwrap();
+        assert!(!active_layer_supports_direct_overlay(&document));
+
+        document.set_layer_opacity(top, 0.0).unwrap();
+        assert!(active_layer_supports_direct_overlay(&document));
+        document.set_layer_opacity(top, 1.0).unwrap();
+        document.set_layer_visibility(top, false).unwrap();
+        assert!(active_layer_supports_direct_overlay(&document));
     }
 }
