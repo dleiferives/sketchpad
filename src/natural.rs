@@ -20,6 +20,17 @@ const BRISTLE_PICKUP: f32 = 0.16;
 const BRISTLE_LOAD_USE: f32 = 0.004;
 const BRISTLE_CONTACT_FRACTION: f32 = 0.42;
 
+pub fn contact_direction_from_tilt(tilt: [f32; 2]) -> Option<[f32; 2]> {
+    let length_squared = tilt[0] * tilt[0] + tilt[1] * tilt[1];
+    if !length_squared.is_finite()
+        || length_squared < ORIENTATION_TILT_DEAD_ZONE * ORIENTATION_TILT_DEAD_ZONE
+    {
+        return None;
+    }
+    let inverse_length = length_squared.sqrt().recip();
+    Some([tilt[1] * inverse_length, -tilt[0] * inverse_length])
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FlatBrush {
     color: [f32; 3],
@@ -909,13 +920,8 @@ impl OrientationTracker {
     }
 
     fn resolve(&mut self, sample: BrushSample) -> [f32; 2] {
-        let tilt_length_squared = sample.tilt[0] * sample.tilt[0] + sample.tilt[1] * sample.tilt[1];
-        if tilt_length_squared >= ORIENTATION_TILT_DEAD_ZONE * ORIENTATION_TILT_DEAD_ZONE {
-            let inverse_length = tilt_length_squared.sqrt().recip();
-            self.direction = [
-                sample.tilt[0] * inverse_length,
-                sample.tilt[1] * inverse_length,
-            ];
+        if let Some(direction) = contact_direction_from_tilt(sample.tilt) {
+            self.direction = direction;
         } else {
             let dx = sample.position[0] - self.last_position[0];
             let dy = sample.position[1] - self.last_position[1];
@@ -1358,10 +1364,17 @@ mod tests {
         .unwrap();
         let vertical = painted_bounds(&vertical);
 
-        assert!(horizontal.width() > horizontal.height() * 2);
-        assert!(vertical.height() > vertical.width() * 2);
-        assert_eq!(horizontal.width(), vertical.height());
+        assert!(horizontal.height() > horizontal.width() * 2);
+        assert!(vertical.width() > vertical.height() * 2);
         assert_eq!(horizontal.height(), vertical.width());
+        assert_eq!(horizontal.width(), vertical.height());
+    }
+
+    #[test]
+    fn wacom_tilt_axis_is_rotated_into_the_contact_axis() {
+        assert_eq!(contact_direction_from_tilt([0.8, 0.0]), Some([0.0, -1.0]));
+        assert_eq!(contact_direction_from_tilt([0.0, 0.8]), Some([1.0, -0.0]));
+        assert_eq!(contact_direction_from_tilt([0.01, 0.01]), None);
     }
 
     #[test]
@@ -1441,7 +1454,7 @@ mod tests {
         PencilStroke::begin(
             &mut tilted,
             pencil,
-            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.9, 0.0]),
+            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.0, 0.9]),
         )
         .unwrap()
         .finish(&mut tilted)
@@ -1466,8 +1479,8 @@ mod tests {
     #[test]
     fn pencil_replay_is_independent_of_collinear_packet_batching() {
         let pencil = PencilBrush::new([0.05; 3], 28.0, 0.8).unwrap();
-        let first = BrushSample::with_tilt([24.0, 96.0], 0.4, [0.7, 0.1]);
-        let last = BrushSample::with_tilt([224.0, 96.0], 0.9, [0.7, 0.1]);
+        let first = BrushSample::with_tilt([24.0, 96.0], 0.4, [-0.1, 0.7]);
+        let last = BrushSample::with_tilt([224.0, 96.0], 0.9, [-0.1, 0.7]);
 
         let mut direct = layer();
         let mut direct_stroke = PencilStroke::begin(&mut direct, pencil, first).unwrap();
@@ -1504,7 +1517,7 @@ mod tests {
         PaletteKnifeStroke::begin(
             &mut layer,
             knife,
-            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.9, 0.0]),
+            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.0, 0.9]),
         )
         .unwrap()
         .finish(&mut layer)
@@ -1561,7 +1574,7 @@ mod tests {
         BristleStroke::begin(
             &mut layer,
             brush,
-            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.9, 0.0]),
+            BrushSample::with_tilt([128.0, 128.0], 1.0, [0.0, 0.9]),
         )
         .unwrap()
         .finish(&mut layer)

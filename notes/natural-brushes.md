@@ -38,6 +38,17 @@ The practical consequences are:
 - mouse input supplies zero tilt and falls back to stroke direction where
   orientation is useful.
 
+### Live Wacom axis calibration
+
+The first Apollo Wacom evaluation on 2026-07-28 showed that treating the
+normalized X/Y tilt vector itself as the footprint's long axis made every
+oriented brush and cursor appear 90 degrees away from the physical contact.
+The shared conversion now rotates meaningful Wacom tilt clockwise by 90
+degrees before it becomes a contact direction. This correction lives in one
+function used by both CPU ink and GPU cursor feedback; movement fallback
+remains aligned with movement. A regression test fixes the X-tilt → vertical
+contact and Y-tilt → horizontal contact convention.
+
 Sousa and Buchanan's graphite model represents paper as a height field and
 models deposition from tip shape, pressure, and hardness. The visual grain
 comes from interaction with the paper tooth rather than fresh random noise.

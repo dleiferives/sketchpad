@@ -14,8 +14,8 @@ use sketchpad::{
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
     natural::{
-        BristleBrush, BristleStroke, FlatBrush, FlatStroke, PaletteKnifeBrush, PaletteKnifeStroke,
-        PencilBrush, PencilStroke,
+        contact_direction_from_tilt, BristleBrush, BristleStroke, FlatBrush, FlatStroke,
+        PaletteKnifeBrush, PaletteKnifeStroke, PencilBrush, PencilStroke,
     },
     palette::{RecentColors, MAX_RECENT_COLORS},
     persistence::PersistenceState,
@@ -56,7 +56,6 @@ const BRUSH_OPACITY_STEP: f32 = 0.1;
 const CURSOR_SHAPE_CIRCLE: f32 = 0.0;
 const CURSOR_SHAPE_BOX: f32 = 1.0;
 const CURSOR_SHAPE_ELLIPSE: f32 = 2.0;
-const CURSOR_ORIENTATION_DEAD_ZONE: f32 = 0.12;
 const MIXING_PICKUP: f32 = 0.65;
 const MIXING_COLOR_RATE: f32 = 0.08;
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
@@ -895,10 +894,8 @@ impl App {
 
     fn update_cursor_orientation(&mut self, position: [f32; 2], tilt: [f32; 2]) {
         self.cursor_tilt = tilt;
-        let tilt_length_squared = tilt[0] * tilt[0] + tilt[1] * tilt[1];
-        if tilt_length_squared >= CURSOR_ORIENTATION_DEAD_ZONE * CURSOR_ORIENTATION_DEAD_ZONE {
-            let inverse_length = tilt_length_squared.sqrt().recip();
-            self.cursor_direction = [tilt[0] * inverse_length, tilt[1] * inverse_length];
+        if let Some(direction) = contact_direction_from_tilt(tilt) {
+            self.cursor_direction = direction;
             return;
         }
         let Some(previous) = self.last_cursor_pos else {
