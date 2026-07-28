@@ -670,6 +670,45 @@ Apollo visual smoke confirmed the compact bounds and file-to-color popover
 handoff. Actual native dialog acceptance/cancellation remains a manual product
 test rather than something driven through synthetic clicks.
 
+### First continuous color picker, 2026-07-28
+
+The color popover now contains a custom saturation/value plane, hue strip,
+live hexadecimal display, the six presets, and session-local recent colors.
+HSV is only an interaction model: its channels are defined in display sRGB,
+then converted through the standard sRGB transfer function into the
+application's canonical linear RGB before any brush state changes. Document
+pixels, sampling, mixing, persistence, and undo do not acquire a second color
+representation. When an external gray color is selected, the picker retains
+the last meaningful hue so increasing saturation does not unexpectedly jump
+back to red.
+
+The gradients are explicit egui meshes. The saturation/value surface uses a
+16-by-16 cell mesh rather than four corner colors because interpolating only
+the corners would not reproduce the piecewise HSV hue surface. The hue strip
+uses the same 16 horizontal subdivisions and includes both equivalent red
+endpoints without making the right-hand marker jump to the left.
+
+Dragging is deliberately split at the application boundary:
+
+- motion emits `PreviewColor`, updating the live brush without touching recent
+  color history;
+- click or drag release emits one `CommitColor`, recording the final exact
+  linear RGB value once;
+- preset and recent-color buttons commit immediately.
+
+Unit tests cover linear/sRGB transfer round trips, HSV primaries and arbitrary
+round trips, gray hue preservation, hue-slider endpoint behavior, and the
+preview/commit transaction. The complete Apollo test suite and warning-denied
+Clippy pass are clean.
+
+An Apollo visual smoke confirmed the panel geometry, color surfaces, markers,
+hex display, and coexistence with the layer panel. Physical drawing overlapped
+the synthetic interaction pass, so that pass is not retained as picker timing
+evidence. The uncontaminated closed-picker portion did provide a useful cache
+check: all 101 contact frames reused prepared UI geometry with zero UI
+declaration/tessellation or GPU-buffer preparation calls. Picker-open dirty
+frame cost still needs a controlled release-mode measurement.
+
 ## Custom Fallback
 
 If the egui spike fails, build only the control surface Sketchpad needs:

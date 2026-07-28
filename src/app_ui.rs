@@ -19,6 +19,10 @@ const TOOL_BUTTON_WIDTH: f32 = 44.0;
 const SLIDER_WIDTH: f32 = 152.0;
 const COLOR_BUTTON_SIZE: f32 = 32.0;
 const COLOR_PRESET_COUNT: usize = 6;
+const COLOR_PICKER_WIDTH: f32 = 220.0;
+const COLOR_PLANE_HEIGHT: f32 = 168.0;
+const HUE_SLIDER_HEIGHT: f32 = 18.0;
+const COLOR_MESH_STEPS: usize = 16;
 const LAYER_PANEL_WIDTH: f32 = 292.0;
 const LAYER_NAME_WIDTH: f32 = 170.0;
 const TOOLBAR_RADIUS: u8 = 14;
@@ -74,7 +78,8 @@ pub enum UiAction {
     SelectTool(UiTool),
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
-    SelectColor([f32; 3]),
+    PreviewColor([f32; 3]),
+    CommitColor([f32; 3]),
     SelectLayer(LayerId),
     ToggleLayerVisibility(LayerId),
     AdjustLayerOpacity { layer: LayerId, delta: f32 },
@@ -212,6 +217,71 @@ impl UiHitRegions {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ColorPickerState {
+    hue: f32,
+    saturation: f32,
+    value: f32,
+    source_linear: [f32; 3],
+}
+
+impl ColorPickerState {
+    fn new(linear: [f32; 3]) -> Self {
+        let [red, green, blue] = linear.map(linear_to_srgb);
+        let (hue, saturation, value) = srgb_to_hsv(red, green, blue);
+        Self {
+            hue,
+            saturation,
+            value,
+            source_linear: linear,
+        }
+    }
+
+    fn sync(&mut self, linear: [f32; 3]) {
+        if self.source_linear == linear {
+            return;
+        }
+        let [red, green, blue] = linear.map(linear_to_srgb);
+        let (hue, saturation, value) = srgb_to_hsv(red, green, blue);
+        if saturation > f32::EPSILON {
+            self.hue = hue;
+        }
+        self.saturation = saturation;
+        self.value = value;
+        self.source_linear = linear;
+    }
+
+    fn set_sv(&mut self, saturation: f32, value: f32) -> [f32; 3] {
+        self.saturation = saturation.clamp(0.0, 1.0);
+        self.value = value.clamp(0.0, 1.0);
+        self.update_source()
+    }
+
+    fn set_hue(&mut self, hue: f32) -> [f32; 3] {
+        self.hue = hue.clamp(0.0, 1.0);
+        self.update_source()
+    }
+
+    fn update_source(&mut self) -> [f32; 3] {
+        self.source_linear = hsv_to_srgb(self.hue, self.saturation, self.value).map(srgb_to_linear);
+        self.source_linear
+    }
+}
+
+impl Default for ColorPickerState {
+    fn default() -> Self {
+        Self::new([0.0; 3])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct UiSessionState {
+    file_panel_open: bool,
+    color_panel_open: bool,
+    layers_panel_open: bool,
+    color_picker: ColorPickerState,
+}
+
 pub struct UiOverlay {
     context: egui::Context,
     platform: egui_winit::State,
@@ -224,9 +294,7 @@ pub struct UiOverlay {
     mouse_capture: bool,
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
-    file_panel_open: bool,
-    color_panel_open: bool,
-    layers_panel_open: bool,
+    session: UiSessionState,
     modifiers: ModifiersState,
     cpu_dirty: bool,
     gpu_dirty: bool,
@@ -260,9 +328,10 @@ impl UiOverlay {
             mouse_capture: false,
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
-            file_panel_open: false,
-            color_panel_open: false,
-            layers_panel_open: true,
+            session: UiSessionState {
+                layers_panel_open: true,
+                ..Default::default()
+            },
             modifiers: ModifiersState::empty(),
             cpu_dirty: true,
             gpu_dirty: false,
@@ -375,21 +444,12 @@ impl UiOverlay {
         let context = self.context.clone();
         let mut actions = Vec::new();
         let mut hit_regions = UiHitRegions::default();
-        let mut file_panel_open = self.file_panel_open;
-        let mut color_panel_open = self.color_panel_open;
-        let mut layers_panel_open = self.layers_panel_open;
+        let mut session = self.session;
+        session.color_picker.sync(snapshot.color);
         let layers = layer_snapshot();
         let output = context.run_ui(input, |root| {
             if snapshot.visible {
-                hit_regions = show_toolbar(
-                    root,
-                    snapshot,
-                    &layers,
-                    &mut actions,
-                    &mut file_panel_open,
-                    &mut color_panel_open,
-                    &mut layers_panel_open,
-                );
+                hit_regions = show_toolbar(root, snapshot, &layers, &mut actions, &mut session);
             }
         });
         let repaint_delay = output
@@ -402,9 +462,7 @@ impl UiOverlay {
         self.textures_to_set.extend(output.textures_delta.set);
         self.textures_to_free.extend(output.textures_delta.free);
         self.hit_regions = hit_regions;
-        self.file_panel_open = file_panel_open;
-        self.color_panel_open = color_panel_open;
-        self.layers_panel_open = layers_panel_open;
+        self.session = session;
         self.last_snapshot = Some(snapshot);
         self.cpu_dirty = false;
         self.gpu_dirty = true;
@@ -605,9 +663,7 @@ fn show_toolbar(
     snapshot: UiSnapshot,
     layers: &[UiLayerSnapshot<'_>],
     actions: &mut Vec<UiAction>,
-    file_panel_open: &mut bool,
-    color_panel_open: &mut bool,
-    layers_panel_open: &mut bool,
+    session: &mut UiSessionState,
 ) -> UiHitRegions {
     let area = egui::Area::new(Id::new("sketchpad-tool-strip"))
         .fixed_pos(TOOLBAR_POSITION)
@@ -623,9 +679,9 @@ fn show_toolbar(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        if text_button(ui, "FILE", *file_panel_open).clicked() {
-                            *file_panel_open = !*file_panel_open;
-                            *color_panel_open = false;
+                        if text_button(ui, "FILE", session.file_panel_open).clicked() {
+                            session.file_panel_open = !session.file_panel_open;
+                            session.color_panel_open = false;
                         }
                         separator(ui);
                         ui.add_enabled_ui(snapshot.undo_available, |ui| {
@@ -679,12 +735,12 @@ fn show_toolbar(
                                 .color(TEXT),
                         );
                         if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
-                            *color_panel_open = !*color_panel_open;
-                            *file_panel_open = false;
+                            session.color_panel_open = !session.color_panel_open;
+                            session.file_panel_open = false;
                         }
                         separator(ui);
-                        if text_button(ui, "LAYERS", *layers_panel_open).clicked() {
-                            *layers_panel_open = !*layers_panel_open;
+                        if text_button(ui, "LAYERS", session.layers_panel_open).clicked() {
+                            session.layers_panel_open = !session.layers_panel_open;
                         }
                         if icon_button(ui, "×", "Hide interface (F1)", false).clicked() {
                             actions.push(UiAction::SetVisible(false));
@@ -692,18 +748,30 @@ fn show_toolbar(
                     });
                 });
         });
-    let file_panel = if *file_panel_open {
-        show_file_panel(root, actions, file_panel_open)
+    let file_panel = if session.file_panel_open {
+        show_file_panel(root, actions, &mut session.file_panel_open)
     } else {
         Rect::NOTHING
     };
-    let color_panel = if *color_panel_open {
-        show_color_panel(root, snapshot, actions, color_panel_open)
+    let color_panel = if session.color_panel_open {
+        show_color_panel(
+            root,
+            snapshot,
+            actions,
+            &mut session.color_panel_open,
+            &mut session.color_picker,
+        )
     } else {
         Rect::NOTHING
     };
-    let layers_panel = if *layers_panel_open {
-        show_layers_panel(root, snapshot, layers, actions, layers_panel_open)
+    let layers_panel = if session.layers_panel_open {
+        show_layers_panel(
+            root,
+            snapshot,
+            layers,
+            actions,
+            &mut session.layers_panel_open,
+        )
     } else {
         Rect::NOTHING
     };
@@ -720,6 +788,7 @@ fn show_color_panel(
     snapshot: UiSnapshot,
     actions: &mut Vec<UiAction>,
     color_panel_open: &mut bool,
+    picker: &mut ColorPickerState,
 ) -> Rect {
     let area = egui::Area::new(Id::new("sketchpad-color-panel"))
         .fixed_pos(COLOR_PANEL_POSITION)
@@ -733,13 +802,40 @@ fn show_color_panel(
                 .corner_radius(TOOLBAR_RADIUS)
                 .inner_margin(10.0)
                 .show(ui, |ui| {
+                    ui.set_width(COLOR_PICKER_WIDTH);
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "COLOR");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, "×", "Close color picker", false).clicked() {
+                                *color_panel_open = false;
+                            }
+                            ui.label(
+                                egui::RichText::new(linear_rgb_hex(picker.source_linear))
+                                    .font(FontId::monospace(11.0))
+                                    .color(TEXT),
+                            );
+                        });
+                    });
+                    let plane = saturation_value_picker(ui, *picker);
+                    apply_picker_interaction(plane, picker, actions, |picker, position, rect| {
+                        let saturation =
+                            ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        let value =
+                            (1.0 - (position.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                        picker.set_sv(saturation, value)
+                    });
+                    let hue = hue_picker(ui, *picker);
+                    apply_picker_interaction(hue, picker, actions, |picker, position, rect| {
+                        let hue = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                        picker.set_hue(hue)
+                    });
+                    separator_horizontal(ui);
                     palette_label(ui, "PALETTE");
                     ui.horizontal(|ui| {
                         for color in snapshot.color_presets {
                             if color_button(ui, color, color == snapshot.color).clicked() {
-                                actions.push(UiAction::SelectColor(color));
-                                *color_panel_open = false;
+                                actions.push(UiAction::CommitColor(color));
                             }
                         }
                     });
@@ -749,8 +845,7 @@ fn show_color_panel(
                             let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
                             for &color in &snapshot.recent_colors[..count] {
                                 if color_button(ui, color, color == snapshot.color).clicked() {
-                                    actions.push(UiAction::SelectColor(color));
-                                    *color_panel_open = false;
+                                    actions.push(UiAction::CommitColor(color));
                                 }
                             }
                         });
@@ -758,6 +853,133 @@ fn show_color_panel(
                 });
         });
     area.response.rect
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PickerInteraction {
+    rect: Rect,
+    position: Option<Pos2>,
+    commit: bool,
+}
+
+fn apply_picker_interaction(
+    interaction: PickerInteraction,
+    picker: &mut ColorPickerState,
+    actions: &mut Vec<UiAction>,
+    update: impl FnOnce(&mut ColorPickerState, Pos2, Rect) -> [f32; 3],
+) {
+    let changed = interaction
+        .position
+        .map(|position| update(picker, position, interaction.rect));
+    if interaction.commit {
+        actions.push(UiAction::CommitColor(
+            changed.unwrap_or(picker.source_linear),
+        ));
+    } else if let Some(color) = changed {
+        actions.push(UiAction::PreviewColor(color));
+    }
+}
+
+fn saturation_value_picker(ui: &mut egui::Ui, picker: ColorPickerState) -> PickerInteraction {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(COLOR_PICKER_WIDTH, COLOR_PLANE_HEIGHT),
+        Sense::click_and_drag(),
+    );
+    paint_color_mesh(
+        ui,
+        rect,
+        COLOR_MESH_STEPS,
+        COLOR_MESH_STEPS,
+        |saturation, y| hsv_to_srgb(picker.hue, saturation, 1.0 - y),
+    );
+    ui.painter()
+        .rect_stroke(rect, 3, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let marker = Pos2::new(
+        egui::lerp(rect.x_range(), picker.saturation),
+        egui::lerp(rect.y_range(), 1.0 - picker.value),
+    );
+    picker_marker(ui, marker);
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::ColorButton,
+            ui.is_enabled(),
+            "Color saturation and value",
+        )
+    });
+    picker_interaction(rect, &response)
+}
+
+fn hue_picker(ui: &mut egui::Ui, picker: ColorPickerState) -> PickerInteraction {
+    let (rect, response) = ui.allocate_exact_size(
+        Vec2::new(COLOR_PICKER_WIDTH, HUE_SLIDER_HEIGHT),
+        Sense::click_and_drag(),
+    );
+    paint_color_mesh(ui, rect, COLOR_MESH_STEPS, 1, |hue, _| {
+        hsv_to_srgb(hue, 1.0, 1.0)
+    });
+    ui.painter()
+        .rect_stroke(rect, 3, Stroke::new(1.0, BORDER), StrokeKind::Inside);
+    let marker = Pos2::new(egui::lerp(rect.x_range(), picker.hue), rect.center().y);
+    ui.painter()
+        .circle_filled(marker, 6.0, Color32::from_black_alpha(150));
+    ui.painter()
+        .circle_stroke(marker, 6.0, Stroke::new(2.0, Color32::WHITE));
+    response.widget_info(|| {
+        WidgetInfo::slider(ui.is_enabled(), f64::from(picker.hue * 360.0), "Color hue")
+    });
+    picker_interaction(rect, &response)
+}
+
+fn picker_interaction(rect: Rect, response: &egui::Response) -> PickerInteraction {
+    let active = response.dragged() || response.clicked();
+    PickerInteraction {
+        rect,
+        position: active.then(|| response.interact_pointer_pos()).flatten(),
+        commit: response.clicked() || response.drag_stopped(),
+    }
+}
+
+fn picker_marker(ui: &egui::Ui, position: Pos2) {
+    ui.painter()
+        .circle_filled(position, 7.0, Color32::from_black_alpha(150));
+    ui.painter()
+        .circle_stroke(position, 7.0, Stroke::new(2.0, Color32::WHITE));
+}
+
+fn paint_color_mesh(
+    ui: &egui::Ui,
+    rect: Rect,
+    x_steps: usize,
+    y_steps: usize,
+    color_at: impl Fn(f32, f32) -> [f32; 3],
+) {
+    let mut mesh = egui::Mesh::default();
+    let vertex_count = (x_steps + 1) * (y_steps + 1);
+    mesh.reserve_vertices(vertex_count);
+    mesh.reserve_triangles(x_steps * y_steps * 2);
+    for y in 0..=y_steps {
+        let y_unit = y as f32 / y_steps as f32;
+        for x in 0..=x_steps {
+            let x_unit = x as f32 / x_steps as f32;
+            let position = Pos2::new(
+                egui::lerp(rect.x_range(), x_unit),
+                egui::lerp(rect.y_range(), y_unit),
+            );
+            mesh.colored_vertex(position, srgb_color32(color_at(x_unit, y_unit)));
+        }
+    }
+    let row = x_steps + 1;
+    for y in 0..y_steps {
+        for x in 0..x_steps {
+            let top_left = (y * row + x) as u32;
+            let top_right = top_left + 1;
+            let bottom_left = top_left + row as u32;
+            let bottom_right = bottom_left + 1;
+            mesh.add_triangle(top_left, top_right, bottom_left);
+            mesh.add_triangle(top_right, bottom_right, bottom_left);
+        }
+    }
+    ui.painter().add(egui::Shape::mesh(mesh));
 }
 
 fn show_file_panel(
@@ -1245,13 +1467,81 @@ fn color_button(ui: &mut egui::Ui, linear_rgb: [f32; 3], selected: bool) -> egui
 }
 
 fn linear_to_srgb_u8(value: f32) -> u8 {
+    srgb_to_u8(linear_to_srgb(value))
+}
+
+fn linear_to_srgb(value: f32) -> f32 {
     let value = value.clamp(0.0, 1.0);
-    let srgb = if value <= 0.003_130_8 {
+    if value <= 0.003_130_8 {
         value * 12.92
     } else {
         1.055 * value.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn srgb_to_linear(value: f32) -> f32 {
+    let value = value.clamp(0.0, 1.0);
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn srgb_to_u8(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+fn srgb_color32(rgb: [f32; 3]) -> Color32 {
+    Color32::from_rgb(srgb_to_u8(rgb[0]), srgb_to_u8(rgb[1]), srgb_to_u8(rgb[2]))
+}
+
+fn linear_rgb_hex(linear: [f32; 3]) -> String {
+    let rgb = linear.map(linear_to_srgb_u8);
+    format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2])
+}
+
+fn srgb_to_hsv(red: f32, green: f32, blue: f32) -> (f32, f32, f32) {
+    let red = red.clamp(0.0, 1.0);
+    let green = green.clamp(0.0, 1.0);
+    let blue = blue.clamp(0.0, 1.0);
+    let maximum = red.max(green).max(blue);
+    let minimum = red.min(green).min(blue);
+    let chroma = maximum - minimum;
+    let hue = if chroma <= f32::EPSILON {
+        0.0
+    } else if maximum == red {
+        ((green - blue) / chroma).rem_euclid(6.0) / 6.0
+    } else if maximum == green {
+        ((blue - red) / chroma + 2.0) / 6.0
+    } else {
+        ((red - green) / chroma + 4.0) / 6.0
     };
-    (srgb * 255.0).round() as u8
+    let saturation = if maximum <= f32::EPSILON {
+        0.0
+    } else {
+        chroma / maximum
+    };
+    (hue, saturation, maximum)
+}
+
+fn hsv_to_srgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
+    let hue = hue.rem_euclid(1.0) * 6.0;
+    let saturation = saturation.clamp(0.0, 1.0);
+    let value = value.clamp(0.0, 1.0);
+    let sector = hue.floor() as u32;
+    let fraction = hue - sector as f32;
+    let low = value * (1.0 - saturation);
+    let falling = value * (1.0 - saturation * fraction);
+    let rising = value * (1.0 - saturation * (1.0 - fraction));
+    match sector % 6 {
+        0 => [value, rising, low],
+        1 => [falling, value, low],
+        2 => [low, value, rising],
+        3 => [low, falling, value],
+        4 => [rising, low, value],
+        _ => [value, low, falling],
+    }
 }
 
 fn separator(ui: &mut egui::Ui) {
@@ -1279,6 +1569,105 @@ mod tests {
         assert_eq!(linear_to_srgb_u8(1.0), 255);
         assert_eq!(linear_to_srgb_u8(-1.0), 0);
         assert_eq!(linear_to_srgb_u8(2.0), 255);
+    }
+
+    #[test]
+    fn linear_and_srgb_transfer_functions_round_trip() {
+        for linear in [0.0, 0.001, 0.003_130_8, 0.018, 0.25, 0.5, 0.9, 1.0] {
+            let round_trip = srgb_to_linear(linear_to_srgb(linear));
+            assert!((round_trip - linear).abs() < 0.000_001);
+        }
+    }
+
+    #[test]
+    fn hsv_conversion_matches_primaries_and_round_trips() {
+        for (rgb, expected_hue) in [
+            ([1.0, 0.0, 0.0], 0.0),
+            ([0.0, 1.0, 0.0], 1.0 / 3.0),
+            ([0.0, 0.0, 1.0], 2.0 / 3.0),
+        ] {
+            let (hue, saturation, value) = srgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+            assert!((hue - expected_hue).abs() < 0.000_001);
+            assert_eq!(saturation, 1.0);
+            assert_eq!(value, 1.0);
+            assert_eq!(hsv_to_srgb(hue, saturation, value), rgb);
+        }
+
+        for rgb in [
+            [0.12, 0.43, 0.87],
+            [0.91, 0.32, 0.18],
+            [0.42, 0.42, 0.42],
+            [0.0, 0.0, 0.0],
+        ] {
+            let (hue, saturation, value) = srgb_to_hsv(rgb[0], rgb[1], rgb[2]);
+            let round_trip = hsv_to_srgb(hue, saturation, value);
+            for channel in 0..3 {
+                assert!((round_trip[channel] - rgb[channel]).abs() < 0.000_001);
+            }
+        }
+    }
+
+    #[test]
+    fn picker_preserves_hue_when_an_external_color_is_gray() {
+        let mut picker = ColorPickerState::new([1.0, 0.0, 0.0]);
+        picker.set_hue(0.72);
+        let preserved_hue = picker.hue;
+
+        let gray = [0.25, 0.25, 0.25];
+        picker.sync(gray);
+
+        assert_eq!(picker.hue, preserved_hue);
+        assert_eq!(picker.saturation, 0.0);
+    }
+
+    #[test]
+    fn hue_slider_keeps_its_right_endpoint_while_producing_red() {
+        let mut picker = ColorPickerState::new([1.0, 0.0, 0.0]);
+        let color = picker.set_hue(1.0);
+
+        assert_eq!(picker.hue, 1.0);
+        assert_eq!(color, [1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn picker_drag_previews_and_release_commits_once() {
+        let mut picker = ColorPickerState::default();
+        let mut actions = Vec::new();
+        let rect = Rect::from_min_size(Pos2::ZERO, Vec2::splat(100.0));
+        let update = |picker: &mut ColorPickerState, position: Pos2, rect: Rect| {
+            picker.set_sv(
+                (position.x - rect.left()) / rect.width(),
+                1.0 - (position.y - rect.top()) / rect.height(),
+            )
+        };
+
+        for position in [Pos2::new(20.0, 80.0), Pos2::new(60.0, 30.0)] {
+            apply_picker_interaction(
+                PickerInteraction {
+                    rect,
+                    position: Some(position),
+                    commit: false,
+                },
+                &mut picker,
+                &mut actions,
+                update,
+            );
+        }
+        apply_picker_interaction(
+            PickerInteraction {
+                rect,
+                position: None,
+                commit: true,
+            },
+            &mut picker,
+            &mut actions,
+            update,
+        );
+
+        assert_eq!(actions.len(), 3);
+        assert!(matches!(actions[0], UiAction::PreviewColor(_)));
+        assert!(matches!(actions[1], UiAction::PreviewColor(_)));
+        assert_eq!(actions[2], UiAction::CommitColor(picker.source_linear));
     }
 
     #[test]

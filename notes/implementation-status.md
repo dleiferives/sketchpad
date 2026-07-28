@@ -40,8 +40,8 @@ prototype:
 - a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
   surface texture, command encoder, and render pass;
 - a compact first toolbar for pen/eraser/mixing selection, brush diameter and
-  opacity adjustment, a preset/recent-color popover, undo/redo, and interface
-  hiding;
+  opacity adjustment, a continuous HSV color picker plus preset/recent colors,
+  undo/redo, and interface hiding;
 - a custom file popover dispatching the existing Open, Save, Save As, PNG
   import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,
@@ -133,6 +133,9 @@ Controls:
 - Control/Command-Page Up / Page Down: move the active layer above/below;
 - F1: show or hide the interface;
 - UI `LAYERS`: show or hide the layer panel;
+- UI color swatch: open or close the color picker;
+- color saturation/value plane: preview continuously and commit on release;
+- color hue strip: preview continuously and commit on release;
 - UI `FILE`: open the native document/import/export command surface;
 - layer-panel row: select that layer;
 - layer-panel visibility mark: show or hide that row's layer;
@@ -542,12 +545,11 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - tilt and source timestamps are preserved but not yet consumed by the round
   brush;
 - no smoothing beyond constant-distance resampling;
-- layer operations are keyboard/file-drop driven; brush geometry remains one
-  hard-round family with an experimental linear-mixing engine, six preset
-  colors, visible-color sampling, and one coverage eraser;
-- the first graphical toolbar is an integration scaffold; there is not yet a
-  layer panel, full color interface, brush editor, final responsive layout,
-  rotation, selection, or transforms;
+- brush geometry remains one hard-round family with an experimental
+  linear-mixing engine, visible-color sampling, and one coverage eraser;
+- the first graphical toolbar, layer panel, file surface, and HSV picker are
+  functional integration slices; there is not yet a brush editor, final
+  responsive layout, rotation, selection, or transforms;
 - the current named `.sketchpad` document is the exact layered snapshot
   container proven by recovery, not the eventual scalable schema: it has no
   embedded preview or serialized undo history, and the active named path is
@@ -587,10 +589,10 @@ The active delivery sequence is governed by
 defined in [performance-proof-plan.md](performance-proof-plan.md). The
 immediate order is:
 
-1. evaluate hard-round, mixing, cancellation, undo, file drop, and color
-   sampling with the physical Wacom setup;
-2. design the first graphical layer/brush/color surface over the now-proven
-   command semantics;
+1. evaluate hard-round, mixing, cancellation, undo, file drop, color sampling,
+   and the new color picker with the physical Wacom setup;
+2. continue turning the proven toolbar, layer, file, and color surfaces into a
+   coherent usable drawing workflow;
 3. add canvas rotation controls before broader selection/transform work.
 4. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.

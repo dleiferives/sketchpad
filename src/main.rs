@@ -554,7 +554,8 @@ impl App {
             UiAction::SelectTool(tool) => self.select_ui_tool(tool),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
-            UiAction::SelectColor(color) => self.set_paint_color(color, true),
+            UiAction::PreviewColor(color) => self.set_paint_color(color, false),
+            UiAction::CommitColor(color) => self.set_paint_color(color, true),
             UiAction::SelectLayer(layer) => self.select_layer(layer),
             UiAction::ToggleLayerVisibility(layer) => self.toggle_layer_visibility(layer),
             UiAction::AdjustLayerOpacity { layer, delta } => {
