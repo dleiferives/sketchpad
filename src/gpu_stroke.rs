@@ -1,5 +1,287 @@
-use crate::raster::{Damage, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord};
-use std::{collections::HashSet, error::Error, fmt};
+use crate::{
+    brush::{BrushError, BrushSample},
+    contact::{for_each_subdivided_sweep, BladePose, BladeSweep},
+    natural::{contact_direction_from_tilt, PaletteKnifeBrush},
+    raster::{Damage, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord},
+};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt, mem,
+};
+
+const MAXIMUM_BLADE_ANGLE_RADIANS: f32 = 7.5_f32.to_radians();
+const MAXIMUM_BLADE_SUBDIVISIONS: usize = 24;
+const ORIENTATION_MOVE_DEAD_ZONE: f32 = 0.25;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct GpuStrokeVertex {
+    pub position: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StrokeTileDamage {
+    pub coord: TileCoord,
+    pub local_damage: RectU32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GpuStrokeBatch {
+    vertices: Vec<GpuStrokeVertex>,
+    touched_tiles: Vec<StrokeTileDamage>,
+    sweeps: u32,
+}
+
+impl GpuStrokeBatch {
+    pub fn vertices(&self) -> &[GpuStrokeVertex] {
+        &self.vertices
+    }
+
+    pub fn touched_tiles(&self) -> &[StrokeTileDamage] {
+        &self.touched_tiles
+    }
+
+    pub const fn sweeps(&self) -> u32 {
+        self.sweeps
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.vertices.is_empty()
+    }
+}
+
+pub struct ContinuousBladeStroke {
+    brush: PaletteKnifeBrush,
+    canvas: [u32; 2],
+    tile_size: u32,
+    direction: [f32; 2],
+    last_position: [f32; 2],
+    previous_pose: Option<BladePose>,
+    pending_vertices: Vec<GpuStrokeVertex>,
+    pending_damage: HashMap<TileCoord, RectU32>,
+    pending_sweeps: u32,
+    total_sweeps: u64,
+    finalized: bool,
+}
+
+impl ContinuousBladeStroke {
+    pub fn begin(
+        brush: PaletteKnifeBrush,
+        canvas: [u32; 2],
+        tile_size: u32,
+        sample: BrushSample,
+    ) -> Result<Self, ContinuousBladeError> {
+        if canvas[0] == 0 || canvas[1] == 0 {
+            return Err(ContinuousBladeError::EmptyCanvas);
+        }
+        if tile_size == 0 {
+            return Err(ContinuousBladeError::InvalidTileSize);
+        }
+        if !sample.is_finite() {
+            return Err(BrushError::InvalidSample.into());
+        }
+        let mut stroke = Self {
+            brush,
+            canvas,
+            tile_size,
+            direction: [1.0, 0.0],
+            last_position: sample.position,
+            previous_pose: None,
+            pending_vertices: Vec::new(),
+            pending_damage: HashMap::new(),
+            pending_sweeps: 0,
+            total_sweeps: 0,
+            finalized: false,
+        };
+        stroke.add_sample(sample)?;
+        Ok(stroke)
+    }
+
+    pub const fn diameter(&self) -> f32 {
+        self.brush.diameter()
+    }
+
+    pub fn color(&self) -> [f32; 4] {
+        let opacity = self.brush.opacity();
+        let color = self.brush.color();
+        [
+            color[0] * opacity,
+            color[1] * opacity,
+            color[2] * opacity,
+            opacity,
+        ]
+    }
+
+    pub const fn total_sweeps(&self) -> u64 {
+        self.total_sweeps
+    }
+
+    pub fn update(&mut self, sample: BrushSample) -> Result<(), ContinuousBladeError> {
+        if self.finalized {
+            return Err(BrushError::StrokeFinalized.into());
+        }
+        if !sample.is_finite() {
+            return Err(BrushError::InvalidSample.into());
+        }
+        self.add_sample(sample)
+    }
+
+    pub fn finish(&mut self) -> Result<(), ContinuousBladeError> {
+        if self.finalized {
+            return Err(BrushError::StrokeFinalized.into());
+        }
+        self.finalized = true;
+        Ok(())
+    }
+
+    pub fn take_batch(&mut self) -> GpuStrokeBatch {
+        let mut touched_tiles: Vec<_> = self
+            .pending_damage
+            .drain()
+            .map(|(coord, local_damage)| StrokeTileDamage {
+                coord,
+                local_damage,
+            })
+            .collect();
+        touched_tiles.sort_by_key(|tile| (tile.coord.y, tile.coord.x));
+        GpuStrokeBatch {
+            vertices: mem::take(&mut self.pending_vertices),
+            touched_tiles,
+            sweeps: mem::take(&mut self.pending_sweeps),
+        }
+    }
+
+    fn add_sample(&mut self, sample: BrushSample) -> Result<(), ContinuousBladeError> {
+        self.resolve_direction(sample);
+        let pressure = sample.pressure.clamp(0.0, 1.0);
+        if pressure == 0.0 || self.brush.opacity() == 0.0 {
+            self.previous_pose = None;
+            return Ok(());
+        }
+        let current = BladePose::new(
+            sample.position,
+            self.direction,
+            self.brush.contact_half_extents(pressure),
+        )
+        .ok_or(ContinuousBladeError::InvalidPose)?;
+        if let Some(previous) = self.previous_pose {
+            let sweeps_before = self.pending_sweeps;
+            let count = for_each_subdivided_sweep(
+                previous,
+                current,
+                MAXIMUM_BLADE_ANGLE_RADIANS,
+                MAXIMUM_BLADE_SUBDIVISIONS,
+                |sweep| self.append_sweep(sweep),
+            );
+            debug_assert_eq!(self.pending_sweeps - sweeps_before, count as u32);
+        } else {
+            self.append_sweep(BladeSweep::between(current, current));
+        }
+        self.previous_pose = Some(current);
+        Ok(())
+    }
+
+    fn resolve_direction(&mut self, sample: BrushSample) {
+        if let Some(direction) = contact_direction_from_tilt(sample.tilt) {
+            self.direction = direction;
+        } else {
+            let dx = sample.position[0] - self.last_position[0];
+            let dy = sample.position[1] - self.last_position[1];
+            let length_squared = dx * dx + dy * dy;
+            if length_squared >= ORIENTATION_MOVE_DEAD_ZONE * ORIENTATION_MOVE_DEAD_ZONE {
+                let inverse_length = length_squared.sqrt().recip();
+                self.direction = [dx * inverse_length, dy * inverse_length];
+            }
+        }
+        self.last_position = sample.position;
+    }
+
+    fn append_sweep(&mut self, sweep: BladeSweep) {
+        let polygon = sweep.polygon();
+        let vertices = polygon.vertices();
+        let first = vertices[0];
+        for index in 1..vertices.len() - 1 {
+            self.pending_vertices.extend([
+                GpuStrokeVertex { position: first },
+                GpuStrokeVertex {
+                    position: vertices[index],
+                },
+                GpuStrokeVertex {
+                    position: vertices[index + 1],
+                },
+            ]);
+        }
+        self.pending_sweeps += 1;
+        self.total_sweeps += 1;
+        self.include_bounds(polygon.bounds());
+    }
+
+    fn include_bounds(&mut self, bounds: [f32; 4]) {
+        let min_x = bounds[0].floor().clamp(0.0, self.canvas[0] as f32) as u32;
+        let min_y = bounds[1].floor().clamp(0.0, self.canvas[1] as f32) as u32;
+        let max_x = bounds[2].ceil().clamp(0.0, self.canvas[0] as f32) as u32;
+        let max_y = bounds[3].ceil().clamp(0.0, self.canvas[1] as f32) as u32;
+        if min_x >= max_x || min_y >= max_y {
+            return;
+        }
+        let min_tile_x = min_x / self.tile_size;
+        let min_tile_y = min_y / self.tile_size;
+        let max_tile_x = (max_x - 1) / self.tile_size;
+        let max_tile_y = (max_y - 1) / self.tile_size;
+        for tile_y in min_tile_y..=max_tile_y {
+            for tile_x in min_tile_x..=max_tile_x {
+                let origin_x = tile_x * self.tile_size;
+                let origin_y = tile_y * self.tile_size;
+                let local = RectU32::from_min_max(
+                    min_x.max(origin_x) - origin_x,
+                    min_y.max(origin_y) - origin_y,
+                    max_x.min(origin_x + self.tile_size) - origin_x,
+                    max_y.min(origin_y + self.tile_size) - origin_y,
+                )
+                .expect("every enumerated tile intersects the clipped sweep bounds");
+                self.pending_damage
+                    .entry(TileCoord::new(tile_x, tile_y))
+                    .and_modify(|damage| *damage = damage.union(local))
+                    .or_insert(local);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ContinuousBladeError {
+    EmptyCanvas,
+    InvalidTileSize,
+    InvalidPose,
+    Brush(BrushError),
+}
+
+impl fmt::Display for ContinuousBladeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyCanvas => write!(formatter, "continuous blade canvas is empty"),
+            Self::InvalidTileSize => write!(formatter, "continuous blade tile size is zero"),
+            Self::InvalidPose => write!(formatter, "continuous blade generated an invalid pose"),
+            Self::Brush(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for ContinuousBladeError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Brush(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<BrushError> for ContinuousBladeError {
+    fn from(error: BrushError) -> Self {
+        Self::Brush(error)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SourceOverTile {
@@ -251,6 +533,20 @@ mod tests {
         )
     }
 
+    fn blade() -> PaletteKnifeBrush {
+        PaletteKnifeBrush::new([0.2, 0.1, 0.4], 72.0, 1.0).unwrap()
+    }
+
+    fn blade_samples() -> [BrushSample; 5] {
+        [
+            BrushSample::with_tilt([30.0, 80.0], 0.3, [0.0, 0.8]),
+            BrushSample::with_tilt([70.0, 92.0], 0.5, [0.3, 0.7]),
+            BrushSample::with_tilt([110.0, 74.0], 0.8, [0.7, 0.3]),
+            BrushSample::with_tilt([150.0, 100.0], 1.0, [0.8, 0.0]),
+            BrushSample::with_tilt([210.0, 86.0], 0.6, [0.4, -0.6]),
+        ]
+    }
+
     #[test]
     fn opaque_readback_commits_as_one_undoable_gesture() {
         let mut layer = layer();
@@ -344,5 +640,82 @@ mod tests {
         ));
         assert_eq!(layer.allocated_tile_count(), 0);
         assert_eq!(layer.undo_depth(), 0);
+    }
+
+    #[test]
+    fn continuous_blade_batches_do_not_change_generated_geometry() {
+        let samples = blade_samples();
+        let mut whole = ContinuousBladeStroke::begin(blade(), [256, 192], 64, samples[0]).unwrap();
+        for sample in &samples[1..] {
+            whole.update(*sample).unwrap();
+        }
+        whole.finish().unwrap();
+        let whole = whole.take_batch();
+
+        let mut incremental =
+            ContinuousBladeStroke::begin(blade(), [256, 192], 64, samples[0]).unwrap();
+        let mut vertices = Vec::new();
+        let mut sweeps = 0;
+        let mut damage = HashMap::new();
+        let mut collect = |batch: GpuStrokeBatch| {
+            vertices.extend_from_slice(batch.vertices());
+            sweeps += batch.sweeps();
+            for tile in batch.touched_tiles() {
+                damage
+                    .entry(tile.coord)
+                    .and_modify(|current: &mut RectU32| *current = current.union(tile.local_damage))
+                    .or_insert(tile.local_damage);
+            }
+        };
+        collect(incremental.take_batch());
+        for sample in &samples[1..] {
+            incremental.update(*sample).unwrap();
+            collect(incremental.take_batch());
+        }
+        incremental.finish().unwrap();
+        collect(incremental.take_batch());
+        let mut touched_tiles: Vec<_> = damage
+            .into_iter()
+            .map(|(coord, local_damage)| StrokeTileDamage {
+                coord,
+                local_damage,
+            })
+            .collect();
+        touched_tiles.sort_by_key(|tile| (tile.coord.y, tile.coord.x));
+
+        assert_eq!(vertices, whole.vertices());
+        assert_eq!(sweeps, whole.sweeps());
+        assert_eq!(touched_tiles, whole.touched_tiles());
+    }
+
+    #[test]
+    fn zero_pressure_breaks_contact_without_emitting_geometry() {
+        let zero = BrushSample::with_tilt([32.0, 32.0], 0.0, [0.0, 0.8]);
+        let mut stroke = ContinuousBladeStroke::begin(blade(), [128, 128], 64, zero).unwrap();
+        assert!(stroke.take_batch().is_empty());
+
+        stroke
+            .update(BrushSample::with_tilt([48.0, 48.0], 1.0, [0.0, 0.8]))
+            .unwrap();
+        let first_contact = stroke.take_batch();
+        assert_eq!(first_contact.sweeps(), 1);
+        assert!(!first_contact.is_empty());
+
+        stroke.update(zero).unwrap();
+        assert!(stroke.take_batch().is_empty());
+    }
+
+    #[test]
+    fn continuous_blade_damage_is_clipped_to_edge_tiles() {
+        let sample = BrushSample::with_tilt([2.0, 2.0], 1.0, [0.0, 0.8]);
+        let mut stroke = ContinuousBladeStroke::begin(blade(), [130, 130], 64, sample).unwrap();
+        let batch = stroke.take_batch();
+        assert!(!batch.is_empty());
+        for tile in batch.touched_tiles() {
+            let valid_width = 64.min(130 - tile.coord.x * 64);
+            let valid_height = 64.min(130 - tile.coord.y * 64);
+            assert!(tile.local_damage.max_x() <= valid_width);
+            assert!(tile.local_damage.max_y() <= valid_height);
+        }
     }
 }

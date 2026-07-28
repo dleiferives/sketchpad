@@ -162,6 +162,15 @@ Do not wait for a fixed number of samples. The benchmark's batch counts are
 workload probes, not quality settings. Display pacing decides when to submit;
 contact tolerances decide geometry fidelity.
 
+`gpu_stroke::ContinuousBladeStroke` now owns this backend-neutral live
+generation state. It preserves corrected tilt orientation and movement
+fallback across input updates, breaks contact at zero pressure, performs
+bounded angular subdivision, triangulates only new convex sweeps, and unions
+their clipped bounds into deterministic `StrokeTileDamage` entries. Draining
+after each input update or only at gesture end produces byte-identical vertex
+order, equal sweep counts, and equal unioned tile damage in the regression
+fixture. No per-update heap is allocated for subdivision.
+
 ## Layer Order and Staged Integration
 
 For a topmost visible active layer, presenting
@@ -239,7 +248,9 @@ pen-up-to-next-pen-down blocking.
 3. [Foundation complete] Split canvas/cursor presentation stages and prove the
    sparse scratch display shader. Wire it between canvas and cursor in the app
    only when the active layer is topmost.
-4. Drive connected knife geometry from physical input into the scratch tiles.
+4. [Generator complete] Drive connected knife geometry from physical input
+   into the scratch tiles. The packet-persistent generator and batching
+   invariance tests are complete; app event/render wiring remains.
 5. Make finish asynchronous and connect mapped tiles to one document commit.
 6. Validate cancel, undo, save blocking, device loss, and exact final pixels.
 7. Replace the top-layer restriction with bottom-to-top layer-aware GPU tile

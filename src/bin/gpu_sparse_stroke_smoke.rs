@@ -1,6 +1,6 @@
 use sketchpad::{
-    gpu_stroke::commit_source_over_tiles,
-    gpu_stroke_target::{GpuStrokeVertex, SparseStrokeTarget, StrokeTileDamage},
+    gpu_stroke::{commit_source_over_tiles, GpuStrokeVertex, StrokeTileDamage},
+    gpu_stroke_target::SparseStrokeTarget,
     pipeline::CanvasUniform,
     raster::{LinearRgba, RasterLayer, RectU32, TileCoord},
 };

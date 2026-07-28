@@ -1,5 +1,5 @@
 use crate::{
-    gpu_stroke::SourceOverTile,
+    gpu_stroke::{GpuStrokeVertex, SourceOverTile, StrokeTileDamage},
     pipeline::CanvasUniform,
     raster::{LinearRgba, RectU32, TileCoord},
 };
@@ -15,12 +15,6 @@ use std::{
 const PIXEL_BYTES: u32 = size_of::<LinearRgba>() as u32;
 const COPY_ROW_ALIGNMENT: u32 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct GpuStrokeVertex {
-    pub position: [f32; 2],
-}
-
 impl GpuStrokeVertex {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         const ATTRIBUTES: [wgpu::VertexAttribute; 1] = wgpu::vertex_attr_array![0 => Float32x2];
@@ -30,12 +24,6 @@ impl GpuStrokeVertex {
             attributes: &ATTRIBUTES,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StrokeTileDamage {
-    pub coord: TileCoord,
-    pub local_damage: RectU32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
