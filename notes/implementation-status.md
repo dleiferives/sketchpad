@@ -631,6 +631,9 @@ immediate order is:
    final validation pixels for the opaque geometry proof.
 6. Define active-layer GPU/CPU ownership, below/active/above composition,
    cancel, undo, save, and recovery semantics before any live GPU mutation.
+   [Complete] The selected sparse scratch-tile transaction and tested
+   source-over readback commit boundary are defined in
+   [GPU active-stroke architecture](gpu-active-stroke-architecture.md).
 7. Integrate a validated continuous-contact path without live readback, then
    extend it to flat, pencil, and bounded-strand marks. The design and quality
    gates are in

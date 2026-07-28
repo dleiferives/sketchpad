@@ -69,6 +69,10 @@ The notes are organized by purpose:
   industrial bristles, sweeping versus stamping, the proposed contact-command
   split, and the GPU/CPU measurement plan for faster, better knife and bristle
   marks.
+- [GPU active-stroke architecture](gpu-active-stroke-architecture.md) — the
+  selected sparse scratch-tile transaction, CPU/GPU authority state machine,
+  layer-order constraint, asynchronous readback/undo contract, and staged
+  route from the measured offscreen sweep to a correct live brush.
 - [Document semantics and storage](document-semantics-and-storage.md) — brush
   graphs, eraser lineage, color contracts, SQLite versus container formats,
   undo, autosave, recovery, and coordinate serialization.

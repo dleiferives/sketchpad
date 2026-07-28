@@ -2,6 +2,7 @@ pub mod brush;
 pub mod checkpoint;
 pub mod contact;
 pub mod document;
+pub mod gpu_stroke;
 pub mod image_io;
 pub mod input;
 pub mod input_trace;
