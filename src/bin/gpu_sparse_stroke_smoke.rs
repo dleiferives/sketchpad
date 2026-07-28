@@ -1,9 +1,10 @@
 use sketchpad::{
     gpu_stroke::commit_source_over_tiles,
     gpu_stroke_target::{GpuStrokeVertex, SparseStrokeTarget, StrokeTileDamage},
+    pipeline::CanvasUniform,
     raster::{LinearRgba, RasterLayer, RectU32, TileCoord},
 };
-use std::{error::Error, iter};
+use std::{error::Error, iter, sync::mpsc};
 
 const CANVAS_SIZE: u32 = 512;
 const TILE_SIZE: u32 = 128;
@@ -35,19 +36,108 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Default::default()
     }))?;
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
-    let mut target = SparseStrokeTarget::new(&device, CANVAS_SIZE, CANVAS_SIZE, TILE_SIZE, 4)?;
+    let mut target = SparseStrokeTarget::new(
+        &device,
+        CANVAS_SIZE,
+        CANVAS_SIZE,
+        TILE_SIZE,
+        4,
+        wgpu::TextureFormat::Rgba8UnormSrgb,
+    )?;
     target.begin(COLOR)?;
 
     let vertices = rectangle_vertices(RECTANGLE);
     let touched = rectangle_tiles(RECTANGLE);
+    let output = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("Sparse Stroke Smoke Presentation"),
+        size: wgpu::Extent3d {
+            width: CANVAS_SIZE,
+            height: CANVAS_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let output_view = output.create_view(&Default::default());
+    let output_bytes_per_row = CANVAS_SIZE * 4;
+    let output_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Sparse Stroke Smoke Presentation Readback"),
+        size: u64::from(output_bytes_per_row) * u64::from(CANVAS_SIZE),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("Sparse Stroke Smoke"),
     });
     let stats = target.encode_batch(&device, &queue, &mut encoder, &vertices, &touched)?;
+    target.prepare_presentation(
+        &queue,
+        CanvasUniform {
+            center: [CANVAS_SIZE as f32 * 0.5; 2],
+            zoom: 1.0,
+            _padding: 0.0,
+            viewport_size: [CANVAS_SIZE as f32; 2],
+            canvas_size: [CANVAS_SIZE as f32; 2],
+        },
+    );
+    {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("Sparse Stroke Smoke Presentation"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &output_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: 0.0,
+                        g: 0.0,
+                        b: 0.0,
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        target.draw(&mut pass);
+    }
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &output,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &output_readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(output_bytes_per_row),
+                rows_per_image: Some(CANVAS_SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: CANVAS_SIZE,
+            height: CANVAS_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
     let mut readback = target.encode_readback(&device, &mut encoder)?;
     let readback_bytes = readback.byte_len();
     let submission = queue.submit(iter::once(encoder.finish()));
     readback.begin_map()?;
+    let output_slice = output_readback.slice(..);
+    let (output_sender, output_receiver) = mpsc::channel();
+    output_slice.map_async(wgpu::MapMode::Read, move |result| {
+        let _ = output_sender.send(result);
+    });
     device.poll(wgpu::PollType::Wait {
         submission_index: Some(submission),
         timeout: None,
@@ -55,6 +145,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     let tiles = readback
         .try_finish()?
         .ok_or("the completed GPU submission did not finish its map callback")?;
+    output_receiver.recv()??;
+    let output_pixels = output_slice.get_mapped_range()?;
+    let mut presented_pixels = 0;
+    for (index, pixel) in output_pixels.chunks_exact(4).enumerate() {
+        let x = index as u32 % CANVAS_SIZE;
+        let y = index as u32 / CANVAS_SIZE;
+        let inside = x >= RECTANGLE[0]
+            && x < RECTANGLE[2]
+            && y >= CANVAS_SIZE - RECTANGLE[3]
+            && y < CANVAS_SIZE - RECTANGLE[1];
+        let colored = pixel[0] != 0 || pixel[1] != 0 || pixel[2] != 0;
+        if colored != inside || pixel[3] != 255 {
+            return Err(format!(
+                "unexpected presented pixel ({x}, {y}): {pixel:?}, inside={inside}"
+            )
+            .into());
+        }
+        presented_pixels += u64::from(colored);
+    }
+    drop(output_pixels);
+    output_readback.unmap();
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
@@ -86,6 +197,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     if painted_pixels != expected_pixels {
         return Err(format!("painted {painted_pixels} pixels, expected {expected_pixels}").into());
     }
+    if presented_pixels != expected_pixels {
+        return Err(
+            format!("presented {presented_pixels} pixels, expected {expected_pixels}").into(),
+        );
+    }
     if damage.tiles().len() != 6 || tiles.len() != 6 {
         return Err(format!(
             "sparse stroke touched {} readback tiles and {} damage tiles, expected six",
@@ -112,7 +228,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "sparse_gpu_stroke_smoke adapter={:?} touched_tiles={} retained_pages={} \
-         render_passes={} vertices={} vertex_bytes={} readback_bytes={} painted_pixels={} undo=exact",
+         render_passes={} vertices={} vertex_bytes={} readback_bytes={} presented_pixels={} \
+         painted_pixels={} undo=exact",
         adapter.get_info().name,
         stats.allocated_tiles,
         stats.retained_pages,
@@ -120,6 +237,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         stats.vertices,
         stats.vertex_bytes,
         readback_bytes,
+        presented_pixels,
         painted_pixels
     );
     Ok(())

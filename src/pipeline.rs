@@ -1178,6 +1178,11 @@ impl RasterDisplayPipeline {
     }
 
     pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        self.draw_canvas(pass);
+        self.draw_cursor(pass);
+    }
+
+    pub fn draw_canvas<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         pass.set_bind_group(0, &self.pages[0].bind_group, &[]);
         pass.set_pipeline(&self.background_pipeline);
         pass.draw(0..6, 0..1);
@@ -1204,7 +1209,9 @@ impl RasterDisplayPipeline {
                 pass.draw(0..6, 0..1);
             }
         }
+    }
 
+    pub fn draw_cursor<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
         pass.set_bind_group(0, &self.pages[0].bind_group, &[]);
         pass.set_pipeline(&self.cursor_pipeline);
         pass.draw(0..6, 0..1);

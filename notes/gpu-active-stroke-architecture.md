@@ -129,14 +129,18 @@ resource:
 - row-aligned batched texture-to-buffer copies;
 - callback-driven `map_async` completion through `PendingStrokeReadback`;
 - deterministic tile ordering and production of validated `SourceOverTile`
-  inputs.
+  inputs;
+- a sparse-tile presentation pipeline using the same camera contract as the
+  retained canvas, with premultiplied source-over into the surface.
 
 `gpu_sparse_stroke_smoke` renders one rectangle across six `128 × 128` tiles
 with a forced four-layer page capacity. On Apollo it retained two pages,
 encoded six clipped passes, copied 1,572,864 bytes, committed exactly 24,576
-expected pixels, and undid to zero allocated CPU tiles. The test deliberately
-uses a small fixture; it proves resource growth, clipping, mapping, row
-packing, commit, and undo correctness rather than final knife performance.
+expected pixels, presented exactly the same 24,576 pixels through the sparse
+display pipeline, and undid to zero allocated CPU tiles. The test deliberately
+uses a small fixture; it proves resource growth, clipping, presentation,
+mapping, row packing, commit, and undo correctness rather than final knife
+performance.
 
 ## Drawing and Scheduling
 
@@ -232,8 +236,9 @@ pen-up-to-next-pen-down blocking.
    tile-origin dynamic uniform contract.
 2. [Complete] Add an offscreen multi-tile render/readback test using the exact
    `SourceOverTile` commit boundary.
-3. Split canvas/cursor presentation stages and display scratch tiles above the
-   flattened composite only when the active layer is topmost.
+3. [Foundation complete] Split canvas/cursor presentation stages and prove the
+   sparse scratch display shader. Wire it between canvas and cursor in the app
+   only when the active layer is topmost.
 4. Drive connected knife geometry from physical input into the scratch tiles.
 5. Make finish asynchronous and connect mapped tiles to one document commit.
 6. Validate cancel, undo, save blocking, device loss, and exact final pixels.

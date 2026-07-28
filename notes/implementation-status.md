@@ -640,7 +640,9 @@ immediate order is:
    [Continuous brush contact and physical paint](continuous-brush-contact.md).
    The reusable sparse `Rgba32Float` stroke target, asynchronous tile
    readback, exact six-tile GPU smoke round trip, and CPU commit/undo boundary
-   are complete; live presentation/input wiring is next.
+   are complete. Sparse presentation now reproduces the exact smoke fixture,
+   and the retained canvas exposes separate canvas/cursor stages; live
+   presentation/input wiring is next.
 8. Validate the Wacom tilt mapping with a labeled calibration view.
 9. Continue turning the proven toolbar, layer, file, color, and keybinding
    surfaces into a coherent usable drawing workflow.

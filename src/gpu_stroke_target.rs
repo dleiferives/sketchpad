@@ -1,5 +1,6 @@
 use crate::{
     gpu_stroke::SourceOverTile,
+    pipeline::CanvasUniform,
     raster::{LinearRgba, RectU32, TileCoord},
 };
 use std::{
@@ -66,6 +67,30 @@ struct StrokeSlot {
 struct StrokePage {
     texture: wgpu::Texture,
     layer_views: Vec<wgpu::TextureView>,
+    display_bind_group: wgpu::BindGroup,
+    display_instance_buffer: wgpu::Buffer,
+    display_instance_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct DisplayInstance {
+    origin: [f32; 2],
+    extent: [f32; 2],
+    layer: u32,
+    _padding: [u32; 3],
+}
+
+impl DisplayInstance {
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+            wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x2, 2 => Uint32];
+        wgpu::VertexBufferLayout {
+            array_stride: size_of::<Self>() as u64,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &ATTRIBUTES,
+        }
+    }
 }
 
 pub struct SparseStrokeTarget {
@@ -83,6 +108,9 @@ pub struct SparseStrokeTarget {
     vertex_buffer: wgpu::Buffer,
     vertex_capacity: u64,
     pipeline: wgpu::RenderPipeline,
+    display_layout: wgpu::BindGroupLayout,
+    display_pipeline: wgpu::RenderPipeline,
+    camera_buffer: wgpu::Buffer,
 }
 
 impl SparseStrokeTarget {
@@ -92,6 +120,7 @@ impl SparseStrokeTarget {
         height: u32,
         tile_size: u32,
         page_capacity: u32,
+        surface_format: wgpu::TextureFormat,
     ) -> Result<Self, StrokeTargetError> {
         if width == 0 || height == 0 {
             return Err(StrokeTargetError::EmptyCanvas);
@@ -206,6 +235,74 @@ impl SparseStrokeTarget {
             multiview_mask: None,
             cache: None,
         });
+        let camera_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Sparse Stroke Camera"),
+            size: size_of::<CanvasUniform>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let display_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Sparse Stroke Display Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2Array,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: NonZeroU64::new(size_of::<CanvasUniform>() as u64),
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let display_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Sparse Stroke Display Pipeline Layout"),
+                bind_group_layouts: &[Some(&display_layout)],
+                immediate_size: 0,
+            });
+        let display_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Sparse Stroke Display Shader"),
+            source: wgpu::ShaderSource::Wgsl(
+                include_str!("shaders/sparse_stroke_display.wgsl").into(),
+            ),
+        });
+        let display_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Sparse Stroke Display Pipeline"),
+            layout: Some(&display_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &display_shader,
+                entry_point: Some("display_vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(DisplayInstance::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &display_shader,
+                entry_point: Some("display_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: surface_format,
+                    blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         let initial_vertex_capacity = 4096;
         let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Sparse Stroke Vertices"),
@@ -229,6 +326,9 @@ impl SparseStrokeTarget {
             vertex_buffer,
             vertex_capacity: initial_vertex_capacity,
             pipeline,
+            display_layout,
+            display_pipeline,
+            camera_buffer,
         })
     }
 
@@ -247,6 +347,49 @@ impl SparseStrokeTarget {
 
     pub fn retained_page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    pub fn prepare_presentation(&mut self, queue: &wgpu::Queue, camera: CanvasUniform) {
+        queue.write_buffer(&self.camera_buffer, 0, bytemuck::bytes_of(&camera));
+        let mut page_instances = vec![Vec::new(); self.pages.len()];
+        for (&coord, slot) in &self.slots {
+            let origin_x = coord.x * self.tile_size;
+            let origin_y = coord.y * self.tile_size;
+            page_instances[slot.page].push(DisplayInstance {
+                origin: [origin_x as f32, origin_y as f32],
+                extent: [
+                    self.tile_size.min(self.width - origin_x) as f32,
+                    self.tile_size.min(self.height - origin_y) as f32,
+                ],
+                layer: slot.layer,
+                _padding: [0; 3],
+            });
+        }
+        for (page, mut instances) in self.pages.iter_mut().zip(page_instances) {
+            instances.sort_by_key(|instance| {
+                (instance.origin[1].to_bits(), instance.origin[0].to_bits())
+            });
+            if !instances.is_empty() {
+                queue.write_buffer(
+                    &page.display_instance_buffer,
+                    0,
+                    bytemuck::cast_slice(&instances),
+                );
+            }
+            page.display_instance_count = instances.len() as u32;
+        }
+    }
+
+    pub fn draw<'pass>(&'pass self, pass: &mut wgpu::RenderPass<'pass>) {
+        pass.set_pipeline(&self.display_pipeline);
+        for page in &self.pages {
+            if page.display_instance_count == 0 {
+                continue;
+            }
+            pass.set_bind_group(0, &page.display_bind_group, &[]);
+            pass.set_vertex_buffer(0, page.display_instance_buffer.slice(..));
+            pass.draw(0..6, 0..page.display_instance_count);
+        }
     }
 
     pub fn encode_batch(
@@ -466,8 +609,13 @@ impl SparseStrokeTarget {
                 let page = (next_index / self.page_capacity) as usize;
                 let layer = next_index % self.page_capacity;
                 while self.pages.len() <= page {
-                    self.pages
-                        .push(create_page(device, self.tile_size, self.page_capacity));
+                    self.pages.push(create_page(
+                        device,
+                        self.tile_size,
+                        self.page_capacity,
+                        &self.display_layout,
+                        &self.camera_buffer,
+                    ));
                 }
                 let uniform_offset = next_index
                     .checked_mul(self.uniform_stride)
@@ -501,7 +649,13 @@ impl SparseStrokeTarget {
     }
 }
 
-fn create_page(device: &wgpu::Device, tile_size: u32, capacity: u32) -> StrokePage {
+fn create_page(
+    device: &wgpu::Device,
+    tile_size: u32,
+    capacity: u32,
+    display_layout: &wgpu::BindGroupLayout,
+    camera_buffer: &wgpu::Buffer,
+) -> StrokePage {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Sparse Stroke Tile Page"),
         size: wgpu::Extent3d {
@@ -529,9 +683,39 @@ fn create_page(device: &wgpu::Device, tile_size: u32, capacity: u32) -> StrokePa
             })
         })
         .collect();
+    let array_view = texture.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("Sparse Stroke Tile Array"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        base_array_layer: 0,
+        array_layer_count: Some(capacity),
+        ..Default::default()
+    });
+    let display_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("Sparse Stroke Display Bind Group"),
+        layout: display_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(&array_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: camera_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let display_instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("Sparse Stroke Display Instances"),
+        size: u64::from(capacity) * size_of::<DisplayInstance>() as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
     StrokePage {
         texture,
         layer_views,
+        display_bind_group,
+        display_instance_buffer,
+        display_instance_count: 0,
     }
 }
 
