@@ -79,6 +79,14 @@ would introduce new canonical material channels and document semantics. It is
 not a prerequisite for useful tactile brushes. This phase preserves a clean
 upgrade path but does not silently encode pseudo-height into RGBA.
 
+The current pixel-centric dab implementation is now the control for a
+continuous-contact replacement, not the planned production architecture. The
+research, transient contact commands, visual/performance gates, and ordered
+experiment are defined in
+[Continuous brush contact and physical paint](continuous-brush-contact.md).
+That work is explicitly about opaque/dry contact and future optional
+oil/impasto state, not watercolor diffusion.
+
 Primary references:
 
 - Wacom, [Universal Ink Model encoding](https://developer-docs.wacom.com/docs/specifications/uim/encoding/)
@@ -90,7 +98,7 @@ Primary references:
   [Detail-Preserving Paint Modeling for 3D Brushes](https://www.microsoft.com/en-us/research/wp-content/uploads/2010/06/PaintModel_NPAR_2010.pdf)
 - Baxter et al.,
   [A Versatile Interactive 3D Brush Model](https://diglib.eg.org/items/4810e389-c4bd-4e2e-a53b-0d4145a612f8)
-- Van Laerhoven and Van Reeth,
+- Stuyck, Da, Hadap, and Dutré,
   [Real-Time Oil Painting on Mobile Hardware](https://diglib.eg.org/items/d37a6d8c-1ea9-47f0-a39c-49bddbd67e5f)
 - MyPaint,
   [libmypaint brush engine](https://github.com/mypaint/libmypaint)
@@ -227,6 +235,9 @@ considering a GPU implementation.
    add oriented cursor shapes.
 7. Build an authored visual/replay corpus and use Apollo measurements to decide
    which kernels, if any, justify moving to compute shaders.
+8. Replace the pixel-centric knife control with the validated continuous
+   blade-sweep backend, then reuse that contact boundary for flat, pencil, and
+   bounded-strand recipes.
 
 The brush editor remains a later product feature. These presets should first
 become coherent enough that an editor would expose useful, stable parameters

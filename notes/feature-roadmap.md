@@ -152,7 +152,11 @@ product code.
 
 The composition model, research basis, performance contract, and deliberate
 deferral of full paint-height simulation are defined in
-[Natural brush composition](natural-brushes.md).
+[Natural brush composition](natural-brushes.md). The replacement of dense
+knife/bristle dabs with continuous swept contact, including its GPU/CPU
+measurement gate, is defined in
+[Continuous brush contact and physical paint](continuous-brush-contact.md).
+This is not a watercolor or live color-mixing project.
 
 Acceptance: each brush has distinct, stable contact/material behavior rather
 than being a cosmetic hard-round preset; tilt changes the expected contact

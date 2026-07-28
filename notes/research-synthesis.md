@@ -12,8 +12,10 @@ The first Sketchpad is a fast, usable desktop painter:
 - defined and resizeable canvas bounds;
 - sparse canonical raster layers;
 - excellent real stylus input;
-- hard ink, textured pencil/chalk, and a painterly mixing brush;
-- brush-local pickup/deposit and pigment-like color mixing;
+- hard ink, a flat nib, textured pencil/chalk, a palette knife, and a bristle
+  brush;
+- fixed-color deposition first, with brush-local pickup and pigment-like color
+  mixing deliberately deferred;
 - custom bounded `wgpu` tile work;
 - layers, raster eraser, per-gesture tile undo, navigation, save, recovery, and
   export;
@@ -163,6 +165,16 @@ efficiently update an SDF cache.”
     nested local 2D canvases are promising only if zoom intentionally reveals
     different artistic content. See
     [scale-space-storage.md](scale-space-storage.md).
+
+19. **A physical brush and a repeated 2D stamp are separate design choices.**
+    WetBrush uses localized particle detail and a field representation away
+    from contact; industrial bristle work simulates bounded strand dynamics
+    and sweeps projected contact strips; linear-stroke work shows that
+    continuous evaluation can remove diameter-scaled stamp amplification.
+    Sketchpad should first test connected blade and strand sweeps with
+    fixed-color transfer. Optional load, pickup, height, and impasto are
+    separate material stages, not hidden behavior in every brush. See
+    [Continuous brush contact and physical paint](continuous-brush-contact.md).
 
 ## Definitions
 
@@ -611,9 +623,15 @@ Specify and tune:
 
 - hard pressure ink;
 - document-anchored textured pencil/chalk;
-- a painterly brush with bounded reservoir, pickup, deposit, and color mixing;
+- a tilt-oriented flat nib;
+- a continuous palette knife and bounded-strand brush with fixed-color
+  deposition;
 - a raster coverage eraser;
-- a soft airbrush after the first three paths are stable.
+- a soft airbrush after the contact paths are stable.
+
+Destination pickup and live color/pigment mixing are deferred until they have
+a visual corpus, explicit semantics, and a measured budget. Brush geometry
+must not enable them implicitly.
 
 The first product bakes finalized paint into sparse tiles and does not require
 individual retained-stroke editing. The detailed contract is in
@@ -793,16 +811,17 @@ protocol in [performance-laboratory.md](performance-laboratory.md). Then run:
    and memory-pressure scenes on both Atlas adapters.
 3. **Active input:** real/coalesced/predicted tails, cancellation, finalization,
    and gesture transaction behavior.
-4. **Painterly mixing:** reservoir pickup/deposit with linear, perceptual, and
-   legally usable pigment-like interpolation candidates.
+4. **Continuous brush contact:** connected blade and strand sweeps at large
+   diameters, with a shared command stream, CPU-span reference, full-float GPU
+   path, visual continuity corpus, and no live readback.
 5. **Residency/navigation:** pan, zoom, rotate, eviction, revisit, and device
    reconstruction over a large sparse document.
 6. **Storage/recovery:** transactional native tiles under process kill,
    partial commit, migration, disk pressure, and cache loss.
 
 After the painter is usable, run the retained hard-edge, continuous-density,
-ADF, deep-zoom, semantic-scale, and wet-simulation comparisons already defined
-in the subject notes.
+ADF, deep-zoom, semantic-scale, pigment-mixing, and physical-paint simulation
+comparisons already defined in the subject notes.
 
 Every rendering experiment preserves the raw per-frame/event/pass evidence and
 records p50/p95/p99 CPU and GPU time, precise latency interval, uploads, work

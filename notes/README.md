@@ -64,6 +64,11 @@ The notes are organized by purpose:
   analytic curve coverage, sparse vector strips, continuous-density brushes,
   Gaussian primitives, wet simulation, latency, caching, and a prioritized
   experiment plan.
+- [Continuous brush contact and physical paint](continuous-brush-contact.md) —
+  the non-watercolor investigation of WetBrush, mobile oil/impasto,
+  industrial bristles, sweeping versus stamping, the proposed contact-command
+  split, and the GPU/CPU measurement plan for faster, better knife and bristle
+  marks.
 - [Document semantics and storage](document-semantics-and-storage.md) — brush
   graphs, eraser lineage, color contracts, SQLite versus container formats,
   undo, autosave, recovery, and coordinate serialization.
