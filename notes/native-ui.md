@@ -31,7 +31,7 @@ problem, move only the dialog call behind an application user event. Do not
 make document decoding or encoding asynchronous merely to compensate for the
 dialog API.
 
-## Why Egui Is Not Being Added Now
+## Initial Egui Deferral
 
 The released
 [egui 0.35 workspace](https://raw.githubusercontent.com/emilk/egui/0.35.0/Cargo.toml)
@@ -47,6 +47,20 @@ panels, widgets, text, and accessibility. Reconsider it when a released version
 matches Sketchpad's chosen wgpu version, then measure idle wakeups, UI
 tessellation/upload work, binary/dependency cost, and canvas event routing
 before adopting it.
+
+### 2026-07-28 compatibility follow-up
+
+The initial released-version decision remains correct: egui 0.35 cannot share
+Sketchpad's `wgpu` 30 types. Egui's development workspace has since moved to
+`wgpu` 30 while retaining `winit` 0.30. An exact pinned Git revision is now a
+viable bounded experiment, though it is not equivalent to a released
+dependency.
+
+The working recommendation is to embed only `egui`, `egui-winit`, and
+`egui-wgpu` over Sketchpad's existing surface—never hand the application to
+`eframe`—and measure it against a glyphon-backed custom fallback. The complete
+ownership, caching, input, and promotion conditions are in
+[Immediate-mode UI overlay architecture](ui-overlay-architecture.md).
 
 ## Thin Custom Overlay Candidate
 
@@ -81,8 +95,11 @@ does not supply application widget semantics.
 
 Ship native PNG import/export dialogs with `rfd` first. Keep the current
 keyboard and window-title controls while evaluating the physical tablet. Build
-the graphical layer/brush/color surface only after selecting either a
-wgpu-version-aligned toolkit or a deliberately scoped custom overlay.
+the first graphical layer/brush/color surface as the bounded pinned-egui
+vertical slice defined in
+[Immediate-mode UI overlay architecture](ui-overlay-architecture.md). Retain
+the deliberately scoped custom overlay as the fallback if that measurement
+fails.
 
 ### Implemented vertical slice
 

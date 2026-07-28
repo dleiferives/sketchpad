@@ -20,6 +20,10 @@ The notes are organized by purpose:
 - [Native UI and dialog boundary](native-ui.md) — the isolated native-dialog
   decision, current wgpu compatibility findings, and invariants for a future
   graphical control surface.
+- [Immediate-mode UI overlay architecture](ui-overlay-architecture.md) —
+  current `wgpu` 30 toolkit compatibility, the recommended pinned-egui
+  integration experiment, input/render ownership, cached repaint policy,
+  performance gate, and a glyphon-backed custom fallback.
 - [Native tablet input](tablet-input.md) — the implemented Atlas/XInput2 pen
   and eraser path, verified device ranges, normalized event contract,
   correctness coverage, hardware test checklist, and Wayland/Windows/macOS

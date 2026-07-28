@@ -73,6 +73,9 @@ restores a valid whole document or leaves the prior file intact.
 - [x] Show active layer, layer count, and modified state in existing feedback.
 - [x] Prevent structural commands during an active brush transaction.
 - [ ] Add the graphical layer panel after command semantics are proven.
+  Begin with the bounded embedded-egui experiment and promotion gate in
+  [Immediate-mode UI overlay architecture](ui-overlay-architecture.md);
+  preserve the same `UiAction` boundary for the custom fallback.
 
 Acceptance: a user can create, select, reorder, hide, duplicate, rename, and
 delete layers without corrupting active strokes or undo state.
