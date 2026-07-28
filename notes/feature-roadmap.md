@@ -131,7 +131,29 @@ untouched.
 Acceptance: the saved mixing corpus is deterministic, visually intentional,
 bounded to brush damage, and does not implicitly mix hidden layers.
 
-### 7. Usability follow-through
+### 7. Natural-media brush family
+
+- [ ] Propagate normalized tablet tilt through distance-resampled brush
+  samples.
+- [ ] Add a tilt-oriented flat rectangular nib.
+- [ ] Add a graphite pencil with deterministic canvas-anchored paper tooth.
+- [ ] Add a palette knife with persistent cross-blade paint lanes.
+- [ ] Add a separated-bristle paint brush with per-strand paint load.
+- [ ] Preserve one undoable gesture, bounded damage, deterministic replay, and
+  allocation-free dab loops for every brush.
+- [ ] Add brush-specific replay scenes and Apollo CPU measurements.
+- [ ] Expose the presets through a compact selector, then add oriented cursor
+  feedback.
+
+The composition model, research basis, performance contract, and deliberate
+deferral of full paint-height simulation are defined in
+[Natural brush composition](natural-brushes.md).
+
+Acceptance: each brush has distinct, stable contact/material behavior rather
+than being a cosmetic hard-round preset; tilt changes the expected contact
+without upright jitter; saved traces replay exactly.
+
+### 8. Usability follow-through
 
 - [x] Visible-composite Alt-contact color picker for mouse and tablet.
 - [x] Eight-entry session-local recent colors with deterministic MRU behavior

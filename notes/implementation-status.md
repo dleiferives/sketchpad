@@ -29,6 +29,10 @@ prototype:
   active-layer editing, and an incremental premultiplied-linear composite;
 - hard-round source-over brush and an opt-in CPU linear-mixing control with
   stable pre-stroke active-layer pickup;
+- a researched natural-media brush design covering a tilt-oriented flat nib,
+  canvas-anchored graphite, lane-preserving palette knife, and persistent
+  bristles; implementation is tracked in
+  [natural-brushes.md](natural-brushes.md);
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
 - normalized pressure, tilt, physical source ID, tool type, and source
