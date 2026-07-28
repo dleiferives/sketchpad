@@ -490,3 +490,38 @@ pickup; it is not presented as the main latency fix. The current Apollo
 128-pixel-tile medians are 88.920 ms for bristle on the painted scene and
 46.364/44.129 ms for palette knife on empty/painted scenes. Color mixing is a
 separate deferred roadmap project with an explicit future performance gate.
+
+### Maximum-size palette-knife profile and brush-model correction
+
+The next live trace identified the selected brush explicitly: the severe case
+was the palette knife at the UI maximum of 512 px. Most input packets emitted
+only one dab, so distance-resampler amplification was not the explanation.
+Individual packets still spent roughly 2.6/8.9/15.9 ms
+mean/p95/maximum in brush mutation in one interval, before layer recomposition
+and presentation work.
+
+`brush_bench` version 3 adds `--diameter` so this failure mode is a permanent
+fixture rather than an anecdote. On Apollo, the 512 px knife with 128 px tiles
+processed 18.900 million conservative pixels in the 256-sample replay and,
+after a conservative scanline-bound experiment, took about 247 ms median on
+both empty and painted scenes. A sampled `perf` run attributed 92.3% of cycles
+to `LaneDabKernel<12>::run`; memory copying was 3.1%, gesture commit 1.2%, and
+all other named functions were below that. The bottleneck is the brush
+rasterization model.
+
+A scanline half-plane intersection retained the current coverage and blend
+math while skipping impossible oriented-box corners. It preserved existing
+checksums and improved the 48 px knife/bristle medians only modestly:
+
+| Case | Before | Scanline-bound |
+| --- | ---: | ---: |
+| Knife, empty | 47.044 ms | 46.375 ms |
+| Knife, painted | 40.405 ms | 37.980 ms |
+| Bristle, painted | 83.648 ms | 79.107 ms |
+
+This experiment is useful evidence but not the intended endpoint. The old
+pixels are not a product contract. A drawing app should compare genuinely
+better stamp, swept-ribbon, strand, and textured-tip models by visual quality,
+pressure/tilt response, continuity, latency, and throughput. Exact checksums
+remain valuable for document semantics and for regressions within one chosen
+model; they must not prevent improving the model itself.

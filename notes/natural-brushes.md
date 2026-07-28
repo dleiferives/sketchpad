@@ -12,10 +12,21 @@ deterministic, measurable foundation:
 - a palette knife with fixed cross-blade transfer variation;
 - a bristle brush with fixed, separated strands.
 
-The initial implementation remains a CPU reference renderer over the canonical
-sparse `f32` raster. That makes output exact, undoable, replayable, and useful
-as an oracle for a later GPU kernel. Every hot loop stays bounded by the
-footprint and must not allocate per dab.
+The initial implementation is a CPU prototype over the canonical sparse `f32`
+raster. It makes the first presets undoable and replayable, but its dab shapes,
+spacing, lane model, and pixels are not a permanent visual specification. A
+new brush representation may deliberately produce different pixels when it
+gives better marks, dynamics, or performance. Every production hot loop must
+still be bounded by useful visual work and must not allocate per dab.
+
+There are two distinct correctness classes:
+
+- document operations such as undo, save/load, damage batching, and a backend
+  implementation of an already selected brush model require exact state
+  transition tests where practical;
+- brush-model research requires controlled reference images, difference
+  images, continuity and dynamics fixtures, artist evaluation, and performance
+  distributions. It does not require reproducing the prototype's checksum.
 
 ## Evidence and Consequences
 
@@ -40,14 +51,14 @@ The practical consequences are:
 
 ### Live Wacom axis calibration
 
-The first Apollo Wacom evaluation on 2026-07-28 showed that treating the
-normalized X/Y tilt vector itself as the footprint's long axis made every
-oriented brush and cursor appear 90 degrees away from the physical contact.
-The shared conversion now rotates meaningful Wacom tilt clockwise by 90
-degrees before it becomes a contact direction. This correction lives in one
-function used by both CPU ink and GPU cursor feedback; movement fallback
-remains aligned with movement. A regression test fixes the X-tilt → vertical
-contact and Y-tilt → horizontal contact convention.
+Apollo testing on 2026-07-28 showed that neither using the normalized tilt
+vector directly nor the first 90-degree calibration produced the intended
+physical contact orientation. The current conversion is retained only to avoid
+mixing an unverified input change into the brush-performance work. Before the
+orientation is treated as product behavior, add a calibration view that shows
+the raw X/Y values, both candidate axes, and an asymmetric labeled tip. Record
+the physical lean direction and chosen mapping instead of inferring it from an
+unlabeled rectangle.
 
 Sousa and Buchanan's graphite model represents paper as a height field and
 models deposition from tip shape, pressure, and hardness. The visual grain

@@ -212,6 +212,55 @@ incremental edits, device support, and brush semantics.
 
 ## Implications for Sketchpad
 
+### Artistic brushes are not the old per-dab loop on another processor
+
+Sketchpad's first palette-knife and bristle prototypes stamp oriented boxes
+into a CPU tile raster. That is useful scaffolding, not a brush specification.
+The 2018 JCGT paper
+[Efficient Rendering of Linear Brush Strokes](https://jcgt.org/published/0007/01/01/)
+shows why the representation matters: repeated diameter-sized stamps perform
+`O(NM²)` work for a stroke of length `N` and diameter `M`, whereas integrating
+a continuously swept brush along the centerline reduces the work to `O(NM)`,
+avoids stamp overdraw, and renders in one GPU draw call. Its exact circular
+flow model is not a ready-made palette knife, but its complexity result is
+directly relevant.
+
+The 2024 SIGGRAPH paper
+[Ciallo: GPU-Accelerated Rendering of Vector Brush Strokes](https://doi.org/10.1145/3641519.3657418)
+goes further toward drawing-app semantics. It describes GPU rendering for
+vanilla, textured stamp, and airbrush strokes while retaining an editable
+vector representation. Krita's production pixel engine remains evidence for a
+different, equally useful family: brush-tip impressions whose size, color,
+opacity, spacing, rotation, scatter, and texture respond to input sensors.
+
+The shared abstraction to investigate is therefore a compact brush command
+stream, not a shared pixel loop:
+
+```text
+timestamped stylus samples
+    -> brush dynamics / resampling
+    -> dab, ribbon, strand, or particle commands
+    -> CPU-span or GPU-raster backend
+    -> active-layer tiles
+```
+
+For ordinary fixed-color deposition, the first GPU experiment should use a
+render pass: oriented quads or connected ribbons, fragment coverage/material
+evaluation, and fixed-function source-over blending. A palette knife can be a
+single swept ribbon; separated bristles can be a bounded set of instanced
+strand ribbons; pencil grain can sample a canvas-anchored texture or
+procedural field. Compute is reserved for neighborhood-dependent behavior such
+as future pickup, smudge, diffusion, or wet mixing.
+
+The brush model must not depend on a specific GPU. A CPU span backend may
+consume the same commands, with appearance tolerances rather than forced
+pixel identity across unrelated implementations. The GPU can own the active
+layer during a stroke and use texture-to-texture copies for undo snapshots;
+readback should happen asynchronously at persistence/export boundaries, not
+inside the input path. This ownership model remains an experiment until
+Apollo's adapter features, readback cost, undo behavior, and recovery path are
+measured.
+
 ### Direct rendering baseline
 
 The most direct use is to feed expanded outlines into a coverage rasterizer and

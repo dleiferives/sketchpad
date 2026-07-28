@@ -18,6 +18,7 @@ const CANVAS_SIZE: u32 = 2048;
 const INPUT_SAMPLES: u32 = 256;
 const DEFAULT_RUNS: usize = 12;
 const WARMUP_RUNS: usize = 2;
+const DEFAULT_DIAMETER: f32 = 48.0;
 
 #[derive(Clone, Copy, Debug)]
 enum InitialState {
@@ -97,8 +98,13 @@ fn main() {
         process::exit(2);
     });
     println!(
-        "brush_family_replay version=2 canvas={}x{} input_samples={} runs={} warmups={}",
-        CANVAS_SIZE, CANVAS_SIZE, INPUT_SAMPLES, arguments.runs, arguments.warmup_runs
+        "brush_family_replay version=3 canvas={}x{} input_samples={} diameter={} runs={} warmups={}",
+        CANVAS_SIZE,
+        CANVAS_SIZE,
+        INPUT_SAMPLES,
+        arguments.diameter,
+        arguments.runs,
+        arguments.warmup_runs
     );
 
     for tile_size in arguments.tile_sizes {
@@ -107,11 +113,12 @@ fn main() {
             .filter(|(brush, _)| arguments.brush.is_none_or(|selected| selected == *brush))
         {
             for _ in 0..arguments.warmup_runs {
-                black_box(run_once(tile_size, brush, initial_state).unwrap());
+                black_box(run_once(tile_size, brush, initial_state, arguments.diameter).unwrap());
             }
             let mut results = Vec::with_capacity(arguments.runs);
             for _ in 0..arguments.runs {
-                results.push(run_once(tile_size, brush, initial_state).unwrap());
+                results
+                    .push(run_once(tile_size, brush, initial_state, arguments.diameter).unwrap());
             }
             print_results(tile_size, brush, initial_state, &results);
         }
@@ -123,6 +130,7 @@ struct Arguments {
     warmup_runs: usize,
     brush: Option<BrushKind>,
     tile_sizes: Vec<u32>,
+    diameter: f32,
 }
 
 fn parse_arguments() -> Result<Arguments, String> {
@@ -131,6 +139,7 @@ fn parse_arguments() -> Result<Arguments, String> {
     let mut warmup_runs = WARMUP_RUNS;
     let mut brush = None;
     let mut tile_sizes = vec![128, 256];
+    let mut diameter = DEFAULT_DIAMETER;
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--runs" => {
@@ -170,11 +179,22 @@ fn parse_arguments() -> Result<Arguments, String> {
                 }
                 tile_sizes = vec![tile_size];
             }
+            "--diameter" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--diameter requires a positive number".to_owned())?;
+                diameter = value
+                    .parse()
+                    .map_err(|_| format!("invalid --diameter value: {value}"))?;
+                if !diameter.is_finite() || diameter <= 0.0 {
+                    return Err("--diameter must be finite and greater than zero".to_owned());
+                }
+            }
             "-h" | "--help" => {
                 println!(
                     "usage: brush_bench [--runs N] [--warmups N] \
                      [--brush hard-round|eraser|flat|pencil|palette-knife|bristle] \
-                     [--tile-size 128|256]"
+                     [--tile-size 128|256] [--diameter PX]"
                 );
                 process::exit(0);
             }
@@ -186,6 +206,7 @@ fn parse_arguments() -> Result<Arguments, String> {
         warmup_runs,
         brush,
         tile_sizes,
+        diameter,
     })
 }
 
@@ -193,6 +214,7 @@ fn run_once(
     tile_size: u32,
     brush_kind: BrushKind,
     initial_state: InitialState,
+    diameter: f32,
 ) -> Result<RunResult, Box<dyn Error>> {
     let mut layer = RasterLayer::new(CANVAS_SIZE, CANVAS_SIZE, tile_size)?;
     if initial_state.starts_painted() {
@@ -215,32 +237,32 @@ fn run_once(
     match brush_kind {
         BrushKind::HardRound => replay!(HardRoundStroke::begin(
             &mut layer,
-            HardRoundBrush::new([0.04, 0.08, 0.2], 48.0, 1.0, 0.18)?,
+            HardRoundBrush::new([0.04, 0.08, 0.2], diameter, 1.0, 0.18)?,
             first,
         )),
         BrushKind::Eraser => replay!(HardRoundStroke::begin(
             &mut layer,
-            HardRoundBrush::eraser(48.0, 1.0, 0.18)?,
+            HardRoundBrush::eraser(diameter, 1.0, 0.18)?,
             first,
         )),
         BrushKind::Flat => replay!(FlatStroke::begin(
             &mut layer,
-            FlatBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            FlatBrush::new([0.04, 0.08, 0.2], diameter, 1.0)?,
             first,
         )),
         BrushKind::Pencil => replay!(PencilStroke::begin(
             &mut layer,
-            PencilBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            PencilBrush::new([0.04, 0.08, 0.2], diameter, 1.0)?,
             first,
         )),
         BrushKind::PaletteKnife => replay!(PaletteKnifeStroke::begin(
             &mut layer,
-            PaletteKnifeBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            PaletteKnifeBrush::new([0.04, 0.08, 0.2], diameter, 1.0)?,
             first,
         )),
         BrushKind::Bristle => replay!(BristleStroke::begin(
             &mut layer,
-            BristleBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            BristleBrush::new([0.04, 0.08, 0.2], diameter, 1.0)?,
             first,
         )),
     }

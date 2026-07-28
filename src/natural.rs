@@ -963,6 +963,48 @@ impl OrientedBoxFootprint {
         let inside = q[0].max(q[1]).min(0.0);
         (0.5 - (outside + inside)).clamp(0.0, 1.0)
     }
+
+    fn scanline_x_range(self, pixel_y: u32, min_x: u32, max_x: u32) -> Option<[u32; 2]> {
+        let world_y = pixel_y as f32 + 0.5;
+        let dy = world_y - self.position[1];
+        let fringe_extents = [self.half_extents[0] + 0.5, self.half_extents[1] + 0.5];
+        let constraints = [
+            (
+                self.direction[0],
+                dy * self.direction[1] - self.position[0] * self.direction[0],
+                fringe_extents[0],
+            ),
+            (
+                -self.direction[1],
+                dy * self.direction[0] + self.position[0] * self.direction[1],
+                fringe_extents[1],
+            ),
+        ];
+        let mut lower_center = f32::NEG_INFINITY;
+        let mut upper_center = f32::INFINITY;
+        for (slope, offset, extent) in constraints {
+            if slope.abs() <= f32::EPSILON {
+                if offset.abs() >= extent {
+                    return None;
+                }
+                continue;
+            }
+            let first = (-extent - offset) / slope;
+            let second = (extent - offset) / slope;
+            lower_center = lower_center.max(first.min(second));
+            upper_center = upper_center.min(first.max(second));
+        }
+        if lower_center >= upper_center {
+            return None;
+        }
+
+        // Keep one conservative boundary candidate where rounding lands exactly
+        // on an open half-plane. The existing coverage function rejects it, so
+        // this changes iteration only, never the pixels or their arithmetic.
+        let first_x = (lower_center - 0.5).floor().max(min_x as f32) as u32;
+        let end_x = (upper_center - 0.5).ceil().min(max_x as f32) as u32;
+        (first_x < end_x).then_some([first_x, end_x])
+    }
 }
 
 struct FlatDabKernel {
@@ -983,8 +1025,15 @@ impl FlatDabKernel {
         for local_y in self.local_damage.min_y()..self.local_damage.max_y() {
             let world_y = self.tile_origin[1] + local_y;
             let row_start = local_y as usize * stride;
-            for local_x in self.local_damage.min_x()..self.local_damage.max_x() {
-                let world_x = self.tile_origin[0] + local_x;
+            let Some([world_min_x, world_max_x]) = self.footprint.scanline_x_range(
+                world_y,
+                self.tile_origin[0] + self.local_damage.min_x(),
+                self.tile_origin[0] + self.local_damage.max_x(),
+            ) else {
+                continue;
+            };
+            for world_x in world_min_x..world_max_x {
+                let local_x = world_x - self.tile_origin[0];
                 let coverage = self.footprint.coverage(world_x, world_y);
                 if coverage == 0.0 {
                     continue;
@@ -1026,8 +1075,15 @@ impl<const LANE_COUNT: usize> LaneDabKernel<'_, LANE_COUNT> {
         for local_y in self.local_damage.min_y()..self.local_damage.max_y() {
             let world_y = self.tile_origin[1] + local_y;
             let row_start = local_y as usize * stride;
-            for local_x in self.local_damage.min_x()..self.local_damage.max_x() {
-                let world_x = self.tile_origin[0] + local_x;
+            let Some([world_min_x, world_max_x]) = self.footprint.scanline_x_range(
+                world_y,
+                self.tile_origin[0] + self.local_damage.min_x(),
+                self.tile_origin[0] + self.local_damage.max_x(),
+            ) else {
+                continue;
+            };
+            for world_x in world_min_x..world_max_x {
+                let local_x = world_x - self.tile_origin[0];
                 let local = self.footprint.local_coordinates(world_x, world_y);
                 let coverage = self.footprint.coverage_at_local(local);
                 if coverage == 0.0 {
