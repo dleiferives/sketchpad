@@ -1,7 +1,7 @@
 mod app_ui;
 mod latency_probe;
 
-use app_ui::{UiAction, UiLayerSnapshot, UiOverlay, UiSnapshot, UiTool};
+use app_ui::{UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiSnapshot, UiTool};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
@@ -564,6 +564,18 @@ impl App {
             UiAction::DuplicateActiveLayer => self.duplicate_active_layer(),
             UiAction::DeleteActiveLayer => self.delete_active_layer(),
             UiAction::MoveActiveLayer(offset) => self.move_active_layer(offset),
+            UiAction::OpenDocument => self.choose_document_open(),
+            UiAction::SaveDocument => {
+                self.save_document();
+            }
+            UiAction::SaveDocumentAs => {
+                self.choose_document_save_as();
+            }
+            UiAction::ImportPng => self.choose_png_import(),
+            UiAction::ExportPng(region) => self.choose_png_export(match region {
+                UiExportRegion::FullCanvas => ExportRegion::FullCanvas,
+                UiExportRegion::ContentBounds => ExportRegion::ContentBounds,
+            }),
             UiAction::Undo => self.undo(),
             UiAction::Redo => self.redo(),
         }

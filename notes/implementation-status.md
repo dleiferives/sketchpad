@@ -42,6 +42,8 @@ prototype:
 - a compact first toolbar for pen/eraser/mixing selection, brush diameter and
   opacity adjustment, a preset/recent-color popover, undo/redo, and interface
   hiding;
+- a custom file popover dispatching the existing Open, Save, Save As, PNG
+  import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,
   duplicate, delete, ordering, and stepped active-layer opacity;
 - typed UI actions that invoke the same application command methods as
@@ -131,6 +133,7 @@ Controls:
 - Control/Command-Page Up / Page Down: move the active layer above/below;
 - F1: show or hide the interface;
 - UI `LAYERS`: show or hide the layer panel;
+- UI `FILE`: open the native document/import/export command surface;
 - layer-panel row: select that layer;
 - layer-panel visibility mark: show or hide that row's layer;
 - layer-panel `+` / `COPY` / `DEL`: create, duplicate, or delete;

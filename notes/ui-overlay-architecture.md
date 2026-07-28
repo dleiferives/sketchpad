@@ -652,6 +652,24 @@ committed stroke changed undo availability. This preserves the high-rate
 contact path while keeping history controls correct at transaction commit.
 These remain debug diagnostics, not release performance claims.
 
+### File command surface, 2026-07-28
+
+A compact file popover now exposes the application's existing Open, Save,
+Save As, PNG import, full-canvas export, and content-bounds export workflows.
+Its typed actions immediately leave the UI boundary and invoke the same
+parented native-dialog, checkpoint, image-I/O, and persistence methods as the
+keyboard shortcuts. Egui does not own paths, file-format state, document
+replacement, or background recovery work.
+
+The file and color popovers are mutually exclusive, while the independent
+layer panel may remain visible. All four surfaces keep separate hit
+rectangles. The first live screenshot exposed an unconstrained horizontal
+header expanding the file popover to roughly twice its intended width; the
+panel now fixes its content width to the 220-point menu controls. A repeated
+Apollo visual smoke confirmed the compact bounds and file-to-color popover
+handoff. Actual native dialog acceptance/cancellation remains a manual product
+test rather than something driven through synthetic clicks.
+
 ## Custom Fallback
 
 If the egui spike fails, build only the control surface Sketchpad needs:

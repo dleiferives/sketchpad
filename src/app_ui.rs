@@ -12,6 +12,7 @@ use std::{
 use winit::{event::WindowEvent, keyboard::ModifiersState, window::Window};
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
+const FILE_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
 const COLOR_PANEL_POSITION: Pos2 = Pos2::new(564.0, 82.0);
 const CONTROL_HEIGHT: f32 = 36.0;
 const TOOL_BUTTON_WIDTH: f32 = 44.0;
@@ -61,6 +62,12 @@ pub struct UiLayerSnapshot<'a> {
     pub opacity: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiExportRegion {
+    FullCanvas,
+    ContentBounds,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum UiAction {
     SetVisible(bool),
@@ -75,6 +82,11 @@ pub enum UiAction {
     DuplicateActiveLayer,
     DeleteActiveLayer,
     MoveActiveLayer(isize),
+    OpenDocument,
+    SaveDocument,
+    SaveDocumentAs,
+    ImportPng,
+    ExportPng(UiExportRegion),
     Undo,
     Redo,
 }
@@ -175,6 +187,7 @@ impl TabletCapture {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct UiHitRegions {
     toolbar: Rect,
+    file_panel: Rect,
     color_panel: Rect,
     layers_panel: Rect,
 }
@@ -183,6 +196,7 @@ impl Default for UiHitRegions {
     fn default() -> Self {
         Self {
             toolbar: Rect::NOTHING,
+            file_panel: Rect::NOTHING,
             color_panel: Rect::NOTHING,
             layers_panel: Rect::NOTHING,
         }
@@ -192,6 +206,7 @@ impl Default for UiHitRegions {
 impl UiHitRegions {
     fn contains(self, position: Pos2) -> bool {
         self.toolbar.contains(position)
+            || self.file_panel.contains(position)
             || self.color_panel.contains(position)
             || self.layers_panel.contains(position)
     }
@@ -209,6 +224,7 @@ pub struct UiOverlay {
     mouse_capture: bool,
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
+    file_panel_open: bool,
     color_panel_open: bool,
     layers_panel_open: bool,
     modifiers: ModifiersState,
@@ -244,6 +260,7 @@ impl UiOverlay {
             mouse_capture: false,
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
+            file_panel_open: false,
             color_panel_open: false,
             layers_panel_open: true,
             modifiers: ModifiersState::empty(),
@@ -358,6 +375,7 @@ impl UiOverlay {
         let context = self.context.clone();
         let mut actions = Vec::new();
         let mut hit_regions = UiHitRegions::default();
+        let mut file_panel_open = self.file_panel_open;
         let mut color_panel_open = self.color_panel_open;
         let mut layers_panel_open = self.layers_panel_open;
         let layers = layer_snapshot();
@@ -368,6 +386,7 @@ impl UiOverlay {
                     snapshot,
                     &layers,
                     &mut actions,
+                    &mut file_panel_open,
                     &mut color_panel_open,
                     &mut layers_panel_open,
                 );
@@ -383,6 +402,7 @@ impl UiOverlay {
         self.textures_to_set.extend(output.textures_delta.set);
         self.textures_to_free.extend(output.textures_delta.free);
         self.hit_regions = hit_regions;
+        self.file_panel_open = file_panel_open;
         self.color_panel_open = color_panel_open;
         self.layers_panel_open = layers_panel_open;
         self.last_snapshot = Some(snapshot);
@@ -585,6 +605,7 @@ fn show_toolbar(
     snapshot: UiSnapshot,
     layers: &[UiLayerSnapshot<'_>],
     actions: &mut Vec<UiAction>,
+    file_panel_open: &mut bool,
     color_panel_open: &mut bool,
     layers_panel_open: &mut bool,
 ) -> UiHitRegions {
@@ -602,6 +623,11 @@ fn show_toolbar(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                        if text_button(ui, "FILE", *file_panel_open).clicked() {
+                            *file_panel_open = !*file_panel_open;
+                            *color_panel_open = false;
+                        }
+                        separator(ui);
                         ui.add_enabled_ui(snapshot.undo_available, |ui| {
                             if history_button(ui, false).clicked() {
                                 actions.push(UiAction::Undo);
@@ -654,6 +680,7 @@ fn show_toolbar(
                         );
                         if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
                             *color_panel_open = !*color_panel_open;
+                            *file_panel_open = false;
                         }
                         separator(ui);
                         if text_button(ui, "LAYERS", *layers_panel_open).clicked() {
@@ -665,6 +692,11 @@ fn show_toolbar(
                     });
                 });
         });
+    let file_panel = if *file_panel_open {
+        show_file_panel(root, actions, file_panel_open)
+    } else {
+        Rect::NOTHING
+    };
     let color_panel = if *color_panel_open {
         show_color_panel(root, snapshot, actions, color_panel_open)
     } else {
@@ -677,6 +709,7 @@ fn show_toolbar(
     };
     UiHitRegions {
         toolbar: area.response.rect,
+        file_panel,
         color_panel,
         layers_panel,
     }
@@ -721,6 +754,66 @@ fn show_color_panel(
                                 }
                             }
                         });
+                    }
+                });
+        });
+    area.response.rect
+}
+
+fn show_file_panel(
+    root: &mut egui::Ui,
+    actions: &mut Vec<UiAction>,
+    file_panel_open: &mut bool,
+) -> Rect {
+    let area = egui::Area::new(Id::new("sketchpad-file-panel"))
+        .fixed_pos(FILE_PANEL_POSITION)
+        .order(Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(TOOLBAR_RADIUS)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(220.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "FILE");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, "×", "Close file menu", false).clicked() {
+                                *file_panel_open = false;
+                            }
+                        });
+                    });
+                    if menu_button(ui, "OPEN", "Open a Sketchpad document").clicked() {
+                        actions.push(UiAction::OpenDocument);
+                        *file_panel_open = false;
+                    }
+                    if menu_button(ui, "SAVE", "Save the current Sketchpad document").clicked() {
+                        actions.push(UiAction::SaveDocument);
+                        *file_panel_open = false;
+                    }
+                    if menu_button(ui, "SAVE AS", "Save to a new Sketchpad document").clicked() {
+                        actions.push(UiAction::SaveDocumentAs);
+                        *file_panel_open = false;
+                    }
+                    separator_horizontal(ui);
+                    if menu_button(ui, "IMPORT PNG", "Import a PNG as a new layer").clicked() {
+                        actions.push(UiAction::ImportPng);
+                        *file_panel_open = false;
+                    }
+                    if menu_button(ui, "EXPORT CANVAS", "Export the full visible canvas").clicked()
+                    {
+                        actions.push(UiAction::ExportPng(UiExportRegion::FullCanvas));
+                        *file_panel_open = false;
+                    }
+                    if menu_button(ui, "EXPORT CONTENT", "Export exact visible content bounds")
+                        .clicked()
+                    {
+                        actions.push(UiAction::ExportPng(UiExportRegion::ContentBounds));
+                        *file_panel_open = false;
                     }
                 });
         });
@@ -923,6 +1016,25 @@ fn compact_text_button(ui: &mut egui::Ui, text: &str, description: &str) -> egui
                 Align2::CENTER_CENTER,
                 text,
                 FontId::monospace(10.0),
+                color,
+            );
+        },
+    )
+    .on_hover_text(description)
+}
+
+fn menu_button(ui: &mut egui::Ui, text: &str, description: &str) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(220.0, CONTROL_HEIGHT),
+        false,
+        description,
+        |ui, rect, color| {
+            ui.painter().text(
+                Pos2::new(rect.left() + 10.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                text,
+                FontId::monospace(11.0),
                 color,
             );
         },
@@ -1173,6 +1285,7 @@ mod tests {
     fn disjoint_ui_regions_do_not_capture_the_canvas_between_them() {
         let regions = UiHitRegions {
             toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
+            file_panel: Rect::from_min_max(Pos2::new(60.0, 60.0), Pos2::new(70.0, 70.0)),
             color_panel: Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(30.0, 30.0)),
             layers_panel: Rect::from_min_max(Pos2::new(40.0, 40.0), Pos2::new(50.0, 50.0)),
         };
@@ -1180,6 +1293,7 @@ mod tests {
         assert!(regions.contains(Pos2::new(5.0, 5.0)));
         assert!(regions.contains(Pos2::new(25.0, 25.0)));
         assert!(regions.contains(Pos2::new(45.0, 45.0)));
+        assert!(regions.contains(Pos2::new(65.0, 65.0)));
         assert!(!regions.contains(Pos2::new(15.0, 15.0)));
         assert!(!regions.contains(Pos2::new(35.0, 35.0)));
     }
