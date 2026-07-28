@@ -29,9 +29,9 @@ prototype:
   active-layer editing, and an incremental premultiplied-linear composite;
 - hard-round source-over brush and an opt-in CPU linear-mixing control with
   stable pre-stroke active-layer pickup;
-- a researched natural-media brush design covering a tilt-oriented flat nib,
-  canvas-anchored graphite, lane-preserving palette knife, and persistent
-  bristles; implementation is tracked in
+- a tilt-oriented flat rectangular brush with anti-aliased contact, a tilt
+  dead zone, motion-direction mouse/upright fallback, and interpolated tilt;
+  the remaining graphite, palette-knife, and bristle design is tracked in
   [natural-brushes.md](natural-brushes.md);
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
@@ -44,8 +44,8 @@ prototype:
 - a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
   surface texture, command encoder, and render pass;
 - a compact first toolbar for pen/eraser/mixing selection, brush diameter and
-  opacity adjustment, a continuous HSV color picker plus preset/recent colors,
-  undo/redo, and interface hiding;
+  opacity adjustment, a tilt-oriented flat-brush selection, a continuous HSV
+  color picker plus preset/recent colors, undo/redo, and interface hiding;
 - a custom file popover dispatching the existing Open, Save, Save As, PNG
   import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,

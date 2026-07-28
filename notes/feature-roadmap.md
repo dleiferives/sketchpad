@@ -133,9 +133,9 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 
 ### 7. Natural-media brush family
 
-- [ ] Propagate normalized tablet tilt through distance-resampled brush
+- [x] Propagate normalized tablet tilt through distance-resampled brush
   samples.
-- [ ] Add a tilt-oriented flat rectangular nib.
+- [x] Add a tilt-oriented flat rectangular nib.
 - [ ] Add a graphite pencil with deterministic canvas-anchored paper tooth.
 - [ ] Add a palette knife with persistent cross-blade paint lanes.
 - [ ] Add a separated-bristle paint brush with per-strand paint load.

@@ -5,15 +5,32 @@ use std::{error::Error, fmt};
 pub struct BrushSample {
     pub position: [f32; 2],
     pub pressure: f32,
+    pub tilt: [f32; 2],
 }
 
 impl BrushSample {
     pub const fn new(position: [f32; 2], pressure: f32) -> Self {
-        Self { position, pressure }
+        Self {
+            position,
+            pressure,
+            tilt: [0.0, 0.0],
+        }
+    }
+
+    pub const fn with_tilt(position: [f32; 2], pressure: f32, tilt: [f32; 2]) -> Self {
+        Self {
+            position,
+            pressure,
+            tilt,
+        }
     }
 
     pub(crate) fn is_finite(self) -> bool {
-        self.position[0].is_finite() && self.position[1].is_finite() && self.pressure.is_finite()
+        self.position[0].is_finite()
+            && self.position[1].is_finite()
+            && self.pressure.is_finite()
+            && self.tilt[0].is_finite()
+            && self.tilt[1].is_finite()
     }
 }
 
@@ -497,6 +514,10 @@ impl DistanceResampler {
             emit(BrushSample {
                 position: [start.position[0] + dx * t, start.position[1] + dy * t],
                 pressure: start.pressure + (sample.pressure - start.pressure) * t,
+                tilt: [
+                    start.tilt[0] + (sample.tilt[0] - start.tilt[0]) * t,
+                    start.tilt[1] + (sample.tilt[1] - start.tilt[1]) * t,
+                ],
             })?;
             emitted += 1;
             distance += self.spacing;

@@ -13,6 +13,7 @@ use sketchpad::{
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
+    natural::{FlatBrush, FlatStroke},
     palette::{RecentColors, MAX_RECENT_COLORS},
     persistence::PersistenceState,
     pipeline::{
@@ -166,6 +167,7 @@ enum PaintEngine {
     #[default]
     HardRound,
     LinearMixing,
+    Flat,
 }
 
 impl PaintEngine {
@@ -173,6 +175,7 @@ impl PaintEngine {
         match self {
             Self::HardRound => "Pen",
             Self::LinearMixing => "Mix",
+            Self::Flat => "Flat",
         }
     }
 }
@@ -180,6 +183,7 @@ impl PaintEngine {
 enum ActiveStroke {
     HardRound(HardRoundStroke),
     LinearMixing(MixingStrokeV1),
+    Flat(FlatStroke),
 }
 
 impl ActiveStroke {
@@ -187,6 +191,7 @@ impl ActiveStroke {
         match self {
             Self::HardRound(stroke) => stroke.gesture_id(),
             Self::LinearMixing(stroke) => stroke.gesture_id(),
+            Self::Flat(stroke) => stroke.gesture_id(),
         }
     }
 
@@ -198,6 +203,7 @@ impl ActiveStroke {
         match self {
             Self::HardRound(stroke) => stroke.update(layer, sample).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.update(layer, sample).map_err(Into::into),
+            Self::Flat(stroke) => stroke.update(layer, sample).map_err(Into::into),
         }
     }
 
@@ -205,6 +211,7 @@ impl ActiveStroke {
         match self {
             Self::HardRound(stroke) => stroke.finalize(layer).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.finalize(layer).map_err(Into::into),
+            Self::Flat(stroke) => stroke.finalize(layer).map_err(Into::into),
         }
     }
 
@@ -221,6 +228,10 @@ impl ActiveStroke {
                     mixing: Some((result.stats, result.final_color)),
                 })
             }
+            Self::Flat(stroke) => Ok(FinishedStroke {
+                damage: stroke.finish(layer)?,
+                mixing: None,
+            }),
         }
     }
 
@@ -228,6 +239,7 @@ impl ActiveStroke {
         match self {
             Self::HardRound(stroke) => stroke.cancel(layer).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.cancel(layer).map_err(Into::into),
+            Self::Flat(stroke) => stroke.cancel(layer).map_err(Into::into),
         }
     }
 }
@@ -239,14 +251,14 @@ struct FinishedStroke {
 
 #[derive(Debug)]
 enum ActiveStrokeError {
-    HardRound(BrushError),
+    Brush(BrushError),
     LinearMixing(MixingError),
 }
 
 impl fmt::Display for ActiveStrokeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HardRound(error) => error.fmt(formatter),
+            Self::Brush(error) => error.fmt(formatter),
             Self::LinearMixing(error) => error.fmt(formatter),
         }
     }
@@ -255,7 +267,7 @@ impl fmt::Display for ActiveStrokeError {
 impl std::error::Error for ActiveStrokeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::HardRound(error) => Some(error),
+            Self::Brush(error) => Some(error),
             Self::LinearMixing(error) => Some(error),
         }
     }
@@ -263,7 +275,7 @@ impl std::error::Error for ActiveStrokeError {
 
 impl From<BrushError> for ActiveStrokeError {
     fn from(value: BrushError) -> Self {
-        Self::HardRound(value)
+        Self::Brush(value)
     }
 }
 
@@ -548,6 +560,7 @@ impl App {
             (ToolKind::Eraser, _) => UiTool::Eraser,
             (ToolKind::Pen, PaintEngine::LinearMixing) => UiTool::Mixing,
             (ToolKind::Pen, PaintEngine::HardRound) => UiTool::Pen,
+            (ToolKind::Pen, PaintEngine::Flat) => UiTool::Flat,
         };
         let brush = self.brush_for_tool(self.mouse_tool);
         let mut recent_colors = [[0.0; 3]; MAX_RECENT_COLORS];
@@ -717,6 +730,10 @@ impl App {
                 self.mouse_tool = ToolKind::Pen;
                 self.paint_engine = PaintEngine::LinearMixing;
             }
+            UiTool::Flat => {
+                self.mouse_tool = ToolKind::Pen;
+                self.paint_engine = PaintEngine::Flat;
+            }
         }
         self.cursor_tool = self.mouse_tool;
         self.cursor_pressure = 0.0;
@@ -879,7 +896,7 @@ impl App {
         }
         self.paint_engine = match self.paint_engine {
             PaintEngine::HardRound => PaintEngine::LinearMixing,
-            PaintEngine::LinearMixing => PaintEngine::HardRound,
+            PaintEngine::LinearMixing | PaintEngine::Flat => PaintEngine::HardRound,
         };
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
@@ -957,7 +974,13 @@ impl App {
         ));
     }
 
-    fn start_stroke(&mut self, screen: [f32; 2], pressure: f32, owner: PointerOwner) {
+    fn start_stroke(
+        &mut self,
+        screen: [f32; 2],
+        pressure: f32,
+        tilt: [f32; 2],
+        owner: PointerOwner,
+    ) {
         if self.active_stroke.is_some() {
             return;
         }
@@ -971,7 +994,7 @@ impl App {
             PointerOwner::Mouse => self.mouse_tool,
         };
         let brush = self.brush_for_tool(tool);
-        let sample = BrushSample::new(world, pressure);
+        let sample = BrushSample::with_tilt(world, pressure, tilt);
         let stroke = match (tool, self.paint_engine) {
             (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
                 HardRoundStroke::begin(self.document.active_layer_mut(), brush, sample)
@@ -982,6 +1005,12 @@ impl App {
                 let mixing = mixing_brush_from_paint(brush);
                 MixingStrokeV1::begin(self.document.active_layer_mut(), mixing, sample)
                     .map(ActiveStroke::LinearMixing)
+                    .map_err(ActiveStrokeError::from)
+            }
+            (ToolKind::Pen, PaintEngine::Flat) => {
+                let flat = flat_brush_from_paint(brush);
+                FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
+                    .map(ActiveStroke::Flat)
                     .map_err(ActiveStrokeError::from)
             }
         };
@@ -995,12 +1024,12 @@ impl App {
         }
     }
 
-    fn update_stroke(&mut self, screen: [f32; 2], pressure: f32) {
+    fn update_stroke(&mut self, screen: [f32; 2], pressure: f32, tilt: [f32; 2]) {
         let world = self.camera().world_from_screen(screen);
         let result = match &mut self.active_stroke {
             Some(stroke) => stroke.update(
                 self.document.active_layer_mut(),
-                BrushSample::new(world, pressure.clamp(0.0, 1.0)),
+                BrushSample::with_tilt(world, pressure.clamp(0.0, 1.0), tilt),
             ),
             None => return,
         };
@@ -1801,24 +1830,24 @@ impl App {
                     sample.tilt[1],
                     sample.timestamp_millis
                 );
-                self.start_stroke(sample.position, sample.pressure, owner);
+                self.start_stroke(sample.position, sample.pressure, sample.tilt, owner);
             }
             TabletPhase::Move => {
                 if self.active_pointer == Some(owner) {
                     self.tablet_sample_count += 1;
                     self.tablet_max_pressure = self.tablet_max_pressure.max(sample.pressure);
-                    self.update_stroke(sample.position, sample.pressure);
+                    self.update_stroke(sample.position, sample.pressure, sample.tilt);
                 } else if self.active_pointer.is_none() && sample.pressure > 0.0 {
                     self.tablet_sample_count = 1;
                     self.tablet_max_pressure = sample.pressure;
-                    self.start_stroke(sample.position, sample.pressure, owner);
+                    self.start_stroke(sample.position, sample.pressure, sample.tilt, owner);
                 }
             }
             TabletPhase::Up => {
                 if self.active_pointer == Some(owner) {
                     self.tablet_sample_count += 1;
                     self.tablet_max_pressure = self.tablet_max_pressure.max(sample.pressure);
-                    self.update_stroke(sample.position, sample.pressure);
+                    self.update_stroke(sample.position, sample.pressure, sample.tilt);
                     self.finish_stroke();
                 }
                 log::info!(
@@ -2457,7 +2486,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     self.metrics.input_handling.record(handling_start.elapsed());
                 } else if self.active_pointer == Some(PointerOwner::Mouse) {
                     let handling_start = Instant::now();
-                    self.update_stroke(current, 1.0);
+                    self.update_stroke(current, 1.0, [0.0, 0.0]);
                     self.metrics.input_handling.record(handling_start.elapsed());
                 }
                 if !self.tablet_is_recent() {
@@ -2504,7 +2533,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     self.cursor_contact = true;
                     self.last_cursor_pos = self.cursor_pos;
                     if let Some(cursor) = self.cursor_pos {
-                        self.start_stroke(cursor, 1.0, PointerOwner::Mouse);
+                        self.start_stroke(cursor, 1.0, [0.0, 0.0], PointerOwner::Mouse);
                     }
                     self.metrics.input_handling.record(handling_start.elapsed());
                 }
@@ -3060,6 +3089,11 @@ fn mixing_brush_from_paint(paint: HardRoundBrush) -> MixingBrushV1 {
         paint.spacing() / paint.diameter(),
     )
     .expect("the validated hard-round geometry is valid mixing-brush geometry")
+}
+
+fn flat_brush_from_paint(paint: HardRoundBrush) -> FlatBrush {
+    FlatBrush::new(paint.color(), paint.diameter(), paint.opacity())
+        .expect("validated hard-round values are valid flat-brush values")
 }
 
 fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {

@@ -52,6 +52,7 @@ pub enum UiTool {
     Pen,
     Eraser,
     Mixing,
+    Flat,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -830,6 +831,9 @@ fn show_toolbar(
                         }
                         if text_button(ui, "MIX", snapshot.tool == UiTool::Mixing).clicked() {
                             actions.push(UiAction::SelectTool(UiTool::Mixing));
+                        }
+                        if text_button(ui, "FLAT", snapshot.tool == UiTool::Flat).clicked() {
+                            actions.push(UiAction::SelectTool(UiTool::Flat));
                         }
                         separator(ui);
                         ui.label(

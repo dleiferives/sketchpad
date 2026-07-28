@@ -5,6 +5,7 @@ pub mod image_io;
 pub mod input;
 pub mod input_trace;
 pub mod mixing;
+pub mod natural;
 pub mod palette;
 pub mod persistence;
 pub mod pipeline;
