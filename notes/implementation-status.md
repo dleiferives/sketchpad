@@ -27,19 +27,17 @@ prototype:
 - linear premultiplied `f32` RGBA reference pixels;
 - ordered sparse raster layers with stable IDs, names, visibility, opacity,
   active-layer editing, and an incremental premultiplied-linear composite;
-- hard-round source-over brush and an opt-in CPU linear-mixing control with
-  stable pre-stroke active-layer pickup;
+- hard-round source-over brush with no destination-color pickup;
 - a tilt-oriented flat rectangular brush with anti-aliased contact, plus a
   pressure/tilt graphite pencil whose deterministic multi-scale paper tooth is
   fixed in canvas coordinates;
 - a shared tilt dead zone, motion-direction mouse/upright fallback, and
   interpolated tilt for oriented natural brushes;
-- a palette knife with twelve fixed inline paint lanes, per-lane load and
-  color, stable pre-dab active-layer pickup, cross-blade streak variation, and
-  no dab-time lane allocation;
-- a twenty-four-strand bristle brush with visible strand gaps, persistent
-  per-strand color/load, stable pickup, and deterministic low-amplitude bundle
-  wobble;
+- a palette knife with twelve fixed inline deposit lanes, cross-blade streak
+  variation, selected-color output, and no dab-time lane allocation;
+- a twenty-four-strand bristle brush with visible strand gaps, fixed
+  per-strand deposition strength, selected-color output, and deterministic
+  low-amplitude bundle wobble;
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
 - normalized pressure, tilt, physical source ID, tool type, and source
@@ -52,14 +50,14 @@ prototype:
 - a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
   surface texture, command encoder, and render pass;
 - a compact first toolbar and brush-preset popover for hard round, eraser,
-  mixing, flat nib, graphite pencil, palette knife, and bristle brush, plus
+  flat nib, graphite pencil, palette knife, and bristle brush, plus
   diameter/opacity adjustment, a continuous HSV color picker, preset/recent
   colors, undo/redo, and interface hiding;
 - a custom file popover dispatching the existing Open, Save, Save As, PNG
   import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,
   duplicate, delete, ordering, and stepped active-layer opacity;
-- a custom keybinding editor covering 33 application commands with two slots,
+- a custom keybinding editor covering 32 application commands with two slots,
   physical-key capture, deterministic conflict displacement, confirmed reset,
   and versioned user-config persistence;
 - typed UI actions that invoke the same application command methods as
@@ -128,7 +126,6 @@ Controls:
 - `[` / `]`: decrease/increase the hovered tool size;
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
 - E: toggle mouse pen/eraser mode;
-- M: toggle hard-round/linear-mixing pen mode;
 - B: cycle hard round, flat nib, pencil, palette knife, and bristle presets;
 - 1–6: select a built-in pen color;
 - X / Shift-X: select the older/newer recent pen color;
@@ -187,7 +184,7 @@ exits nonzero.
 ```text
 window samples
     ↓
-ActiveStroke hard-round/mixing dispatcher
+ActiveStroke brush-family dispatcher
     ↓
 shared distance resampler
     ↓
@@ -250,8 +247,6 @@ The current test suite covers:
 - one undo entry across many input updates;
 - independence from collinear event batching;
 - exact shared round-dab coverage and distance-resampling behavior;
-- stable pre-stroke active-layer pickup, bounded uniform-reservoir mixing,
-  exact hard-round control output, snapshot accounting, and mixing rollback;
 - globally ordered raster/layer undo, redo invalidation, imported-layer
   restoration, and matched bounded raster-memento eviction;
 - redo cleanup for both present layers and rasters temporarily retained by
@@ -281,8 +276,8 @@ are recorded in
 ### Shared brush-kernel equivalence
 
 On 2026-07-27, the hard-round brush's round-dab coverage and distance
-resampling were extracted into shared internal primitives for the mixing-brush
-work. An Apollo release replay used the canonical Wacom trace, the empty scene,
+resampling were extracted into shared internal primitives during the now
+removed mixing experiment. An Apollo release replay used the canonical Wacom trace, the empty scene,
 the 1× scheduled rate, and one stress/corpus stroke. Before and after the
 refactor it produced the exact same raster checksum (`5aa3f3b00ec18bec`), 450
 dabs, 45 damaged tiles, 44 resident tiles, 621 write lookups/bulk edits, and
@@ -290,8 +285,8 @@ dabs, 45 damaged tiles, 44 resident tiles, 621 write lookups/bulk edits, and
 
 This is an exact behavioral oracle rather than a timing claim: the extraction
 changed code ownership without changing coverage, spacing, damage, allocation,
-or final pixels. The shared primitives are therefore a safe geometric basis
-for comparing the hard-round control with the forthcoming mixing brush.
+or final pixels. The shared primitives remain useful brush infrastructure even
+though the mixing experiment was removed.
 
 ### Serialized Zellij remote execution
 
@@ -334,19 +329,15 @@ scripts/apollo run cargo run --locked --release --bin png_bench -- \
 The first controlled Apollo findings and their engineering consequence are
 recorded in [png-io-contract.md](png-io-contract.md#controlled-apollo-codec-baseline-2026-07-27).
 
-### Mixing-brush benchmark and oracle
+### Removed mixing-brush benchmark and oracle
 
-`mixing_bench` compares hard-round and version-1 linear-mixing strokes over
-transparent and opaque swatch scenes. Corpus geometry, input count, pressure,
-colors, recipe, and initial/result checksums are fixed. First and warm timings
-are separate; every run verifies exact counters and undo restoration.
+The deleted `mixing_bench` compared hard-round and version-1 linear-mixing
+strokes over transparent and opaque swatch scenes. Corpus geometry, input
+count, pressure, colors, recipe, and initial/result checksums were fixed. First
+and warm timings were separate; every run verified exact counters and undo
+restoration.
 
-```text
-scripts/apollo run cargo run --locked --release --bin mixing_bench -- \
-  --warm-runs 7
-```
-
-The first controlled Apollo baseline is recorded in
+The historical controlled Apollo baseline remains recorded in
 [pigment-mixing.md](pigment-mixing.md#controlled-apollo-baseline-2026-07-27).
 On the fixed corpus, linear mixing costs 1.38× the hard-round warm median over
 transparency and 2.19× over painted swatches. The painted mixing snapshot
@@ -568,8 +559,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - tilt and source timestamps are preserved but not yet consumed by the round
   brush;
 - no smoothing beyond constant-distance resampling;
-- brush geometry remains one hard-round family with an experimental
-  linear-mixing engine, visible-color sampling, and one coverage eraser;
+- color mixing is deliberately absent; natural brushes deposit their selected
+  color without destination sampling, and future mixing is a gated roadmap
+  item;
 - the first graphical toolbar, layer panel, file surface, and HSV picker are
   functional integration slices, alongside the first keybinding editor; there
   is not yet a brush editor, final responsive layout, rotation, selection, or
@@ -616,8 +608,8 @@ The active delivery sequence is governed by
 defined in [performance-proof-plan.md](performance-proof-plan.md). The
 immediate order is:
 
-1. evaluate hard-round, mixing, cancellation, undo, file drop, color sampling,
-   and the new color picker with the physical Wacom setup;
+1. evaluate hard-round, natural brushes, cancellation, undo, file drop, color
+   sampling, and the new color picker with the physical Wacom setup;
 2. continue turning the proven toolbar, layer, file, color, and keybinding
    surfaces into a coherent usable drawing workflow;
 3. add canvas rotation controls before broader selection/transform work.

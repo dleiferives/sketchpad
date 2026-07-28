@@ -12,12 +12,8 @@ const PENCIL_SPACING_FRACTION: f32 = 0.035;
 const PENCIL_GRAIN_SEED: u32 = 0x91e1_0da5;
 const KNIFE_LANE_COUNT: usize = 12;
 const KNIFE_SPACING_FRACTION: f32 = 0.06;
-const KNIFE_PICKUP: f32 = 0.24;
-const KNIFE_LOAD_USE: f32 = 0.0075;
 const BRISTLE_COUNT: usize = 24;
 const BRISTLE_SPACING_FRACTION: f32 = 0.035;
-const BRISTLE_PICKUP: f32 = 0.16;
-const BRISTLE_LOAD_USE: f32 = 0.004;
 const BRISTLE_CONTACT_FRACTION: f32 = 0.42;
 
 pub fn contact_direction_from_tilt(tilt: [f32; 2]) -> Option<[f32; 2]> {
@@ -381,7 +377,7 @@ impl PaletteKnifeBrush {
         gesture: GestureId,
         sample: BrushSample,
         direction: [f32; 2],
-        lanes: &mut [PaintLane; KNIFE_LANE_COUNT],
+        deposits: &[LaneDeposit; KNIFE_LANE_COUNT],
     ) -> Result<(), BrushError> {
         if !sample.is_finite() {
             return Err(BrushError::InvalidSample);
@@ -400,28 +396,6 @@ impl PaletteKnifeBrush {
         ) else {
             return Ok(());
         };
-
-        let mut deposits = [LaneDeposit::default(); KNIFE_LANE_COUNT];
-        for (index, lane) in lanes.iter_mut().enumerate() {
-            let lane_t = (index as f32 + 0.5) / KNIFE_LANE_COUNT as f32;
-            let offset = (lane_t * 2.0 - 1.0) * half_extents[0] * 0.92;
-            let source_position = [
-                sample.position[0] + direction[0] * offset,
-                sample.position[1] + direction[1] * offset,
-            ];
-            if let Some(source) = sample_straight(layer, source_position) {
-                let pickup = KNIFE_PICKUP * source.alpha;
-                for channel in 0..3 {
-                    lane.color[channel] += (source.color[channel] - lane.color[channel]) * pickup;
-                }
-                lane.load += (1.0 - lane.load) * pickup;
-            }
-            deposits[index] = LaneDeposit {
-                color: lane.color,
-                alpha: self.opacity * lane.strength * (0.12 + 0.78 * lane.load),
-            };
-            lane.load = (lane.load - KNIFE_LOAD_USE * (0.35 + 0.65 * pressure)).clamp(0.025, 1.0);
-        }
 
         let tile_size = layer.tile_size();
         let [min_tile_x, min_tile_y, max_tile_x, max_tile_y] =
@@ -452,62 +426,37 @@ impl PaletteKnifeBrush {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct PaintLane {
-    color: [f32; 3],
-    load: f32,
-    strength: f32,
-}
-
-impl PaintLane {
-    fn knife(index: usize, color: [f32; 3]) -> Self {
-        let variation = hash_unit(index as u32, 0, 0x40d3_6f17);
-        Self {
-            color,
-            load: 0.78 + variation * 0.22,
-            strength: 0.42 + variation * 0.58,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct LaneDeposit {
     color: [f32; 3],
     alpha: f32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct StraightSample {
-    color: [f32; 3],
-    alpha: f32,
-}
+impl LaneDeposit {
+    fn knife(index: usize, color: [f32; 3], opacity: f32) -> Self {
+        let variation = hash_unit(index as u32, 0, 0x40d3_6f17);
+        let load = 0.78 + variation * 0.22;
+        let strength = 0.42 + variation * 0.58;
+        Self {
+            color,
+            alpha: opacity * strength * (0.12 + 0.78 * load),
+        }
+    }
 
-fn sample_straight(layer: &RasterLayer, position: [f32; 2]) -> Option<StraightSample> {
-    if position[0] < 0.0
-        || position[1] < 0.0
-        || position[0] >= layer.width() as f32
-        || position[1] >= layer.height() as f32
-    {
-        return None;
+    fn bristle(index: usize, color: [f32; 3], opacity: f32) -> Self {
+        let variation = hash_unit(index as u32, 0, 0x73f4_a821);
+        let load = 0.7 + variation * 0.3;
+        let strength = 0.48 + variation * 0.52;
+        Self {
+            color,
+            alpha: opacity * strength * (0.1 + 0.72 * load),
+        }
     }
-    let pixel = layer.pixel(position[0].floor() as u32, position[1].floor() as u32)?;
-    if pixel.a <= f32::EPSILON {
-        return None;
-    }
-    let inverse_alpha = pixel.a.recip();
-    Some(StraightSample {
-        color: [
-            (pixel.r * inverse_alpha).clamp(0.0, 1.0),
-            (pixel.g * inverse_alpha).clamp(0.0, 1.0),
-            (pixel.b * inverse_alpha).clamp(0.0, 1.0),
-        ],
-        alpha: pixel.a.clamp(0.0, 1.0),
-    })
 }
 
 pub struct PaletteKnifeStroke {
     brush: PaletteKnifeBrush,
-    lanes: [PaintLane; KNIFE_LANE_COUNT],
+    deposits: [LaneDeposit; KNIFE_LANE_COUNT],
     state: OrientedStrokeState,
 }
 
@@ -523,14 +472,15 @@ impl PaletteKnifeStroke {
         let gesture = layer.begin_brush_gesture(brush.diameter())?;
         let mut state = OrientedStrokeState::new(gesture, sample, brush.spacing());
         let direction = state.orientation.resolve(sample);
-        let mut lanes = std::array::from_fn(|index| PaintLane::knife(index, brush.color()));
-        if let Err(error) = brush.paint_dab(layer, gesture, sample, direction, &mut lanes) {
+        let deposits =
+            std::array::from_fn(|index| LaneDeposit::knife(index, brush.color(), brush.opacity()));
+        if let Err(error) = brush.paint_dab(layer, gesture, sample, direction, &deposits) {
             let _ = layer.cancel_gesture(gesture);
             return Err(error);
         }
         Ok(Self {
             brush,
-            lanes,
+            deposits,
             state,
         })
     }
@@ -550,18 +500,18 @@ impl PaletteKnifeStroke {
     ) -> Result<(), BrushError> {
         let brush = self.brush;
         let gesture = self.state.gesture;
-        let lanes = &mut self.lanes;
+        let deposits = &self.deposits;
         self.state.update(sample, |dab, direction| {
-            brush.paint_dab(layer, gesture, dab, direction, lanes)
+            brush.paint_dab(layer, gesture, dab, direction, deposits)
         })
     }
 
     pub fn finalize(&mut self, layer: &mut RasterLayer) -> Result<(), BrushError> {
         let brush = self.brush;
         let gesture = self.state.gesture;
-        let lanes = &mut self.lanes;
+        let deposits = &self.deposits;
         self.state
-            .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, lanes))
+            .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, deposits))
     }
 
     pub fn finish(mut self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
@@ -634,7 +584,7 @@ impl BristleBrush {
         gesture: GestureId,
         sample: BrushSample,
         direction: [f32; 2],
-        bristles: &mut [PaintLane; BRISTLE_COUNT],
+        deposits: &[LaneDeposit; BRISTLE_COUNT],
     ) -> Result<(), BrushError> {
         if !sample.is_finite() {
             return Err(BrushError::InvalidSample);
@@ -653,30 +603,6 @@ impl BristleBrush {
         ) else {
             return Ok(());
         };
-
-        let mut deposits = [LaneDeposit::default(); BRISTLE_COUNT];
-        for (index, bristle) in bristles.iter_mut().enumerate() {
-            let lane_t = (index as f32 + 0.5) / BRISTLE_COUNT as f32;
-            let offset = (lane_t * 2.0 - 1.0) * half_extents[0] * 0.95;
-            let source_position = [
-                sample.position[0] + direction[0] * offset,
-                sample.position[1] + direction[1] * offset,
-            ];
-            if let Some(source) = sample_straight(layer, source_position) {
-                let pickup = BRISTLE_PICKUP * source.alpha;
-                for channel in 0..3 {
-                    bristle.color[channel] +=
-                        (source.color[channel] - bristle.color[channel]) * pickup;
-                }
-                bristle.load += (1.0 - bristle.load) * pickup;
-            }
-            deposits[index] = LaneDeposit {
-                color: bristle.color,
-                alpha: self.opacity * bristle.strength * (0.1 + 0.72 * bristle.load),
-            };
-            bristle.load =
-                (bristle.load - BRISTLE_LOAD_USE * (0.25 + 0.75 * pressure)).clamp(0.02, 1.0);
-        }
 
         let wobble = ((sample.position[0] * 0.071 + sample.position[1] * 0.053).sin() * 0.22)
             / BRISTLE_COUNT as f32;
@@ -709,20 +635,9 @@ impl BristleBrush {
     }
 }
 
-impl PaintLane {
-    fn bristle(index: usize, color: [f32; 3]) -> Self {
-        let variation = hash_unit(index as u32, 0, 0x73f4_a821);
-        Self {
-            color,
-            load: 0.7 + variation * 0.3,
-            strength: 0.48 + variation * 0.52,
-        }
-    }
-}
-
 pub struct BristleStroke {
     brush: BristleBrush,
-    bristles: [PaintLane; BRISTLE_COUNT],
+    deposits: [LaneDeposit; BRISTLE_COUNT],
     state: OrientedStrokeState,
 }
 
@@ -738,14 +653,16 @@ impl BristleStroke {
         let gesture = layer.begin_brush_gesture(brush.diameter())?;
         let mut state = OrientedStrokeState::new(gesture, sample, brush.spacing());
         let direction = state.orientation.resolve(sample);
-        let mut bristles = std::array::from_fn(|index| PaintLane::bristle(index, brush.color()));
-        if let Err(error) = brush.paint_dab(layer, gesture, sample, direction, &mut bristles) {
+        let deposits = std::array::from_fn(|index| {
+            LaneDeposit::bristle(index, brush.color(), brush.opacity())
+        });
+        if let Err(error) = brush.paint_dab(layer, gesture, sample, direction, &deposits) {
             let _ = layer.cancel_gesture(gesture);
             return Err(error);
         }
         Ok(Self {
             brush,
-            bristles,
+            deposits,
             state,
         })
     }
@@ -765,18 +682,18 @@ impl BristleStroke {
     ) -> Result<(), BrushError> {
         let brush = self.brush;
         let gesture = self.state.gesture;
-        let bristles = &mut self.bristles;
+        let deposits = &self.deposits;
         self.state.update(sample, |dab, direction| {
-            brush.paint_dab(layer, gesture, dab, direction, bristles)
+            brush.paint_dab(layer, gesture, dab, direction, deposits)
         })
     }
 
     pub fn finalize(&mut self, layer: &mut RasterLayer) -> Result<(), BrushError> {
         let brush = self.brush;
         let gesture = self.state.gesture;
-        let bristles = &mut self.bristles;
+        let deposits = &self.deposits;
         self.state
-            .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, bristles))
+            .finalize(|dab, direction| brush.paint_dab(layer, gesture, dab, direction, deposits))
     }
 
     pub fn finish(mut self, layer: &mut RasterLayer) -> Result<Option<Damage>, BrushError> {
@@ -1089,16 +1006,16 @@ impl FlatDabKernel {
     }
 }
 
-struct LaneDabKernel<const LANE_COUNT: usize> {
+struct LaneDabKernel<'a, const LANE_COUNT: usize> {
     footprint: OrientedBoxFootprint,
-    deposits: [LaneDeposit; LANE_COUNT],
+    deposits: &'a [LaneDeposit; LANE_COUNT],
     contact_fraction: f32,
     lane_offset: f32,
     local_damage: RectU32,
     tile_origin: [u32; 2],
 }
 
-impl<const LANE_COUNT: usize> LaneDabKernel<LANE_COUNT> {
+impl<const LANE_COUNT: usize> LaneDabKernel<'_, LANE_COUNT> {
     fn run(self, tile: &mut TileEdit<'_>) -> Option<RectU32> {
         let stride = tile.stride();
         let pixels = tile.pixels_mut();
@@ -1571,7 +1488,7 @@ mod tests {
     }
 
     #[test]
-    fn palette_knife_lanes_pick_up_existing_color() {
+    fn palette_knife_deposits_keep_the_selected_color() {
         let mut layer = layer();
         let red = HardRoundBrush::new([1.0, 0.0, 0.0], 64.0, 1.0, 0.15).unwrap();
         HardRoundStroke::begin(&mut layer, red, BrushSample::new([190.0, 128.0], 1.0))
@@ -1593,8 +1510,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(stroke.lanes.iter().any(|lane| lane.color[0] > 0.05));
-        assert!(stroke.lanes.iter().any(|lane| lane.color[2] > 0.2));
+        assert!(stroke
+            .deposits
+            .iter()
+            .all(|deposit| deposit.color == [0.0, 0.0, 1.0]));
         stroke.cancel(&mut layer).unwrap();
     }
 
@@ -1602,8 +1521,8 @@ mod tests {
     fn palette_knife_state_is_inline_and_bounded() {
         assert_eq!(KNIFE_LANE_COUNT, 12);
         assert_eq!(
-            std::mem::size_of::<[PaintLane; KNIFE_LANE_COUNT]>(),
-            std::mem::size_of::<PaintLane>() * KNIFE_LANE_COUNT
+            std::mem::size_of::<[LaneDeposit; KNIFE_LANE_COUNT]>(),
+            std::mem::size_of::<LaneDeposit>() * KNIFE_LANE_COUNT
         );
     }
 
@@ -1634,7 +1553,7 @@ mod tests {
     }
 
     #[test]
-    fn bristles_pick_up_color_without_collapsing_to_one_reservoir() {
+    fn bristle_deposits_keep_the_selected_color() {
         let mut layer = layer();
         let red = HardRoundBrush::new([1.0, 0.0, 0.0], 52.0, 1.0, 0.15).unwrap();
         HardRoundStroke::begin(&mut layer, red, BrushSample::new([190.0, 128.0], 1.0))
@@ -1656,12 +1575,10 @@ mod tests {
             )
             .unwrap();
 
-        let red_channels: [f32; BRISTLE_COUNT] =
-            std::array::from_fn(|index| stroke.bristles[index].color[0]);
-        assert!(red_channels.iter().any(|red| *red > 0.05));
-        assert!(red_channels
-            .windows(2)
-            .any(|pair| (pair[0] - pair[1]).abs() > 0.001));
+        assert!(stroke
+            .deposits
+            .iter()
+            .all(|deposit| deposit.color == [0.0, 0.0, 1.0]));
         stroke.cancel(&mut layer).unwrap();
     }
 
@@ -1669,8 +1586,8 @@ mod tests {
     fn bristle_state_is_inline_and_bounded() {
         assert_eq!(BRISTLE_COUNT, 24);
         assert_eq!(
-            std::mem::size_of::<[PaintLane; BRISTLE_COUNT]>(),
-            std::mem::size_of::<PaintLane>() * BRISTLE_COUNT
+            std::mem::size_of::<[LaneDeposit; BRISTLE_COUNT]>(),
+            std::mem::size_of::<LaneDeposit>() * BRISTLE_COUNT
         );
     }
 }

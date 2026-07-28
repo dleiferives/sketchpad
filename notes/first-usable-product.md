@@ -1,6 +1,6 @@
 # First Usable Product
 
-Status: current product direction, 2026-07-24. This note defines the first
+Status: current product direction, updated 2026-07-28. This note defines the first
 Sketchpad worth using. It supersedes any implication that deep zoom, infinite
 extent, a universal retained renderer, or novel multiscale storage must be
 solved before the application becomes useful.
@@ -15,7 +15,7 @@ The first product is:
 - sparse tiled raster layers;
 - excellent stylus response;
 - a small set of excellent brushes;
-- painterly pickup, deposition, and color mixing;
+- predictable selected-color deposition; color mixing is deferred;
 - fast layer compositing and per-gesture undo;
 - ordinary pan, zoom, and rotation;
 - reliable save, autosave, recovery, and export;
@@ -251,9 +251,11 @@ the brush, resampling may use:
 No brush should place one canonical document operation per raw event simply
 because that is how the windowing system delivered input.
 
-### Brush reservoir
+### Deferred brush reservoir
 
-Painterly behavior uses a small state carried along the active stroke:
+Destination pickup, carried pigment, and live color mixing are not part of the
+first usable product. The removed experiment used a small state carried along
+the active stroke:
 
 - current held color/mixture;
 - pickup capacity;
@@ -269,9 +271,9 @@ For each bounded contact step:
 4. deposit a controlled amount back to the canvas;
 5. update the reservoir deterministically.
 
-This can create convincing dirty-brush and blending behavior without a
-full-canvas fluid simulation or persistent high-dimensional pigments in every
-tile.
+This remains a possible later model, but it requires its own visual corpus,
+semantics, and constrained-device performance budget before implementation.
+Natural brush shapes must not implicitly enable it.
 
 ### Mixing modes
 
@@ -285,9 +287,9 @@ Keep separate:
    perceptual, or pigment-like.
 4. **Wet simulation**: optional local state evolution after deposition.
 
-The first product prioritizes brush pickup/deposit with a pigment-like
-interpolation option. It does not replace all layer compositing with pigment
-math.
+Any future implementation must keep brush geometry, pickup/deposit, color
+interpolation, and layer compositing separate. The first product does not
+perform destination-dependent brush mixing.
 
 The existing [pigment research](pigment-mixing.md) remains relevant to the
 mixing kernel. Licensing, gamut behavior, neutral mixtures, and comparison
@@ -296,8 +298,7 @@ implementation.
 
 ## Initial Brush Set
 
-Three excellent brushes are a stronger first product than many shallow
-presets.
+A small set of excellent brushes is stronger than many shallow presets.
 
 ### 1. Hard pressure ink
 
@@ -334,21 +335,20 @@ Required behavior:
 - repeated passes build density naturally;
 - no obvious stamp rhythm at normal drawing speeds.
 
-### 3. Painterly mixing brush
+### 3. Natural-media tips
 
 Purpose:
 
-- define Sketchpad's differentiating color interaction.
+- provide useful tilt-oriented marks without destination sampling.
 
 Required behavior:
 
-- configurable pickup and deposit;
-- a visible reservoir that becomes contaminated by destination color;
+- flat, pencil, knife, and bristle contacts with distinct geometry;
+- every tip deposits only the selected color;
 - smooth pressure/tilt response;
 - bounded tile interaction;
 - deterministic result for a saved real input trace;
-- no implicit mixing across hidden layers;
-- finalize without a long blocking simulation.
+- no implicit destination reads or hidden-layer interaction.
 
 ### Fourth brush after the core is stable
 
@@ -719,16 +719,16 @@ deterministic existing content. A representative physical trace family,
 drawing-feel evaluation, coalesced history, active-tail handling, and
 input-to-presentation latency instrumentation remain.
 
-### Milestone 4 — Painterly mixing brush
+### Milestone 4 — Natural brush family and latency
 
-- reservoir;
-- pickup/deposit;
-- linear and pigment-like mixing candidates;
-- textured/tilted contact where justified;
-- bounded temporary material state.
+- tilt-oriented flat, pencil, knife, and bristle contacts;
+- fixed selected-color deposition;
+- deterministic replay and bounded damage;
+- live dabs-per-input and stage-level latency measurement;
+- optimized CPU reference before considering specialized GPU kernels.
 
-Exit: the mixing corpus produces convincing, deterministic color interaction
-without breaking the active-frame budget.
+Exit: natural brushes are useful and deterministic without breaking the active
+frame budget.
 
 ### Milestone 5 — Layers, UI, and eraser
 
@@ -834,8 +834,8 @@ The first Sketchpad should be a painter, not a graphics research showcase.
 Its architectural bet is deliberately practical:
 
 > defined canvas bounds, sparse canonical raster tiles, custom bounded `wgpu`
-> brush/composite work, a small excellent brush set, brush-local color mixing,
-> per-gesture tile undo, and transactional recovery.
+> brush/composite work, a small excellent brush set, predictable selected-color
+> deposition, per-gesture tile undo, and transactional recovery.
 
 That is enough room to build something unusually fast and artistically
 interesting. The more ambitious retained, infinite, multiscale, and simulation

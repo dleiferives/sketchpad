@@ -206,7 +206,6 @@ pub enum KeyCommand {
     BrushOpacityDown,
     BrushOpacityUp,
     ToggleEraser,
-    ToggleMixing,
     CycleBrushPreset,
     RecentColorOlder,
     RecentColorNewer,
@@ -226,7 +225,7 @@ pub enum KeyCommand {
     MoveLayerBelow,
 }
 
-pub const ALL_KEY_COMMANDS: [KeyCommand; 33] = [
+pub const ALL_KEY_COMMANDS: [KeyCommand; 32] = [
     KeyCommand::ToggleInterface,
     KeyCommand::Undo,
     KeyCommand::Redo,
@@ -242,7 +241,6 @@ pub const ALL_KEY_COMMANDS: [KeyCommand; 33] = [
     KeyCommand::BrushOpacityDown,
     KeyCommand::BrushOpacityUp,
     KeyCommand::ToggleEraser,
-    KeyCommand::ToggleMixing,
     KeyCommand::CycleBrushPreset,
     KeyCommand::RecentColorOlder,
     KeyCommand::RecentColorNewer,
@@ -284,7 +282,6 @@ impl KeyCommand {
             Self::BrushOpacityDown => "brush_opacity_down",
             Self::BrushOpacityUp => "brush_opacity_up",
             Self::ToggleEraser => "toggle_eraser",
-            Self::ToggleMixing => "toggle_mixing",
             Self::CycleBrushPreset => "cycle_brush_preset",
             Self::RecentColorOlder => "recent_color_older",
             Self::RecentColorNewer => "recent_color_newer",
@@ -328,7 +325,6 @@ impl KeyCommand {
             Self::BrushOpacityDown => "Decrease brush opacity",
             Self::BrushOpacityUp => "Increase brush opacity",
             Self::ToggleEraser => "Toggle pen / eraser",
-            Self::ToggleMixing => "Toggle paint mixing",
             Self::CycleBrushPreset => "Next brush preset",
             Self::RecentColorOlder => "Older recent color",
             Self::RecentColorNewer => "Newer recent color",
@@ -365,7 +361,6 @@ impl KeyCommand {
             | Self::BrushOpacityDown
             | Self::BrushOpacityUp
             | Self::ToggleEraser
-            | Self::ToggleMixing
             | Self::CycleBrushPreset => "BRUSH",
             Self::RecentColorOlder
             | Self::RecentColorNewer
@@ -553,7 +548,6 @@ fn default_bindings(key_command: KeyCommand) -> CommandBindings {
         Command::BrushOpacityDown => CommandBindings::one(shift(Key::BracketLeft)),
         Command::BrushOpacityUp => CommandBindings::one(shift(Key::BracketRight)),
         Command::ToggleEraser => CommandBindings::one(plain(Key::KeyE)),
-        Command::ToggleMixing => CommandBindings::one(plain(Key::KeyM)),
         Command::CycleBrushPreset => CommandBindings::one(plain(Key::KeyB)),
         Command::RecentColorOlder => CommandBindings::one(plain(Key::KeyX)),
         Command::RecentColorNewer => CommandBindings::one(shift(Key::KeyX)),
@@ -713,7 +707,7 @@ mod tests {
     fn persisted_bindings_round_trip_exactly() {
         let mut bindings = KeyBindings::default();
         bindings.set(
-            KeyCommand::ToggleMixing,
+            KeyCommand::CycleBrushPreset,
             0,
             Some(KeyChord::new(BindingKey::F12, false, true, true)),
         );

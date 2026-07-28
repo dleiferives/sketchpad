@@ -4,12 +4,12 @@ The notes are organized by purpose:
 
 - [First usable product](first-usable-product.md) — the current governing
   direction: a fast defined/resizeable canvas, sparse raster tiles, excellent
-  input and brushes, brush-local color mixing, layers, undo, recovery, and
-  explicit post-MVP boundaries. Start here for what to build.
+  input and brushes, layers, undo, recovery, and explicit post-MVP boundaries.
+  Color mixing is currently deferred. Start here for what to build.
 - [Product feature roadmap](feature-roadmap.md) — the active ordered delivery
-  queue for layers, native persistence, image import/export, painterly mixing,
-  UI follow-through, and the correctness/performance infrastructure shipped
-  with each slice.
+  queue for layers, native persistence, image import/export, UI follow-through,
+  the deferred mixing gate, and the correctness/performance infrastructure
+  shipped with each slice.
 - [PNG import and export contract](png-io-contract.md) — the implemented
   bounded static-PNG codec contract: straight/sRGB interchange,
   premultiplied-linear working pixels, centered clipping, atomic streaming

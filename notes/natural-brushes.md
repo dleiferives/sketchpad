@@ -9,8 +9,8 @@ deterministic, measurable foundation:
 
 - a flat rectangular nib whose contact rotates with pen tilt;
 - a graphite pencil with canvas-anchored tooth and side shading;
-- a palette knife that retains cross-blade paint variation;
-- a bristle brush with persistent, separated paint-carrying strands.
+- a palette knife with fixed cross-blade transfer variation;
+- a bristle brush with fixed, separated strands.
 
 The initial implementation remains a CPU reference renderer over the canonical
 sparse `f32` raster. That makes output exact, undoable, replayable, and useful
@@ -58,12 +58,9 @@ canvas-sized texture, and gives repeated passes stable graphite buildup.
 
 Paint-brush research commonly computes a two-dimensional contact footprint
 from an oriented, deforming brush and then imprints it along a trajectory.
-The important warning for this implementation comes from detail-preserving
-paint modeling: repeatedly collapsing a brush to one coarse or uniform color
-destroys cross-width paint detail. A palette knife or bristle brush therefore
-cannot reuse the current single-color mixing reservoir without becoming a
-round mixing brush in disguise. It needs persistent lanes or strands, each
-with its own load and color.
+This implementation preserves cross-width detail with fixed lane/strand
+strengths. It deliberately does not sample destination pixels, carry pigment,
+or mix colors. Those material interactions are a separate deferred system.
 
 Full shallow-water paint height, impasto, and pigment-fluid simulation can
 produce richer oil behavior, including on constrained mobile hardware, but
@@ -156,15 +153,13 @@ The palette knife uses a broad, narrow oriented box subdivided across its width
 into a fixed number of lanes. Each lane owns:
 
 ```text
-color: premultiplied-independent linear RGB
-load: bounded paint quantity
+strength: fixed deposition multiplier
 ```
 
-At each contact, the lane samples the stable pre-dab active-layer source,
-deposits from its current load, and picks up a bounded fraction of the source.
-Sparse gaps and load exhaustion expose the canvas as streaks. Orientation
-comes from pen tilt with stroke-direction fallback. The lane count is fixed by
-the recipe and uses inline storage, so footprint diameter cannot create
+Every lane deposits the selected brush color. It never reads destination
+color. Fixed strength differences create cross-blade streaks, while
+orientation comes from pen tilt with stroke-direction fallback. The lane count
+and deposit table are fixed and inline, so footprint diameter cannot create
 unbounded brush state.
 
 This is a paint-transfer model, not a geometric scraper yet. True scraping
@@ -172,20 +167,19 @@ requires a canonical paint-height/material layer and is deferred.
 
 ### Bristle brush
 
-The bristle brush shares the lane-reservoir machinery but uses many narrow,
-separated strand contacts:
+The bristle brush uses many narrow, separated strand contacts:
 
-- each strand has a stable cross-width offset, load, and color;
+- each strand has a stable cross-width offset and deposition strength;
 - strand gaps remain visible instead of being filled by one uniform footprint;
 - low-amplitude deterministic path-relative wobble avoids a synthetic comb
   while remaining replay exact;
-- pickup/deposition varies by strand;
-- pressure widens the bundle and raises contact/deposition;
-- paint load persists for the stroke and may visibly run out.
+- deposition varies by strand;
+- pressure widens the bundle and raises contact.
 
 The first preset uses a bounded fixed strand count. A later brush editor can
-expose strand density, stiffness, pickup, reload, and grain only after the
-recipe format is versioned.
+expose strand density, stiffness, and grain only after the recipe format is
+versioned. Pickup, reload, and pigment mixing belong to the separate deferred
+material-system TODO.
 
 ## Correctness and Performance Contract
 
@@ -204,9 +198,9 @@ All four brushes must satisfy:
   sample field is equivalent.
 
 Add focused unit tests for footprint rotation, tilt interpolation, world-fixed
-grain, lane persistence, cancellation, and batching. Add replay cases for
-upright/tilted pencil, rotating flat nib, knife pull, and bristle color
-pickup. Record CPU time, dabs, visited pixels, and changed pixels before
+grain, fixed lane variation, cancellation, and batching. Add replay cases for
+upright/tilted pencil, rotating flat nib, knife pull, and separated bristle
+marks. Record CPU time, dabs, visited pixels, and changed pixels before
 considering a GPU implementation.
 
 ## Delivery Slices
@@ -216,7 +210,7 @@ considering a GPU implementation.
 2. Ship the flat nib and expose it through the existing brush selection
    boundary.
 3. Ship the deterministic graphite pencil.
-4. Introduce fixed lane reservoirs and ship the palette knife.
+4. Introduce fixed lane deposits and ship the palette knife.
 5. Specialize the lane model into separated bristles.
 6. [Complete] Replace the temporary selector with a compact preset popover and
    add oriented cursor shapes.

@@ -1,9 +1,13 @@
 # Pigment Color Mixing Research
 
-Status: first-product brush research. Pigment-like interpolation is a candidate
-inside the painterly brush's bounded pickup/deposit reservoir. It is not the
-default layer compositor, and it does not determine the geometry architecture.
-See [first-usable-product.md](first-usable-product.md).
+Status: deferred research archive, 2026-07-28. The experimental CPU mixing
+engine, benchmark, live UI mode, and natural-brush destination pickup were
+removed from the current product. Mixing may return only after an authored
+quality corpus and an explicit performance budget exist. The sections below
+preserve prior research and measurements; statements that a reference “is
+implemented” describe the removed 2026-07-27 experiment, not the current
+codebase. See the active TODO in
+[feature-roadmap.md](feature-roadmap.md#6-painterly-color-mixing-brush).
 
 ## 2026 Reservoir and Smudge Findings
 

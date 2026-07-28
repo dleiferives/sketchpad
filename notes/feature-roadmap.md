@@ -113,23 +113,28 @@ untouched.
 
 ### 6. Painterly color-mixing brush
 
-- [x] Define a versioned brush recipe and bounded reservoir state.
-- [x] Separate pickup, reservoir mixing, and deposition.
-- [x] Begin with a conventional linear-RGB control.
-- [ ] Add pigment-like candidates only against a saved swatch and stroke
-  corpus with acceptable licensing.
-- [x] Make pickup source explicit: active layer by default, visible composite
-  only as an opt-in semantic mode.
-- [ ] Define behavior across transparency, repeated passes, stroke start/end,
-  undo, and deterministic replay.
-- [x] Add CPU reference tests before any GPU kernel.
-- [x] Measure work per dab, affected pixels, sampled tiles, and temporary
-  reservoir storage.
-- [x] Expose the control in the live app as a temporary between-stroke keyboard
-  toggle before designing brush UI.
+Status: deliberately deferred. The experimental CPU mixing engine, benchmark,
+live-app mode, keybinding, and destination-color pickup in natural brushes were
+removed on 2026-07-28. Ordinary brushes deposit only their selected color.
 
-Acceptance: the saved mixing corpus is deterministic, visually intentional,
-bounded to brush damage, and does not implicitly mix hidden layers.
+- [ ] Define the artistic target and a saved visual corpus before writing a
+  new mixing kernel.
+- [ ] Treat tip geometry and material interaction as separate systems; a
+  bristle or knife shape must not implicitly enable mixing.
+- [ ] Establish a per-frame/per-dab CPU, GPU, memory-bandwidth, and temporary
+  storage budget on Apollo before integrating a live mode.
+- [ ] Define pickup source, transparency, repeated-pass, undo, persistence,
+  replay, and hidden-layer semantics.
+- [ ] Compare conventional, perceptual, and properly licensed pigment-like
+  candidates against the same corpus.
+- [ ] Require deterministic correctness tests and a non-mixing control with
+  identical geometry.
+
+Acceptance for any future restart: compelling visual evidence, bounded state
+and work, no implicit destination sampling, and measured headroom on the
+constrained target. Research history remains in
+[Pigment color mixing research](pigment-mixing.md), but it is not current
+product code.
 
 ### 7. Natural-media brush family
 

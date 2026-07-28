@@ -52,7 +52,6 @@ const TEXT_MUTED: Color32 = Color32::from_rgb(166, 168, 176);
 pub enum UiTool {
     Pen,
     Eraser,
-    Mixing,
     Flat,
     Pencil,
     PaletteKnife,
@@ -60,10 +59,9 @@ pub enum UiTool {
 }
 
 impl UiTool {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 6] = [
         Self::Pen,
         Self::Eraser,
-        Self::Mixing,
         Self::Flat,
         Self::Pencil,
         Self::PaletteKnife,
@@ -74,7 +72,6 @@ impl UiTool {
         match self {
             Self::Pen => "PEN",
             Self::Eraser => "ERASE",
-            Self::Mixing => "MIX",
             Self::Flat => "FLAT",
             Self::Pencil => "PCL",
             Self::PaletteKnife => "KNIFE",
@@ -86,7 +83,6 @@ impl UiTool {
         match self {
             Self::Pen => "HARD ROUND",
             Self::Eraser => "ERASER",
-            Self::Mixing => "COLOR MIXER",
             Self::Flat => "FLAT NIB",
             Self::Pencil => "GRAPHITE PENCIL",
             Self::PaletteKnife => "PALETTE KNIFE",

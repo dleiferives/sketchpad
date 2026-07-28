@@ -29,7 +29,7 @@ impl LatencySeries {
         self.record_value(micros);
     }
 
-    fn record_value(&mut self, value: u64) {
+    pub(crate) fn record_value(&mut self, value: u64) {
         self.values[self.next] = value;
         self.next = (self.next + 1) % SAMPLE_CAPACITY;
         self.retained = (self.retained + 1).min(SAMPLE_CAPACITY);

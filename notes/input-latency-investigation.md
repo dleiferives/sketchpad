@@ -454,3 +454,39 @@ On the same Apollo 128-pixel-tile case, 20-run median bristle time fell from
 remaining cycles, so this is a useful first reduction rather than completion.
 The next live trace must determine how much of the deterministic gain survives
 large-document recomposition and recovery-worker contention.
+
+### Large-document acceptance trace and missing work counter
+
+The optimized build was then exercised against a recovered four-layer,
+3,427-tile document. The first sustained bristle interval improved from the
+pre-optimization heavy interval as follows:
+
+| Stage | Before mean/p95/max | After mean/p95/max |
+| --- | ---: | ---: |
+| brush mutation | 4.30/9.15/22.95 ms | 2.43/5.18/5.96 ms |
+| layer recomposition | 1.32/2.75/7.02 ms | 1.02/2.10/3.17 ms |
+| total input handling | 5.62/11.38/25.24 ms | 2.92/6.80/13.36 ms |
+| backend contact queue | 66.6/197.3/211.2 ms | 5.0/16.8/19.5 ms |
+
+The interval still generated 1,456 damage regions and about 94 MiB of uploads.
+A longer 1,277-sample stroke eventually reached 4.39/9.20/17.04 ms mutation
+and roughly 701 ms backend-queue p95. A later stroke overlapped a full recovery
+worker and reached 8.62/21.37/39.93 ms mutation with about 3.3 seconds of queue.
+The kernel reduction therefore helps substantially but does not establish
+bounded high-speed throughput, especially under checkpoint contention.
+
+Mutation time alone does not say whether an expensive packet emitted one large
+dab or many distance-resampled dabs. The live probe now reports selected brush,
+diameter, and the mean/p95/maximum dabs emitted per input update. Any next
+optimization must correlate those values before changing spacing or footprint
+quality.
+
+Destination-color pickup is no longer a product requirement for this phase.
+The experimental mixing engine and benchmark were removed, as were pickup and
+carried pigment from palette-knife and bristle strokes. Natural brushes now
+use fixed selected-color lane deposits. This simplifies semantics and removes
+destination reads, but the profile had attributed only 1.8% of cycles to
+pickup; it is not presented as the main latency fix. The current Apollo
+128-pixel-tile medians are 88.920 ms for bristle on the painted scene and
+46.364/44.129 ms for palette knife on empty/painted scenes. Color mixing is a
+separate deferred roadmap project with an explicit future performance gate.
