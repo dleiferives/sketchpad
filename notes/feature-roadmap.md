@@ -136,7 +136,7 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 - [x] Propagate normalized tablet tilt through distance-resampled brush
   samples.
 - [x] Add a tilt-oriented flat rectangular nib.
-- [ ] Add a graphite pencil with deterministic canvas-anchored paper tooth.
+- [x] Add a graphite pencil with deterministic canvas-anchored paper tooth.
 - [ ] Add a palette knife with persistent cross-blade paint lanes.
 - [ ] Add a separated-bristle paint brush with per-strand paint load.
 - [ ] Preserve one undoable gesture, bounded damage, deterministic replay, and

@@ -13,7 +13,7 @@ use sketchpad::{
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
-    natural::{FlatBrush, FlatStroke},
+    natural::{FlatBrush, FlatStroke, PencilBrush, PencilStroke},
     palette::{RecentColors, MAX_RECENT_COLORS},
     persistence::PersistenceState,
     pipeline::{
@@ -168,6 +168,7 @@ enum PaintEngine {
     HardRound,
     LinearMixing,
     Flat,
+    Pencil,
 }
 
 impl PaintEngine {
@@ -176,6 +177,7 @@ impl PaintEngine {
             Self::HardRound => "Pen",
             Self::LinearMixing => "Mix",
             Self::Flat => "Flat",
+            Self::Pencil => "Pencil",
         }
     }
 }
@@ -184,6 +186,7 @@ enum ActiveStroke {
     HardRound(HardRoundStroke),
     LinearMixing(MixingStrokeV1),
     Flat(FlatStroke),
+    Pencil(PencilStroke),
 }
 
 impl ActiveStroke {
@@ -192,6 +195,7 @@ impl ActiveStroke {
             Self::HardRound(stroke) => stroke.gesture_id(),
             Self::LinearMixing(stroke) => stroke.gesture_id(),
             Self::Flat(stroke) => stroke.gesture_id(),
+            Self::Pencil(stroke) => stroke.gesture_id(),
         }
     }
 
@@ -204,6 +208,7 @@ impl ActiveStroke {
             Self::HardRound(stroke) => stroke.update(layer, sample).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.update(layer, sample).map_err(Into::into),
             Self::Flat(stroke) => stroke.update(layer, sample).map_err(Into::into),
+            Self::Pencil(stroke) => stroke.update(layer, sample).map_err(Into::into),
         }
     }
 
@@ -212,6 +217,7 @@ impl ActiveStroke {
             Self::HardRound(stroke) => stroke.finalize(layer).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.finalize(layer).map_err(Into::into),
             Self::Flat(stroke) => stroke.finalize(layer).map_err(Into::into),
+            Self::Pencil(stroke) => stroke.finalize(layer).map_err(Into::into),
         }
     }
 
@@ -232,6 +238,10 @@ impl ActiveStroke {
                 damage: stroke.finish(layer)?,
                 mixing: None,
             }),
+            Self::Pencil(stroke) => Ok(FinishedStroke {
+                damage: stroke.finish(layer)?,
+                mixing: None,
+            }),
         }
     }
 
@@ -240,6 +250,7 @@ impl ActiveStroke {
             Self::HardRound(stroke) => stroke.cancel(layer).map_err(Into::into),
             Self::LinearMixing(stroke) => stroke.cancel(layer).map_err(Into::into),
             Self::Flat(stroke) => stroke.cancel(layer).map_err(Into::into),
+            Self::Pencil(stroke) => stroke.cancel(layer).map_err(Into::into),
         }
     }
 }
@@ -561,6 +572,7 @@ impl App {
             (ToolKind::Pen, PaintEngine::LinearMixing) => UiTool::Mixing,
             (ToolKind::Pen, PaintEngine::HardRound) => UiTool::Pen,
             (ToolKind::Pen, PaintEngine::Flat) => UiTool::Flat,
+            (ToolKind::Pen, PaintEngine::Pencil) => UiTool::Pencil,
         };
         let brush = self.brush_for_tool(self.mouse_tool);
         let mut recent_colors = [[0.0; 3]; MAX_RECENT_COLORS];
@@ -734,6 +746,10 @@ impl App {
                 self.mouse_tool = ToolKind::Pen;
                 self.paint_engine = PaintEngine::Flat;
             }
+            UiTool::Pencil => {
+                self.mouse_tool = ToolKind::Pen;
+                self.paint_engine = PaintEngine::Pencil;
+            }
         }
         self.cursor_tool = self.mouse_tool;
         self.cursor_pressure = 0.0;
@@ -896,7 +912,9 @@ impl App {
         }
         self.paint_engine = match self.paint_engine {
             PaintEngine::HardRound => PaintEngine::LinearMixing,
-            PaintEngine::LinearMixing | PaintEngine::Flat => PaintEngine::HardRound,
+            PaintEngine::LinearMixing | PaintEngine::Flat | PaintEngine::Pencil => {
+                PaintEngine::HardRound
+            }
         };
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
@@ -1011,6 +1029,12 @@ impl App {
                 let flat = flat_brush_from_paint(brush);
                 FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
                     .map(ActiveStroke::Flat)
+                    .map_err(ActiveStrokeError::from)
+            }
+            (ToolKind::Pen, PaintEngine::Pencil) => {
+                let pencil = pencil_brush_from_paint(brush);
+                PencilStroke::begin(self.document.active_layer_mut(), pencil, sample)
+                    .map(ActiveStroke::Pencil)
                     .map_err(ActiveStrokeError::from)
             }
         };
@@ -3094,6 +3118,11 @@ fn mixing_brush_from_paint(paint: HardRoundBrush) -> MixingBrushV1 {
 fn flat_brush_from_paint(paint: HardRoundBrush) -> FlatBrush {
     FlatBrush::new(paint.color(), paint.diameter(), paint.opacity())
         .expect("validated hard-round values are valid flat-brush values")
+}
+
+fn pencil_brush_from_paint(paint: HardRoundBrush) -> PencilBrush {
+    PencilBrush::new(paint.color(), paint.diameter(), paint.opacity())
+        .expect("validated hard-round values are valid pencil-brush values")
 }
 
 fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {

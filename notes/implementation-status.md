@@ -29,10 +29,12 @@ prototype:
   active-layer editing, and an incremental premultiplied-linear composite;
 - hard-round source-over brush and an opt-in CPU linear-mixing control with
   stable pre-stroke active-layer pickup;
-- a tilt-oriented flat rectangular brush with anti-aliased contact, a tilt
-  dead zone, motion-direction mouse/upright fallback, and interpolated tilt;
-  the remaining graphite, palette-knife, and bristle design is tracked in
-  [natural-brushes.md](natural-brushes.md);
+- a tilt-oriented flat rectangular brush with anti-aliased contact, plus a
+  pressure/tilt graphite pencil whose deterministic multi-scale paper tooth is
+  fixed in canvas coordinates;
+- a shared tilt dead zone, motion-direction mouse/upright fallback, and
+  interpolated tilt for oriented natural brushes; the remaining palette-knife
+  and bristle design is tracked in [natural-brushes.md](natural-brushes.md);
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
 - normalized pressure, tilt, physical source ID, tool type, and source
