@@ -42,6 +42,8 @@ prototype:
 - a compact first toolbar for pen/eraser/mixing selection, brush diameter and
   opacity adjustment, a preset/recent-color popover, undo/redo, and interface
   hiding;
+- a collapsible custom layer panel for selection, per-row visibility, create,
+  duplicate, delete, ordering, and stepped active-layer opacity;
 - typed UI actions that invoke the same application command methods as
   keyboard controls rather than owning document state;
 - explicit mouse and direct-XInput tablet UI capture, with ownership fixed
@@ -128,6 +130,12 @@ Controls:
 - Page Up / Page Down: select the layer above/below;
 - Control/Command-Page Up / Page Down: move the active layer above/below;
 - F1: show or hide the interface;
+- UI `LAYERS`: show or hide the layer panel;
+- layer-panel row: select that layer;
+- layer-panel visibility mark: show or hide that row's layer;
+- layer-panel `+` / `COPY` / `DEL`: create, duplicate, or delete;
+- layer-panel `UP` / `DOWN`: reorder the active layer;
+- layer-panel opacity `-` / `+`: change active-layer opacity by ten percent;
 - Escape while drawing: cancel the active stroke;
 - Escape while idle: exit.
 
@@ -227,6 +235,7 @@ The current test suite covers:
 - redraw/raw-axis UI invalidation filtering;
 - UI-origin tablet capture through release, canvas-origin ownership exclusion,
   and hover-boundary forwarding.
+- disjoint toolbar/color/layer hit-region ownership, including uncaptured gaps.
 
 ### CPU brush replay
 

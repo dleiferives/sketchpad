@@ -2,6 +2,7 @@ use egui::{
     Align, Align2, Color32, FontId, Id, Key, Layout, Order, Pos2, Rect, Sense, Stroke, StrokeKind,
     TextureId, Vec2, WidgetInfo, WidgetType,
 };
+use sketchpad::document::LayerId;
 use sketchpad::input::{TabletPhase, TabletSample};
 use sketchpad::palette::MAX_RECENT_COLORS;
 use std::{
@@ -17,6 +18,8 @@ const TOOL_BUTTON_WIDTH: f32 = 44.0;
 const SLIDER_WIDTH: f32 = 152.0;
 const COLOR_BUTTON_SIZE: f32 = 32.0;
 const COLOR_PRESET_COUNT: usize = 6;
+const LAYER_PANEL_WIDTH: f32 = 292.0;
+const LAYER_NAME_WIDTH: f32 = 170.0;
 const TOOLBAR_RADIUS: u8 = 14;
 const CONTROL_RADIUS: u8 = 9;
 
@@ -45,6 +48,17 @@ pub struct UiSnapshot {
     pub color_presets: [[f32; 3]; COLOR_PRESET_COUNT],
     pub recent_colors: [[f32; 3]; MAX_RECENT_COLORS],
     pub recent_color_count: usize,
+    pub active_layer: LayerId,
+    pub undo_available: bool,
+    pub redo_available: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct UiLayerSnapshot<'a> {
+    pub id: LayerId,
+    pub name: &'a str,
+    pub visible: bool,
+    pub opacity: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -54,6 +68,13 @@ pub enum UiAction {
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
     SelectColor([f32; 3]),
+    SelectLayer(LayerId),
+    ToggleLayerVisibility(LayerId),
+    AdjustLayerOpacity { layer: LayerId, delta: f32 },
+    CreateLayer,
+    DuplicateActiveLayer,
+    DeleteActiveLayer,
+    MoveActiveLayer(isize),
     Undo,
     Redo,
 }
@@ -155,6 +176,7 @@ impl TabletCapture {
 struct UiHitRegions {
     toolbar: Rect,
     color_panel: Rect,
+    layers_panel: Rect,
 }
 
 impl Default for UiHitRegions {
@@ -162,13 +184,16 @@ impl Default for UiHitRegions {
         Self {
             toolbar: Rect::NOTHING,
             color_panel: Rect::NOTHING,
+            layers_panel: Rect::NOTHING,
         }
     }
 }
 
 impl UiHitRegions {
     fn contains(self, position: Pos2) -> bool {
-        self.toolbar.contains(position) || self.color_panel.contains(position)
+        self.toolbar.contains(position)
+            || self.color_panel.contains(position)
+            || self.layers_panel.contains(position)
     }
 }
 
@@ -185,6 +210,7 @@ pub struct UiOverlay {
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
     color_panel_open: bool,
+    layers_panel_open: bool,
     modifiers: ModifiersState,
     cpu_dirty: bool,
     gpu_dirty: bool,
@@ -219,6 +245,7 @@ impl UiOverlay {
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
             color_panel_open: false,
+            layers_panel_open: true,
             modifiers: ModifiersState::empty(),
             cpu_dirty: true,
             gpu_dirty: false,
@@ -312,7 +339,12 @@ impl UiOverlay {
         }
     }
 
-    pub fn prepare(&mut self, window: &Window, snapshot: UiSnapshot) -> Vec<UiAction> {
+    pub fn prepare<'a>(
+        &mut self,
+        window: &Window,
+        snapshot: UiSnapshot,
+        layer_snapshot: impl FnOnce() -> Vec<UiLayerSnapshot<'a>>,
+    ) -> Vec<UiAction> {
         if self.last_snapshot != Some(snapshot) {
             self.cpu_dirty = true;
         }
@@ -327,9 +359,18 @@ impl UiOverlay {
         let mut actions = Vec::new();
         let mut hit_regions = UiHitRegions::default();
         let mut color_panel_open = self.color_panel_open;
+        let mut layers_panel_open = self.layers_panel_open;
+        let layers = layer_snapshot();
         let output = context.run_ui(input, |root| {
             if snapshot.visible {
-                hit_regions = show_toolbar(root, snapshot, &mut actions, &mut color_panel_open);
+                hit_regions = show_toolbar(
+                    root,
+                    snapshot,
+                    &layers,
+                    &mut actions,
+                    &mut color_panel_open,
+                    &mut layers_panel_open,
+                );
             }
         });
         let repaint_delay = output
@@ -342,7 +383,8 @@ impl UiOverlay {
         self.textures_to_set.extend(output.textures_delta.set);
         self.textures_to_free.extend(output.textures_delta.free);
         self.hit_regions = hit_regions;
-        self.color_panel_open = color_panel_open && snapshot.visible;
+        self.color_panel_open = color_panel_open;
+        self.layers_panel_open = layers_panel_open;
         self.last_snapshot = Some(snapshot);
         self.cpu_dirty = false;
         self.gpu_dirty = true;
@@ -541,8 +583,10 @@ fn to_egui_modifiers(modifiers: ModifiersState) -> egui::Modifiers {
 fn show_toolbar(
     root: &mut egui::Ui,
     snapshot: UiSnapshot,
+    layers: &[UiLayerSnapshot<'_>],
     actions: &mut Vec<UiAction>,
     color_panel_open: &mut bool,
+    layers_panel_open: &mut bool,
 ) -> UiHitRegions {
     let area = egui::Area::new(Id::new("sketchpad-tool-strip"))
         .fixed_pos(TOOLBAR_POSITION)
@@ -558,12 +602,16 @@ fn show_toolbar(
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        if icon_button(ui, "↶", "Undo", false).clicked() {
-                            actions.push(UiAction::Undo);
-                        }
-                        if icon_button(ui, "↷", "Redo", false).clicked() {
-                            actions.push(UiAction::Redo);
-                        }
+                        ui.add_enabled_ui(snapshot.undo_available, |ui| {
+                            if history_button(ui, false).clicked() {
+                                actions.push(UiAction::Undo);
+                            }
+                        });
+                        ui.add_enabled_ui(snapshot.redo_available, |ui| {
+                            if history_button(ui, true).clicked() {
+                                actions.push(UiAction::Redo);
+                            }
+                        });
                         separator(ui);
                         if text_button(ui, "PEN", snapshot.tool == UiTool::Pen).clicked() {
                             actions.push(UiAction::SelectTool(UiTool::Pen));
@@ -608,6 +656,9 @@ fn show_toolbar(
                             *color_panel_open = !*color_panel_open;
                         }
                         separator(ui);
+                        if text_button(ui, "LAYERS", *layers_panel_open).clicked() {
+                            *layers_panel_open = !*layers_panel_open;
+                        }
                         if icon_button(ui, "×", "Hide interface (F1)", false).clicked() {
                             actions.push(UiAction::SetVisible(false));
                         }
@@ -619,9 +670,15 @@ fn show_toolbar(
     } else {
         Rect::NOTHING
     };
+    let layers_panel = if *layers_panel_open {
+        show_layers_panel(root, snapshot, layers, actions, layers_panel_open)
+    } else {
+        Rect::NOTHING
+    };
     UiHitRegions {
         toolbar: area.response.rect,
         color_panel,
+        layers_panel,
     }
 }
 
@@ -670,12 +727,220 @@ fn show_color_panel(
     area.response.rect
 }
 
+fn show_layers_panel(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    layers: &[UiLayerSnapshot<'_>],
+    actions: &mut Vec<UiAction>,
+    layers_panel_open: &mut bool,
+) -> Rect {
+    let area = egui::Area::new(Id::new("sketchpad-layers-panel"))
+        .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, 16.0))
+        .order(Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(TOOLBAR_RADIUS)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(LAYER_PANEL_WIDTH);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "LAYERS");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, "×", "Close layers", false).clicked() {
+                                *layers_panel_open = false;
+                            }
+                            ui.add_enabled_ui(layers.len() > 1, |ui| {
+                                if compact_text_button(ui, "DEL", "Delete active layer").clicked() {
+                                    actions.push(UiAction::DeleteActiveLayer);
+                                }
+                            });
+                            if compact_text_button(ui, "COPY", "Duplicate active layer").clicked() {
+                                actions.push(UiAction::DuplicateActiveLayer);
+                            }
+                            if icon_button(ui, "+", "Create layer", false).clicked() {
+                                actions.push(UiAction::CreateLayer);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        if compact_text_button(ui, "UP", "Move active layer up").clicked() {
+                            actions.push(UiAction::MoveActiveLayer(1));
+                        }
+                        if compact_text_button(ui, "DOWN", "Move active layer down").clicked() {
+                            actions.push(UiAction::MoveActiveLayer(-1));
+                        }
+                    });
+                    separator_horizontal(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("sketchpad-layer-list")
+                        .max_height(360.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            for layer in layers.iter().rev() {
+                                show_layer_row(ui, *layer, snapshot.active_layer, actions);
+                            }
+                        });
+                    separator_horizontal(ui);
+                    if let Some(active) = layers
+                        .iter()
+                        .find(|layer| layer.id == snapshot.active_layer)
+                    {
+                        ui.horizontal(|ui| {
+                            palette_label(ui, "OPACITY");
+                            if icon_button(ui, "−", "Decrease layer opacity", false).clicked() {
+                                actions.push(UiAction::AdjustLayerOpacity {
+                                    layer: active.id,
+                                    delta: -0.1,
+                                });
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("{:.0}%", active.opacity * 100.0))
+                                    .font(FontId::monospace(12.0))
+                                    .color(TEXT),
+                            );
+                            if icon_button(ui, "+", "Increase layer opacity", false).clicked() {
+                                actions.push(UiAction::AdjustLayerOpacity {
+                                    layer: active.id,
+                                    delta: 0.1,
+                                });
+                            }
+                        });
+                    }
+                });
+        });
+    area.response.rect
+}
+
+fn show_layer_row(
+    ui: &mut egui::Ui,
+    layer: UiLayerSnapshot<'_>,
+    active_layer: LayerId,
+    actions: &mut Vec<UiAction>,
+) {
+    ui.horizontal(|ui| {
+        let visibility_label = if layer.visible {
+            "Hide layer"
+        } else {
+            "Show layer"
+        };
+        if visibility_button(ui, layer.visible, visibility_label).clicked() {
+            actions.push(UiAction::ToggleLayerVisibility(layer.id));
+        }
+        if layer_button(ui, layer.name, layer.id == active_layer).clicked() {
+            actions.push(UiAction::SelectLayer(layer.id));
+        }
+        ui.label(
+            egui::RichText::new(format!("{:.0}%", layer.opacity * 100.0))
+                .font(FontId::monospace(11.0))
+                .color(TEXT_MUTED),
+        );
+    });
+}
+
+fn layer_button(ui: &mut egui::Ui, name: &str, selected: bool) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(LAYER_NAME_WIDTH, CONTROL_HEIGHT),
+        selected,
+        name,
+        |ui, rect, color| {
+            ui.painter().with_clip_rect(rect.shrink(4.0)).text(
+                Pos2::new(rect.left() + 10.0, rect.center().y),
+                Align2::LEFT_CENTER,
+                name,
+                FontId::proportional(13.0),
+                color,
+            );
+        },
+    )
+}
+
+fn visibility_button(ui: &mut egui::Ui, visible: bool, description: &str) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::splat(CONTROL_HEIGHT),
+        false,
+        description,
+        |ui, rect, color| {
+            let center = rect.center();
+            ui.painter()
+                .circle_stroke(center, 7.0, Stroke::new(1.5, color));
+            if visible {
+                ui.painter().circle_filled(center, 3.0, color);
+            } else {
+                ui.painter().line_segment(
+                    [
+                        Pos2::new(center.x - 6.0, center.y + 6.0),
+                        Pos2::new(center.x + 6.0, center.y - 6.0),
+                    ],
+                    Stroke::new(1.5, color),
+                );
+            }
+        },
+    )
+    .on_hover_text(description)
+}
+
+fn history_button(ui: &mut egui::Ui, redo: bool) -> egui::Response {
+    let description = if redo { "Redo" } else { "Undo" };
+    custom_button(
+        ui,
+        Vec2::splat(CONTROL_HEIGHT),
+        false,
+        description,
+        |ui, rect, color| {
+            let center = rect.center();
+            let direction = if redo { 1.0 } else { -1.0 };
+            let points = [
+                Pos2::new(center.x - 7.0 * direction, center.y - 5.0),
+                Pos2::new(center.x + 2.0 * direction, center.y - 5.0),
+                Pos2::new(center.x + 7.0 * direction, center.y),
+                Pos2::new(center.x + 2.0 * direction, center.y + 5.0),
+            ];
+            for segment in points.windows(2) {
+                ui.painter()
+                    .line_segment([segment[0], segment[1]], Stroke::new(1.8, color));
+            }
+        },
+    )
+    .on_hover_text(description)
+}
+
+fn compact_text_button(ui: &mut egui::Ui, text: &str, description: &str) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(44.0, CONTROL_HEIGHT),
+        false,
+        description,
+        |ui, rect, color| {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::monospace(10.0),
+                color,
+            );
+        },
+    )
+    .on_hover_text(description)
+}
+
 fn palette_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
             .font(FontId::monospace(11.0))
             .color(TEXT_MUTED),
     );
+}
+
+fn separator_horizontal(ui: &mut egui::Ui) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 1.0), Sense::hover());
+    ui.painter().rect_filled(rect, 0, BORDER);
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: &str, description: &str, selected: bool) -> egui::Response {
@@ -698,9 +963,10 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, description: &str, selected: bool)
 }
 
 fn text_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
+    let width = TOOL_BUTTON_WIDTH.max(text.chars().count() as f32 * 7.0 + 16.0);
     custom_button(
         ui,
-        Vec2::new(TOOL_BUTTON_WIDTH, CONTROL_HEIGHT),
+        Vec2::new(width, CONTROL_HEIGHT),
         selected,
         text,
         |ui, rect, color| {
@@ -908,11 +1174,14 @@ mod tests {
         let regions = UiHitRegions {
             toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
             color_panel: Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(30.0, 30.0)),
+            layers_panel: Rect::from_min_max(Pos2::new(40.0, 40.0), Pos2::new(50.0, 50.0)),
         };
 
         assert!(regions.contains(Pos2::new(5.0, 5.0)));
         assert!(regions.contains(Pos2::new(25.0, 25.0)));
+        assert!(regions.contains(Pos2::new(45.0, 45.0)));
         assert!(!regions.contains(Pos2::new(15.0, 15.0)));
+        assert!(!regions.contains(Pos2::new(35.0, 35.0)));
     }
 
     #[test]

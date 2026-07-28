@@ -1,7 +1,7 @@
 # Immediate-Mode UI Overlay Architecture
 
-Status: architecture accepted and first integration slice in progress,
-2026-07-28.
+Status: architecture accepted, cached overlay and first functional controls
+implemented, 2026-07-28.
 
 The dependency compatibility gate has passed on Apollo. Sketchpad pins egui,
 `egui-winit`, and `egui-wgpu` to revision
@@ -589,6 +589,68 @@ Apollo. Cold font/device startup was much larger. These debug smoke numbers
 are diagnostic scale indicators, not release benchmarks or adoption results.
 The remaining gate still requires release-mode distributions, GPU timestamps
 where supported, memory/geometry counts, and a physical pen comparison.
+
+### First layer panel, 2026-07-28
+
+The next product slice projects only layer metadata into the UI:
+
+- stable `LayerId`;
+- borrowed name;
+- visibility;
+- opacity;
+- active-layer ID and undo/redo availability.
+
+The projection is created by a closure that `UiOverlay::prepare` invokes only
+after its dirty check. Canvas-only frames therefore do not allocate a layer
+vector, clone names, walk layers, or rebuild panel geometry. Raster data is
+never exposed to the UI.
+
+The first panel dispatches typed actions for layer selection, per-row
+visibility, create, duplicate, delete, up/down ordering, and active-layer
+opacity. Application methods validate the target ID and call the existing
+`Document` commands; the panel has no second layer model and produces the same
+undo/recovery behavior as keyboard commands. Undo and redo controls now reflect
+real document history availability.
+
+Layer opacity is intentionally a pair of ten-percent step controls in this
+slice. Each click is one document edit and one undo entry. A continuous slider
+requires an explicit preview/commit or history-coalescing contract; sending
+one ordinary `set_layer_opacity` command per drag sample would create dozens
+of undo entries and repeated full affected-layer recompositions. Do not add
+that slider until this transaction boundary exists.
+
+Toolbar, color-popover, and layer-panel hit rectangles remain disjoint. A
+regression test proves that points in the gaps do not become UI-owned merely
+because they lie inside the panels' combined bounding box.
+
+The Apollo debug action smoke exercised:
+
+1. layer creation;
+2. active-layer opacity change;
+3. per-row visibility;
+4. undo of all three operations;
+5. redo;
+6. row selection;
+7. duplication;
+8. ordering;
+9. deletion.
+
+Panel state, active selection, row order, opacity/visibility, undo/redo
+availability, and the title all followed the underlying document. The first
+run found that recording mode returned from `mark_document_dirty` before
+refreshing the title; the document and panel were correct but the title stayed
+on the removed layer after undo. The non-persistent path now refreshes the
+title before returning, and the repeated three-undo run ended consistently on
+`Layer 1 (1/1)`.
+
+A held-contact canvas smoke with two layer rows and the panel visible reported
+six input samples, one canvas frame, zero routed UI events, zero UI
+declaration/tessellation calls with one cache hit, zero UI buffer preparations
+with one cache hit, zero texture updates, and `30.6 µs` of retained overlay
+draw encoding. Mouse-up intentionally caused one dirty UI pass because the
+committed stroke changed undo availability. This preserves the high-rate
+contact path while keeping history controls correct at transaction commit.
+These remain debug diagnostics, not release performance claims.
 
 ## Custom Fallback
 

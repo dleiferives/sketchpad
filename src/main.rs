@@ -1,12 +1,12 @@
 mod app_ui;
 mod latency_probe;
 
-use app_ui::{UiAction, UiOverlay, UiSnapshot, UiTool};
+use app_ui::{UiAction, UiLayerSnapshot, UiOverlay, UiSnapshot, UiTool};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
     checkpoint::{self, CheckpointError},
-    document::Document,
+    document::{Document, LayerId},
     image_io::{self, ExportRegion},
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
@@ -536,6 +536,9 @@ impl App {
             color_presets: COLOR_PRESETS,
             recent_colors,
             recent_color_count,
+            active_layer: self.document.active_layer_id(),
+            undo_available: self.document.undo_depth() > 0,
+            redo_available: self.document.redo_depth() > 0,
         }
     }
 
@@ -552,6 +555,15 @@ impl App {
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
             UiAction::SelectColor(color) => self.set_paint_color(color, true),
+            UiAction::SelectLayer(layer) => self.select_layer(layer),
+            UiAction::ToggleLayerVisibility(layer) => self.toggle_layer_visibility(layer),
+            UiAction::AdjustLayerOpacity { layer, delta } => {
+                self.adjust_layer_opacity(layer, delta)
+            }
+            UiAction::CreateLayer => self.create_layer(),
+            UiAction::DuplicateActiveLayer => self.duplicate_active_layer(),
+            UiAction::DeleteActiveLayer => self.delete_active_layer(),
+            UiAction::MoveActiveLayer(offset) => self.move_active_layer(offset),
             UiAction::Undo => self.undo(),
             UiAction::Redo => self.redo(),
         }
@@ -1042,21 +1054,63 @@ impl App {
     }
 
     fn toggle_active_layer_visibility(&mut self) {
+        let layer = self.document.active_layer_id();
+        self.toggle_layer_visibility(layer);
+    }
+
+    fn toggle_layer_visibility(&mut self, layer: LayerId) {
         if self.active_stroke.is_some() {
             return;
         }
-        let layer = self.document.active_layer_id();
-        let visible = self
-            .document
-            .layer(layer)
-            .expect("the active layer belongs to the document")
-            .visible();
+        let visible = self.document.layer(layer).map(|layer| layer.visible());
+        let Some(visible) = visible else {
+            log::warn!(
+                "could not change visibility of missing layer {}",
+                layer.get()
+            );
+            return;
+        };
         match self.document.set_layer_visibility(layer, !visible) {
             Ok(damage) => {
                 self.sync_composite_damage(&damage);
                 self.mark_document_dirty();
             }
             Err(error) => log::error!("could not change layer visibility: {error}"),
+        }
+    }
+
+    fn adjust_layer_opacity(&mut self, layer: LayerId, delta: f32) {
+        if self.active_stroke.is_some() || !delta.is_finite() {
+            return;
+        }
+        let opacity = self.document.layer(layer).map(|layer| layer.opacity());
+        let Some(opacity) = opacity else {
+            log::warn!("could not change opacity of missing layer {}", layer.get());
+            return;
+        };
+        let adjusted = (opacity + delta).clamp(0.0, 1.0);
+        if adjusted == opacity {
+            return;
+        }
+        match self.document.set_layer_opacity(layer, adjusted) {
+            Ok(damage) => {
+                self.sync_composite_damage(&damage);
+                self.mark_document_dirty();
+            }
+            Err(error) => log::error!("could not change layer opacity: {error}"),
+        }
+    }
+
+    fn select_layer(&mut self, layer: LayerId) {
+        if self.active_stroke.is_some() || layer == self.document.active_layer_id() {
+            return;
+        }
+        match self.document.set_active_layer(layer) {
+            Ok(()) => {
+                self.invalidate_ui();
+                self.update_window_title(None);
+            }
+            Err(error) => log::warn!("could not select layer: {error}"),
         }
     }
 
@@ -1069,12 +1123,7 @@ impl App {
             .saturating_add_signed(offset)
             .min(self.document.layers().len() - 1);
         let layer = self.document.layers()[destination].id();
-        if layer != self.document.active_layer_id() {
-            self.document
-                .set_active_layer(layer)
-                .expect("the selected layer belongs to the document");
-            self.update_window_title(None);
-        }
+        self.select_layer(layer);
     }
 
     fn move_active_layer(&mut self, offset: isize) {
@@ -1099,13 +1148,22 @@ impl App {
     }
 
     fn mark_document_dirty(&mut self) {
+        self.invalidate_ui();
         if !self.persistence_enabled {
+            self.update_window_title(None);
             return;
         }
         self.recovery_revision = self.recovery_revision.wrapping_add(1);
         self.persistence.document_changed();
         self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
         self.update_window_title(None);
+    }
+
+    fn invalidate_ui(&mut self) {
+        if let Some(ui) = &mut self.ui {
+            ui.mark_dirty();
+        }
+        self.request_redraw();
     }
 
     fn start_recovery_checkpoint(&mut self) -> bool {
@@ -1412,7 +1470,7 @@ impl App {
                     path
                 );
                 self.update_window_title(None);
-                self.request_redraw();
+                self.invalidate_ui();
             }
             Ok(_) => log::error!(
                 "document geometry is incompatible with the running canvas: {:?}",
@@ -1807,8 +1865,20 @@ impl App {
             return;
         }
         let snapshot = self.ui_snapshot();
+        let document = &self.document;
         let actions = match (&self.window, &mut self.ui) {
-            (Some(window), Some(ui)) => ui.prepare(window, snapshot),
+            (Some(window), Some(ui)) => ui.prepare(window, snapshot, || {
+                document
+                    .layers()
+                    .iter()
+                    .map(|layer| UiLayerSnapshot {
+                        id: layer.id(),
+                        name: layer.name(),
+                        visible: layer.visible(),
+                        opacity: layer.opacity(),
+                    })
+                    .collect()
+            }),
             _ => Vec::new(),
         };
         for action in actions {
