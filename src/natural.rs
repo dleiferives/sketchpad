@@ -1023,10 +1023,25 @@ impl OrientedBoxFootprint {
 
     fn coverage(self, pixel_x: u32, pixel_y: u32) -> f32 {
         let local = self.local_coordinates(pixel_x, pixel_y);
+        self.coverage_at_local(local)
+    }
+
+    fn coverage_at_local(self, local: [f32; 2]) -> f32 {
         let q = [
             local[0].abs() - self.half_extents[0],
             local[1].abs() - self.half_extents[1],
         ];
+
+        // The signed-distance form below is only necessary in the one-pixel
+        // antialiasing fringe. Avoid its square root for the solid interior and
+        // for the large empty corners of an oriented box's axis-aligned bounds.
+        if q[0] >= 0.5 || q[1] >= 0.5 {
+            return 0.0;
+        }
+        if q[0] <= 0.0 && q[1] <= 0.0 {
+            return (0.5 - q[0].max(q[1])).min(1.0);
+        }
+
         let outside = (q[0].max(0.0) * q[0].max(0.0) + q[1].max(0.0) * q[1].max(0.0)).sqrt();
         let inside = q[0].max(q[1]).min(0.0);
         (0.5 - (outside + inside)).clamp(0.0, 1.0)
@@ -1096,17 +1111,17 @@ impl<const LANE_COUNT: usize> LaneDabKernel<LANE_COUNT> {
             let row_start = local_y as usize * stride;
             for local_x in self.local_damage.min_x()..self.local_damage.max_x() {
                 let world_x = self.tile_origin[0] + local_x;
-                let coverage = self.footprint.coverage(world_x, world_y);
+                let local = self.footprint.local_coordinates(world_x, world_y);
+                let coverage = self.footprint.coverage_at_local(local);
                 if coverage == 0.0 {
                     continue;
                 }
-                let local = self.footprint.local_coordinates(world_x, world_y);
                 let lane_position =
                     (local[0] / self.footprint.half_extents[0] * 0.5 + 0.5 + self.lane_offset)
                         .clamp(0.0, 0.999_999);
                 let lane_coordinate = lane_position * LANE_COUNT as f32;
                 let lane_index = lane_coordinate as usize;
-                let distance_from_center = (lane_coordinate.fract() - 0.5).abs() * 2.0;
+                let distance_from_center = (lane_coordinate - lane_index as f32 - 0.5).abs() * 2.0;
                 let strand_coverage = ((self.contact_fraction - distance_from_center)
                     * self.footprint.half_extents[0]
                     / LANE_COUNT as f32
@@ -1375,6 +1390,31 @@ mod tests {
         assert_eq!(contact_direction_from_tilt([0.8, 0.0]), Some([0.0, -1.0]));
         assert_eq!(contact_direction_from_tilt([0.0, 0.8]), Some([1.0, -0.0]));
         assert_eq!(contact_direction_from_tilt([0.01, 0.01]), None);
+    }
+
+    #[test]
+    fn oriented_box_fast_paths_match_the_signed_distance_reference() {
+        let footprint =
+            OrientedBoxFootprint::new(256, 256, [128.0, 128.0], [0.8, 0.6], [29.0, 7.0]).unwrap();
+        for y in -200..=200 {
+            for x in -200..=200 {
+                let local = [x as f32 * 0.17, y as f32 * 0.17];
+                let q = [
+                    local[0].abs() - footprint.half_extents[0],
+                    local[1].abs() - footprint.half_extents[1],
+                ];
+                let outside =
+                    (q[0].max(0.0) * q[0].max(0.0) + q[1].max(0.0) * q[1].max(0.0)).sqrt();
+                let inside = q[0].max(q[1]).min(0.0);
+                let reference = (0.5 - (outside + inside)).clamp(0.0, 1.0);
+                let optimized = footprint.coverage_at_local(local);
+                assert_eq!(
+                    optimized.to_bits(),
+                    reference.to_bits(),
+                    "coverage differs at {local:?}: optimized={optimized} reference={reference}",
+                );
+            }
+        }
     }
 
     #[test]

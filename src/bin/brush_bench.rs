@@ -38,7 +38,7 @@ impl InitialState {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrushKind {
     HardRound,
     Eraser,
@@ -49,6 +49,18 @@ enum BrushKind {
 }
 
 impl BrushKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value {
+            "hard-round" => Ok(Self::HardRound),
+            "eraser" => Ok(Self::Eraser),
+            "flat" => Ok(Self::Flat),
+            "pencil" => Ok(Self::Pencil),
+            "palette-knife" => Ok(Self::PaletteKnife),
+            "bristle" => Ok(Self::Bristle),
+            _ => Err(format!("unknown --brush value: {value}")),
+        }
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::HardRound => "hard-round",
@@ -80,22 +92,25 @@ struct RunResult {
 }
 
 fn main() {
-    let runs = parse_runs().unwrap_or_else(|message| {
+    let arguments = parse_arguments().unwrap_or_else(|message| {
         eprintln!("{message}");
         process::exit(2);
     });
     println!(
         "brush_family_replay version=2 canvas={}x{} input_samples={} runs={} warmups={}",
-        CANVAS_SIZE, CANVAS_SIZE, INPUT_SAMPLES, runs, WARMUP_RUNS
+        CANVAS_SIZE, CANVAS_SIZE, INPUT_SAMPLES, arguments.runs, arguments.warmup_runs
     );
 
-    for tile_size in [128, 256] {
-        for (brush, initial_state) in CASES {
-            for _ in 0..WARMUP_RUNS {
+    for tile_size in arguments.tile_sizes {
+        for (brush, initial_state) in CASES
+            .into_iter()
+            .filter(|(brush, _)| arguments.brush.is_none_or(|selected| selected == *brush))
+        {
+            for _ in 0..arguments.warmup_runs {
                 black_box(run_once(tile_size, brush, initial_state).unwrap());
             }
-            let mut results = Vec::with_capacity(runs);
-            for _ in 0..runs {
+            let mut results = Vec::with_capacity(arguments.runs);
+            for _ in 0..arguments.runs {
                 results.push(run_once(tile_size, brush, initial_state).unwrap());
             }
             print_results(tile_size, brush, initial_state, &results);
@@ -103,9 +118,19 @@ fn main() {
     }
 }
 
-fn parse_runs() -> Result<usize, String> {
+struct Arguments {
+    runs: usize,
+    warmup_runs: usize,
+    brush: Option<BrushKind>,
+    tile_sizes: Vec<u32>,
+}
+
+fn parse_arguments() -> Result<Arguments, String> {
     let mut args = env::args().skip(1);
     let mut runs = DEFAULT_RUNS;
+    let mut warmup_runs = WARMUP_RUNS;
+    let mut brush = None;
+    let mut tile_sizes = vec![128, 256];
     while let Some(argument) = args.next() {
         match argument.as_str() {
             "--runs" => {
@@ -119,14 +144,49 @@ fn parse_runs() -> Result<usize, String> {
                     return Err("--runs must be greater than zero".to_owned());
                 }
             }
+            "--warmups" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--warmups requires a non-negative integer".to_owned())?;
+                warmup_runs = value
+                    .parse()
+                    .map_err(|_| format!("invalid --warmups value: {value}"))?;
+            }
+            "--brush" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--brush requires a brush name".to_owned())?;
+                brush = Some(BrushKind::parse(&value)?);
+            }
+            "--tile-size" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--tile-size requires 128 or 256".to_owned())?;
+                let tile_size = value
+                    .parse()
+                    .map_err(|_| format!("invalid --tile-size value: {value}"))?;
+                if !matches!(tile_size, 128 | 256) {
+                    return Err(format!("unsupported --tile-size value: {value}"));
+                }
+                tile_sizes = vec![tile_size];
+            }
             "-h" | "--help" => {
-                println!("usage: brush_bench [--runs N]");
+                println!(
+                    "usage: brush_bench [--runs N] [--warmups N] \
+                     [--brush hard-round|eraser|flat|pencil|palette-knife|bristle] \
+                     [--tile-size 128|256]"
+                );
                 process::exit(0);
             }
             _ => return Err(format!("unknown argument: {argument}")),
         }
     }
-    Ok(runs)
+    Ok(Arguments {
+        runs,
+        warmup_runs,
+        brush,
+        tile_sizes,
+    })
 }
 
 fn run_once(

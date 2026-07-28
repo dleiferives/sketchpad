@@ -394,3 +394,63 @@ Likely corrective architecture, pending the split evidence:
 4. Coalesce final per-tile damage before upload preparation.
 5. Measure checkpoint-worker contention separately and move recovery toward
    incremental/delta storage rather than weakening durability.
+
+### Stage split and bristle CPU profile
+
+The stage probe isolated one light stroke and one sustained heavy natural-brush
+stroke. The light stroke remained healthy:
+
+```text
+input_us mean/p95/max = 283/1066/2229
+mutation_us mean/p95/max = 79/329/843
+recompose_us mean/p95/max = 62/313/1133
+```
+
+The sustained heavy stroke produced:
+
+```text
+input_us mean/p95/max = 5620/11375/25236
+mutation_us mean/p95/max = 4302/9152/22945
+damage_drain_us mean/p95/max = 0/1/2
+recompose_us mean/p95/max = 1318/2746/7023
+damage_schedule_us mean/p95/max = 6/12/60
+backend_queue_us contact mean/p95/max = 66615/197300/211213
+samples_per_submit mean/p95/max = 13/140/140
+```
+
+Brush mutation is the primary event-loop cost. Per-packet layer recomposition
+is material but secondary. Damage draining and GPU scheduling are not useful
+optimization targets. Moving recomposition to a bounded presentation boundary
+should remove roughly one quarter of the current handler cost and eliminate
+many intermediate damage/upload regions, but it cannot repair the brush kernel
+by itself.
+
+The deterministic brush harness can now select one brush, tile size, run count,
+and warmup count. Linux `perf` on Apollo attributed 77.1% of all sampled cycles
+in an isolated bristle replay to `LaneDabKernel<24>::run`. Pickup sampling used
+1.8%; tile edit bookkeeping and damage insertion were each below 1%. The
+machine retired 26.35 billion instructions at 1.26 instructions/cycle over 50
+profiled runs, while last-level-cache misses were about 1% of LLC loads. The
+first-order problem is scalar work and dependency chains in the conservative
+per-pixel loop, not DRAM capacity misses.
+
+Disassembly exposed two avoidable inner-loop operations:
+
+- the oriented-box signed-distance expression performed a square root for
+  solid interior pixels and for obviously empty AABB corner pixels;
+- `f32::fract()` became an out-of-line `truncf` call for every covered pixel.
+
+The kernel now uses exact solid-interior/empty-exterior coverage fast paths and
+derives the fractional lane coordinate from the already bounded integer lane
+index. It does not change dab spacing, bristle count, pickup, deposition,
+blending, or the antialiasing fringe. A dense reference test compares the
+coverage fast paths with the original signed-distance expression. The
+deterministic replay checksum remained `85403.150316`.
+
+On the same Apollo 128-pixel-tile case, 20-run median bristle time fell from
+116.123 ms to 85.517 ms, a 26.4% reduction. A second sampled run fell from
+20.93 to 14.76 billion cycles and from 26.35 to 19.67 billion instructions;
+`truncf` disappeared from the profile. The lane kernel still owns 73.2% of
+remaining cycles, so this is a useful first reduction rather than completion.
+The next live trace must determine how much of the deterministic gain survives
+large-document recomposition and recovery-worker contention.
