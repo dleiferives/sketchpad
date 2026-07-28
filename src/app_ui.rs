@@ -3,6 +3,7 @@ use egui::{
     TextureId, Vec2, WidgetInfo, WidgetType,
 };
 use sketchpad::input::{TabletPhase, TabletSample};
+use sketchpad::palette::MAX_RECENT_COLORS;
 use std::{
     mem,
     time::{Duration, Instant},
@@ -10,9 +11,12 @@ use std::{
 use winit::{event::WindowEvent, keyboard::ModifiersState, window::Window};
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
+const COLOR_PANEL_POSITION: Pos2 = Pos2::new(564.0, 82.0);
 const CONTROL_HEIGHT: f32 = 36.0;
 const TOOL_BUTTON_WIDTH: f32 = 44.0;
 const SLIDER_WIDTH: f32 = 152.0;
+const COLOR_BUTTON_SIZE: f32 = 32.0;
+const COLOR_PRESET_COUNT: usize = 6;
 const TOOLBAR_RADIUS: u8 = 14;
 const CONTROL_RADIUS: u8 = 9;
 
@@ -38,6 +42,9 @@ pub struct UiSnapshot {
     pub brush_diameter: f32,
     pub brush_opacity: f32,
     pub color: [f32; 3],
+    pub color_presets: [[f32; 3]; COLOR_PRESET_COUNT],
+    pub recent_colors: [[f32; 3]; MAX_RECENT_COLORS],
+    pub recent_color_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,6 +53,7 @@ pub enum UiAction {
     SelectTool(UiTool),
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
+    SelectColor([f32; 3]),
     Undo,
     Redo,
 }
@@ -143,6 +151,27 @@ impl TabletCapture {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct UiHitRegions {
+    toolbar: Rect,
+    color_panel: Rect,
+}
+
+impl Default for UiHitRegions {
+    fn default() -> Self {
+        Self {
+            toolbar: Rect::NOTHING,
+            color_panel: Rect::NOTHING,
+        }
+    }
+}
+
+impl UiHitRegions {
+    fn contains(self, position: Pos2) -> bool {
+        self.toolbar.contains(position) || self.color_panel.contains(position)
+    }
+}
+
 pub struct UiOverlay {
     context: egui::Context,
     platform: egui_winit::State,
@@ -150,11 +179,12 @@ pub struct UiOverlay {
     paint_jobs: Vec<egui::ClippedPrimitive>,
     textures_to_set: Vec<(TextureId, egui::epaint::ImageDelta)>,
     textures_to_free: Vec<TextureId>,
-    interactive_rect: Rect,
+    hit_regions: UiHitRegions,
     pointer_over: bool,
     mouse_capture: bool,
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
+    color_panel_open: bool,
     modifiers: ModifiersState,
     cpu_dirty: bool,
     gpu_dirty: bool,
@@ -183,11 +213,12 @@ impl UiOverlay {
             paint_jobs: Vec::new(),
             textures_to_set: Vec::new(),
             textures_to_free: Vec::new(),
-            interactive_rect: Rect::NOTHING,
+            hit_regions: UiHitRegions::default(),
             pointer_over: false,
             mouse_capture: false,
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
+            color_panel_open: false,
             modifiers: ModifiersState::empty(),
             cpu_dirty: true,
             gpu_dirty: false,
@@ -229,7 +260,7 @@ impl UiOverlay {
                 position.x as f32 / window.scale_factor() as f32,
                 position.y as f32 / window.scale_factor() as f32,
             );
-            self.pointer_over = self.interactive_rect.contains(points);
+            self.pointer_over = self.hit_regions.contains(points);
         } else if matches!(event, WindowEvent::CursorLeft { .. }) {
             self.pointer_over = false;
         }
@@ -294,10 +325,11 @@ impl UiOverlay {
         let input = self.platform.take_egui_input(window);
         let context = self.context.clone();
         let mut actions = Vec::new();
-        let mut interactive_rect = Rect::NOTHING;
+        let mut hit_regions = UiHitRegions::default();
+        let mut color_panel_open = self.color_panel_open;
         let output = context.run_ui(input, |root| {
             if snapshot.visible {
-                interactive_rect = show_toolbar(root, snapshot, &mut actions);
+                hit_regions = show_toolbar(root, snapshot, &mut actions, &mut color_panel_open);
             }
         });
         let repaint_delay = output
@@ -309,7 +341,8 @@ impl UiOverlay {
         self.paint_jobs = context.tessellate(output.shapes, output.pixels_per_point);
         self.textures_to_set.extend(output.textures_delta.set);
         self.textures_to_free.extend(output.textures_delta.free);
-        self.interactive_rect = interactive_rect;
+        self.hit_regions = hit_regions;
+        self.color_panel_open = color_panel_open && snapshot.visible;
         self.last_snapshot = Some(snapshot);
         self.cpu_dirty = false;
         self.gpu_dirty = true;
@@ -441,7 +474,7 @@ impl UiOverlay {
             sample.position[0] / pixels_per_point,
             sample.position[1] / pixels_per_point,
         );
-        let pointer_over = self.interactive_rect.contains(position);
+        let pointer_over = self.hit_regions.contains(position);
         let route = self.tablet_capture.route(
             phase,
             sample.device_id,
@@ -505,7 +538,12 @@ fn to_egui_modifiers(modifiers: ModifiersState) -> egui::Modifiers {
     }
 }
 
-fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiAction>) -> Rect {
+fn show_toolbar(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    color_panel_open: &mut bool,
+) -> UiHitRegions {
     let area = egui::Area::new(Id::new("sketchpad-tool-strip"))
         .fixed_pos(TOOLBAR_POSITION)
         .order(Order::Foreground)
@@ -566,7 +604,9 @@ fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiA
                                 .font(FontId::monospace(12.0))
                                 .color(TEXT),
                         );
-                        color_swatch(ui, snapshot.color, snapshot.brush_opacity);
+                        if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
+                            *color_panel_open = !*color_panel_open;
+                        }
                         separator(ui);
                         if icon_button(ui, "×", "Hide interface (F1)", false).clicked() {
                             actions.push(UiAction::SetVisible(false));
@@ -574,7 +614,68 @@ fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiA
                     });
                 });
         });
+    let color_panel = if *color_panel_open {
+        show_color_panel(root, snapshot, actions, color_panel_open)
+    } else {
+        Rect::NOTHING
+    };
+    UiHitRegions {
+        toolbar: area.response.rect,
+        color_panel,
+    }
+}
+
+fn show_color_panel(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    color_panel_open: &mut bool,
+) -> Rect {
+    let area = egui::Area::new(Id::new("sketchpad-color-panel"))
+        .fixed_pos(COLOR_PANEL_POSITION)
+        .order(Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(TOOLBAR_RADIUS)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    palette_label(ui, "PALETTE");
+                    ui.horizontal(|ui| {
+                        for color in snapshot.color_presets {
+                            if color_button(ui, color, color == snapshot.color).clicked() {
+                                actions.push(UiAction::SelectColor(color));
+                                *color_panel_open = false;
+                            }
+                        }
+                    });
+                    if snapshot.recent_color_count > 0 {
+                        palette_label(ui, "RECENT");
+                        ui.horizontal(|ui| {
+                            let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
+                            for &color in &snapshot.recent_colors[..count] {
+                                if color_button(ui, color, color == snapshot.color).clicked() {
+                                    actions.push(UiAction::SelectColor(color));
+                                    *color_panel_open = false;
+                                }
+                            }
+                        });
+                    }
+                });
+        });
     area.response.rect
+}
+
+fn palette_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .font(FontId::monospace(11.0))
+            .color(TEXT_MUTED),
+    );
 }
 
 fn icon_button(ui: &mut egui::Ui, icon: &str, description: &str, selected: bool) -> egui::Response {
@@ -726,13 +827,43 @@ fn unit_to_diameter(unit: f32) -> f32 {
     (min + unit.clamp(0.0, 1.0) * (max - min)).exp()
 }
 
-fn color_swatch(ui: &mut egui::Ui, linear_rgb: [f32; 3], opacity: f32) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::splat(CONTROL_HEIGHT), Sense::hover());
+fn color_swatch(ui: &mut egui::Ui, linear_rgb: [f32; 3], opacity: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(CONTROL_HEIGHT), Sense::click());
     let rgb = linear_rgb.map(linear_to_srgb_u8);
     let fill = Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(opacity.clamp(0.0, 1.0));
     ui.painter().circle_filled(rect.center(), 11.0, fill);
     ui.painter()
         .circle_stroke(rect.center(), 11.0, Stroke::new(1.0, TEXT_MUTED));
+    response.widget_info(|| {
+        WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), "Choose brush color")
+    });
+    response.on_hover_text("Choose brush color")
+}
+
+fn color_button(ui: &mut egui::Ui, linear_rgb: [f32; 3], selected: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(COLOR_BUTTON_SIZE), Sense::click());
+    let rgb = linear_rgb.map(linear_to_srgb_u8);
+    let fill = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    let radius = if response.hovered() { 11.0 } else { 10.0 };
+    ui.painter().circle_filled(rect.center(), radius, fill);
+    ui.painter().circle_stroke(
+        rect.center(),
+        radius,
+        Stroke::new(
+            if selected { 2.0 } else { 1.0 },
+            if selected { CONTROL_ACTIVE } else { BORDER },
+        ),
+    );
+    let label = format!("#{:02X}{:02X}{:02X}", rgb[0], rgb[1], rgb[2]);
+    response.widget_info(|| {
+        WidgetInfo::selected(
+            WidgetType::Button,
+            ui.is_enabled(),
+            selected,
+            format!("Select color {label}"),
+        )
+    });
+    response.on_hover_text(label)
 }
 
 fn linear_to_srgb_u8(value: f32) -> u8 {
@@ -770,6 +901,18 @@ mod tests {
         assert_eq!(linear_to_srgb_u8(1.0), 255);
         assert_eq!(linear_to_srgb_u8(-1.0), 0);
         assert_eq!(linear_to_srgb_u8(2.0), 255);
+    }
+
+    #[test]
+    fn disjoint_ui_regions_do_not_capture_the_canvas_between_them() {
+        let regions = UiHitRegions {
+            toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
+            color_panel: Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(30.0, 30.0)),
+        };
+
+        assert!(regions.contains(Pos2::new(5.0, 5.0)));
+        assert!(regions.contains(Pos2::new(25.0, 25.0)));
+        assert!(!regions.contains(Pos2::new(15.0, 15.0)));
     }
 
     #[test]

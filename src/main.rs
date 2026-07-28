@@ -11,7 +11,7 @@ use sketchpad::{
     input::{TabletEvent, TabletPhase, TabletSample, ToolKind},
     input_trace::{InputTrace, TraceDevice, TraceSample},
     mixing::{LinearRgb, MixingBrushV1, MixingError, MixingRecipeV1, MixingStats, MixingStrokeV1},
-    palette::RecentColors,
+    palette::{RecentColors, MAX_RECENT_COLORS},
     persistence::PersistenceState,
     pipeline::{
         BrushCursorUniform, CanvasUniform, RasterDisplayPipeline, RasterPresentationStats,
@@ -524,12 +524,18 @@ impl App {
             (ToolKind::Pen, PaintEngine::HardRound) => UiTool::Pen,
         };
         let brush = self.brush_for_tool(self.mouse_tool);
+        let mut recent_colors = [[0.0; 3]; MAX_RECENT_COLORS];
+        let recent_color_count = self.recent_colors.colors().len();
+        recent_colors[..recent_color_count].copy_from_slice(self.recent_colors.colors());
         UiSnapshot {
             visible: self.ui_visible,
             tool,
             brush_diameter: brush.diameter(),
             brush_opacity: brush.opacity(),
             color: self.paint_brush.color(),
+            color_presets: COLOR_PRESETS,
+            recent_colors,
+            recent_color_count,
         }
     }
 
@@ -545,6 +551,7 @@ impl App {
             UiAction::SelectTool(tool) => self.select_ui_tool(tool),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
+            UiAction::SelectColor(color) => self.set_paint_color(color, true),
             UiAction::Undo => self.undo(),
             UiAction::Redo => self.redo(),
         }
