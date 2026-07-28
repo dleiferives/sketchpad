@@ -649,8 +649,19 @@ Report before/after counts appropriate to the change:
 
 1. isolate visibility versus painted-coverage scaling;
 2. retain visibility and per-page instance data across unchanged frames;
-3. test a stable composited display cache on Apollo;
-4. decide whether cache format specialization is justified.
+3. complete the existing direct versus full-precision display-cache matrix on
+   Apollo;
+4. isolate recomposition at 1, 8, 32, and 128 intersecting layers before
+   assuming the active layer needs a separate render path;
+5. if stable display sampling remains material, test a viewport-bounded exact
+   final-composite cache rather than another canvas-sized cache;
+6. measure the viewport experiment on a tile-based mobile-class GPU, where an
+   additional stored and sampled render target may increase bandwidth;
+7. decide whether any cache or format specialization is justified.
+
+The detailed decision boundary, correctness cases, and native front-buffer
+distinction are in
+[Active-stroke presentation](active-stroke-presentation.md).
 
 ### Phase E — optimize the remaining hot kernel
 

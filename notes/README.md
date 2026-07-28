@@ -27,6 +27,10 @@ The notes are organized by purpose:
 - [Physical pen latency investigation](input-latency-investigation.md) —
   Apollo hover/contact failure, live probe boundaries, interpretation, and
   controlled capture procedure.
+- [Active-stroke presentation](active-stroke-presentation.md) — investigation
+  of “Immediate only for the current layer,” the current retained/damage
+  architecture, portable viewport caching versus true platform front buffers,
+  mobile bandwidth risks, and the measurements required before implementation.
 - [Research synthesis](research-synthesis.md) — evidence ledger, definitions,
   comparison of architectures, corrected claims, and prioritized research
   agenda for both the first product and later work.

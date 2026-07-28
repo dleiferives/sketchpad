@@ -115,10 +115,15 @@ efficiently update an SDF cache.”
     CPU coarse-raster stage proved costly and conflicted with filter layers.
     Semantic boundaries are more durable than one scheduling strategy.
 
-13. **Low latency implies a distinct active-stroke path.** A stable committed
+13. **Low latency benefits from a distinct active-stroke lifecycle, but not
+    necessarily a second portable presentation layer.** A stable committed
     prefix can be cached incrementally, an unstable real tail can redraw
-    locally, and predicted input must remain replaceable. The transient overlay
-    becomes one authoritative semantic operation only at finalization.
+    locally, and predicted input must remain replaceable. In one `wgpu`
+    surface, presentation mode still applies to the entire frame. Retained
+    viewport caching, many-layer compositing caches, and a native front buffer
+    are separate experiments with different costs. The current direct renderer
+    remains the control; see
+    [Active-stroke presentation](active-stroke-presentation.md).
 
 14. **Storage deserves architectural research now.** SQLite is a credible
     native-document candidate because it provides transactions, incremental

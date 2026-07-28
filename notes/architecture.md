@@ -184,6 +184,14 @@ stable committed prefix | unstable real tail | predicted tail
 The overlay remains visually above the retained document until authoritative
 content is ready; finalization must not expose a blank or duplicate frame.
 
+“Overlay” does not imply a separate `wgpu` presentation mode. Present mode is
+surface-wide. The portable renderer may use retained final-composite regions
+and transient content inside one surface frame; a true front-buffer active
+layer is a later native platform capability. The active representation for
+real input must produce the exact authoritative result. Only replaceable
+prediction may be approximate. See
+[Active-stroke presentation](active-stroke-presentation.md).
+
 ### Finalization
 
 On pen-up:
