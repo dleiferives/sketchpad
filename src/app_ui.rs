@@ -54,6 +54,7 @@ pub enum UiTool {
     Mixing,
     Flat,
     Pencil,
+    PaletteKnife,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -838,6 +839,10 @@ fn show_toolbar(
                         }
                         if text_button(ui, "PCL", snapshot.tool == UiTool::Pencil).clicked() {
                             actions.push(UiAction::SelectTool(UiTool::Pencil));
+                        }
+                        if text_button(ui, "KNIFE", snapshot.tool == UiTool::PaletteKnife).clicked()
+                        {
+                            actions.push(UiAction::SelectTool(UiTool::PaletteKnife));
                         }
                         separator(ui);
                         ui.label(

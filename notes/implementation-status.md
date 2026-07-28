@@ -33,8 +33,11 @@ prototype:
   pressure/tilt graphite pencil whose deterministic multi-scale paper tooth is
   fixed in canvas coordinates;
 - a shared tilt dead zone, motion-direction mouse/upright fallback, and
-  interpolated tilt for oriented natural brushes; the remaining palette-knife
-  and bristle design is tracked in [natural-brushes.md](natural-brushes.md);
+  interpolated tilt for oriented natural brushes;
+- a palette knife with twelve fixed inline paint lanes, per-lane load and
+  color, stable pre-dab active-layer pickup, cross-blade streak variation, and
+  no dab-time lane allocation; the remaining bristle design is tracked in
+  [natural-brushes.md](natural-brushes.md);
 - distance-based deterministic dab resampling;
 - native Atlas/XInput2 pen and eraser device discovery;
 - normalized pressure, tilt, physical source ID, tool type, and source
