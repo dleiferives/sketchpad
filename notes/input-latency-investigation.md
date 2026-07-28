@@ -332,3 +332,65 @@ application defaults, not just benchmark flags. If a platform lacks
 it uses wgpu's synchronized automatic fallback. Explicit command-line options
 remain available for controlled comparisons and for users who prefer
 tear-free presentation over the lowest measured latency.
+
+## Natural-brush event-loop collapse: 2026-07-28
+
+The first live natural-brush evaluation used Immediate/1 on Apollo with the
+same Wacom path. Hover and light contact were healthy: input handling was
+usually tens of microseconds for hover and roughly 1 ms p95 for simple contact.
+Heavy palette-knife/bristle contact caused a qualitatively different failure.
+
+Representative one-second windows included:
+
+```text
+input_us mean/p95/max = 8094/15950/83216
+damage_regions = 18225
+upload_kib = 133394
+backend_queue_us contact mean/p95/max = 2494865/4813506/5055843
+samples_per_submit mean/p95/max = 73/4/1423
+```
+
+Another stroke produced 3,875 damage regions, about 100 MiB of upload traffic,
+23.9 ms input p95, and 1.37 seconds maximum backend queue delay. Immediately
+after contact stopped, hover handling returned to roughly 35 microseconds p95.
+The device and XInput collection thread are therefore not the source of the
+stall. CPU contact work blocks winit's event-loop consumer, the independent
+XInput producer continues to enqueue samples, and the app later processes a
+large stale burst.
+
+The document had also grown from 2,012 to more than 3,000 allocated tiles.
+Immutable snapshot capture remained below 1 ms, so the earlier synchronous
+autosave bug has not returned. However, full recovery workers wrote
+552--632 MiB checkpoints in 4.5--12.3 seconds while some stress strokes were in
+progress. That background encoding and I/O competes for memory bandwidth and
+worsens the constrained-machine case. It does not explain the failure alone:
+heavy contact stalls also occur outside checkpoint completion boundaries.
+
+The application currently performs this sequence for every tablet packet:
+
+```text
+distance-resample and mutate brush dabs
+    → drain active gesture damage
+    → recompose active-layer damage
+    → merge/schedule GPU tile damage
+    → request redraw
+```
+
+When the brush emits many dabs, repeating the entire presentation boundary per
+packet creates thousands of intermediate damage regions even though only the
+latest accumulated image can be presented. The next probe splits the existing
+input timing into brush mutation, gesture-damage drain, layer recomposition,
+and GPU-damage scheduling distributions. This is required before changing the
+boundary: quality, exact canonical pixels, final damage, undo, and input sample
+order must remain unchanged.
+
+Likely corrective architecture, pending the split evidence:
+
+1. Keep canonical brush mutation and every input sample in order.
+2. Drain/recompose/schedule once for a bounded group of already-queued tablet
+   samples or once before presentation, not after every packet.
+3. Maintain a strict time/sample budget so catch-up cannot monopolize the event
+   loop and hover/up semantics remain prompt.
+4. Coalesce final per-tile damage before upload preparation.
+5. Measure checkpoint-worker contention separately and move recovery toward
+   incremental/delta storage rather than weakening durability.

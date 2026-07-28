@@ -330,6 +330,10 @@ impl From<MixingError> for ActiveStrokeError {
 struct LiveMetrics {
     period_start: Instant,
     input_handling: LatencySeries,
+    brush_mutation: LatencySeries,
+    damage_drain: LatencySeries,
+    layer_recompose: LatencySeries,
+    damage_schedule: LatencySeries,
     rendering: LatencySeries,
     frame_stages: FrameStageMetrics,
     tablet_latency: TabletLatencyMetrics,
@@ -341,6 +345,10 @@ impl LiveMetrics {
         Self {
             period_start: Instant::now(),
             input_handling: LatencySeries::new(),
+            brush_mutation: LatencySeries::new(),
+            damage_drain: LatencySeries::new(),
+            layer_recompose: LatencySeries::new(),
+            damage_schedule: LatencySeries::new(),
             rendering: LatencySeries::new(),
             frame_stages: FrameStageMetrics::new(),
             tablet_latency: TabletLatencyMetrics::new(),
@@ -351,6 +359,10 @@ impl LiveMetrics {
     fn reset(&mut self, gpu_stats: RasterPresentationStats) {
         self.period_start = Instant::now();
         self.input_handling.clear();
+        self.brush_mutation.clear();
+        self.damage_drain.clear();
+        self.layer_recompose.clear();
+        self.damage_schedule.clear();
         self.rendering.clear();
         self.frame_stages.clear();
         self.tablet_latency.clear_period();
@@ -1172,6 +1184,7 @@ impl App {
 
     fn update_stroke(&mut self, screen: [f32; 2], pressure: f32, tilt: [f32; 2]) {
         let world = self.camera().world_from_screen(screen);
+        let mutation_started = Instant::now();
         let result = match &mut self.active_stroke {
             Some(stroke) => stroke.update(
                 self.document.active_layer_mut(),
@@ -1179,6 +1192,9 @@ impl App {
             ),
             None => return,
         };
+        self.metrics
+            .brush_mutation
+            .record(mutation_started.elapsed());
         if let Err(error) = result {
             log::error!("could not update stroke: {error}");
             self.cancel_stroke();
@@ -1256,11 +1272,13 @@ impl App {
         let Some(gesture) = self.active_stroke.as_ref().map(ActiveStroke::gesture_id) else {
             return;
         };
-        match self
+        let drain_started = Instant::now();
+        let damage = self
             .document
             .active_layer_mut()
-            .take_gesture_damage(gesture)
-        {
+            .take_gesture_damage(gesture);
+        self.metrics.damage_drain.record(drain_started.elapsed());
+        match damage {
             Ok(damage) if !damage.is_empty() => self.sync_damage(&damage),
             Ok(_) => {}
             Err(error) => log::error!("could not drain stroke damage: {error}"),
@@ -1268,6 +1286,7 @@ impl App {
     }
 
     fn sync_damage(&mut self, damage: &Damage) {
+        let recompose_started = Instant::now();
         let damage = match self.document.recompose_damage(damage) {
             Ok(damage) => damage,
             Err(error) => {
@@ -1275,7 +1294,17 @@ impl App {
                 return;
             }
         };
-        self.sync_composite_damage(&damage);
+        self.metrics
+            .layer_recompose
+            .record(recompose_started.elapsed());
+        let schedule_started = Instant::now();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.canvas.sync_damage(self.document.composite(), &damage);
+        }
+        self.metrics
+            .damage_schedule
+            .record(schedule_started.elapsed());
+        self.request_redraw();
     }
 
     fn sync_composite_damage(&mut self, damage: &Damage) {
@@ -2306,6 +2335,10 @@ impl App {
             .map(|gpu| gpu.canvas.stats())
             .unwrap_or_default();
         let input = self.metrics.input_handling.summary();
+        let brush_mutation = self.metrics.brush_mutation.summary();
+        let damage_drain = self.metrics.damage_drain.summary();
+        let layer_recompose = self.metrics.layer_recompose.summary();
+        let damage_schedule = self.metrics.damage_schedule.summary();
         let render = self.metrics.rendering.summary();
         let frame_stages = self.metrics.frame_stages.summary();
         let tablet_latency = self.metrics.tablet_latency.summary();
@@ -2473,6 +2506,27 @@ impl App {
                 samples_per_submit.mean,
                 samples_per_submit.p95,
                 samples_per_submit.maximum,
+            );
+        }
+        if brush_mutation.count > 0 {
+            log::info!(
+                "stroke_stages samples={} mutation_us(mean/p95/max)={}/{}/{} \
+                 drain_us(mean/p95/max)={}/{}/{} \
+                 recompose_us(mean/p95/max)={}/{}/{} \
+                 schedule_us(mean/p95/max)={}/{}/{}",
+                brush_mutation.count,
+                brush_mutation.mean,
+                brush_mutation.p95,
+                brush_mutation.maximum,
+                damage_drain.mean,
+                damage_drain.p95,
+                damage_drain.maximum,
+                layer_recompose.mean,
+                layer_recompose.p95,
+                layer_recompose.maximum,
+                damage_schedule.mean,
+                damage_schedule.p95,
+                damage_schedule.maximum,
             );
         }
         if frame_stages.acquire.count > 0 {
