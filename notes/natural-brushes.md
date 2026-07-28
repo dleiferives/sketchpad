@@ -207,8 +207,8 @@ considering a GPU implementation.
 3. Ship the deterministic graphite pencil.
 4. Introduce fixed lane reservoirs and ship the palette knife.
 5. Specialize the lane model into separated bristles.
-6. Replace the temporary selector with a compact preset popover and add
-   oriented cursor shapes.
+6. [Complete] Replace the temporary selector with a compact preset popover and
+   add oriented cursor shapes.
 7. Build an authored visual/replay corpus and use Apollo measurements to decide
    which kernels, if any, justify moving to compute shaders.
 

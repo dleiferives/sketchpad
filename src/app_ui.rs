@@ -20,6 +20,7 @@ use winit::{
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
 const FILE_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
+const BRUSH_PANEL_POSITION: Pos2 = Pos2::new(188.0, 82.0);
 const COLOR_PANEL_POSITION: Pos2 = Pos2::new(564.0, 82.0);
 const KEYBINDING_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
 const CONTROL_HEIGHT: f32 = 36.0;
@@ -56,6 +57,42 @@ pub enum UiTool {
     Pencil,
     PaletteKnife,
     Bristle,
+}
+
+impl UiTool {
+    const ALL: [Self; 7] = [
+        Self::Pen,
+        Self::Eraser,
+        Self::Mixing,
+        Self::Flat,
+        Self::Pencil,
+        Self::PaletteKnife,
+        Self::Bristle,
+    ];
+
+    const fn short_label(self) -> &'static str {
+        match self {
+            Self::Pen => "PEN",
+            Self::Eraser => "ERASE",
+            Self::Mixing => "MIX",
+            Self::Flat => "FLAT",
+            Self::Pencil => "PCL",
+            Self::PaletteKnife => "KNIFE",
+            Self::Bristle => "BRUSH",
+        }
+    }
+
+    const fn menu_label(self) -> &'static str {
+        match self {
+            Self::Pen => "HARD ROUND",
+            Self::Eraser => "ERASER",
+            Self::Mixing => "COLOR MIXER",
+            Self::Flat => "FLAT NIB",
+            Self::Pencil => "GRAPHITE PENCIL",
+            Self::PaletteKnife => "PALETTE KNIFE",
+            Self::Bristle => "BRISTLE BRUSH",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -218,6 +255,7 @@ impl TabletCapture {
 struct UiHitRegions {
     toolbar: Rect,
     file_panel: Rect,
+    brush_panel: Rect,
     color_panel: Rect,
     keybinding_panel: Rect,
     layers_panel: Rect,
@@ -228,6 +266,7 @@ impl Default for UiHitRegions {
         Self {
             toolbar: Rect::NOTHING,
             file_panel: Rect::NOTHING,
+            brush_panel: Rect::NOTHING,
             color_panel: Rect::NOTHING,
             keybinding_panel: Rect::NOTHING,
             layers_panel: Rect::NOTHING,
@@ -239,6 +278,7 @@ impl UiHitRegions {
     fn contains(self, position: Pos2) -> bool {
         self.toolbar.contains(position)
             || self.file_panel.contains(position)
+            || self.brush_panel.contains(position)
             || self.color_panel.contains(position)
             || self.keybinding_panel.contains(position)
             || self.layers_panel.contains(position)
@@ -305,6 +345,7 @@ impl Default for ColorPickerState {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct UiSessionState {
     file_panel_open: bool,
+    brush_panel_open: bool,
     color_panel_open: bool,
     keybinding_panel_open: bool,
     layers_panel_open: bool,
@@ -804,6 +845,7 @@ fn show_toolbar(
                     ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                         if text_button(ui, "FILE", session.file_panel_open).clicked() {
                             session.file_panel_open = !session.file_panel_open;
+                            session.brush_panel_open = false;
                             session.color_panel_open = false;
                             session.keybinding_panel_open = false;
                             session.key_capture = None;
@@ -811,6 +853,7 @@ fn show_toolbar(
                         if text_button(ui, "KEYS", session.keybinding_panel_open).clicked() {
                             session.keybinding_panel_open = !session.keybinding_panel_open;
                             session.file_panel_open = false;
+                            session.brush_panel_open = false;
                             session.color_panel_open = false;
                             session.key_capture = None;
                         }
@@ -826,27 +869,14 @@ fn show_toolbar(
                             }
                         });
                         separator(ui);
-                        if text_button(ui, "PEN", snapshot.tool == UiTool::Pen).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Pen));
-                        }
-                        if text_button(ui, "ERASE", snapshot.tool == UiTool::Eraser).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Eraser));
-                        }
-                        if text_button(ui, "MIX", snapshot.tool == UiTool::Mixing).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Mixing));
-                        }
-                        if text_button(ui, "FLAT", snapshot.tool == UiTool::Flat).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Flat));
-                        }
-                        if text_button(ui, "PCL", snapshot.tool == UiTool::Pencil).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Pencil));
-                        }
-                        if text_button(ui, "KNIFE", snapshot.tool == UiTool::PaletteKnife).clicked()
+                        if text_button(ui, snapshot.tool.short_label(), session.brush_panel_open)
+                            .clicked()
                         {
-                            actions.push(UiAction::SelectTool(UiTool::PaletteKnife));
-                        }
-                        if text_button(ui, "BRUSH", snapshot.tool == UiTool::Bristle).clicked() {
-                            actions.push(UiAction::SelectTool(UiTool::Bristle));
+                            session.brush_panel_open = !session.brush_panel_open;
+                            session.file_panel_open = false;
+                            session.color_panel_open = false;
+                            session.keybinding_panel_open = false;
+                            session.key_capture = None;
                         }
                         separator(ui);
                         ui.label(
@@ -881,6 +911,7 @@ fn show_toolbar(
                         if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
                             session.color_panel_open = !session.color_panel_open;
                             session.file_panel_open = false;
+                            session.brush_panel_open = false;
                             session.keybinding_panel_open = false;
                             session.key_capture = None;
                         }
@@ -896,6 +927,11 @@ fn show_toolbar(
         });
     let file_panel = if session.file_panel_open {
         show_file_panel(root, actions, &mut session.file_panel_open)
+    } else {
+        Rect::NOTHING
+    };
+    let brush_panel = if session.brush_panel_open {
+        show_brush_panel(root, snapshot, actions, &mut session.brush_panel_open)
     } else {
         Rect::NOTHING
     };
@@ -929,6 +965,7 @@ fn show_toolbar(
     UiHitRegions {
         toolbar: area.response.rect,
         file_panel,
+        brush_panel,
         color_panel,
         keybinding_panel,
         layers_panel,
@@ -1214,6 +1251,50 @@ fn picker_marker(ui: &egui::Ui, position: Pos2) {
         .circle_filled(position, 7.0, Color32::from_black_alpha(150));
     ui.painter()
         .circle_stroke(position, 7.0, Stroke::new(2.0, Color32::WHITE));
+}
+
+fn show_brush_panel(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    brush_panel_open: &mut bool,
+) -> Rect {
+    let area = egui::Area::new(Id::new("sketchpad-brush-panel"))
+        .fixed_pos(BRUSH_PANEL_POSITION)
+        .order(Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(TOOLBAR_RADIUS)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(190.0);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "BRUSH PRESET");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, "×", "Close brush presets", false).clicked() {
+                                *brush_panel_open = false;
+                            }
+                        });
+                    });
+                    for tool in UiTool::ALL {
+                        let label = if tool == snapshot.tool {
+                            format!("{}  •", tool.menu_label())
+                        } else {
+                            tool.menu_label().to_owned()
+                        };
+                        if menu_button(ui, &label, "Select brush preset").clicked() {
+                            actions.push(UiAction::SelectTool(tool));
+                            *brush_panel_open = false;
+                        }
+                    }
+                });
+        });
+    area.response.rect
 }
 
 fn paint_color_mesh(
@@ -2041,6 +2122,7 @@ mod tests {
         let regions = UiHitRegions {
             toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
             file_panel: Rect::from_min_max(Pos2::new(60.0, 60.0), Pos2::new(70.0, 70.0)),
+            brush_panel: Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(110.0, 110.0)),
             color_panel: Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(30.0, 30.0)),
             keybinding_panel: Rect::from_min_max(Pos2::new(80.0, 80.0), Pos2::new(90.0, 90.0)),
             layers_panel: Rect::from_min_max(Pos2::new(40.0, 40.0), Pos2::new(50.0, 50.0)),
@@ -2051,6 +2133,7 @@ mod tests {
         assert!(regions.contains(Pos2::new(45.0, 45.0)));
         assert!(regions.contains(Pos2::new(65.0, 65.0)));
         assert!(regions.contains(Pos2::new(85.0, 85.0)));
+        assert!(regions.contains(Pos2::new(105.0, 105.0)));
         assert!(!regions.contains(Pos2::new(15.0, 15.0)));
         assert!(!regions.contains(Pos2::new(35.0, 35.0)));
     }

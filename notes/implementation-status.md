@@ -46,18 +46,20 @@ prototype:
   timestamp delivery;
 - mouse fallback at pressure 1;
 - pressure-sized pen ink and destination-out erasing;
-- GPU brush-footprint cursor that distinguishes pen and eraser and follows
-  contact pressure;
+- GPU brush-footprint cursor with circular, tilt-oriented box, and
+  tilt-oriented ellipse modes that follows pressure and the active preset's
+  actual contact geometry;
 - a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
   surface texture, command encoder, and render pass;
-- a compact first toolbar for pen/eraser/mixing selection, brush diameter and
-  opacity adjustment, a tilt-oriented flat-brush selection, a continuous HSV
-  color picker plus preset/recent colors, undo/redo, and interface hiding;
+- a compact first toolbar and brush-preset popover for hard round, eraser,
+  mixing, flat nib, graphite pencil, palette knife, and bristle brush, plus
+  diameter/opacity adjustment, a continuous HSV color picker, preset/recent
+  colors, undo/redo, and interface hiding;
 - a custom file popover dispatching the existing Open, Save, Save As, PNG
   import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,
   duplicate, delete, ordering, and stepped active-layer opacity;
-- a custom keybinding editor covering 32 application commands with two slots,
+- a custom keybinding editor covering 33 application commands with two slots,
   physical-key capture, deterministic conflict displacement, confirmed reset,
   and versioned user-config persistence;
 - typed UI actions that invoke the same application command methods as
@@ -127,6 +129,7 @@ Controls:
 - Shift-`[` / Shift-`]`: decrease/increase the hovered tool opacity;
 - E: toggle mouse pen/eraser mode;
 - M: toggle hard-round/linear-mixing pen mode;
+- B: cycle hard round, flat nib, pencil, palette knife, and bristle presets;
 - 1–6: select a built-in pen color;
 - X / Shift-X: select the older/newer recent pen color;
 - Control/Command-Z: undo;
@@ -148,6 +151,7 @@ Controls:
 - F1: show or hide the interface;
 - UI `LAYERS`: show or hide the layer panel;
 - UI `KEYS`: open or close the keybinding editor;
+- UI current-brush button: open the brush preset selector;
 - keybinding slot: capture the next physical key and exact modifiers;
 - Escape while capturing: cancel without changing the slot;
 - Backspace while capturing: clear the slot;

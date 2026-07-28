@@ -193,7 +193,9 @@ pub struct CanvasUniform {
 #[derive(Clone, Copy, Debug, Default, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct BrushCursorUniform {
     pub position: [f32; 2],
-    pub radius: f32,
+    pub half_extents: [f32; 2],
+    pub direction: [f32; 2],
+    pub shape: f32,
     pub visible: f32,
     pub color: [f32; 4],
 }

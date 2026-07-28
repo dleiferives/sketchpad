@@ -207,6 +207,7 @@ pub enum KeyCommand {
     BrushOpacityUp,
     ToggleEraser,
     ToggleMixing,
+    CycleBrushPreset,
     RecentColorOlder,
     RecentColorNewer,
     PresetColor1,
@@ -225,7 +226,7 @@ pub enum KeyCommand {
     MoveLayerBelow,
 }
 
-pub const ALL_KEY_COMMANDS: [KeyCommand; 32] = [
+pub const ALL_KEY_COMMANDS: [KeyCommand; 33] = [
     KeyCommand::ToggleInterface,
     KeyCommand::Undo,
     KeyCommand::Redo,
@@ -242,6 +243,7 @@ pub const ALL_KEY_COMMANDS: [KeyCommand; 32] = [
     KeyCommand::BrushOpacityUp,
     KeyCommand::ToggleEraser,
     KeyCommand::ToggleMixing,
+    KeyCommand::CycleBrushPreset,
     KeyCommand::RecentColorOlder,
     KeyCommand::RecentColorNewer,
     KeyCommand::PresetColor1,
@@ -283,6 +285,7 @@ impl KeyCommand {
             Self::BrushOpacityUp => "brush_opacity_up",
             Self::ToggleEraser => "toggle_eraser",
             Self::ToggleMixing => "toggle_mixing",
+            Self::CycleBrushPreset => "cycle_brush_preset",
             Self::RecentColorOlder => "recent_color_older",
             Self::RecentColorNewer => "recent_color_newer",
             Self::PresetColor1 => "preset_color_1",
@@ -326,6 +329,7 @@ impl KeyCommand {
             Self::BrushOpacityUp => "Increase brush opacity",
             Self::ToggleEraser => "Toggle pen / eraser",
             Self::ToggleMixing => "Toggle paint mixing",
+            Self::CycleBrushPreset => "Next brush preset",
             Self::RecentColorOlder => "Older recent color",
             Self::RecentColorNewer => "Newer recent color",
             Self::PresetColor1 => "Select color 1",
@@ -361,7 +365,8 @@ impl KeyCommand {
             | Self::BrushOpacityDown
             | Self::BrushOpacityUp
             | Self::ToggleEraser
-            | Self::ToggleMixing => "BRUSH",
+            | Self::ToggleMixing
+            | Self::CycleBrushPreset => "BRUSH",
             Self::RecentColorOlder
             | Self::RecentColorNewer
             | Self::PresetColor1
@@ -549,6 +554,7 @@ fn default_bindings(key_command: KeyCommand) -> CommandBindings {
         Command::BrushOpacityUp => CommandBindings::one(shift(Key::BracketRight)),
         Command::ToggleEraser => CommandBindings::one(plain(Key::KeyE)),
         Command::ToggleMixing => CommandBindings::one(plain(Key::KeyM)),
+        Command::CycleBrushPreset => CommandBindings::one(plain(Key::KeyB)),
         Command::RecentColorOlder => CommandBindings::one(plain(Key::KeyX)),
         Command::RecentColorNewer => CommandBindings::one(shift(Key::KeyX)),
         Command::PresetColor1 => CommandBindings::one(plain(Key::Digit1)),

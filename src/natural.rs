@@ -66,7 +66,7 @@ impl FlatBrush {
         self.spacing
     }
 
-    fn half_extents(self, pressure: f32) -> [f32; 2] {
+    pub fn contact_half_extents(self, pressure: f32) -> [f32; 2] {
         let pressure = pressure.clamp(0.0, 1.0);
         [
             self.diameter * 0.5 * (0.55 + pressure.sqrt() * 0.45),
@@ -93,7 +93,7 @@ impl FlatBrush {
             layer.height(),
             sample.position,
             direction,
-            self.half_extents(pressure),
+            self.contact_half_extents(pressure),
         ) else {
             return Ok(());
         };
@@ -185,6 +185,11 @@ impl PencilBrush {
             ],
             transfer: self.opacity * (0.06 + 0.38 * pressure),
         }
+    }
+
+    pub fn contact_half_extents(self, pressure: f32, tilt: [f32; 2]) -> [f32; 2] {
+        self.contact(BrushSample::with_tilt([0.0, 0.0], pressure, tilt))
+            .half_extents
     }
 
     fn paint_dab(
@@ -351,7 +356,7 @@ impl PaletteKnifeBrush {
         self.spacing
     }
 
-    fn half_extents(self, pressure: f32) -> [f32; 2] {
+    pub fn contact_half_extents(self, pressure: f32) -> [f32; 2] {
         let pressure = pressure.clamp(0.0, 1.0);
         [
             self.diameter * 0.5 * (0.72 + 0.28 * pressure.sqrt()),
@@ -374,7 +379,7 @@ impl PaletteKnifeBrush {
         if pressure == 0.0 || self.opacity == 0.0 {
             return Ok(());
         }
-        let half_extents = self.half_extents(pressure);
+        let half_extents = self.contact_half_extents(pressure);
         let Some(footprint) = OrientedBoxFootprint::new(
             layer.width(),
             layer.height(),
@@ -604,7 +609,7 @@ impl BristleBrush {
         self.spacing
     }
 
-    fn half_extents(self, pressure: f32) -> [f32; 2] {
+    pub fn contact_half_extents(self, pressure: f32) -> [f32; 2] {
         let pressure = pressure.clamp(0.0, 1.0);
         [
             self.diameter * 0.5 * (0.55 + 0.45 * pressure.sqrt()),
@@ -627,7 +632,7 @@ impl BristleBrush {
         if pressure == 0.0 || self.opacity == 0.0 {
             return Ok(());
         }
-        let half_extents = self.half_extents(pressure);
+        let half_extents = self.contact_half_extents(pressure);
         let Some(footprint) = OrientedBoxFootprint::new(
             layer.width(),
             layer.height(),

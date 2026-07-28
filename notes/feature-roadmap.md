@@ -142,7 +142,7 @@ bounded to brush damage, and does not implicitly mix hidden layers.
 - [ ] Preserve one undoable gesture, bounded damage, deterministic replay, and
   allocation-free dab loops for every brush.
 - [ ] Add brush-specific replay scenes and Apollo CPU measurements.
-- [ ] Expose the presets through a compact selector, then add oriented cursor
+- [x] Expose the presets through a compact selector, then add oriented cursor
   feedback.
 
 The composition model, research basis, performance contract, and deliberate
@@ -158,7 +158,7 @@ without upright jitter; saved traces replay exactly.
 - [x] Visible-composite Alt-contact color picker for mouse and tablet.
 - [x] Eight-entry session-local recent colors with deterministic MRU behavior
   and keyboard traversal.
-- [ ] Minimal brush/preset selector.
+- [x] Minimal brush/preset selector.
 - [ ] Layer panel.
 - [x] Native PNG import/export dialogs.
 - [x] Native document open dialog.

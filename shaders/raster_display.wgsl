@@ -8,7 +8,9 @@ struct Camera {
 
 struct BrushCursor {
     position: vec2f,
-    radius: f32,
+    half_extents: vec2f,
+    direction: vec2f,
+    shape: f32,
     visible: f32,
     color: vec4f,
 }
@@ -124,7 +126,7 @@ fn cursor_vs(@builtin(vertex_index) vertex_index: u32) -> CursorVertexOutput {
         vec2f(1.0, 1.0),
     );
     let pixel_world = view_size().y / camera.viewport_size.y;
-    let outer_radius = cursor.radius + pixel_world * 3.5;
+    let outer_radius = max(cursor.half_extents.x, cursor.half_extents.y) + pixel_world * 3.5;
     let delta = corners[vertex_index] * outer_radius;
     let world = cursor.position + delta;
     let size = view_size();
@@ -143,7 +145,21 @@ fn cursor_fs(input: CursorVertexOutput) -> @location(0) vec4f {
     }
 
     let pixel_world = view_size().y / camera.viewport_size.y;
-    let edge_distance = abs(length(input.delta_world) - cursor.radius);
+    let local = vec2f(
+        dot(input.delta_world, cursor.direction),
+        dot(input.delta_world, vec2f(-cursor.direction.y, cursor.direction.x)),
+    );
+    var signed_distance: f32;
+    if (cursor.shape < 0.5) {
+        signed_distance = length(input.delta_world) - cursor.half_extents.x;
+    } else if (cursor.shape < 1.5) {
+        let q = abs(local) - cursor.half_extents;
+        signed_distance = length(max(q, vec2f(0.0))) + min(max(q.x, q.y), 0.0);
+    } else {
+        let normalized = length(local / cursor.half_extents);
+        signed_distance = (normalized - 1.0) * min(cursor.half_extents.x, cursor.half_extents.y);
+    }
+    let edge_distance = abs(signed_distance);
     let outline = 1.0 - smoothstep(pixel_world * 2.2, pixel_world * 3.2, edge_distance);
     let bright_core = 1.0 - smoothstep(pixel_world * 0.65, pixel_world * 1.35, edge_distance);
     let rgb = mix(vec3f(0.025), cursor.color.rgb, bright_core);

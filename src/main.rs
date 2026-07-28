@@ -53,6 +53,10 @@ const MIN_BRUSH_DIAMETER: f32 = 1.0;
 const MAX_BRUSH_DIAMETER: f32 = 512.0;
 const BRUSH_SIZE_STEP: f32 = std::f32::consts::SQRT_2;
 const BRUSH_OPACITY_STEP: f32 = 0.1;
+const CURSOR_SHAPE_CIRCLE: f32 = 0.0;
+const CURSOR_SHAPE_BOX: f32 = 1.0;
+const CURSOR_SHAPE_ELLIPSE: f32 = 2.0;
+const CURSOR_ORIENTATION_DEAD_ZONE: f32 = 0.12;
 const MIXING_PICKUP: f32 = 0.65;
 const MIXING_COLOR_RATE: f32 = 0.08;
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
@@ -464,6 +468,8 @@ struct App {
     cursor_tool: ToolKind,
     cursor_pressure: f32,
     cursor_contact: bool,
+    cursor_tilt: [f32; 2],
+    cursor_direction: [f32; 2],
     mouse_tool: ToolKind,
     modifiers: ModifiersState,
     keybindings: KeyBindings,
@@ -546,6 +552,8 @@ impl App {
             cursor_tool: ToolKind::Pen,
             cursor_pressure: 0.0,
             cursor_contact: false,
+            cursor_tilt: [0.0, 0.0],
+            cursor_direction: [1.0, 0.0],
             mouse_tool: ToolKind::Pen,
             modifiers: ModifiersState::empty(),
             keybindings,
@@ -739,6 +747,7 @@ impl App {
             KeyCommand::BrushOpacityUp => self.adjust_brush_opacity(BRUSH_OPACITY_STEP),
             KeyCommand::ToggleEraser => self.toggle_mouse_tool(),
             KeyCommand::ToggleMixing => self.toggle_paint_engine(),
+            KeyCommand::CycleBrushPreset => self.cycle_brush_preset(),
             KeyCommand::RecentColorOlder => self.select_recent_color(false),
             KeyCommand::RecentColorNewer => self.select_recent_color(true),
             KeyCommand::PresetColor1 => self.select_color(0),
@@ -850,12 +859,57 @@ impl App {
             ToolKind::Pen => [brush.color()[0], brush.color()[1], brush.color()[2], 1.0],
             ToolKind::Eraser => [1.0, 0.36, 0.08, 1.0],
         };
+        let (half_extents, shape) = match (self.cursor_tool, self.paint_engine) {
+            (ToolKind::Eraser, _)
+            | (ToolKind::Pen, PaintEngine::HardRound | PaintEngine::LinearMixing) => {
+                let radius = brush.radius_for_pressure(pressure);
+                ([radius, radius], CURSOR_SHAPE_CIRCLE)
+            }
+            (ToolKind::Pen, PaintEngine::Flat) => (
+                flat_brush_from_paint(brush).contact_half_extents(pressure),
+                CURSOR_SHAPE_BOX,
+            ),
+            (ToolKind::Pen, PaintEngine::Pencil) => (
+                pencil_brush_from_paint(brush).contact_half_extents(pressure, self.cursor_tilt),
+                CURSOR_SHAPE_ELLIPSE,
+            ),
+            (ToolKind::Pen, PaintEngine::PaletteKnife) => (
+                palette_knife_from_paint(brush).contact_half_extents(pressure),
+                CURSOR_SHAPE_BOX,
+            ),
+            (ToolKind::Pen, PaintEngine::Bristle) => (
+                bristle_brush_from_paint(brush).contact_half_extents(pressure),
+                CURSOR_SHAPE_BOX,
+            ),
+        };
 
         BrushCursorUniform {
             position: self.camera().world_from_screen(screen),
-            radius: brush.radius_for_pressure(pressure),
+            half_extents,
+            direction: self.cursor_direction,
+            shape,
             visible: 1.0,
             color,
+        }
+    }
+
+    fn update_cursor_orientation(&mut self, position: [f32; 2], tilt: [f32; 2]) {
+        self.cursor_tilt = tilt;
+        let tilt_length_squared = tilt[0] * tilt[0] + tilt[1] * tilt[1];
+        if tilt_length_squared >= CURSOR_ORIENTATION_DEAD_ZONE * CURSOR_ORIENTATION_DEAD_ZONE {
+            let inverse_length = tilt_length_squared.sqrt().recip();
+            self.cursor_direction = [tilt[0] * inverse_length, tilt[1] * inverse_length];
+            return;
+        }
+        let Some(previous) = self.last_cursor_pos else {
+            return;
+        };
+        let dx = position[0] - previous[0];
+        let dy = previous[1] - position[1];
+        let length_squared = dx * dx + dy * dy;
+        if length_squared >= 0.25 * 0.25 {
+            let inverse_length = length_squared.sqrt().recip();
+            self.cursor_direction = [dx * inverse_length, dy * inverse_length];
         }
     }
 
@@ -955,6 +1009,25 @@ impl App {
             | PaintEngine::Pencil
             | PaintEngine::PaletteKnife
             | PaintEngine::Bristle => PaintEngine::HardRound,
+        };
+        self.mouse_tool = ToolKind::Pen;
+        self.cursor_tool = ToolKind::Pen;
+        self.cursor_pressure = 0.0;
+        self.cursor_contact = false;
+        self.update_window_title(None);
+        self.request_redraw();
+    }
+
+    fn cycle_brush_preset(&mut self) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        self.paint_engine = match self.paint_engine {
+            PaintEngine::HardRound | PaintEngine::LinearMixing => PaintEngine::Flat,
+            PaintEngine::Flat => PaintEngine::Pencil,
+            PaintEngine::Pencil => PaintEngine::PaletteKnife,
+            PaintEngine::PaletteKnife => PaintEngine::Bristle,
+            PaintEngine::Bristle => PaintEngine::HardRound,
         };
         self.mouse_tool = ToolKind::Pen;
         self.cursor_tool = ToolKind::Pen;
@@ -1850,6 +1923,7 @@ impl App {
             sample.timestamp_millis
         );
         self.last_tablet_activity = Some(Instant::now());
+        self.update_cursor_orientation(sample.position, sample.tilt);
         self.cursor_pos = Some(sample.position);
         self.last_cursor_pos = Some(sample.position);
         self.cursor_visible = true;
@@ -2551,6 +2625,7 @@ impl ApplicationHandler<TabletEvent> for App {
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
                 let current = [position.x as f32, position.y as f32];
+                self.update_cursor_orientation(current, [0.0, 0.0]);
                 if self.panning {
                     if let Some(previous) = self.last_cursor_pos {
                         self.pan_from_cursor(previous, current);

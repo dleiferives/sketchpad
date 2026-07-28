@@ -142,7 +142,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         &queue,
         BrushCursorUniform {
             position: [SIZE as f32 * 0.5, SIZE as f32 - 72.0],
-            radius: 24.0,
+            half_extents: [24.0, 24.0],
+            direction: [1.0, 0.0],
+            shape: 0.0,
             visible: 1.0,
             color: [1.0, 0.36, 0.08, 1.0],
         },
