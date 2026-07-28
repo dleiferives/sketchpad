@@ -620,8 +620,11 @@ immediate order is:
    the old dab control at `512 px`; retain their evidence, not their product
    code. See the rejected-prototype table in
    [Continuous brush contact and physical paint](continuous-brush-contact.md).
-4. Benchmark a connected, fixed-color `512 px` palette-knife sweep offscreen
-   on the GPU and compare it with the old dab control.
+4. [Complete] Benchmark a connected, fixed-color `512 px` palette-knife sweep
+   offscreen on Apollo's GPU. The full-float opaque geometry proof measured
+   8.366 ms empty and 8.353 ms painted versus 263.544 ms and 260.293 ms for
+   the retained CPU control—approximately 31× faster. Readback is measured
+   separately and remains forbidden from the live stroke path.
 5. Integrate a validated continuous-contact path without live readback, then
    extend it to flat, pencil, and bounded-strand marks. The design and quality
    gates are in

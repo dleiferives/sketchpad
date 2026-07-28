@@ -396,6 +396,59 @@ It does not establish that the path is fast, that multisampling is the right
 edge strategy, or that a live GPU-owned active layer has correct document and
 undo semantics. Those remain measurement and architecture gates.
 
+### Offscreen GPU result — 2026-07-28
+
+`gpu_brush_bench` consumes the deterministic `BladePose`/`BladeSweep` model
+and triangulates the same `2048 × 2048`, 256-sample, rotating `512 px` trace
+used by the CPU control. It uploads the mesh once and performs one source-over
+draw into an `Rgba32Float` target. Target reset, brush rendering, CPU
+encode/submit, and readback are separately measured. Thirty measured runs
+after three warm-ups on Apollo produced:
+
+| State | Old CPU control median | GPU brush median | GPU brush p95 | Median speedup |
+|---|---:|---:|---:|---:|
+| Empty | 263.544 ms | 8.366 ms | 9.034 ms | 31.5× |
+| Painted | 260.293 ms | 8.353 ms | 8.457 ms | 31.2× |
+
+The GPU geometry batch contained 256 sweeps, 1,018 triangles, 3,054 vertices,
+and 24,432 bytes of vertex data. CPU construction took 108.723 µs. The sum of
+the clipped polygon bounding-box areas was 33,892,792 pixels; this is a
+conservative work-amplification indicator, not a hardware fragment count.
+
+The median CPU encode/submit costs were 267.589 µs empty and 260.790 µs
+painted. Full-target resets were timestamped separately at 10.208 µs and
+10.104 µs median. A single correctness readback after all timed runs took
+66.403 ms and 66.680 ms, respectively, and is excluded from brush timing.
+Both states changed the same 1,211,528 pixels, and their checksums repeated
+exactly across the 12-run and 30-run captures.
+
+Run the experiment with:
+
+```sh
+scripts/apollo run cargo run --release --bin gpu_brush_bench -- \
+  --adapter Intel --runs 30 --warmups 3
+```
+
+This passes the first throughput gate: even Apollo's constrained integrated
+GPU is more than ten times faster than the current CPU control without
+reducing storage precision. It does **not** yet pass the product gate:
+
+- the benchmark uses one opaque, hard-edged color so internal triangulation
+  overlap cannot accumulate opacity;
+- it measures a fully batched stroke rather than display-paced incremental
+  command batches;
+- the target is disposable and has no layer, undo, save, recovery, or cancel
+  ownership contract;
+- it does not prove a final antialiasing, transverse load, texture, or dry-mark
+  model;
+- it excludes the intentionally isolated 64 MiB readback, as the live stroke
+  path must never perform it.
+
+The next proof should retain this full-float target, split the trace into
+display-paced incremental batches, and measure new geometry only. Live
+integration must then give the active layer an explicit GPU/CPU ownership and
+undo contract; writing into the flattened visible composite remains invalid.
+
 ### GPU path
 
 For the initial render path:
@@ -541,7 +594,9 @@ should only begin after:
    paths and GPU timestamps.
 2. [Complete] Define the internal contact-pose and blade-sweep command contract
    with deterministic fixtures.
-3. Add an offscreen GPU benchmark for a `512 px` continuous knife stroke.
+3. [Complete] Add an offscreen GPU benchmark for a `512 px` continuous knife
+   stroke. Apollo is approximately 31× faster than the old CPU control for the
+   first full-float opaque geometry proof.
 4. [Rejected] Add a CPU span implementation consuming the same commands; the
    measured prototypes were slower than the existing dab control, so retain
    the evidence rather than their product code.
