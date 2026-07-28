@@ -459,6 +459,44 @@ Do not accept “the UI is small” as performance evidence. Conversely, do not
 reject a library merely because it rebuilds a small logical widget tree. The
 measured input-path and GPU cost decides.
 
+## Implementation Record
+
+### Dependency and first overlay, 2026-07-28
+
+- The pinned egui dependency graph contains exactly one `wgpu`, version 30.
+- Apollo `cargo check --bin sketchpad` and the binary unit tests pass.
+- The first overlay shares Sketchpad's device, queue, surface texture, command
+  encoder, and render pass. It does not create a full-window intermediate.
+- UI declaration/tessellation and `egui-wgpu` buffer updates run only when the
+  UI snapshot or routed UI input is dirty. Canvas-only frames draw the retained
+  paint jobs from the already prepared renderer buffers.
+- The first custom-painted toolbar exercises typed actions, selected tool
+  state, a logarithmic brush-diameter slider, linear-to-sRGB color display,
+  undo/redo, and hide behavior. It is an integration scaffold, not a final
+  product layout.
+
+The first runtime attempt exposed an idle-loop integration trap:
+`egui_winit::State::on_window_event` reports `repaint: true` for
+`WindowEvent::RedrawRequested`. Treating that notification as new UI input and
+calling `Window::request_redraw` again produced a self-sustaining loop at
+roughly 180 debug frames per second on Apollo. The adapter now excludes
+redraw, close, destroy, move, and occlusion notifications from UI
+invalidation. A regression test records the redraw rule. After the fix, the
+Apollo Vulkan smoke run rendered one startup frame and then remained idle for
+the observed five-second interval.
+
+Apollo also reports egui's warning that `Bgra8UnormSrgb` is an sRGB-aware
+framebuffer while egui prefers an unorm framebuffer. The pinned renderer
+explicitly selects its `fs_main_linear_framebuffer` shader for sRGB formats,
+so it handles the conversion rather than blindly using the gamma-framebuffer
+path. Do not change Sketchpad's established canvas surface format merely to
+silence the warning; evaluate UI blending visually and with a color test
+before considering a different view format.
+
+The smoke run used the debug build and cold initialization, so its first-frame
+timing is not a performance result. Direct-tablet UI event translation and
+physical pen capture remain the next slice.
+
 ## Custom Fallback
 
 If the egui spike fails, build only the control surface Sketchpad needs:

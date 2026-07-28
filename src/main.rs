@@ -1,5 +1,7 @@
+mod app_ui;
 mod latency_probe;
 
+use app_ui::{UiAction, UiOverlay, UiSnapshot, UiTool};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
@@ -18,7 +20,7 @@ use sketchpad::{
     raster::{Damage, GestureId, LinearRgba, RasterLayer, DEFAULT_TILE_SIZE},
 };
 use std::{
-    env, fmt, io, iter,
+    env, fmt, io,
     path::{Path, PathBuf},
     process,
     sync::Arc,
@@ -389,6 +391,8 @@ struct RecoveryJob {
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
+    ui: Option<UiOverlay>,
+    ui_visible: bool,
     configured: bool,
     document: Document,
     paint_brush: HardRoundBrush,
@@ -448,6 +452,8 @@ impl App {
         Self {
             window: None,
             gpu: None,
+            ui: None,
+            ui_visible: true,
             configured: false,
             document,
             paint_brush,
@@ -509,6 +515,73 @@ impl App {
         if let Some(window) = &self.window {
             window.request_redraw();
         }
+    }
+
+    fn ui_snapshot(&self) -> UiSnapshot {
+        let tool = match (self.mouse_tool, self.paint_engine) {
+            (ToolKind::Eraser, _) => UiTool::Eraser,
+            (ToolKind::Pen, PaintEngine::LinearMixing) => UiTool::Mixing,
+            (ToolKind::Pen, PaintEngine::HardRound) => UiTool::Pen,
+        };
+        let brush = self.brush_for_tool(self.mouse_tool);
+        UiSnapshot {
+            visible: self.ui_visible,
+            tool,
+            brush_diameter: brush.diameter(),
+            brush_opacity: brush.opacity(),
+            color: self.paint_brush.color(),
+        }
+    }
+
+    fn apply_ui_action(&mut self, action: UiAction) {
+        match action {
+            UiAction::SetVisible(visible) => {
+                self.ui_visible = visible;
+                if let Some(ui) = &mut self.ui {
+                    ui.mark_dirty();
+                }
+                self.request_redraw();
+            }
+            UiAction::SelectTool(tool) => self.select_ui_tool(tool),
+            UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
+            UiAction::Undo => self.undo(),
+            UiAction::Redo => self.redo(),
+        }
+    }
+
+    fn select_ui_tool(&mut self, tool: UiTool) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        match tool {
+            UiTool::Pen => {
+                self.mouse_tool = ToolKind::Pen;
+                self.paint_engine = PaintEngine::HardRound;
+            }
+            UiTool::Eraser => self.mouse_tool = ToolKind::Eraser,
+            UiTool::Mixing => {
+                self.mouse_tool = ToolKind::Pen;
+                self.paint_engine = PaintEngine::LinearMixing;
+            }
+        }
+        self.cursor_tool = self.mouse_tool;
+        self.cursor_pressure = 0.0;
+        self.cursor_contact = false;
+        self.update_window_title(None);
+        self.request_redraw();
+    }
+
+    fn set_brush_diameter(&mut self, diameter: f32) {
+        if self.active_stroke.is_some() || !diameter.is_finite() {
+            return;
+        }
+        let tool = self.mouse_tool;
+        let brush = self.brush_for_tool(tool);
+        *self.brush_for_tool_mut(tool) = brush
+            .with_diameter(diameter.clamp(MIN_BRUSH_DIAMETER, MAX_BRUSH_DIAMETER))
+            .expect("the clamped UI brush diameter is valid");
+        self.update_window_title(None);
+        self.request_redraw();
     }
 
     fn brush_for_tool(&self, tool: ToolKind) -> HardRoundBrush {
@@ -1687,6 +1760,9 @@ impl App {
     }
 
     fn resize(&mut self, width: u32, height: u32) {
+        if let Some(ui) = &mut self.ui {
+            ui.mark_dirty();
+        }
         if let Some(gpu) = &mut self.gpu {
             if width > 0 && height > 0 {
                 gpu.config.width = width;
@@ -1703,9 +1779,17 @@ impl App {
         if !self.configured {
             return;
         }
+        let snapshot = self.ui_snapshot();
+        let actions = match (&self.window, &mut self.ui) {
+            (Some(window), Some(ui)) => ui.prepare(window, snapshot),
+            _ => Vec::new(),
+        };
+        for action in actions {
+            self.apply_ui_action(action);
+        }
         let camera = self.camera();
         let cursor = self.cursor_uniform();
-        let Some(gpu) = &mut self.gpu else {
+        let (Some(gpu), Some(ui)) = (&mut self.gpu, &mut self.ui) else {
             return;
         };
 
@@ -1733,6 +1817,13 @@ impl App {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("Raster Frame"),
             });
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [gpu.config.width, gpu.config.height],
+            pixels_per_point: self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor() as f32),
+        };
         gpu.canvas.prepare_visible(
             &gpu.device,
             &gpu.queue,
@@ -1752,6 +1843,7 @@ impl App {
         gpu.canvas.write_cursor(&gpu.queue, cursor);
         let prepared_at = Instant::now();
         gpu.canvas.encode_uploads(&mut encoder);
+        let mut commands = ui.prepare_gpu(&gpu.device, &gpu.queue, &mut encoder, &screen);
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Raster Display"),
@@ -1770,11 +1862,13 @@ impl App {
                 multiview_mask: None,
             });
             gpu.canvas.draw(&mut pass);
+            ui.draw(&mut pass.forget_lifetime(), &screen);
         }
-        let commands = encoder.finish();
+        commands.push(encoder.finish());
         let encoded_at = Instant::now();
-        let submission = gpu.queue.submit(iter::once(commands));
+        let submission = gpu.queue.submit(commands);
         gpu.canvas.uploads_submitted(submission);
+        ui.finish_submit();
         gpu.queue.present(output);
         let submitted_at = Instant::now();
         self.metrics.frame_stages.record(
@@ -2003,6 +2097,7 @@ impl ApplicationHandler<TabletEvent> for App {
         );
 
         let gpu = App::init(window.clone(), self.document.tile_size(), self.presentation);
+        let ui = UiOverlay::new(&window, &gpu.device, gpu.config.format);
         #[cfg(target_os = "linux")]
         match x11_tablet::start(&window, self.tablet_proxy.clone()) {
             Ok(backend) => {
@@ -2026,6 +2121,7 @@ impl ApplicationHandler<TabletEvent> for App {
             Err(error) => log::warn!("native tablet input unavailable: {error}"),
         }
         self.gpu = Some(gpu);
+        self.ui = Some(ui);
         self.window = Some(window);
         self.configured = true;
         self.update_window_title(None);
@@ -2038,6 +2134,23 @@ impl ApplicationHandler<TabletEvent> for App {
         _: winit::window::WindowId,
         event: WindowEvent,
     ) {
+        let canvas_owns_mouse = self.active_pointer == Some(PointerOwner::Mouse)
+            || self.sampling_pointer == Some(PointerOwner::Mouse)
+            || self.panning;
+        let suppress_mouse = self.tablet_is_recent();
+        let ui_response = match (&self.window, &mut self.ui) {
+            (Some(window), Some(ui)) => {
+                ui.on_window_event(window, &event, canvas_owns_mouse, suppress_mouse)
+            }
+            _ => Default::default(),
+        };
+        if ui_response.repaint {
+            self.request_redraw();
+        }
+        if ui_response.consumed {
+            return;
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 self.cancel_stroke();
@@ -2153,6 +2266,9 @@ impl ApplicationHandler<TabletEvent> for App {
             {
                 let command = self.modifiers.control_key() || self.modifiers.super_key();
                 match event.physical_key {
+                    PhysicalKey::Code(KeyCode::F1) => {
+                        self.apply_ui_action(UiAction::SetVisible(!self.ui_visible))
+                    }
                     PhysicalKey::Code(KeyCode::Escape) if self.active_stroke.is_some() => {
                         self.cancel_stroke()
                     }
