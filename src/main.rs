@@ -1,7 +1,9 @@
 mod app_ui;
+mod keybindings;
 mod latency_probe;
 
 use app_ui::{UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiSnapshot, UiTool};
+use keybindings::{KeyBindings, KeyChord, KeyCommand};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
     brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
@@ -413,6 +415,9 @@ struct App {
     cursor_contact: bool,
     mouse_tool: ToolKind,
     modifiers: ModifiersState,
+    keybindings: KeyBindings,
+    keybindings_path: PathBuf,
+    keybindings_save_error: bool,
     tablet_proxy: EventLoopProxy<TabletEvent>,
     last_tablet_activity: Option<Instant>,
     last_tablet_title_update: Option<Instant>,
@@ -449,6 +454,24 @@ impl App {
         let paint_brush = HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap();
         let recent_colors =
             RecentColors::new(paint_brush.color()).expect("the default pen color is valid");
+        let keybindings_path = keybindings::default_keybindings_path();
+        let (keybindings, keybindings_save_error) = if keybindings_path.exists() {
+            match KeyBindings::load(&keybindings_path) {
+                Ok(bindings) => {
+                    log::info!("keybindings loaded: path={keybindings_path:?}");
+                    (bindings, false)
+                }
+                Err(error) => {
+                    log::error!(
+                        "keybindings failed to load; using defaults without replacing the file: \
+                         path={keybindings_path:?}: {error}"
+                    );
+                    (KeyBindings::default(), true)
+                }
+            }
+        } else {
+            (KeyBindings::default(), false)
+        };
         Self {
             window: None,
             gpu: None,
@@ -474,6 +497,9 @@ impl App {
             cursor_contact: false,
             mouse_tool: ToolKind::Pen,
             modifiers: ModifiersState::empty(),
+            keybindings,
+            keybindings_path,
+            keybindings_save_error,
             tablet_proxy,
             last_tablet_activity: None,
             last_tablet_title_update: None,
@@ -539,6 +565,7 @@ impl App {
             active_layer: self.document.active_layer_id(),
             undo_available: self.document.undo_depth() > 0,
             redo_available: self.document.redo_depth() > 0,
+            keybindings_save_error: self.keybindings_save_error,
         }
     }
 
@@ -579,6 +606,100 @@ impl App {
             }),
             UiAction::Undo => self.undo(),
             UiAction::Redo => self.redo(),
+            UiAction::SetKeyBinding {
+                command,
+                slot,
+                chord,
+            } => self.set_keybinding(command, slot, chord),
+            UiAction::ResetKeyBindings => self.replace_keybindings(KeyBindings::default()),
+        }
+    }
+
+    fn set_keybinding(&mut self, command: KeyCommand, slot: usize, chord: Option<KeyChord>) {
+        let mut bindings = self.keybindings;
+        let displaced = bindings.set(command, slot, chord);
+        if let Some((other_command, other_slot)) = displaced {
+            log::info!(
+                "keybinding conflict resolved: moved={} slot={} displaced={} slot={}",
+                command.id(),
+                slot + 1,
+                other_command.id(),
+                other_slot + 1,
+            );
+        }
+        self.replace_keybindings(bindings);
+    }
+
+    fn replace_keybindings(&mut self, bindings: KeyBindings) {
+        self.keybindings = bindings;
+        match bindings.save(&self.keybindings_path) {
+            Ok(()) => {
+                self.keybindings_save_error = false;
+                log::info!("keybindings saved: path={:?}", self.keybindings_path);
+            }
+            Err(error) => {
+                self.keybindings_save_error = true;
+                log::error!(
+                    "keybindings are active for this session but could not be saved: path={:?}: \
+                     {error}",
+                    self.keybindings_path
+                );
+            }
+        }
+        if let Some(ui) = &mut self.ui {
+            ui.mark_dirty();
+        }
+        self.request_redraw();
+    }
+
+    fn execute_key_command(&mut self, command: KeyCommand) {
+        match command {
+            KeyCommand::ToggleInterface => {
+                self.apply_ui_action(UiAction::SetVisible(!self.ui_visible))
+            }
+            KeyCommand::Undo => self.undo(),
+            KeyCommand::Redo => self.redo(),
+            KeyCommand::SaveDocument => {
+                self.save_document();
+            }
+            KeyCommand::SaveDocumentAs => {
+                self.choose_document_save_as();
+            }
+            KeyCommand::OpenDocument => {
+                self.choose_document_open();
+            }
+            KeyCommand::ImportPng => {
+                self.choose_png_import();
+            }
+            KeyCommand::ExportCanvas => {
+                self.choose_png_export(ExportRegion::FullCanvas);
+            }
+            KeyCommand::ExportContent => {
+                self.choose_png_export(ExportRegion::ContentBounds);
+            }
+            KeyCommand::ResetView => self.reset_view(),
+            KeyCommand::BrushSmaller => self.adjust_brush_size(1.0 / BRUSH_SIZE_STEP),
+            KeyCommand::BrushLarger => self.adjust_brush_size(BRUSH_SIZE_STEP),
+            KeyCommand::BrushOpacityDown => self.adjust_brush_opacity(-BRUSH_OPACITY_STEP),
+            KeyCommand::BrushOpacityUp => self.adjust_brush_opacity(BRUSH_OPACITY_STEP),
+            KeyCommand::ToggleEraser => self.toggle_mouse_tool(),
+            KeyCommand::ToggleMixing => self.toggle_paint_engine(),
+            KeyCommand::RecentColorOlder => self.select_recent_color(false),
+            KeyCommand::RecentColorNewer => self.select_recent_color(true),
+            KeyCommand::PresetColor1 => self.select_color(0),
+            KeyCommand::PresetColor2 => self.select_color(1),
+            KeyCommand::PresetColor3 => self.select_color(2),
+            KeyCommand::PresetColor4 => self.select_color(3),
+            KeyCommand::PresetColor5 => self.select_color(4),
+            KeyCommand::PresetColor6 => self.select_color(5),
+            KeyCommand::CreateLayer => self.create_layer(),
+            KeyCommand::DuplicateLayer => self.duplicate_active_layer(),
+            KeyCommand::DeleteLayer => self.delete_active_layer(),
+            KeyCommand::ToggleLayerVisibility => self.toggle_active_layer_visibility(),
+            KeyCommand::SelectLayerAbove => self.select_relative_layer(1),
+            KeyCommand::SelectLayerBelow => self.select_relative_layer(-1),
+            KeyCommand::MoveLayerAbove => self.move_active_layer(1),
+            KeyCommand::MoveLayerBelow => self.move_active_layer(-1),
         }
     }
 
@@ -1879,19 +2000,25 @@ impl App {
         }
         let snapshot = self.ui_snapshot();
         let document = &self.document;
+        let keybindings = &self.keybindings;
         let actions = match (&self.window, &mut self.ui) {
-            (Some(window), Some(ui)) => ui.prepare(window, snapshot, || {
-                document
-                    .layers()
-                    .iter()
-                    .map(|layer| UiLayerSnapshot {
-                        id: layer.id(),
-                        name: layer.name(),
-                        visible: layer.visible(),
-                        opacity: layer.opacity(),
-                    })
-                    .collect()
-            }),
+            (Some(window), Some(ui)) => ui.prepare(
+                window,
+                snapshot,
+                || {
+                    document
+                        .layers()
+                        .iter()
+                        .map(|layer| UiLayerSnapshot {
+                            id: layer.id(),
+                            name: layer.name(),
+                            visible: layer.visible(),
+                            opacity: layer.opacity(),
+                        })
+                        .collect()
+                },
+                || *keybindings,
+            ),
             _ => Vec::new(),
         };
         for action in actions {
@@ -2420,11 +2547,7 @@ impl ApplicationHandler<TabletEvent> for App {
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
-                let command = self.modifiers.control_key() || self.modifiers.super_key();
                 match event.physical_key {
-                    PhysicalKey::Code(KeyCode::F1) => {
-                        self.apply_ui_action(UiAction::SetVisible(!self.ui_visible))
-                    }
                     PhysicalKey::Code(KeyCode::Escape) if self.active_stroke.is_some() => {
                         self.cancel_stroke()
                     }
@@ -2433,68 +2556,13 @@ impl ApplicationHandler<TabletEvent> for App {
                             event_loop.exit();
                         }
                     }
-                    PhysicalKey::Code(KeyCode::KeyZ) if command && self.modifiers.shift_key() => {
-                        self.redo()
+                    PhysicalKey::Code(code) => {
+                        if let Some(chord) = KeyChord::from_winit(code, self.modifiers) {
+                            if let Some(command) = self.keybindings.command_for(chord) {
+                                self.execute_key_command(command);
+                            }
+                        }
                     }
-                    PhysicalKey::Code(KeyCode::KeyZ) if command => self.undo(),
-                    PhysicalKey::Code(KeyCode::KeyY) if command => self.redo(),
-                    PhysicalKey::Code(KeyCode::KeyS) if command && self.modifiers.shift_key() => {
-                        self.choose_document_save_as();
-                    }
-                    PhysicalKey::Code(KeyCode::KeyS) if command => {
-                        self.save_document();
-                    }
-                    PhysicalKey::Code(KeyCode::KeyO) if command => self.choose_document_open(),
-                    PhysicalKey::Code(KeyCode::KeyI) if command => self.choose_png_import(),
-                    PhysicalKey::Code(KeyCode::KeyN) if command && self.modifiers.shift_key() => {
-                        self.create_layer()
-                    }
-                    PhysicalKey::Code(KeyCode::KeyD) if command && self.modifiers.shift_key() => {
-                        self.duplicate_active_layer()
-                    }
-                    PhysicalKey::Code(KeyCode::KeyH) if command && self.modifiers.shift_key() => {
-                        self.toggle_active_layer_visibility()
-                    }
-                    PhysicalKey::Code(KeyCode::KeyE)
-                        if command && self.modifiers.shift_key() && self.modifiers.alt_key() =>
-                    {
-                        self.choose_png_export(ExportRegion::ContentBounds)
-                    }
-                    PhysicalKey::Code(KeyCode::KeyE) if command && self.modifiers.shift_key() => {
-                        self.choose_png_export(ExportRegion::FullCanvas)
-                    }
-                    PhysicalKey::Code(KeyCode::Delete) if command && self.modifiers.shift_key() => {
-                        self.delete_active_layer()
-                    }
-                    PhysicalKey::Code(KeyCode::PageUp) if command => self.move_active_layer(1),
-                    PhysicalKey::Code(KeyCode::PageDown) if command => self.move_active_layer(-1),
-                    PhysicalKey::Code(KeyCode::PageUp) => self.select_relative_layer(1),
-                    PhysicalKey::Code(KeyCode::PageDown) => self.select_relative_layer(-1),
-                    PhysicalKey::Code(KeyCode::Home) => self.reset_view(),
-                    PhysicalKey::Code(KeyCode::BracketLeft) if self.modifiers.shift_key() => {
-                        self.adjust_brush_opacity(-BRUSH_OPACITY_STEP)
-                    }
-                    PhysicalKey::Code(KeyCode::BracketRight) if self.modifiers.shift_key() => {
-                        self.adjust_brush_opacity(BRUSH_OPACITY_STEP)
-                    }
-                    PhysicalKey::Code(KeyCode::BracketLeft) => {
-                        self.adjust_brush_size(1.0 / BRUSH_SIZE_STEP)
-                    }
-                    PhysicalKey::Code(KeyCode::BracketRight) => {
-                        self.adjust_brush_size(BRUSH_SIZE_STEP)
-                    }
-                    PhysicalKey::Code(KeyCode::KeyE) => self.toggle_mouse_tool(),
-                    PhysicalKey::Code(KeyCode::KeyM) => self.toggle_paint_engine(),
-                    PhysicalKey::Code(KeyCode::KeyX) if self.modifiers.shift_key() => {
-                        self.select_recent_color(true)
-                    }
-                    PhysicalKey::Code(KeyCode::KeyX) => self.select_recent_color(false),
-                    PhysicalKey::Code(KeyCode::Digit1) => self.select_color(0),
-                    PhysicalKey::Code(KeyCode::Digit2) => self.select_color(1),
-                    PhysicalKey::Code(KeyCode::Digit3) => self.select_color(2),
-                    PhysicalKey::Code(KeyCode::Digit4) => self.select_color(3),
-                    PhysicalKey::Code(KeyCode::Digit5) => self.select_color(4),
-                    PhysicalKey::Code(KeyCode::Digit6) => self.select_color(5),
                     _ => {}
                 }
             }

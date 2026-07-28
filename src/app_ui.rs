@@ -1,3 +1,6 @@
+use super::keybindings::{
+    KeyBindings, KeyChord, KeyCommand, ALL_KEY_COMMANDS, BINDINGS_PER_COMMAND,
+};
 use egui::{
     Align, Align2, Color32, FontId, Id, Key, Layout, Order, Pos2, Rect, Sense, Stroke, StrokeKind,
     TextureId, Vec2, WidgetInfo, WidgetType,
@@ -9,11 +12,16 @@ use std::{
     mem,
     time::{Duration, Instant},
 };
-use winit::{event::WindowEvent, keyboard::ModifiersState, window::Window};
+use winit::{
+    event::{ElementState, WindowEvent},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    window::Window,
+};
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
 const FILE_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
 const COLOR_PANEL_POSITION: Pos2 = Pos2::new(564.0, 82.0);
+const KEYBINDING_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
 const CONTROL_HEIGHT: f32 = 36.0;
 const TOOL_BUTTON_WIDTH: f32 = 44.0;
 const SLIDER_WIDTH: f32 = 152.0;
@@ -23,6 +31,9 @@ const COLOR_PICKER_WIDTH: f32 = 220.0;
 const COLOR_PLANE_HEIGHT: f32 = 168.0;
 const HUE_SLIDER_HEIGHT: f32 = 18.0;
 const COLOR_MESH_STEPS: usize = 16;
+const KEYBINDING_PANEL_WIDTH: f32 = 510.0;
+const KEYBINDING_LABEL_WIDTH: f32 = 214.0;
+const KEYBINDING_BUTTON_WIDTH: f32 = 134.0;
 const LAYER_PANEL_WIDTH: f32 = 292.0;
 const LAYER_NAME_WIDTH: f32 = 170.0;
 const TOOLBAR_RADIUS: u8 = 14;
@@ -56,6 +67,7 @@ pub struct UiSnapshot {
     pub active_layer: LayerId,
     pub undo_available: bool,
     pub redo_available: bool,
+    pub keybindings_save_error: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -82,7 +94,10 @@ pub enum UiAction {
     CommitColor([f32; 3]),
     SelectLayer(LayerId),
     ToggleLayerVisibility(LayerId),
-    AdjustLayerOpacity { layer: LayerId, delta: f32 },
+    AdjustLayerOpacity {
+        layer: LayerId,
+        delta: f32,
+    },
     CreateLayer,
     DuplicateActiveLayer,
     DeleteActiveLayer,
@@ -94,6 +109,12 @@ pub enum UiAction {
     ExportPng(UiExportRegion),
     Undo,
     Redo,
+    SetKeyBinding {
+        command: KeyCommand,
+        slot: usize,
+        chord: Option<KeyChord>,
+    },
+    ResetKeyBindings,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -194,6 +215,7 @@ struct UiHitRegions {
     toolbar: Rect,
     file_panel: Rect,
     color_panel: Rect,
+    keybinding_panel: Rect,
     layers_panel: Rect,
 }
 
@@ -203,6 +225,7 @@ impl Default for UiHitRegions {
             toolbar: Rect::NOTHING,
             file_panel: Rect::NOTHING,
             color_panel: Rect::NOTHING,
+            keybinding_panel: Rect::NOTHING,
             layers_panel: Rect::NOTHING,
         }
     }
@@ -213,6 +236,7 @@ impl UiHitRegions {
         self.toolbar.contains(position)
             || self.file_panel.contains(position)
             || self.color_panel.contains(position)
+            || self.keybinding_panel.contains(position)
             || self.layers_panel.contains(position)
     }
 }
@@ -278,8 +302,42 @@ impl Default for ColorPickerState {
 struct UiSessionState {
     file_panel_open: bool,
     color_panel_open: bool,
+    keybinding_panel_open: bool,
     layers_panel_open: bool,
     color_picker: ColorPickerState,
+    key_capture: Option<KeyBindingTarget>,
+    pending_key_capture: Option<PendingKeyCapture>,
+    reset_keybindings_armed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct KeyBindingTarget {
+    command: KeyCommand,
+    slot: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingKeyCapture {
+    target: KeyBindingTarget,
+    chord: Option<KeyChord>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeyCaptureDecision {
+    Cancel,
+    Clear,
+    Assign(KeyChord),
+    Ignore,
+}
+
+fn key_capture_decision(key: PhysicalKey, modifiers: ModifiersState) -> KeyCaptureDecision {
+    match key {
+        PhysicalKey::Code(KeyCode::Escape) => KeyCaptureDecision::Cancel,
+        PhysicalKey::Code(KeyCode::Backspace) => KeyCaptureDecision::Clear,
+        PhysicalKey::Code(code) => KeyChord::from_winit(code, modifiers)
+            .map_or(KeyCaptureDecision::Ignore, KeyCaptureDecision::Assign),
+        PhysicalKey::Unidentified(_) => KeyCaptureDecision::Ignore,
+    }
 }
 
 pub struct UiOverlay {
@@ -358,6 +416,45 @@ impl UiOverlay {
             }
             self.modifiers = modifiers;
         }
+        if let (
+            Some(target),
+            WindowEvent::KeyboardInput {
+                event: key_event, ..
+            },
+        ) = (self.session.key_capture, event)
+        {
+            if key_event.state == ElementState::Pressed && !key_event.repeat {
+                match key_capture_decision(key_event.physical_key, self.modifiers) {
+                    KeyCaptureDecision::Cancel => {
+                        self.session.key_capture = None;
+                    }
+                    KeyCaptureDecision::Clear => {
+                        self.session.key_capture = None;
+                        self.session.pending_key_capture = Some(PendingKeyCapture {
+                            target,
+                            chord: None,
+                        });
+                    }
+                    KeyCaptureDecision::Assign(chord) => {
+                        self.session.key_capture = None;
+                        self.session.pending_key_capture = Some(PendingKeyCapture {
+                            target,
+                            chord: Some(chord),
+                        });
+                    }
+                    KeyCaptureDecision::Ignore => {}
+                }
+                self.cpu_dirty = true;
+                return UiEventResponse {
+                    consumed: true,
+                    repaint: true,
+                };
+            }
+            return UiEventResponse {
+                consumed: true,
+                repaint: false,
+            };
+        }
         let pointer_event = matches!(
             event,
             WindowEvent::CursorMoved { .. }
@@ -398,6 +495,7 @@ impl UiOverlay {
         if matches!(event, WindowEvent::Focused(false)) {
             self.modifiers = ModifiersState::empty();
             self.cancel_pointer_capture();
+            self.session.key_capture = None;
         }
 
         if let WindowEvent::MouseInput {
@@ -430,6 +528,7 @@ impl UiOverlay {
         window: &Window,
         snapshot: UiSnapshot,
         layer_snapshot: impl FnOnce() -> Vec<UiLayerSnapshot<'a>>,
+        keybinding_snapshot: impl FnOnce() -> KeyBindings,
     ) -> Vec<UiAction> {
         if self.last_snapshot != Some(snapshot) {
             self.cpu_dirty = true;
@@ -446,10 +545,29 @@ impl UiOverlay {
         let mut hit_regions = UiHitRegions::default();
         let mut session = self.session;
         session.color_picker.sync(snapshot.color);
+        if !snapshot.visible {
+            session.key_capture = None;
+            session.reset_keybindings_armed = false;
+        }
+        if let Some(pending) = session.pending_key_capture.take() {
+            actions.push(UiAction::SetKeyBinding {
+                command: pending.target.command,
+                slot: pending.target.slot,
+                chord: pending.chord,
+            });
+        }
         let layers = layer_snapshot();
+        let keybindings = keybinding_snapshot();
         let output = context.run_ui(input, |root| {
             if snapshot.visible {
-                hit_regions = show_toolbar(root, snapshot, &layers, &mut actions, &mut session);
+                hit_regions = show_toolbar(
+                    root,
+                    snapshot,
+                    &layers,
+                    keybindings,
+                    &mut actions,
+                    &mut session,
+                );
             }
         });
         let repaint_delay = output
@@ -662,6 +780,7 @@ fn show_toolbar(
     root: &mut egui::Ui,
     snapshot: UiSnapshot,
     layers: &[UiLayerSnapshot<'_>],
+    keybindings: KeyBindings,
     actions: &mut Vec<UiAction>,
     session: &mut UiSessionState,
 ) -> UiHitRegions {
@@ -682,6 +801,14 @@ fn show_toolbar(
                         if text_button(ui, "FILE", session.file_panel_open).clicked() {
                             session.file_panel_open = !session.file_panel_open;
                             session.color_panel_open = false;
+                            session.keybinding_panel_open = false;
+                            session.key_capture = None;
+                        }
+                        if text_button(ui, "KEYS", session.keybinding_panel_open).clicked() {
+                            session.keybinding_panel_open = !session.keybinding_panel_open;
+                            session.file_panel_open = false;
+                            session.color_panel_open = false;
+                            session.key_capture = None;
                         }
                         separator(ui);
                         ui.add_enabled_ui(snapshot.undo_available, |ui| {
@@ -737,6 +864,8 @@ fn show_toolbar(
                         if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
                             session.color_panel_open = !session.color_panel_open;
                             session.file_panel_open = false;
+                            session.keybinding_panel_open = false;
+                            session.key_capture = None;
                         }
                         separator(ui);
                         if text_button(ui, "LAYERS", session.layers_panel_open).clicked() {
@@ -764,6 +893,11 @@ fn show_toolbar(
     } else {
         Rect::NOTHING
     };
+    let keybinding_panel = if session.keybinding_panel_open {
+        show_keybinding_panel(root, snapshot, keybindings, actions, session)
+    } else {
+        Rect::NOTHING
+    };
     let layers_panel = if session.layers_panel_open {
         show_layers_panel(
             root,
@@ -779,8 +913,127 @@ fn show_toolbar(
         toolbar: area.response.rect,
         file_panel,
         color_panel,
+        keybinding_panel,
         layers_panel,
     }
+}
+
+fn show_keybinding_panel(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    keybindings: KeyBindings,
+    actions: &mut Vec<UiAction>,
+    session: &mut UiSessionState,
+) -> Rect {
+    let area = egui::Area::new(Id::new("sketchpad-keybinding-panel"))
+        .fixed_pos(KEYBINDING_PANEL_POSITION)
+        .order(Order::Foreground)
+        .movable(false)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            egui::Frame::new()
+                .fill(PANEL)
+                .stroke(Stroke::new(1.0, BORDER))
+                .corner_radius(TOOLBAR_RADIUS)
+                .inner_margin(10.0)
+                .show(ui, |ui| {
+                    ui.set_width(KEYBINDING_PANEL_WIDTH);
+                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "KEY BINDINGS");
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if icon_button(ui, "×", "Close key bindings", false).clicked() {
+                                session.keybinding_panel_open = false;
+                                session.key_capture = None;
+                                session.reset_keybindings_armed = false;
+                            }
+                            let reset_label = if session.reset_keybindings_armed {
+                                "CONFIRM RESET"
+                            } else {
+                                "RESET DEFAULTS"
+                            };
+                            if small_menu_button(
+                                ui,
+                                reset_label,
+                                "Restore every default shortcut",
+                                session.reset_keybindings_armed,
+                            )
+                            .clicked()
+                            {
+                                if session.reset_keybindings_armed {
+                                    actions.push(UiAction::ResetKeyBindings);
+                                    session.reset_keybindings_armed = false;
+                                    session.key_capture = None;
+                                } else {
+                                    session.reset_keybindings_armed = true;
+                                }
+                            }
+                        });
+                    });
+                    let (instruction, instruction_color) = if let Some(target) = session.key_capture
+                    {
+                        (
+                            format!(
+                                "PRESS A KEY FOR {} · BACKSPACE CLEARS · ESC CANCELS",
+                                target.command.label().to_uppercase()
+                            ),
+                            CONTROL_ACTIVE,
+                        )
+                    } else if snapshot.keybindings_save_error {
+                        (
+                            "ACTIVE FOR THIS SESSION · COULD NOT SAVE SETTINGS".to_owned(),
+                            CONTROL_ACTIVE,
+                        )
+                    } else {
+                        (
+                            "CLICK A SLOT TO REBIND · DUPLICATES MOVE TO THE NEW ACTION".to_owned(),
+                            TEXT_MUTED,
+                        )
+                    };
+                    ui.label(
+                        egui::RichText::new(instruction)
+                            .font(FontId::monospace(10.0))
+                            .color(instruction_color),
+                    );
+                    separator_horizontal(ui);
+                    egui::ScrollArea::vertical()
+                        .id_salt("sketchpad-keybinding-list")
+                        .max_height(560.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let mut category = "";
+                            for command in ALL_KEY_COMMANDS {
+                                if command.category() != category {
+                                    category = command.category();
+                                    if !category.is_empty() {
+                                        palette_label(ui, category);
+                                    }
+                                }
+                                ui.horizontal(|ui| {
+                                    keybinding_action_label(ui, command.label());
+                                    let bindings = keybindings.for_command(command);
+                                    for slot in 0..BINDINGS_PER_COMMAND {
+                                        let target = KeyBindingTarget { command, slot };
+                                        let capturing = session.key_capture == Some(target);
+                                        if keybinding_button(
+                                            ui,
+                                            bindings.slots[slot],
+                                            capturing,
+                                            slot,
+                                        )
+                                        .clicked()
+                                        {
+                                            session.key_capture =
+                                                if capturing { None } else { Some(target) };
+                                            session.reset_keybindings_armed = false;
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                });
+        });
+    area.response.rect
 }
 
 fn show_color_panel(
@@ -1264,6 +1517,78 @@ fn menu_button(ui: &mut egui::Ui, text: &str, description: &str) -> egui::Respon
     .on_hover_text(description)
 }
 
+fn small_menu_button(
+    ui: &mut egui::Ui,
+    text: &str,
+    description: &str,
+    selected: bool,
+) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(112.0, CONTROL_HEIGHT),
+        selected,
+        description,
+        |ui, rect, color| {
+            ui.painter().text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::monospace(9.0),
+                color,
+            );
+        },
+    )
+    .on_hover_text(description)
+}
+
+fn keybinding_action_label(ui: &mut egui::Ui, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(
+        Vec2::new(KEYBINDING_LABEL_WIDTH, CONTROL_HEIGHT),
+        Sense::hover(),
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 4.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        text,
+        FontId::proportional(12.0),
+        TEXT,
+    );
+}
+
+fn keybinding_button(
+    ui: &mut egui::Ui,
+    chord: Option<KeyChord>,
+    capturing: bool,
+    slot: usize,
+) -> egui::Response {
+    let text = if capturing {
+        "PRESS KEY".to_owned()
+    } else {
+        chord.map_or_else(|| "NONE".to_owned(), KeyChord::label)
+    };
+    let description = format!(
+        "{} binding: {}",
+        if slot == 0 { "Primary" } else { "Secondary" },
+        chord.map_or("unassigned".to_owned(), KeyChord::label)
+    );
+    custom_button(
+        ui,
+        Vec2::new(KEYBINDING_BUTTON_WIDTH, CONTROL_HEIGHT),
+        capturing,
+        &description,
+        |ui, rect, color| {
+            ui.painter().with_clip_rect(rect.shrink(4.0)).text(
+                rect.center(),
+                Align2::CENTER_CENTER,
+                text,
+                FontId::monospace(9.0),
+                color,
+            );
+        },
+    )
+    .on_hover_text(description)
+}
+
 fn palette_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
@@ -1630,6 +1955,30 @@ mod tests {
     }
 
     #[test]
+    fn key_capture_reserves_escape_and_backspace_but_preserves_modifiers() {
+        assert_eq!(
+            key_capture_decision(PhysicalKey::Code(KeyCode::Escape), ModifiersState::CONTROL),
+            KeyCaptureDecision::Cancel
+        );
+        assert_eq!(
+            key_capture_decision(PhysicalKey::Code(KeyCode::Backspace), ModifiersState::SHIFT),
+            KeyCaptureDecision::Clear
+        );
+        assert_eq!(
+            key_capture_decision(
+                PhysicalKey::Code(KeyCode::KeyK),
+                ModifiersState::CONTROL | ModifiersState::SHIFT | ModifiersState::ALT,
+            ),
+            KeyCaptureDecision::Assign(KeyChord::new(
+                super::super::keybindings::BindingKey::KeyK,
+                true,
+                true,
+                true,
+            ))
+        );
+    }
+
+    #[test]
     fn picker_drag_previews_and_release_commits_once() {
         let mut picker = ColorPickerState::default();
         let mut actions = Vec::new();
@@ -1676,6 +2025,7 @@ mod tests {
             toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
             file_panel: Rect::from_min_max(Pos2::new(60.0, 60.0), Pos2::new(70.0, 70.0)),
             color_panel: Rect::from_min_max(Pos2::new(20.0, 20.0), Pos2::new(30.0, 30.0)),
+            keybinding_panel: Rect::from_min_max(Pos2::new(80.0, 80.0), Pos2::new(90.0, 90.0)),
             layers_panel: Rect::from_min_max(Pos2::new(40.0, 40.0), Pos2::new(50.0, 50.0)),
         };
 
@@ -1683,6 +2033,7 @@ mod tests {
         assert!(regions.contains(Pos2::new(25.0, 25.0)));
         assert!(regions.contains(Pos2::new(45.0, 45.0)));
         assert!(regions.contains(Pos2::new(65.0, 65.0)));
+        assert!(regions.contains(Pos2::new(85.0, 85.0)));
         assert!(!regions.contains(Pos2::new(15.0, 15.0)));
         assert!(!regions.contains(Pos2::new(35.0, 35.0)));
     }

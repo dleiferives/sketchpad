@@ -709,6 +709,62 @@ check: all 101 contact frames reused prepared UI geometry with zero UI
 declaration/tessellation or GPU-buffer preparation calls. Picker-open dirty
 frame cost still needs a controlled release-mode measurement.
 
+### Keybinding model and editor, 2026-07-28
+
+The previous keyboard path was one ordered match over hard-coded winit
+`PhysicalKey` values. The replacement preserves physical-key behavior but
+makes 32 application commands data-driven. Each command owns two fixed
+optional slots in a flat array. A non-repeating key press constructs one small
+`KeyChord` and linearly checks at most 64 slots; the input path performs no
+allocation, hashing, file access, or UI work.
+
+The full binding table is projected into the editor through a closure invoked
+only after the overlay dirty check, like the layer metadata projection. Closed
+or unchanged UI therefore does not copy or compare all 64 slots on each canvas
+frame.
+
+`KeyChord` records a supported physical key plus exact Shift, Alt, and primary
+command modifiers. Primary command deliberately canonicalizes either Control
+or Super/Command so one saved binding remains portable across Linux, Windows,
+and Apple platforms. Escape is not editable: it remains the universal
+stroke-cancel and close-request safety path. In editor capture mode Escape
+cancels capture and Backspace clears the selected slot.
+
+The `KEYS` surface exposes both slots for every command in General, Document,
+Brush, Color, and Layers groups. Clicking a slot captures the next supported
+physical key before normal application dispatch, so rebinding a shortcut
+cannot accidentally execute its previous command. Closing/hiding the UI or
+losing focus cancels capture. Reset Defaults requires a second confirmation
+click.
+
+One chord has one owner. Assigning an occupied chord removes it from the old
+slot and assigns it to the new one; the panel states that policy before the
+edit. This avoids an order-dependent runtime winner. Unit tests preserve all
+previous defaults, prove uniqueness and deterministic displacement, cover
+capture cancellation/clearing/modifiers, reject conflicting persisted input,
+and round-trip edited bindings exactly.
+
+Preferences are intentionally separate from drawings and recovery:
+
+```text
+$XDG_CONFIG_HOME/sketchpad/keybindings.json
+~/.config/sketchpad/keybindings.json       # HOME fallback
+```
+
+`SKETCHPAD_KEYBINDINGS_PATH` is available for controlled tests. The format is
+versioned JSON with stable command and physical-key names. Missing commands
+inherit defaults so later releases can add actions; unknown commands are
+ignored for forward compatibility. Duplicate commands, duplicate chords,
+unknown format versions, and malformed JSON fail closed to defaults without
+overwriting the bad file. A runtime save failure leaves the edit active for
+the session and is visible in the panel. Successful writes use a same-directory
+temporary file, file synchronization, rename, and best-effort directory
+synchronization.
+
+The complete Apollo test suite, warning-denied Clippy, and format check pass.
+The remaining acceptance work is a visual/capture/persistence hand test with
+the release build.
+
 ## Custom Fallback
 
 If the egui spike fails, build only the control surface Sketchpad needs:

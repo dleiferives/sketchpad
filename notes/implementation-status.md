@@ -46,6 +46,9 @@ prototype:
   import, full-canvas export, and content-bounds export workflows;
 - a collapsible custom layer panel for selection, per-row visibility, create,
   duplicate, delete, ordering, and stepped active-layer opacity;
+- a custom keybinding editor covering 32 application commands with two slots,
+  physical-key capture, deterministic conflict displacement, confirmed reset,
+  and versioned user-config persistence;
 - typed UI actions that invoke the same application command methods as
   keyboard controls rather than owning document state;
 - explicit mouse and direct-XInput tablet UI capture, with ownership fixed
@@ -133,6 +136,10 @@ Controls:
 - Control/Command-Page Up / Page Down: move the active layer above/below;
 - F1: show or hide the interface;
 - UI `LAYERS`: show or hide the layer panel;
+- UI `KEYS`: open or close the keybinding editor;
+- keybinding slot: capture the next physical key and exact modifiers;
+- Escape while capturing: cancel without changing the slot;
+- Backspace while capturing: clear the slot;
 - UI color swatch: open or close the color picker;
 - color saturation/value plane: preview continuously and commit on release;
 - color hue strip: preview continuously and commit on release;
@@ -548,8 +555,12 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - brush geometry remains one hard-round family with an experimental
   linear-mixing engine, visible-color sampling, and one coverage eraser;
 - the first graphical toolbar, layer panel, file surface, and HSV picker are
-  functional integration slices; there is not yet a brush editor, final
-  responsive layout, rotation, selection, or transforms;
+  functional integration slices, alongside the first keybinding editor; there
+  is not yet a brush editor, final responsive layout, rotation, selection, or
+  transforms;
+- keybindings currently cover keyboard physical keys and exact modifiers, not
+  mouse buttons, wheel gestures, tablet buttons, key sequences, or
+  layout-relative logical characters;
 - the current named `.sketchpad` document is the exact layered snapshot
   container proven by recovery, not the eventual scalable schema: it has no
   embedded preview or serialized undo history, and the active named path is
@@ -591,8 +602,8 @@ immediate order is:
 
 1. evaluate hard-round, mixing, cancellation, undo, file drop, color sampling,
    and the new color picker with the physical Wacom setup;
-2. continue turning the proven toolbar, layer, file, and color surfaces into a
-   coherent usable drawing workflow;
+2. continue turning the proven toolbar, layer, file, color, and keybinding
+   surfaces into a coherent usable drawing workflow;
 3. add canvas rotation controls before broader selection/transform work.
 4. Add frame-paced replay that processes every sample but coalesces GPU work to
    one submission per display opportunity.
