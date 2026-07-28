@@ -1,6 +1,6 @@
 # Implementation Status
 
-Status: live implementation ledger, 2026-07-27. This note records what the
+Status: live implementation ledger, 2026-07-28. This note records what the
 current executable actually does. Product intent remains in
 [first-usable-product.md](first-usable-product.md); research claims and future
 possibilities belong in the subject notes.
@@ -37,6 +37,15 @@ prototype:
 - pressure-sized pen ink and destination-out erasing;
 - GPU brush-footprint cursor that distinguishes pen and eraser and follows
   contact pressure;
+- a cached custom-painted egui overlay sharing the existing `wgpu` 30 device,
+  surface texture, command encoder, and render pass;
+- a compact first toolbar for pen/eraser/mixing selection, brush diameter,
+  current color/opacity preview, undo/redo, and interface hiding;
+- typed UI actions that invoke the same application command methods as
+  keyboard controls rather than owning document state;
+- explicit mouse and direct-XInput tablet UI capture, with ownership fixed
+  from contact through release and canvas-origin strokes unable to migrate
+  into controls;
 - between-stroke keyboard controls for brush size, opacity, mouse
   pen/eraser mode, and six built-in colors;
 - one persistent tile transaction from pointer contact to release;
@@ -115,6 +124,7 @@ Controls:
   document's last layer;
 - Page Up / Page Down: select the layer above/below;
 - Control/Command-Page Up / Page Down: move the active layer above/below;
+- F1: show or hide the interface;
 - Escape while drawing: cancel the active stroke;
 - Escape while idle: exit.
 
@@ -516,7 +526,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - layer operations are keyboard/file-drop driven; brush geometry remains one
   hard-round family with an experimental linear-mixing engine, six preset
   colors, visible-color sampling, and one coverage eraser;
-- no graphical brush/color UI, rotation, selection, or transforms;
+- the first graphical toolbar is an integration scaffold; there is not yet a
+  layer panel, full color interface, brush editor, final responsive layout,
+  rotation, selection, or transforms;
 - the current named `.sketchpad` document is the exact layered snapshot
   container proven by recovery, not the eventual scalable schema: it has no
   embedded preview or serialized undo history, and the active named path is

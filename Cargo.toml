@@ -21,3 +21,18 @@ egui-winit = { git = "https://github.com/emilk/egui", rev = "2cb071f7f6d71e0f888
 [target.'cfg(target_os = "linux")'.dependencies]
 raw-window-handle = "0.6"
 x11rb = { version = "0.13", features = ["xinput"] }
+
+[patch.crates-io]
+# wgpu-hal 30.0.0 passes an acquire fence on non-Windows Vulkan but only
+# waits/resets it on Windows. This coherent official v30 backport uses a null
+# fence there: https://github.com/gfx-rs/wgpu/pull/9918
+naga = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+naga-types = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-core = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-core-deps-apple = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-core-deps-emscripten = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-core-deps-windows-linux-android = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-hal = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-naga-bridge = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }
+wgpu-types = { git = "https://github.com/gfx-rs/wgpu", rev = "e904d2eac09a9494fb8a453b7e0278fb06e8693c" }

@@ -2,8 +2,9 @@ use egui::{
     Align, Align2, Color32, FontId, Id, Layout, Order, Pos2, Rect, Sense, Stroke, StrokeKind,
     TextureId, Vec2,
 };
+use sketchpad::input::{TabletPhase, TabletSample};
 use std::mem;
-use winit::{event::WindowEvent, window::Window};
+use winit::{event::WindowEvent, keyboard::ModifiersState, window::Window};
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
 const CONTROL_HEIGHT: f32 = 36.0;
@@ -51,6 +52,74 @@ pub struct UiEventResponse {
     pub repaint: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TabletCapture {
+    device_id: Option<u16>,
+    pointer_over: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TabletRoute {
+    forward: bool,
+    pressed: bool,
+    released: bool,
+    consumed: bool,
+}
+
+impl TabletCapture {
+    fn route(
+        &mut self,
+        phase: TabletPhase,
+        device_id: u16,
+        pressure: f32,
+        pointer_over: bool,
+        canvas_owns_pointer: bool,
+    ) -> TabletRoute {
+        let was_over = self.pointer_over;
+        self.pointer_over = pointer_over;
+        let captured = self.device_id == Some(device_id);
+
+        if self.device_id.is_some() && !captured {
+            return TabletRoute::default();
+        }
+        if canvas_owns_pointer && !captured {
+            return TabletRoute::default();
+        }
+
+        let contact_start = matches!(phase, TabletPhase::Down)
+            || (matches!(phase, TabletPhase::Move) && pressure > 0.0);
+        if self.device_id.is_none() && pointer_over && contact_start {
+            self.device_id = Some(device_id);
+            return TabletRoute {
+                forward: true,
+                pressed: true,
+                released: false,
+                consumed: true,
+            };
+        }
+
+        if captured {
+            let released = matches!(phase, TabletPhase::Up | TabletPhase::Hover);
+            if released {
+                self.device_id = None;
+            }
+            return TabletRoute {
+                forward: true,
+                pressed: false,
+                released,
+                consumed: true,
+            };
+        }
+
+        TabletRoute {
+            forward: pointer_over || was_over,
+            pressed: false,
+            released: false,
+            consumed: pointer_over,
+        }
+    }
+}
+
 pub struct UiOverlay {
     context: egui::Context,
     platform: egui_winit::State,
@@ -61,6 +130,8 @@ pub struct UiOverlay {
     interactive_rect: Rect,
     pointer_over: bool,
     mouse_capture: bool,
+    tablet_capture: TabletCapture,
+    tablet_position: Option<Pos2>,
     cpu_dirty: bool,
     gpu_dirty: bool,
     last_snapshot: Option<UiSnapshot>,
@@ -89,6 +160,8 @@ impl UiOverlay {
             interactive_rect: Rect::NOTHING,
             pointer_over: false,
             mouse_capture: false,
+            tablet_capture: TabletCapture::default(),
+            tablet_position: None,
             cpu_dirty: true,
             gpu_dirty: false,
             last_snapshot: None,
@@ -140,6 +213,9 @@ impl UiOverlay {
         let response = self.platform.on_window_event(window, event);
         if response.repaint {
             self.cpu_dirty = true;
+        }
+        if matches!(event, WindowEvent::Focused(false)) {
+            self.cancel_pointer_capture();
         }
 
         if let WindowEvent::MouseInput {
@@ -235,6 +311,75 @@ impl UiOverlay {
     pub fn mark_dirty(&mut self) {
         self.cpu_dirty = true;
     }
+
+    pub fn cancel_pointer_capture(&mut self) {
+        self.mouse_capture = false;
+        if self.tablet_capture.device_id.is_some() {
+            if let Some(pos) = self.tablet_position {
+                self.platform
+                    .egui_input_mut()
+                    .events
+                    .push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed: false,
+                        modifiers: egui::Modifiers::default(),
+                    });
+            }
+        }
+        self.tablet_capture = TabletCapture::default();
+        self.tablet_position = None;
+        self.pointer_over = false;
+        self.platform
+            .egui_input_mut()
+            .events
+            .push(egui::Event::PointerGone);
+        self.cpu_dirty = true;
+    }
+
+    pub fn on_tablet_sample(
+        &mut self,
+        window: &Window,
+        phase: TabletPhase,
+        sample: TabletSample,
+        modifiers: ModifiersState,
+        canvas_owns_pointer: bool,
+    ) -> UiEventResponse {
+        let pixels_per_point = window.scale_factor() as f32;
+        let position = Pos2::new(
+            sample.position[0] / pixels_per_point,
+            sample.position[1] / pixels_per_point,
+        );
+        let pointer_over = self.interactive_rect.contains(position);
+        let route = self.tablet_capture.route(
+            phase,
+            sample.device_id,
+            sample.pressure,
+            pointer_over,
+            canvas_owns_pointer,
+        );
+        if !route.forward {
+            return UiEventResponse::default();
+        }
+
+        self.tablet_position = Some(position);
+        let input = self.platform.egui_input_mut();
+        input.events.push(egui::Event::PointerMoved(position));
+        if route.pressed || route.released {
+            input.events.push(egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Primary,
+                pressed: route.pressed,
+                modifiers: to_egui_modifiers(modifiers),
+            });
+        }
+        self.cpu_dirty = true;
+        window.set_cursor_visible(route.consumed);
+        UiEventResponse {
+            consumed: route.consumed,
+            repaint: true,
+        }
+    }
 }
 
 fn platform_event_can_invalidate_ui(event: &WindowEvent) -> bool {
@@ -246,6 +391,21 @@ fn platform_event_can_invalidate_ui(event: &WindowEvent) -> bool {
             | WindowEvent::Moved(_)
             | WindowEvent::Occluded(_)
     )
+}
+
+fn to_egui_modifiers(modifiers: ModifiersState) -> egui::Modifiers {
+    let super_key = modifiers.super_key();
+    egui::Modifiers {
+        alt: modifiers.alt_key(),
+        ctrl: modifiers.control_key(),
+        shift: modifiers.shift_key(),
+        mac_cmd: cfg!(target_os = "macos") && super_key,
+        command: if cfg!(target_os = "macos") {
+            super_key
+        } else {
+            modifiers.control_key()
+        },
+    }
 }
 
 fn show_toolbar(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiAction>) -> Rect {
@@ -466,5 +626,61 @@ mod tests {
         assert!(!platform_event_can_invalidate_ui(
             &WindowEvent::CloseRequested
         ));
+    }
+
+    #[test]
+    fn tablet_contact_that_starts_on_ui_remains_captured_until_release() {
+        let mut capture = TabletCapture::default();
+        let down = capture.route(TabletPhase::Down, 7, 0.4, true, false);
+        assert_eq!(
+            down,
+            TabletRoute {
+                forward: true,
+                pressed: true,
+                released: false,
+                consumed: true,
+            }
+        );
+
+        let outside = capture.route(TabletPhase::Move, 7, 0.7, false, false);
+        assert!(outside.forward);
+        assert!(outside.consumed);
+        assert!(!outside.pressed);
+        assert!(!outside.released);
+
+        let up = capture.route(TabletPhase::Up, 7, 0.0, false, false);
+        assert!(up.forward);
+        assert!(up.consumed);
+        assert!(up.released);
+        assert_eq!(capture.device_id, None);
+    }
+
+    #[test]
+    fn canvas_owned_tablet_contact_cannot_migrate_to_ui() {
+        let mut capture = TabletCapture::default();
+        let route = capture.route(TabletPhase::Move, 7, 0.8, true, true);
+        assert_eq!(route, TabletRoute::default());
+        assert_eq!(capture.device_id, None);
+    }
+
+    #[test]
+    fn tablet_hover_crossing_ui_only_forwards_boundary_events() {
+        let mut capture = TabletCapture::default();
+        assert_eq!(
+            capture.route(TabletPhase::Hover, 7, 0.0, false, false),
+            TabletRoute::default()
+        );
+        assert!(
+            capture
+                .route(TabletPhase::Hover, 7, 0.0, true, false)
+                .forward
+        );
+        let leaving = capture.route(TabletPhase::Hover, 7, 0.0, false, false);
+        assert!(leaving.forward);
+        assert!(!leaving.consumed);
+        assert_eq!(
+            capture.route(TabletPhase::Hover, 7, 0.0, false, false),
+            TabletRoute::default()
+        );
     }
 }

@@ -1516,8 +1516,7 @@ impl App {
             .is_some_and(|activity| activity.elapsed() < TABLET_MOUSE_SUPPRESSION)
     }
 
-    fn handle_tablet_sample(&mut self, phase: TabletPhase, sample: TabletSample) {
-        let handling_start = Instant::now();
+    fn observe_tablet_sample(&mut self, phase: TabletPhase, sample: TabletSample) {
         log::debug!(
             "tablet_sample phase={:?} device={} tool={:?} x={:.3} y={:.3} pressure={:.6} \
              tilt_x={:.6} tilt_y={:.6} distance={:.6} time_ms={}",
@@ -1541,7 +1540,14 @@ impl App {
         self.cursor_contact =
             matches!(phase, TabletPhase::Down | TabletPhase::Move) && sample.pressure > 0.0;
         self.update_tablet_title(sample);
+    }
 
+    fn handle_canvas_tablet_sample(
+        &mut self,
+        phase: TabletPhase,
+        sample: TabletSample,
+        handling_start: Instant,
+    ) {
         let owner = PointerOwner::Tablet {
             device_id: sample.device_id,
             tool: sample.tool,
@@ -1793,12 +1799,9 @@ impl App {
             return;
         };
 
-        let output = match gpu.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
-            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => {
-                gpu.surface.configure(&gpu.device, &gpu.config);
-                texture
-            }
+        let (output, reconfigure_after_present) = match gpu.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => (texture, false),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
             | wgpu::CurrentSurfaceTexture::Validation => return,
@@ -1870,6 +1873,9 @@ impl App {
         gpu.canvas.uploads_submitted(submission);
         ui.finish_submit();
         gpu.queue.present(output);
+        if reconfigure_after_present {
+            gpu.surface.configure(&gpu.device, &gpu.config);
+        }
         let submitted_at = Instant::now();
         self.metrics.frame_stages.record(
             acquired_at.saturating_duration_since(render_start),
@@ -2148,6 +2154,13 @@ impl ApplicationHandler<TabletEvent> for App {
             self.request_redraw();
         }
         if ui_response.consumed {
+            if matches!(
+                event,
+                WindowEvent::CursorMoved { .. } | WindowEvent::MouseInput { .. }
+            ) {
+                self.cursor_visible = false;
+                self.cursor_contact = false;
+            }
             return;
         }
 
@@ -2370,6 +2383,30 @@ impl ApplicationHandler<TabletEvent> for App {
                     backend_received_at,
                     handled_at,
                 );
+                self.observe_tablet_sample(phase, sample);
+                let canvas_owns_pointer = self.active_pointer.is_some()
+                    || self.sampling_pointer.is_some()
+                    || self.panning;
+                let ui_response = match (&self.window, &mut self.ui) {
+                    (Some(window), Some(ui)) => ui.on_tablet_sample(
+                        window,
+                        phase,
+                        sample,
+                        self.modifiers,
+                        canvas_owns_pointer,
+                    ),
+                    _ => Default::default(),
+                };
+                if ui_response.repaint {
+                    self.request_redraw();
+                }
+                if ui_response.consumed {
+                    self.cursor_visible = false;
+                    self.cursor_contact = false;
+                    self.metrics.input_handling.record(handled_at.elapsed());
+                    return;
+                }
+
                 let device_name = self.tablet_device_name(sample);
                 let viewport = self
                     .window
@@ -2382,7 +2419,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 let completed_trace = self.stroke_recorder.as_mut().map(|recorder| {
                     recorder.observe(handled_at, viewport, device_name, phase, sample)
                 });
-                self.handle_tablet_sample(phase, sample);
+                self.handle_canvas_tablet_sample(phase, sample, handled_at);
 
                 match completed_trace {
                     Some(Ok(Some(trace))) => {
@@ -2418,9 +2455,13 @@ impl ApplicationHandler<TabletEvent> for App {
             }
             TabletEvent::BackendError(error) => {
                 log::error!("native tablet input stopped: {error}");
+                if let Some(ui) = &mut self.ui {
+                    ui.cancel_pointer_capture();
+                }
                 if matches!(self.active_pointer, Some(PointerOwner::Tablet { .. })) {
                     self.cancel_stroke();
                 }
+                self.request_redraw();
             }
         }
     }

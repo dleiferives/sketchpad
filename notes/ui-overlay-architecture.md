@@ -493,9 +493,45 @@ path. Do not change Sketchpad's established canvas surface format merely to
 silence the warning; evaluate UI blending visually and with a color test
 before considering a different view format.
 
-The smoke run used the debug build and cold initialization, so its first-frame
-timing is not a performance result. Direct-tablet UI event translation and
-physical pen capture remain the next slice.
+The next slice added direct-tablet UI translation without sending native
+pressure through egui. A small capture state machine:
+
+- forwards tablet hover only while entering, crossing, or leaving a UI hit
+  region;
+- captures a device whose contact begins on UI;
+- retains that capture outside the panel through release;
+- refuses UI capture while canvas drawing, sampling, or panning owns the
+  pointer;
+- suppresses the duplicate synthesized mouse path after native tablet input;
+- clears capture on focus loss or tablet-backend failure.
+
+Unit tests cover UI-origin capture, canvas-origin ownership, and hover boundary
+forwarding. Physical pen activation of each control and slider dragging still
+require a hand test.
+
+The wakeup test also exposed an upstream Vulkan correctness bug in the
+published `wgpu-hal 30.0.0`. On non-Windows platforms it passed a real fence to
+`vkAcquireNextImageKHR`, but the wait/reset logic for that fence was compiled
+only on Windows. The second acquisition after idle therefore emitted
+`VUID-vkAcquireNextImageKHR-fence-10066` on Apollo.
+
+The wgpu project fixed this exact bug in
+[PR 9918](https://github.com/gfx-rs/wgpu/pull/9918) and backported it to the
+v30 line as commit `e904d2eac09a9494fb8a453b7e0278fb06e8693c`. Sketchpad
+patches the coherent wgpu v30 crate family to that exact official revision;
+patching `wgpu-hal` alone is invalid because Rust types from its Git-sourced
+`wgpu-types` and Naga dependencies do not match crates.io copies. Cargo-tree
+checks prove one `wgpu` and one `wgpu-types`, both revision `e904d2ea`.
+
+Sketchpad also no longer reconfigures the surface while a suboptimal acquired
+texture is still alive. It presents that frame and reconfigures afterward.
+Before the upstream patch, the idle-wakeup reproducer emitted the fence
+validation error on every run. After the patch, Apollo idled for eight seconds
+and then processed a 271-sample, 108-present physical stroke without a Vulkan
+validation error.
+
+These smoke runs used debug builds and cold initialization, so their frame
+timings are not performance results.
 
 ## Custom Fallback
 
