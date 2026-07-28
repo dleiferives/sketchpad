@@ -1,6 +1,6 @@
 use crate::{
     document::{Document, DocumentError, DocumentLayerParts, LayerId},
-    raster::{LinearRgba, RasterError, RasterLayer, TileCoord},
+    raster::{LinearRgba, RasterCheckpointTile, RasterError, RasterLayer, TileCoord},
 };
 use std::{
     collections::HashSet,
@@ -32,6 +32,22 @@ pub struct CheckpointSummary {
     pub layer_count: u32,
     pub tile_count: u32,
     pub stored_pixels: u64,
+}
+
+pub struct DocumentSnapshot {
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    active_layer: u64,
+    layers: Vec<LayerSnapshot>,
+}
+
+struct LayerSnapshot {
+    id: u64,
+    name: String,
+    visible: bool,
+    opacity: f32,
+    tiles: Vec<RasterCheckpointTile>,
 }
 
 #[derive(Debug)]
@@ -108,8 +124,35 @@ pub fn default_recovery_path() -> PathBuf {
 }
 
 pub fn encode(layer: &RasterLayer) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
-    validate_geometry(layer.width(), layer.height(), layer.tile_size())?;
-    let tile_count = u32::try_from(layer.allocated_tile_count())
+    let mut tiles: Vec<_> = layer
+        .allocated_tile_coords()
+        .map(|coord| {
+            (
+                coord,
+                layer
+                    .tile(coord)
+                    .expect("coordinates came from allocated tiles")
+                    .pixels(),
+            )
+        })
+        .collect();
+    encode_raster_parts(layer.width(), layer.height(), layer.tile_size(), &mut tiles)
+}
+
+fn encode_raster_parts(
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    tiles: &mut [(TileCoord, &[LinearRgba])],
+) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    validate_geometry(width, height, tile_size)?;
+    let expected_pixels = usize::try_from(
+        tile_size
+            .checked_mul(tile_size)
+            .ok_or_else(|| CheckpointError::invalid("tile pixel count overflow"))?,
+    )
+    .map_err(|_| CheckpointError::invalid("tile pixel count does not fit usize"))?;
+    let tile_count = u32::try_from(tiles.len())
         .map_err(|_| CheckpointError::invalid("allocated tile count does not fit u32"))?;
     if tile_count > MAX_TILE_COUNT {
         return Err(CheckpointError::invalid(
@@ -118,49 +161,54 @@ pub fn encode(layer: &RasterLayer) -> Result<(Vec<u8>, CheckpointSummary), Check
     }
 
     let mut payload = Vec::new();
-    push_u32(&mut payload, layer.width());
-    push_u32(&mut payload, layer.height());
-    push_u32(&mut payload, layer.tile_size());
+    push_u32(&mut payload, width);
+    push_u32(&mut payload, height);
+    push_u32(&mut payload, tile_size);
     push_u32(&mut payload, tile_count);
 
-    let mut coords: Vec<_> = layer.allocated_tile_coords().collect();
-    coords.sort_unstable_by_key(|coord| (coord.y, coord.x));
+    tiles.sort_unstable_by_key(|(coord, _)| (coord.y, coord.x));
     let mut stored_pixels = 0_u64;
+    let tiles_wide = (width - 1) / tile_size + 1;
+    let tiles_high = (height - 1) / tile_size + 1;
 
-    for coord in coords {
-        let tile = layer
-            .tile(coord)
-            .expect("coordinates came from allocated tiles");
+    for &(coord, pixels) in tiles.iter() {
+        if coord.x >= tiles_wide || coord.y >= tiles_high {
+            return Err(CheckpointError::invalid(
+                "tile coordinate lies outside canvas",
+            ));
+        }
+        if pixels.len() != expected_pixels {
+            return Err(CheckpointError::invalid("tile pixel count is invalid"));
+        }
+        let origin_x = coord.x * tile_size;
+        let origin_y = coord.y * tile_size;
+        let valid_width = tile_size.min(width - origin_x);
+        let valid_height = tile_size.min(height - origin_y);
         push_u32(&mut payload, coord.x);
         push_u32(&mut payload, coord.y);
         let run_count_offset = payload.len();
         push_u32(&mut payload, 0);
         let mut run_count = 0_u32;
 
-        for y in 0..tile.bounds().height() {
-            let row_start = y as usize * tile.stride();
+        for y in 0..valid_height {
+            let row_start = y as usize * tile_size as usize;
             let mut x = 0;
-            while x < tile.bounds().width() {
-                while x < tile.bounds().width()
-                    && tile.pixels()[row_start + x as usize] == LinearRgba::TRANSPARENT
-                {
+            while x < valid_width {
+                while x < valid_width && pixels[row_start + x as usize] == LinearRgba::TRANSPARENT {
                     x += 1;
                 }
-                if x == tile.bounds().width() {
+                if x == valid_width {
                     break;
                 }
                 let run_start = x;
-                while x < tile.bounds().width()
-                    && tile.pixels()[row_start + x as usize] != LinearRgba::TRANSPARENT
-                {
+                while x < valid_width && pixels[row_start + x as usize] != LinearRgba::TRANSPARENT {
                     x += 1;
                 }
                 let run_length = x - run_start;
                 push_u32(&mut payload, y);
                 push_u32(&mut payload, run_start);
                 push_u32(&mut payload, run_length);
-                for pixel in &tile.pixels()[row_start + run_start as usize..row_start + x as usize]
-                {
+                for pixel in &pixels[row_start + run_start as usize..row_start + x as usize] {
                     validate_pixel(*pixel)?;
                     push_pixel(&mut payload, *pixel);
                 }
@@ -208,30 +256,125 @@ pub fn encode(layer: &RasterLayer) -> Result<(Vec<u8>, CheckpointSummary), Check
 pub fn encode_document(
     document: &Document,
 ) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    let mut layers: Vec<_> = document
+        .layers()
+        .iter()
+        .map(|layer| DocumentEncodingLayer {
+            id: layer.id().get(),
+            name: layer.name(),
+            visible: layer.visible(),
+            opacity: layer.opacity(),
+            tiles: layer
+                .raster()
+                .allocated_tile_coords()
+                .map(|coord| {
+                    (
+                        coord,
+                        layer
+                            .raster()
+                            .tile(coord)
+                            .expect("coordinates came from allocated tiles")
+                            .pixels(),
+                    )
+                })
+                .collect(),
+        })
+        .collect();
+    encode_document_parts(
+        document.width(),
+        document.height(),
+        document.tile_size(),
+        document.active_layer_id().get(),
+        &mut layers,
+    )
+}
+
+pub fn snapshot_document(document: &Document) -> Result<DocumentSnapshot, CheckpointError> {
     validate_geometry(document.width(), document.height(), document.tile_size())?;
-    let layer_count = u32::try_from(document.layers().len())
-        .map_err(|_| CheckpointError::invalid("layer count does not fit u32"))?;
-    if layer_count == 0 || layer_count > MAX_LAYER_COUNT {
-        return Err(CheckpointError::invalid("layer count is outside limits"));
+    validate_layer_count(document.layers().len())?;
+    let mut layers = Vec::with_capacity(document.layers().len());
+    for layer in document.layers() {
+        validate_layer_name(layer.name())?;
+        layers.push(LayerSnapshot {
+            id: layer.id().get(),
+            name: layer.name().to_owned(),
+            visible: layer.visible(),
+            opacity: layer.opacity(),
+            tiles: layer.raster().checkpoint_tiles(),
+        });
+    }
+    Ok(DocumentSnapshot {
+        width: document.width(),
+        height: document.height(),
+        tile_size: document.tile_size(),
+        active_layer: document.active_layer_id().get(),
+        layers,
+    })
+}
+
+pub fn encode_document_snapshot(
+    snapshot: &DocumentSnapshot,
+) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    let mut layers: Vec<_> = snapshot
+        .layers
+        .iter()
+        .map(|layer| DocumentEncodingLayer {
+            id: layer.id,
+            name: &layer.name,
+            visible: layer.visible,
+            opacity: layer.opacity,
+            tiles: layer
+                .tiles
+                .iter()
+                .map(|tile| (tile.coord, tile.pixels.as_ref()))
+                .collect(),
+        })
+        .collect();
+    encode_document_parts(
+        snapshot.width,
+        snapshot.height,
+        snapshot.tile_size,
+        snapshot.active_layer,
+        &mut layers,
+    )
+}
+
+struct DocumentEncodingLayer<'a> {
+    id: u64,
+    name: &'a str,
+    visible: bool,
+    opacity: f32,
+    tiles: Vec<(TileCoord, &'a [LinearRgba])>,
+}
+
+fn encode_document_parts(
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    active_layer: u64,
+    layers: &mut [DocumentEncodingLayer<'_>],
+) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    validate_geometry(width, height, tile_size)?;
+    let layer_count = validate_layer_count(layers.len())?;
+    if !layers.iter().any(|layer| layer.id == active_layer) {
+        return Err(CheckpointError::invalid(
+            "active layer does not belong to document",
+        ));
     }
 
     let mut payload = Vec::new();
-    push_u32(&mut payload, document.width());
-    push_u32(&mut payload, document.height());
-    push_u32(&mut payload, document.tile_size());
+    push_u32(&mut payload, width);
+    push_u32(&mut payload, height);
+    push_u32(&mut payload, tile_size);
     push_u32(&mut payload, layer_count);
-    push_u64(&mut payload, document.active_layer_id().get());
+    push_u64(&mut payload, active_layer);
 
     let mut tile_count = 0_u32;
     let mut stored_pixels = 0_u64;
-    for layer in document.layers() {
-        let name = layer.name().as_bytes();
-        if name.is_empty() || name.len() > MAX_LAYER_NAME_BYTES {
-            return Err(CheckpointError::invalid(
-                "layer name length is outside limits",
-            ));
-        }
-        let (encoded_raster, summary) = encode(layer.raster())?;
+    for layer in layers {
+        validate_layer_name(layer.name)?;
+        let (encoded_raster, summary) =
+            encode_raster_parts(width, height, tile_size, &mut layer.tiles)?;
         tile_count = tile_count
             .checked_add(summary.tile_count)
             .ok_or_else(|| CheckpointError::invalid("document tile count overflow"))?;
@@ -244,9 +387,10 @@ pub fn encode_document(
             .checked_add(summary.stored_pixels)
             .ok_or_else(|| CheckpointError::invalid("stored pixel count overflow"))?;
 
-        push_u64(&mut payload, layer.id().get());
-        push_u32(&mut payload, u32::from(layer.visible()));
-        push_u32(&mut payload, layer.opacity().to_bits());
+        let name = layer.name.as_bytes();
+        push_u64(&mut payload, layer.id);
+        push_u32(&mut payload, u32::from(layer.visible));
+        push_u32(&mut payload, layer.opacity.to_bits());
         push_u32(
             &mut payload,
             u32::try_from(name.len())
@@ -285,6 +429,24 @@ pub fn encode_document(
             stored_pixels,
         },
     ))
+}
+
+fn validate_layer_count(layer_count: usize) -> Result<u32, CheckpointError> {
+    let layer_count = u32::try_from(layer_count)
+        .map_err(|_| CheckpointError::invalid("layer count does not fit u32"))?;
+    if layer_count == 0 || layer_count > MAX_LAYER_COUNT {
+        return Err(CheckpointError::invalid("layer count is outside limits"));
+    }
+    Ok(layer_count)
+}
+
+fn validate_layer_name(name: &str) -> Result<(), CheckpointError> {
+    if name.is_empty() || name.len() > MAX_LAYER_NAME_BYTES {
+        return Err(CheckpointError::invalid(
+            "layer name length is outside limits",
+        ));
+    }
+    Ok(())
 }
 
 pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
@@ -503,6 +665,15 @@ pub fn save_document_atomic(
     document: &Document,
 ) -> Result<CheckpointSummary, CheckpointError> {
     let (encoded, summary) = encode_document(document)?;
+    write_atomic(path, &encoded)?;
+    Ok(summary)
+}
+
+pub fn save_document_snapshot_atomic(
+    path: &Path,
+    snapshot: &DocumentSnapshot,
+) -> Result<CheckpointSummary, CheckpointError> {
+    let (encoded, summary) = encode_document_snapshot(snapshot)?;
     write_atomic(path, &encoded)?;
     Ok(summary)
 }
@@ -876,6 +1047,27 @@ mod tests {
             );
         }
         assert_eq!(restored.composite_stats(), Default::default());
+    }
+
+    #[test]
+    fn document_snapshot_is_exact_and_immutable_while_document_changes() {
+        let mut document = sample_document();
+        let snapshot = snapshot_document(&document).unwrap();
+        let (live_before, live_summary) = encode_document(&document).unwrap();
+        let (snapshot_before, snapshot_summary) = encode_document_snapshot(&snapshot).unwrap();
+        assert_eq!(snapshot_before, live_before);
+        assert_eq!(snapshot_summary, live_summary);
+
+        let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+        gesture
+            .set_pixel(12, 13, LinearRgba::from_straight(0.2, 0.4, 0.6, 1.0))
+            .unwrap();
+        gesture.commit().unwrap();
+
+        let (snapshot_after, _) = encode_document_snapshot(&snapshot).unwrap();
+        let (live_after, _) = encode_document(&document).unwrap();
+        assert_eq!(snapshot_after, snapshot_before);
+        assert_ne!(live_after, snapshot_before);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use std::{
     path::{Path, PathBuf},
     process,
     sync::Arc,
+    thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use winit::{
@@ -48,6 +49,7 @@ const MIXING_PICKUP: f32 = 0.65;
 const MIXING_COLOR_RATE: f32 = 0.08;
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
 const AUTOSAVE_RETRY_DELAY: Duration = Duration::from_secs(10);
+const AUTOSAVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const COLOR_PRESETS: [[f32; 3]; 6] = [
     [0.015, 0.02, 0.03],
     [0.035, 0.07, 0.16],
@@ -358,6 +360,14 @@ impl StrokeRecorder {
     }
 }
 
+struct RecoveryJob {
+    revision: u64,
+    path: PathBuf,
+    started: Instant,
+    snapshot_micros: u128,
+    worker: JoinHandle<Result<checkpoint::CheckpointSummary, CheckpointError>>,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -390,6 +400,8 @@ struct App {
     metrics: LiveMetrics,
     persistence: PersistenceState,
     recovery_due: Option<Instant>,
+    recovery_revision: u64,
+    recovery_job: Option<RecoveryJob>,
     export_path: PathBuf,
     stroke_recorder: Option<StrokeRecorder>,
     persistence_enabled: bool,
@@ -447,6 +459,8 @@ impl App {
             metrics: LiveMetrics::new(),
             persistence,
             recovery_due: recovery_dirty.then(|| Instant::now() + AUTOSAVE_DELAY),
+            recovery_revision: u64::from(recovery_dirty),
+            recovery_job: None,
             export_path,
             stroke_recorder: record_stroke.map(StrokeRecorder::new),
             persistence_enabled,
@@ -976,14 +990,125 @@ impl App {
         if !self.persistence_enabled {
             return;
         }
+        self.recovery_revision = self.recovery_revision.wrapping_add(1);
         self.persistence.document_changed();
         self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
         self.update_window_title(None);
     }
 
+    fn start_recovery_checkpoint(&mut self) -> bool {
+        if !self.persistence_enabled || self.active_stroke.is_some() || self.recovery_job.is_some()
+        {
+            return false;
+        }
+        let path = self.persistence.recovery_path().to_owned();
+        let snapshot_started = Instant::now();
+        let snapshot = match checkpoint::snapshot_document(&self.document) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                log::error!("checkpoint snapshot failed: path={path:?}: {error}");
+                return false;
+            }
+        };
+        let snapshot_micros = snapshot_started.elapsed().as_micros();
+        let worker_path = path.clone();
+        let worker = match thread::Builder::new()
+            .name("sketchpad-recovery".to_owned())
+            .spawn(move || checkpoint::save_document_snapshot_atomic(&worker_path, &snapshot))
+        {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                log::error!("could not start checkpoint worker: path={path:?}: {error}");
+                return false;
+            }
+        };
+        self.recovery_job = Some(RecoveryJob {
+            revision: self.recovery_revision,
+            path: path.clone(),
+            started: Instant::now(),
+            snapshot_micros,
+            worker,
+        });
+        self.recovery_due = None;
+        log::info!(
+            "checkpoint started: path={path:?} revision={} snapshot_us={snapshot_micros}",
+            self.recovery_revision
+        );
+        true
+    }
+
+    fn finish_recovery_checkpoint(&mut self, wait: bool) -> bool {
+        let Some(job) = self.recovery_job.as_ref() else {
+            return false;
+        };
+        if !wait && !job.worker.is_finished() {
+            return false;
+        }
+        let job = self
+            .recovery_job
+            .take()
+            .expect("the recovery job was present");
+        let is_current = job.revision == self.recovery_revision;
+        match job.worker.join() {
+            Ok(Ok(summary)) => {
+                if is_current {
+                    self.persistence.recovery_saved();
+                    self.recovery_due = None;
+                }
+                log::info!(
+                    "checkpoint saved: path={:?} revision={} current={} bytes={} layers={} \
+                     tiles={} stored_pixels={} snapshot_us={} worker_elapsed_ms={}",
+                    job.path,
+                    job.revision,
+                    is_current,
+                    summary.encoded_bytes,
+                    summary.layer_count,
+                    summary.tile_count,
+                    summary.stored_pixels,
+                    job.snapshot_micros,
+                    job.started.elapsed().as_millis()
+                );
+                self.update_window_title(None);
+                true
+            }
+            Ok(Err(error)) => {
+                if is_current {
+                    self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                }
+                log::error!(
+                    "checkpoint save failed: path={:?} revision={} current={}: {error}",
+                    job.path,
+                    job.revision,
+                    is_current
+                );
+                self.update_window_title(None);
+                false
+            }
+            Err(_) => {
+                if is_current {
+                    self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                }
+                log::error!(
+                    "checkpoint worker panicked: path={:?} revision={} current={}",
+                    job.path,
+                    job.revision,
+                    is_current
+                );
+                self.update_window_title(None);
+                false
+            }
+        }
+    }
+
     fn save_recovery_checkpoint(&mut self) -> bool {
         if !self.persistence_enabled || self.active_stroke.is_some() {
             return false;
+        }
+        self.finish_recovery_checkpoint(true);
+        if !self.persistence.recovery_dirty() {
+            return true;
         }
         let path = self.persistence.recovery_path().to_owned();
         let started = Instant::now();
@@ -1163,6 +1288,7 @@ impl App {
                     gpu.canvas.clear_residency();
                 }
                 self.persistence.document_opened(path.clone());
+                self.recovery_revision = self.recovery_revision.wrapping_add(1);
                 self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
                 self.metrics.gpu_baseline = self
                     .gpu
@@ -1281,14 +1407,16 @@ impl App {
     }
 
     fn maybe_autosave(&mut self) {
+        self.finish_recovery_checkpoint(false);
         if self.persistence_enabled
             && self.persistence.recovery_dirty()
             && self.active_stroke.is_none()
+            && self.recovery_job.is_none()
             && self
                 .recovery_due
                 .is_some_and(|deadline| Instant::now() >= deadline)
         {
-            self.save_recovery_checkpoint();
+            self.start_recovery_checkpoint();
         }
     }
 
@@ -2187,6 +2315,14 @@ impl ApplicationHandler<TabletEvent> for App {
                         .unwrap_or(checkpoint_due),
                 );
             }
+        }
+        if self.recovery_job.is_some() {
+            let poll_due = Instant::now() + AUTOSAVE_POLL_INTERVAL;
+            deadline = Some(
+                deadline
+                    .map(|existing| existing.min(poll_due))
+                    .unwrap_or(poll_due),
+            );
         }
         match deadline {
             Some(deadline) => event_loop.set_control_flow(ControlFlow::WaitUntil(deadline)),

@@ -2,6 +2,7 @@ use std::{
     collections::{hash_map::Entry, HashMap},
     error::Error,
     fmt, mem,
+    sync::Arc,
 };
 
 pub const DEFAULT_TILE_SIZE: u32 = 128;
@@ -279,7 +280,7 @@ impl Error for RasterError {}
 
 #[derive(Clone)]
 struct TileState {
-    pixels: Box<[LinearRgba]>,
+    pixels: Arc<[LinearRgba]>,
     content_bounds: Option<RectU32>,
     content_bounds_state: ContentBoundsState,
 }
@@ -294,7 +295,7 @@ enum ContentBoundsState {
 impl TileState {
     fn empty(pixel_count: usize) -> Self {
         Self {
-            pixels: vec![LinearRgba::TRANSPARENT; pixel_count].into_boxed_slice(),
+            pixels: vec![LinearRgba::TRANSPARENT; pixel_count].into(),
             content_bounds: None,
             content_bounds_state: ContentBoundsState::Clean,
         }
@@ -503,7 +504,7 @@ impl BlockTileSnapshot {
         let metadata = self.target_metadata?;
         let mut target = current.unwrap_or_else(|| TileState::empty(tile_pixel_count));
         write_blocks(
-            &mut target.pixels,
+            Arc::make_mut(&mut target.pixels),
             &self.block_indices,
             &self.pixels,
             tile_size,
@@ -528,7 +529,7 @@ impl BlockTileSnapshot {
         match (current.as_mut(), target_metadata) {
             (Some(current_state), Some(metadata)) => {
                 swap_blocks(
-                    &mut current_state.pixels,
+                    Arc::make_mut(&mut current_state.pixels),
                     &self.block_indices,
                     &mut self.pixels,
                     tile_size,
@@ -551,7 +552,7 @@ impl BlockTileSnapshot {
             (None, Some(metadata)) => {
                 let mut target = TileState::empty(tile_pixel_count);
                 write_blocks(
-                    &mut target.pixels,
+                    Arc::make_mut(&mut target.pixels),
                     &self.block_indices,
                     &self.pixels,
                     tile_size,
@@ -710,6 +711,12 @@ pub struct RasterLayer {
     stats: RasterStats,
 }
 
+#[derive(Clone)]
+pub(crate) struct RasterCheckpointTile {
+    pub coord: TileCoord,
+    pub pixels: Arc<[LinearRgba]>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DerivedContentChange {
     pub added_bounds: Option<RectU32>,
@@ -795,6 +802,16 @@ impl RasterLayer {
         self.tiles.keys().copied()
     }
 
+    pub(crate) fn checkpoint_tiles(&self) -> Vec<RasterCheckpointTile> {
+        self.tiles
+            .iter()
+            .map(|(&coord, tile)| RasterCheckpointTile {
+                coord,
+                pixels: Arc::clone(&tile.state.pixels),
+            })
+            .collect()
+    }
+
     pub fn tile(&self, coord: TileCoord) -> Option<RasterTile<'_>> {
         let tile = self.tiles.get(&coord)?;
         let bounds = self
@@ -824,7 +841,7 @@ impl RasterLayer {
         }
 
         let mut state = TileState {
-            pixels,
+            pixels: pixels.into(),
             content_bounds: None,
             content_bounds_state: ContentBoundsState::Recompute,
         };
@@ -886,7 +903,7 @@ impl RasterLayer {
             .saturating_add(local_damage.area());
 
         let mut tile_edit = TileEdit {
-            pixels: &mut tile.state.pixels,
+            pixels: Arc::make_mut(&mut tile.state.pixels),
             stride: self.tile_size as usize,
             valid_width,
             valid_height,
@@ -1246,7 +1263,7 @@ impl RasterLayer {
         gesture.damage.add(coord, global_damage);
         gesture.pending_damage.add(coord, global_damage);
         let mut tile_edit = TileEdit {
-            pixels: &mut tile.state.pixels,
+            pixels: Arc::make_mut(&mut tile.state.pixels),
             stride: tile_size,
             valid_width,
             valid_height,
@@ -1478,7 +1495,7 @@ pub struct RasterTile<'a> {
     stride: usize,
 }
 
-impl RasterTile<'_> {
+impl<'a> RasterTile<'a> {
     pub const fn coord(&self) -> TileCoord {
         self.coord
     }
@@ -1491,7 +1508,7 @@ impl RasterTile<'_> {
         self.stride
     }
 
-    pub fn pixels(&self) -> &[LinearRgba] {
+    pub const fn pixels(&self) -> &'a [LinearRgba] {
         self.pixels
     }
 }

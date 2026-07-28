@@ -1,7 +1,7 @@
 # Physical Pen Latency Investigation
 
-Status: live internal latency probe implemented; first physical Apollo capture
-recorded, 2026-07-27.
+Status: live internal latency probe implemented; Immediate/1 presentation and
+non-blocking recovery physically accepted on Apollo, 2026-07-27.
 
 ## Observed Failure
 
@@ -247,3 +247,81 @@ steady hover/contact comparison.
 5. If low-latency presentation leaves substantial visible lag while internal
    stages remain low, add an OS-cursor control and high-speed-camera
    input-to-photon measurement.
+
+## Presentation A/B: 2026-07-27
+
+The follow-up physical runs used the same Apollo display, pen, recovered
+drawing, and optimized build. `Mailbox` with maximum frame latency 1 removed
+the two frame-shaped queues seen in the baseline:
+
+- fast-hover backend queue p95 fell from about 15.3 ms to about 0.17 ms;
+- fast-hover latest-sample-to-submit p95 fell from about 16.7 ms to about
+  0.94 ms;
+- contact latest-sample-to-submit was generally about 1.2--1.8 ms p95;
+- steady frames were about 0.9 ms p95 for hover and remained low for contact;
+- the application submitted roughly 180--200 frames/second and normally used
+  only one or two tablet samples per submission.
+
+The physical result was clearly faster but still not fast enough. Because the
+measured path ended at the CPU present call, the remaining common delay is
+after submission: synchronized presentation, compositor scheduling, 60 Hz
+scanout, and panel response are the leading boundary.
+
+`Immediate` with maximum frame latency 1 was the fastest physical result so
+far. Between outliers it retained the low internal values of `Mailbox`:
+hover queue time was about 0.1 ms p95, latest-sample-to-submit was about 1 ms
+p95, and frames were normally sub-millisecond to about 1.5 ms. This mode may
+tear and therefore is not automatically the final default, but it proves that
+the synchronized presentation path accounts for user-visible latency that the
+CPU-side probe cannot see.
+
+### Immediate's apparent multi-second regression was recovery, not present
+
+The `Immediate` run also appeared unusable because of literal-second freezes.
+Every freeze matched a synchronous recovery checkpoint on the event-loop
+thread:
+
+| Checkpoint duration | Corresponding queue evidence |
+| ---: | --- |
+| 1.154 s | backend queue maximum 1.169 s, p95 1.130 s |
+| 1.069 s | several hover packets queued for about 676 ms |
+| 1.362 s | backend queue maximum about 1.198 s, p95 1.153 s |
+| 1.364 s | backend queue maximum about 1.389 s |
+| 1.299 s | same checkpoint-shaped interruption |
+
+The document contained 996--998 allocated tiles and encoded to roughly
+168--172 MB. There were no staging-buffer waits, and Immediate remained stable
+between checkpoint boundaries. Presentation mode was therefore exonerated as
+the cause of these extreme outliers.
+
+## Non-blocking recovery design
+
+Recovery now separates snapshot capture from checkpoint production:
+
+1. Raster tile pixels use immutable reference-counted storage.
+2. At the autosave deadline, the event loop copies document metadata and
+   reference-counted tile handles. It does not scan or copy pixel arrays.
+3. A named worker thread scans pixels, encodes the checkpoint, writes the
+   temporary file, flushes it, and atomically renames it.
+4. The interactive document uses copy-on-write. If drawing overlaps an active
+   checkpoint, only tiles actually modified after the snapshot are copied;
+   untouched tiles remain shared.
+5. Every document edit advances a revision. Completion of an older snapshot
+   cannot mark newer work as recovered; another checkpoint remains due.
+6. Explicit close/open safety may wait for the worker and synchronously ensure
+   the latest revision. Routine autosave never waits on the event-loop thread.
+
+The checkpoint format is unchanged. A regression test proves that snapshot
+encoding is byte-for-byte identical to live document encoding and remains
+unchanged after the live document mutates. The complete Apollo test suite
+passes.
+
+The physical acceptance run used the recovered large document after it had
+grown to 1,018 tiles. Capturing its immutable snapshot took 0.356 ms on the
+event-loop thread. The worker then spent 1.705 seconds producing and atomically
+installing a 215,940,531-byte checkpoint containing 13,313,315 stored pixels.
+The old design would have blocked input for that full interval; the new run
+did not reproduce the freeze, and the physical result was reported as fast
+enough. Steady contact during the preceding Immediate/1 stress pass remained
+around 0.9--1.3 ms p95 from latest handled sample to CPU submit, with most
+frames below 1 ms and no checkpoint-sized outlier.
