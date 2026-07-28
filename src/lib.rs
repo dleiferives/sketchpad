@@ -3,6 +3,7 @@ pub mod checkpoint;
 pub mod contact;
 pub mod document;
 pub mod gpu_stroke;
+pub mod gpu_stroke_target;
 pub mod image_io;
 pub mod input;
 pub mod input_trace;

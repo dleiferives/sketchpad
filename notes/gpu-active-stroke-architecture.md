@@ -1,8 +1,9 @@
 # GPU Active-Stroke Architecture
 
 Status: selected architecture and incremental implementation contract,
-2026-07-28. The offscreen geometry and commit boundary exist; live sparse GPU
-tiles and layer-aware presentation remain to be integrated.
+2026-07-28. Offscreen geometry, sparse full-float GPU tiles, asynchronous
+readback, and the CPU commit boundary exist; live presentation/input wiring
+and layer-aware composition remain to be integrated.
 
 ## Decision
 
@@ -114,6 +115,29 @@ Erasers, pickup, scraping, and true destination-dependent material operations
 will require a later mode that seeds scratch tiles from the active layer and
 makes those tiles authoritative during the transaction.
 
+### Implemented sparse round trip
+
+`gpu_stroke_target::SparseStrokeTarget` now implements the reusable offscreen
+resource:
+
+- retained small texture-array pages with lazy per-stroke tile allocation;
+- explicit clear on first use of a reused layer;
+- one dynamic, alignment-correct tile-origin/color uniform buffer;
+- one growable vertex buffer reused across clipped tile passes;
+- full-float fixed-function source-over;
+- exact per-tile damage accumulation;
+- row-aligned batched texture-to-buffer copies;
+- callback-driven `map_async` completion through `PendingStrokeReadback`;
+- deterministic tile ordering and production of validated `SourceOverTile`
+  inputs.
+
+`gpu_sparse_stroke_smoke` renders one rectangle across six `128 × 128` tiles
+with a forced four-layer page capacity. On Apollo it retained two pages,
+encoded six clipped passes, copied 1,572,864 bytes, committed exactly 24,576
+expected pixels, and undid to zero allocated CPU tiles. The test deliberately
+uses a small fixture; it proves resource growth, clipping, mapping, row
+packing, commit, and undo correctness rather than final knife performance.
+
 ## Drawing and Scheduling
 
 Each presentation opportunity:
@@ -204,9 +228,9 @@ pen-up-to-next-pen-down blocking.
 
 ## Next Implementation Slices
 
-1. Add the small sparse texture-array scratch allocator and tile-origin dynamic
-   uniform contract.
-2. Add an offscreen multi-tile render/readback test using the exact
+1. [Complete] Add the small sparse texture-array scratch allocator and
+   tile-origin dynamic uniform contract.
+2. [Complete] Add an offscreen multi-tile render/readback test using the exact
    `SourceOverTile` commit boundary.
 3. Split canvas/cursor presentation stages and display scratch tiles above the
    flattened composite only when the active layer is topmost.
@@ -215,4 +239,3 @@ pen-up-to-next-pen-down blocking.
 6. Validate cancel, undo, save blocking, device loss, and exact final pixels.
 7. Replace the top-layer restriction with bottom-to-top layer-aware GPU tile
    composition.
-
