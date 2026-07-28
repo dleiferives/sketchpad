@@ -608,8 +608,11 @@ The active delivery sequence is governed by
 defined in [performance-proof-plan.md](performance-proof-plan.md). The
 immediate order is:
 
-1. Add an Apollo capability report for `Rgba32Float` render attachment,
-   blending/storage, and GPU timestamps.
+1. [Complete] Add an Apollo capability report for `Rgba32Float` render
+   attachment, blending/storage, and GPU timestamps. Apollo's Intel JSL
+   integrated GPU exposes full-float render attachment, fixed-function
+   blending, read/write storage, and timestamp queries through Vulkan; see
+   [Continuous brush contact and physical paint](continuous-brush-contact.md).
 2. [Complete] Define deterministic transient contact poses and convex
    blade-sweep geometry; they remain derived renderer input rather than
    document operations.

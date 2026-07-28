@@ -365,6 +365,37 @@ If full-float fixed-function blending is unavailable, compare:
 
 There must be no silent `f16` fallback.
 
+#### Apollo result — 2026-07-28
+
+`gpu_brush_capabilities` now reports every primary adapter rather than
+silently selecting the first device. On Apollo's constrained target, it
+identified:
+
+- Intel UHD Graphics (JSL), integrated GPU, Vulkan;
+- Intel open-source Mesa driver 25.0.7-2;
+- `Rgba32Float` support for render attachment, texture binding, storage
+  binding, copy source, and copy destination;
+- `Rgba32Float` format flags for fixed-function blending, filtering,
+  read/write storage, multisampling, and resolve;
+- the optional `FLOAT32_BLENDABLE` device feature;
+- timestamp queries both at render-pass boundaries and inside command
+  encoders, with a reported 52.083332 ns timestamp period;
+- a 16,384-pixel maximum 2D texture dimension, 2,147,483,644-byte maximum
+  storage-buffer binding, and 65,536-byte compute workgroup storage limit.
+
+The software `llvmpipe` adapter is reported separately and must not be confused
+with the integrated-GPU measurement. Run the repeatable report with:
+
+```sh
+scripts/apollo run cargo run --release --bin gpu_brush_capabilities
+```
+
+This removes a major uncertainty from the first proof: Apollo can render and
+source-over composite directly into a full-precision `Rgba32Float` target.
+It does not establish that the path is fast, that multisampling is the right
+edge strategy, or that a live GPU-owned active layer has correct document and
+undo semantics. Those remain measurement and architecture gates.
+
 ### GPU path
 
 For the initial render path:
@@ -506,12 +537,14 @@ should only begin after:
 
 ## Ordered Research and Delivery Plan
 
-1. Add an Apollo capability report for full-float render/storage paths and GPU
-   timestamps.
-2. Define the internal contact-pose and blade-sweep command contract with
-   deterministic fixtures.
+1. [Complete] Add an Apollo capability report for full-float render/storage
+   paths and GPU timestamps.
+2. [Complete] Define the internal contact-pose and blade-sweep command contract
+   with deterministic fixtures.
 3. Add an offscreen GPU benchmark for a `512 px` continuous knife stroke.
-4. Add a CPU span implementation consuming the same commands.
+4. [Rejected] Add a CPU span implementation consuming the same commands; the
+   measured prototypes were slower than the existing dab control, so retain
+   the evidence rather than their product code.
 5. Compare GPU, CPU span, and old dab prototype on performance and visual
    continuity.
 6. Integrate the winning path as an active fixed-color palette knife without
