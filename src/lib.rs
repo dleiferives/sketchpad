@@ -1,5 +1,6 @@
 pub mod brush;
 pub mod checkpoint;
+pub mod contact;
 pub mod document;
 pub mod image_io;
 pub mod input;
