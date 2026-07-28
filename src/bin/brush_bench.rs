@@ -1,5 +1,9 @@
 use sketchpad::{
     brush::{BrushSample, HardRoundBrush, HardRoundStroke},
+    natural::{
+        BristleBrush, BristleStroke, FlatBrush, FlatStroke, PaletteKnifeBrush, PaletteKnifeStroke,
+        PencilBrush, PencilStroke,
+    },
     raster::{LinearRgba, RasterError, RasterLayer, RectU32, TileCoord},
 };
 use std::{
@@ -15,11 +19,10 @@ const INPUT_SAMPLES: u32 = 256;
 const DEFAULT_RUNS: usize = 12;
 const WARMUP_RUNS: usize = 2;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum InitialState {
     Empty,
     Painted,
-    PaintedErase,
 }
 
 impl InitialState {
@@ -27,14 +30,47 @@ impl InitialState {
         match self {
             Self::Empty => "empty",
             Self::Painted => "painted",
-            Self::PaintedErase => "painted-erase",
         }
     }
 
     fn starts_painted(self) -> bool {
-        matches!(self, Self::Painted | Self::PaintedErase)
+        matches!(self, Self::Painted)
     }
 }
+
+#[derive(Clone, Copy, Debug)]
+enum BrushKind {
+    HardRound,
+    Eraser,
+    Flat,
+    Pencil,
+    PaletteKnife,
+    Bristle,
+}
+
+impl BrushKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::HardRound => "hard-round",
+            Self::Eraser => "eraser",
+            Self::Flat => "flat",
+            Self::Pencil => "pencil",
+            Self::PaletteKnife => "palette-knife",
+            Self::Bristle => "bristle",
+        }
+    }
+}
+
+const CASES: [(BrushKind, InitialState); 8] = [
+    (BrushKind::HardRound, InitialState::Empty),
+    (BrushKind::HardRound, InitialState::Painted),
+    (BrushKind::Eraser, InitialState::Painted),
+    (BrushKind::Flat, InitialState::Empty),
+    (BrushKind::Pencil, InitialState::Empty),
+    (BrushKind::PaletteKnife, InitialState::Empty),
+    (BrushKind::PaletteKnife, InitialState::Painted),
+    (BrushKind::Bristle, InitialState::Painted),
+];
 
 struct RunResult {
     elapsed: Duration,
@@ -49,24 +85,20 @@ fn main() {
         process::exit(2);
     });
     println!(
-        "hard_round_replay version=1 canvas={}x{} input_samples={} runs={} warmups={}",
+        "brush_family_replay version=2 canvas={}x{} input_samples={} runs={} warmups={}",
         CANVAS_SIZE, CANVAS_SIZE, INPUT_SAMPLES, runs, WARMUP_RUNS
     );
 
     for tile_size in [128, 256] {
-        for initial_state in [
-            InitialState::Empty,
-            InitialState::Painted,
-            InitialState::PaintedErase,
-        ] {
+        for (brush, initial_state) in CASES {
             for _ in 0..WARMUP_RUNS {
-                black_box(run_once(tile_size, initial_state).unwrap());
+                black_box(run_once(tile_size, brush, initial_state).unwrap());
             }
             let mut results = Vec::with_capacity(runs);
             for _ in 0..runs {
-                results.push(run_once(tile_size, initial_state).unwrap());
+                results.push(run_once(tile_size, brush, initial_state).unwrap());
             }
-            print_results(tile_size, initial_state, &results);
+            print_results(tile_size, brush, initial_state, &results);
         }
     }
 }
@@ -97,7 +129,11 @@ fn parse_runs() -> Result<usize, String> {
     Ok(runs)
 }
 
-fn run_once(tile_size: u32, initial_state: InitialState) -> Result<RunResult, Box<dyn Error>> {
+fn run_once(
+    tile_size: u32,
+    brush_kind: BrushKind,
+    initial_state: InitialState,
+) -> Result<RunResult, Box<dyn Error>> {
     let mut layer = RasterLayer::new(CANVAS_SIZE, CANVAS_SIZE, tile_size)?;
     if initial_state.starts_painted() {
         seed_painted_region(&mut layer)?;
@@ -105,25 +141,49 @@ fn run_once(tile_size: u32, initial_state: InitialState) -> Result<RunResult, Bo
     }
     layer.reset_stats();
 
-    let brush = match initial_state {
-        InitialState::Empty | InitialState::Painted => {
-            HardRoundBrush::new([0.04, 0.08, 0.2], 48.0, 1.0, 0.18)?
-        }
-        InitialState::PaintedErase => HardRoundBrush::eraser(48.0, 1.0, 0.18)?,
-    };
     let start = Instant::now();
-    let mut stroke = HardRoundStroke::begin(
-        &mut layer,
-        brush,
-        BrushSample::new(trace_sample(0), trace_pressure(0)),
-    )?;
-    for index in 1..INPUT_SAMPLES {
-        stroke.update(
-            &mut layer,
-            BrushSample::new(trace_sample(index), trace_pressure(index)),
-        )?;
+    macro_rules! replay {
+        ($stroke:expr) => {{
+            let mut stroke = $stroke?;
+            for index in 1..INPUT_SAMPLES {
+                stroke.update(&mut layer, trace_brush_sample(index))?;
+            }
+            stroke.finish(&mut layer)?;
+        }};
     }
-    stroke.finish(&mut layer)?;
+    let first = trace_brush_sample(0);
+    match brush_kind {
+        BrushKind::HardRound => replay!(HardRoundStroke::begin(
+            &mut layer,
+            HardRoundBrush::new([0.04, 0.08, 0.2], 48.0, 1.0, 0.18)?,
+            first,
+        )),
+        BrushKind::Eraser => replay!(HardRoundStroke::begin(
+            &mut layer,
+            HardRoundBrush::eraser(48.0, 1.0, 0.18)?,
+            first,
+        )),
+        BrushKind::Flat => replay!(FlatStroke::begin(
+            &mut layer,
+            FlatBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            first,
+        )),
+        BrushKind::Pencil => replay!(PencilStroke::begin(
+            &mut layer,
+            PencilBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            first,
+        )),
+        BrushKind::PaletteKnife => replay!(PaletteKnifeStroke::begin(
+            &mut layer,
+            PaletteKnifeBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            first,
+        )),
+        BrushKind::Bristle => replay!(BristleStroke::begin(
+            &mut layer,
+            BristleBrush::new([0.04, 0.08, 0.2], 48.0, 1.0)?,
+            first,
+        )),
+    }
     let elapsed = start.elapsed();
 
     let result = RunResult {
@@ -147,6 +207,16 @@ fn trace_sample(index: u32) -> [f32; 2] {
 fn trace_pressure(index: u32) -> f32 {
     let t = index as f32 / (INPUT_SAMPLES - 1) as f32;
     0.2 + 0.8 * (t * std::f32::consts::PI).sin().abs()
+}
+
+fn trace_brush_sample(index: u32) -> BrushSample {
+    let t = index as f32 / (INPUT_SAMPLES - 1) as f32;
+    let angle = t * std::f32::consts::TAU * 1.5;
+    BrushSample::with_tilt(
+        trace_sample(index),
+        trace_pressure(index),
+        [angle.cos() * 0.72, angle.sin() * 0.72],
+    )
 }
 
 fn seed_painted_region(layer: &mut RasterLayer) -> Result<(), RasterError> {
@@ -206,7 +276,12 @@ fn checksum(layer: &RasterLayer) -> f64 {
     black_box(sum)
 }
 
-fn print_results(tile_size: u32, initial_state: InitialState, results: &[RunResult]) {
+fn print_results(
+    tile_size: u32,
+    brush: BrushKind,
+    initial_state: InitialState,
+    results: &[RunResult],
+) {
     let mut nanos: Vec<u128> = results
         .iter()
         .map(|result| result.elapsed.as_nanos())
@@ -220,9 +295,10 @@ fn print_results(tile_size: u32, initial_state: InitialState, results: &[RunResu
     });
 
     println!(
-        "case={} tile={} min_ms={:.3} median_ms={:.3} p95_ms={:.3} max_ms={:.3} \
+        "brush={} state={} tile={} min_ms={:.3} median_ms={:.3} p95_ms={:.3} max_ms={:.3} \
          tile_edits={} before_images={} snapshot_mib={:.3} conservative_mpix={:.3} \
          bound_scan_mpix={:.3} resident_tiles={} checksum={:.6} checksum_spread={:.9}",
+        brush.name(),
         initial_state.name(),
         tile_size,
         nanos[0] as f64 / 1_000_000.0,

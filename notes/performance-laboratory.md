@@ -243,6 +243,60 @@ Overall, the replay continues to show memory amplification dominating the
 reduction in tile dispatches. It is still a CPU/transaction result, not a
 complete frame measurement or final format/tile-size decision.
 
+#### Natural brush-family baseline, 2026-07-28
+
+`brush_bench` version 2 extends the same real transaction replay to the flat
+nib, graphite pencil, palette knife, and bristle brush. The natural brushes
+receive a smoothly rotating 0.72-magnitude tilt vector. Knife and bristle
+painted cases exercise per-lane active-layer pickup. The timed region still
+includes distance resampling, all footprint/lane/grain work, sparse raster
+mutation, gesture snapshots, damage accumulation, final cap, and commit.
+
+Apollo ran two warmups followed by five measured release runs per case:
+
+```text
+cargo run --release --locked --bin brush_bench -- --runs 5
+```
+
+| Brush/state | Tile | Median | p95 | Tile edits | Conservative pixels | Snapshot traffic |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Hard round/empty | 128 | 12.287 ms | 12.615 ms | 905 | 0.770 Mpix | 0 MiB |
+| Hard round/painted | 128 | 7.586 ms | 7.694 ms | 905 | 0.770 Mpix | 4.375 MiB |
+| Eraser/painted | 128 | 6.993 ms | 7.433 ms | 905 | 0.770 Mpix | 4.375 MiB |
+| Flat/empty | 128 | 39.987 ms | 40.539 ms | 2,334 | 1.869 Mpix | 0 MiB |
+| Pencil/empty | 128 | 39.889 ms | 40.670 ms | 4,154 | 1.952 Mpix | 0 MiB |
+| Knife/empty | 128 | 57.824 ms | 59.363 ms | 2,678 | 1.977 Mpix | 0 MiB |
+| Knife/painted | 128 | 51.580 ms | 51.829 ms | 2,678 | 1.977 Mpix | 4.586 MiB |
+| Bristle/painted | 128 | 107.715 ms | 109.357 ms | 4,684 | 3.842 Mpix | 4.723 MiB |
+
+Dividing the whole-stroke medians by 256 input samples gives a coarse average
+of 0.156 ms for flat and pencil, 0.226 ms for the empty knife, and 0.421 ms for
+the bristle brush. This is not an input-tail measurement: an event spanning a
+long distance can emit more dabs than the average event. It does show that all
+four CPU references are plausible for interactive evaluation on Apollo before
+prematurely moving them to GPU compute.
+
+Every case had zero checksum spread across measured runs. Equivalent cases
+also produced identical checksums at tile sizes 128 and 256. Content-bound
+recovery scanned zero pixels for every additive natural brush. The natural
+brushes are slower primarily because their tighter spacing causes 2.6–5.2×
+more tile edits and 2.4–5.0× more conservative pixel visits than hard round;
+the pencil also evaluates two deterministic hashes per covered pixel, while
+knife and bristle retain and sample persistent lane state.
+
+At 256-pixel tiles, natural-brush medians were 48.315 ms flat, 47.649 ms
+pencil, 64.441/50.707 ms knife empty/painted, and 106.305 ms bristle. The
+current 128-pixel application tile remains materially better for flat, pencil,
+and empty knife, approximately neutral for painted knife and bristle, and
+retains finer sparse allocation. There is no evidence here to change the
+application default.
+
+The next performance work should measure per-event tail latency during a live
+Wacom stroke and split lane sampling, pixel coverage, raster transaction, and
+presentation costs. The bristle brush is the first optimization candidate.
+Reducing spacing or strand count solely to improve a benchmark would change
+the authored mark and is not allowed without a visual corpus comparison.
+
 #### Offscreen sparse-GPU correctness replay
 
 `gpu_smoke` validates the current CPU-to-GPU presentation path:

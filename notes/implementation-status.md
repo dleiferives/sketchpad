@@ -263,14 +263,15 @@ The current test suite covers:
 
 ### CPU brush replay
 
-`brush_bench` replays the real hard-round paint/erase and transaction paths over
-empty and painted content:
+`brush_bench` replays the real hard-round, erase, flat, pencil, palette-knife,
+and bristle transaction paths over the relevant empty and painted cases:
 
 ```text
 cargo run --release --bin brush_bench -- --runs 12
 ```
 
-The current provisional Atlas result is recorded in
+The original Atlas hard-round result and the first Apollo natural-brush result
+are recorded in
 [performance-laboratory.md](performance-laboratory.md).
 
 ### Shared brush-kernel equivalence
