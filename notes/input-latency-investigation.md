@@ -325,3 +325,10 @@ did not reproduce the freeze, and the physical result was reported as fast
 enough. Steady contact during the preceding Immediate/1 stress pass remained
 around 0.9--1.3 ms p95 from latest handled sample to CPU submit, with most
 frames below 1 ms and no checkpoint-sized outlier.
+
+The accepted `Immediate` mode and maximum frame latency 1 are now the ordinary
+application defaults, not just benchmark flags. If a platform lacks
+`Immediate` but supports `Mailbox`, startup falls back to `Mailbox`; otherwise
+it uses wgpu's synchronized automatic fallback. Explicit command-line options
+remain available for controlled comparisons and for users who prefer
+tear-free presentation over the lowest measured latency.

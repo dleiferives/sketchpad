@@ -127,10 +127,28 @@ struct PresentationOptions {
 impl Default for PresentationOptions {
     fn default() -> Self {
         Self {
-            present_mode: wgpu::PresentMode::AutoVsync,
-            maximum_frame_latency: 2,
+            present_mode: wgpu::PresentMode::Immediate,
+            maximum_frame_latency: 1,
         }
     }
+}
+
+fn resolve_present_mode(
+    requested: wgpu::PresentMode,
+    supported: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    if matches!(
+        requested,
+        wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
+    ) || supported.contains(&requested)
+    {
+        return requested;
+    }
+    if requested == wgpu::PresentMode::Immediate && supported.contains(&wgpu::PresentMode::Mailbox)
+    {
+        return wgpu::PresentMode::Mailbox;
+    }
+    wgpu::PresentMode::AutoVsync
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1621,23 +1639,15 @@ impl App {
             .copied()
             .find(wgpu::TextureFormat::is_srgb)
             .unwrap_or(capabilities.formats[0]);
-        let explicit_mode = !matches!(
-            presentation.present_mode,
-            wgpu::PresentMode::AutoVsync | wgpu::PresentMode::AutoNoVsync
-        );
-        let present_mode = if !explicit_mode
-            || capabilities
-                .present_modes
-                .contains(&presentation.present_mode)
-        {
-            presentation.present_mode
-        } else {
+        let present_mode =
+            resolve_present_mode(presentation.present_mode, &capabilities.present_modes);
+        if present_mode != presentation.present_mode {
             log::warn!(
-                "requested present mode {:?} is unsupported; falling back to AutoVsync",
-                presentation.present_mode
+                "requested present mode {:?} is unsupported; falling back to {:?}",
+                presentation.present_mode,
+                present_mode
             );
-            wgpu::PresentMode::AutoVsync
-        };
+        }
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -2776,6 +2786,32 @@ mod tests {
             parse_startup_arguments(["--max-frame-latency", "0"].map(str::to_owned))
                 .unwrap_err()
                 .contains("requires 1, 2, or 3")
+        );
+    }
+
+    #[test]
+    fn low_latency_presentation_defaults_and_fallbacks_are_explicit() {
+        assert_eq!(
+            PresentationOptions::default(),
+            PresentationOptions {
+                present_mode: wgpu::PresentMode::Immediate,
+                maximum_frame_latency: 1,
+            }
+        );
+        assert_eq!(
+            resolve_present_mode(
+                wgpu::PresentMode::Immediate,
+                &[wgpu::PresentMode::Mailbox, wgpu::PresentMode::Fifo]
+            ),
+            wgpu::PresentMode::Mailbox
+        );
+        assert_eq!(
+            resolve_present_mode(wgpu::PresentMode::Immediate, &[wgpu::PresentMode::Fifo]),
+            wgpu::PresentMode::AutoVsync
+        );
+        assert_eq!(
+            resolve_present_mode(wgpu::PresentMode::AutoVsync, &[]),
+            wgpu::PresentMode::AutoVsync
         );
     }
 
