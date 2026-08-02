@@ -1,7 +1,7 @@
 use crate::{
     document::{Document, DocumentRevision},
     document_metadata::DocumentMetadata,
-    gpu_atlas::{AtlasError, AtlasLayout, LayerTileKey, SparseAtlasPlanner},
+    gpu_atlas::{AtlasAllocation, AtlasError, AtlasLayout, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{
         GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
         GpuHistoryId, GpuHistoryRecordError, GpuHistoryRecordPreview, DEFAULT_GPU_HISTORY_BYTES,
@@ -34,6 +34,8 @@ use crate::{
         DEFAULT_GPU_RECOVERY_JOURNAL_BYTES, DEFAULT_GPU_RECOVERY_JOURNAL_ENTRIES,
     },
     gpu_recovery_replay::GpuRasterRecoveryCommand,
+    gpu_round::{RoundMaskBatch, RoundMaskError, RoundMaskScheduler},
+    stroke::RoundPathCommand,
 };
 use std::{collections::VecDeque, error::Error, fmt, iter};
 
@@ -73,6 +75,17 @@ pub struct GpuResidentDocument {
     recovery: GpuLiveRecovery,
     mirror_purposes: VecDeque<GpuMirrorRecoveryPurpose>,
     pending_mirror_handoff: Option<PendingGpuResidentMirrorHandoff>,
+    active_round_stroke: Option<GpuResidentRoundStrokeId>,
+    next_round_stroke_id: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GpuResidentRoundStrokeId(u64);
+
+impl GpuResidentRoundStrokeId {
+    pub const fn get(self) -> u64 {
+        self.0
+    }
 }
 
 impl GpuResidentDocument {
@@ -148,6 +161,8 @@ impl GpuResidentDocument {
             recovery,
             mirror_purposes: VecDeque::new(),
             pending_mirror_handoff: None,
+            active_round_stroke: None,
+            next_round_stroke_id: 1,
         })
     }
 
@@ -194,6 +209,40 @@ impl GpuResidentDocument {
         encoded: EncodedGpuDocumentCommit,
         recovery_command: GpuRasterRecoveryCommand,
     ) -> Result<PreparedGpuResidentDocumentCommit, Box<GpuResidentDocumentPrepareFailure>> {
+        self.prepare_commit_internal(None, target, device, encoder, encoded, recovery_command)
+    }
+
+    pub(crate) fn prepare_round_stroke_commit(
+        &self,
+        stroke: GpuResidentRoundStrokeId,
+        target: &GpuDocumentTarget,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        encoded: EncodedGpuDocumentCommit,
+        recovery_command: GpuRasterRecoveryCommand,
+    ) -> Result<PreparedGpuResidentDocumentCommit, Box<GpuResidentDocumentPrepareFailure>> {
+        self.prepare_commit_internal(
+            Some(stroke),
+            target,
+            device,
+            encoder,
+            encoded,
+            recovery_command,
+        )
+    }
+
+    fn prepare_commit_internal(
+        &self,
+        active_stroke: Option<GpuResidentRoundStrokeId>,
+        target: &GpuDocumentTarget,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        encoded: EncodedGpuDocumentCommit,
+        recovery_command: GpuRasterRecoveryCommand,
+    ) -> Result<PreparedGpuResidentDocumentCommit, Box<GpuResidentDocumentPrepareFailure>> {
+        if let Err(error) = self.check_active_round_stroke(active_stroke) {
+            return Err(prepare_failure(error, encoded, recovery_command));
+        }
         if let Err(error) = self.check_target(target) {
             return Err(prepare_failure(error, encoded, recovery_command));
         }
@@ -347,6 +396,9 @@ impl GpuResidentDocument {
         direction: GpuHistoryDirection,
     ) -> Result<Option<PreparedGpuResidentHistorySwap>, Box<GpuResidentHistorySwapPrepareFailure>>
     {
+        if let Err(error) = self.check_active_round_stroke(None) {
+            return Err(history_swap_prepare_failure(error));
+        }
         if let Err(error) = self.check_target(target) {
             return Err(history_swap_prepare_failure(error));
         }
@@ -713,6 +765,109 @@ impl GpuResidentDocument {
         &self.atlas
     }
 
+    pub const fn active_round_stroke(&self) -> Option<GpuResidentRoundStrokeId> {
+        self.active_round_stroke
+    }
+
+    pub(crate) fn begin_round_stroke(
+        &mut self,
+        target: &GpuDocumentTarget,
+        layer: crate::document::LayerId,
+    ) -> Result<GpuResidentRoundStrokeId, GpuResidentDocumentError> {
+        self.check_target(target)?;
+        if target.layout() != self.atlas.layout() {
+            return Err(GpuResidentDocumentError::TargetLayoutMismatch {
+                expected: self.atlas.layout(),
+                actual: target.layout(),
+            });
+        }
+        if layer != self.metadata.active_layer() {
+            return Err(GpuResidentDocumentError::ActiveRoundStrokeLayerMismatch {
+                expected: self.metadata.active_layer(),
+                actual: layer,
+            });
+        }
+        self.check_active_round_stroke(None)?;
+        let id = GpuResidentRoundStrokeId(self.next_round_stroke_id);
+        self.next_round_stroke_id = self
+            .next_round_stroke_id
+            .checked_add(1)
+            .ok_or(GpuResidentDocumentError::ActiveRoundStrokeIdExhausted)?;
+        self.active_round_stroke = Some(id);
+        Ok(id)
+    }
+
+    pub(crate) fn schedule_round_stroke(
+        &mut self,
+        id: GpuResidentRoundStrokeId,
+        scheduler: &mut RoundMaskScheduler,
+        commands: &[RoundPathCommand],
+    ) -> Result<RoundMaskBatch, GpuResidentDocumentError> {
+        self.check_active_round_stroke(Some(id))?;
+        if scheduler.layer() != self.metadata.active_layer() {
+            return Err(GpuResidentDocumentError::ActiveRoundStrokeLayerMismatch {
+                expected: self.metadata.active_layer(),
+                actual: scheduler.layer(),
+            });
+        }
+        Ok(scheduler.schedule(&mut self.atlas, commands)?)
+    }
+
+    pub(crate) fn rollback_round_stroke_allocations(
+        &mut self,
+        id: GpuResidentRoundStrokeId,
+        allocations: &[AtlasAllocation],
+    ) -> Result<(), GpuResidentDocumentError> {
+        self.check_active_round_stroke(Some(id))?;
+        for allocation in allocations
+            .iter()
+            .filter(|allocation| allocation.newly_allocated)
+        {
+            if self.atlas.slot(allocation.key) != Some(allocation.slot)
+                || self.atlas.pin_count(allocation.key) != 0
+            {
+                return Err(
+                    GpuResidentDocumentError::ActiveRoundStrokeAllocationChanged {
+                        key: allocation.key,
+                        expected: allocation.slot,
+                        actual: self.atlas.slot(allocation.key),
+                    },
+                );
+            }
+        }
+        for allocation in allocations
+            .iter()
+            .rev()
+            .filter(|allocation| allocation.newly_allocated)
+        {
+            let released = self.atlas.release(allocation.key)?;
+            debug_assert_eq!(released, Some(allocation.slot));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn finish_round_stroke(
+        &mut self,
+        id: GpuResidentRoundStrokeId,
+    ) -> Result<(), GpuResidentDocumentError> {
+        self.check_active_round_stroke(Some(id))?;
+        self.active_round_stroke = None;
+        Ok(())
+    }
+
+    pub(crate) fn check_active_round_stroke(
+        &self,
+        expected: Option<GpuResidentRoundStrokeId>,
+    ) -> Result<(), GpuResidentDocumentError> {
+        if self.active_round_stroke != expected {
+            return Err(GpuResidentDocumentError::ActiveRoundStrokeMismatch {
+                expected,
+                actual: self.active_round_stroke,
+            });
+        }
+        Ok(())
+    }
+
     pub const fn metadata(&self) -> &DocumentMetadata {
         &self.metadata
     }
@@ -1021,6 +1176,21 @@ pub enum GpuResidentDocumentError {
     HistoryPreviewChanged,
     HistorySwapChanged,
     MirrorHandoffPending(DocumentRevision),
+    ActiveRoundStrokeIdExhausted,
+    ActiveRoundStrokeMismatch {
+        expected: Option<GpuResidentRoundStrokeId>,
+        actual: Option<GpuResidentRoundStrokeId>,
+    },
+    ActiveRoundStrokeLayerMismatch {
+        expected: crate::document::LayerId,
+        actual: crate::document::LayerId,
+    },
+    ActiveRoundStrokeAllocationChanged {
+        key: LayerTileKey,
+        expected: crate::gpu_atlas::AtlasSlot,
+        actual: Option<crate::gpu_atlas::AtlasSlot>,
+    },
+    RoundMask(RoundMaskError),
     Atlas(AtlasError),
     History(GpuDocumentHistoryError),
     HistoryRecord(GpuHistoryRecordError),
@@ -1071,6 +1241,29 @@ impl fmt::Display for GpuResidentDocumentError {
                 "GPU mirror revision {} is waiting for recovery handoff",
                 revision.get()
             ),
+            Self::ActiveRoundStrokeIdExhausted => {
+                write!(
+                    formatter,
+                    "GPU active round stroke identity space is exhausted"
+                )
+            }
+            Self::ActiveRoundStrokeMismatch { expected, actual } => write!(
+                formatter,
+                "GPU active round stroke mismatch: expected {expected:?}, found {actual:?}"
+            ),
+            Self::ActiveRoundStrokeLayerMismatch { expected, actual } => write!(
+                formatter,
+                "GPU active round stroke layer {actual:?} does not match {expected:?}"
+            ),
+            Self::ActiveRoundStrokeAllocationChanged {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GPU active round stroke allocation {key:?} changed from {expected:?} to {actual:?}"
+            ),
+            Self::RoundMask(error) => error.fmt(formatter),
             Self::Atlas(error) => error.fmt(formatter),
             Self::History(error) => error.fmt(formatter),
             Self::HistoryRecord(error) => error.fmt(formatter),
@@ -1094,6 +1287,7 @@ impl Error for GpuResidentDocumentError {
             Self::MirrorReadback(error) => Some(error),
             Self::MirrorDispatch(error) => Some(error),
             Self::Recovery(error) => Some(error),
+            Self::RoundMask(error) => Some(error),
             _ => None,
         }
     }
@@ -1147,10 +1341,19 @@ impl From<GpuLiveRecoveryError> for GpuResidentDocumentError {
     }
 }
 
+impl From<RoundMaskError> for GpuResidentDocumentError {
+    fn from(error: RoundMaskError) -> Self {
+        Self::RoundMask(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu_document_undo::GPU_UNDO_BLOCK_BYTES;
+    use crate::{
+        gpu_document_undo::GPU_UNDO_BLOCK_BYTES,
+        stroke::{RoundContact, RoundPathCommand},
+    };
 
     fn limits() -> GpuResidentDocumentLimits {
         GpuResidentDocumentLimits {
@@ -1277,6 +1480,52 @@ mod tests {
                 atlas: 8
             })
         ));
+    }
+
+    #[test]
+    fn active_round_guard_tracks_and_reclaims_only_its_provisional_allocations() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let id = GpuResidentRoundStrokeId(41);
+        document.active_round_stroke = Some(id);
+        let layer = document.metadata().active_layer();
+        let mut scheduler = RoundMaskScheduler::new([48, 40], layer, layout).unwrap();
+        let contact = RoundContact {
+            center: [4.0, 4.0],
+            radius: 2.0,
+            elapsed_micros: 0,
+        };
+        let commands = [
+            RoundPathCommand::Begin(contact),
+            RoundPathCommand::End {
+                at: contact,
+                elapsed_micros: 1,
+            },
+        ];
+
+        let wrong = GpuResidentRoundStrokeId(42);
+        assert!(matches!(
+            document.schedule_round_stroke(wrong, &mut scheduler, &commands),
+            Err(GpuResidentDocumentError::ActiveRoundStrokeMismatch {
+                expected: Some(expected),
+                actual: Some(actual),
+            }) if expected == wrong && actual == id
+        ));
+        assert_eq!(document.atlas().resident_tile_count(), 0);
+
+        let batch = document
+            .schedule_round_stroke(id, &mut scheduler, &commands)
+            .unwrap();
+        assert_eq!(batch.allocations().len(), 1);
+        assert!(batch.allocations()[0].newly_allocated);
+        assert_eq!(document.atlas().resident_tile_count(), 1);
+
+        document
+            .rollback_round_stroke_allocations(id, batch.allocations())
+            .unwrap();
+        document.finish_round_stroke(id).unwrap();
+        assert_eq!(document.atlas().resident_tile_count(), 0);
+        assert_eq!(document.active_round_stroke(), None);
     }
 
     #[test]

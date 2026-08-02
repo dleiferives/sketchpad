@@ -113,6 +113,7 @@ impl RoundMaskBatch {
     }
 }
 
+#[derive(Clone)]
 pub struct RoundMaskScheduler {
     canvas: [u32; 2],
     layer: LayerId,

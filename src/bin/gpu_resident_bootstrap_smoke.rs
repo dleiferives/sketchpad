@@ -1,14 +1,13 @@
 use sketchpad::{
     document::Document,
-    gpu_atlas::{AtlasLayout, LayerTileKey, SparseAtlasPlanner},
+    gpu_atlas::{AtlasLayout, LayerTileKey},
     gpu_document_compositor::GpuDocumentCompositor,
     gpu_document_target::GpuDocumentTarget,
     gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
-    gpu_round::RoundMaskScheduler,
-    gpu_round_target::RoundMaskTarget,
+    gpu_resident_round_stroke::GpuResidentRoundStrokeEngine,
     pipeline::CanvasUniform,
     raster::{LinearRgba, TileCoord},
-    stroke::{RoundContact, RoundPathCommand, StrokeMaterial},
+    stroke::{RoundBrushRecipeV1, RoundContact, RoundPathCommand, StrokeMaterial},
 };
 use std::{error::Error, mem::size_of, sync::mpsc};
 
@@ -54,11 +53,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         &queue,
         GpuResidentDocumentLimits::default(),
     )?;
-    let resident = bootstrap.document();
-    if resident.metadata().revision() != cpu.revision()
-        || resident.metadata().layers().len() != 2
-        || resident.atlas().resident_tile_count() != 3
-        || resident.mirror().snapshot().tile_count() != 3
+    if bootstrap.document().metadata().revision() != cpu.revision()
+        || bootstrap.document().metadata().layers().len() != 2
+        || bootstrap.document().atlas().resident_tile_count() != 3
+        || bootstrap.document().mirror().snapshot().tile_count() != 3
     {
         return Err("resident bootstrap ownership does not match the CPU document".into());
     }
@@ -68,6 +66,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err(format!("unexpected bootstrap stats: {:?}", bootstrap.stats()).into());
     }
+    let mut resident = bootstrap.into_document();
 
     let bottom_key = LayerTileKey::new(bottom, TileCoord::new(0, 0));
     let bottom_right_key = LayerTileKey::new(bottom, TileCoord::new(1, 0));
@@ -255,15 +254,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(format!("unexpected composite stats: {composite_stats:?}").into());
     }
 
-    let mut preview_atlas = SparseAtlasPlanner::new(layout);
-    for key in [bottom_key, bottom_right_key, top_left_key] {
-        let slot = preview_atlas.allocate(key)?.slot;
-        if resident.atlas().slot(key) != Some(slot) {
-            return Err("preview atlas did not reproduce bootstrap residency".into());
-        }
-    }
-    let mut scheduler = RoundMaskScheduler::new([PAGE_SIZE, TILE_SIZE], top, layout)?;
-    let mut mask = RoundMaskTarget::new(&device, layout)?;
+    let mut strokes = GpuResidentRoundStrokeEngine::new(&device, &resident)?;
     let paint_contact = RoundContact {
         center: [143.5, 17.5],
         radius: 4.0,
@@ -276,22 +267,29 @@ fn main() -> Result<(), Box<dyn Error>> {
             elapsed_micros: 1,
         },
     ];
-    let paint_batch = scheduler.schedule(&mut preview_atlas, &paint_commands)?;
-    mask.begin_stroke()?;
-    encode_mask_batch(&device, &queue, &mut mask, &paint_batch, "paint")?;
     let paint_material = StrokeMaterial::paint([0.25, 0.5, 0.75], 0.5, 1.0)?;
+    strokes.begin(
+        &mut resident,
+        &target,
+        RoundBrushRecipeV1::with_minimum_pressure_fraction(
+            paint_material,
+            paint_contact.radius * 2.0,
+            1.0,
+        )?,
+    )?;
+    let paint_batch_stats =
+        strokes.submit_commands(&mut resident, &device, &queue, &paint_commands)?;
     let transient_key = LayerTileKey::new(top, TileCoord::new(1, 0));
-    let transient_slot = preview_atlas
+    let transient_slot = resident
+        .atlas()
         .slot(transient_key)
         .ok_or("new transient tile was not allocated")?;
-    let paint_preview_stats = compositor.prepare_active_stroke(
+    let paint_preview_stats = strokes.prepare_composite(
+        &resident,
+        &target,
+        &mut compositor,
         &device,
         &queue,
-        resident.metadata(),
-        &preview_atlas,
-        &target,
-        &mask,
-        paint_material,
         canvas_uniform(),
     )?;
     let paint_preview = render_preview(
@@ -313,13 +311,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     )?;
     if paint_preview_stats.transient_tiles != 1
         || paint_preview_stats.visible_tiles != 4
+        || paint_batch_stats.newly_allocated_tiles != 1
+        || strokes.provisional_tile_count() != 1
         || target.initialized_resident(transient_slot).is_some()
     {
         return Err(format!("unexpected paint preview stats: {paint_preview_stats:?}").into());
     }
-    mask.end_stroke()?;
-    if preview_atlas.release(transient_key)? != Some(transient_slot) {
-        return Err("cancel did not reclaim the provisional atlas tile".into());
+    strokes.cancel(&mut resident)?;
+    if resident.atlas().slot(transient_key).is_some()
+        || resident.active_round_stroke().is_some()
+        || strokes.active_id().is_some()
+    {
+        return Err("cancel did not reclaim and release the active transaction".into());
     }
 
     let erase_contact = RoundContact {
@@ -334,18 +337,23 @@ fn main() -> Result<(), Box<dyn Error>> {
             elapsed_micros: 3,
         },
     ];
-    let erase_batch = scheduler.schedule(&mut preview_atlas, &erase_commands)?;
-    mask.begin_stroke()?;
-    encode_mask_batch(&device, &queue, &mut mask, &erase_batch, "erase")?;
     let erase_material = StrokeMaterial::eraser(1.0, 1.0)?;
-    let erase_preview_stats = compositor.prepare_active_stroke(
+    strokes.begin(
+        &mut resident,
+        &target,
+        RoundBrushRecipeV1::with_minimum_pressure_fraction(
+            erase_material,
+            erase_contact.radius * 2.0,
+            1.0,
+        )?,
+    )?;
+    strokes.submit_commands(&mut resident, &device, &queue, &erase_commands)?;
+    let erase_preview_stats = strokes.prepare_composite(
+        &resident,
+        &target,
+        &mut compositor,
         &device,
         &queue,
-        resident.metadata(),
-        &preview_atlas,
-        &target,
-        &mask,
-        erase_material,
         canvas_uniform(),
     )?;
     let erase_preview = render_preview(
@@ -368,13 +376,49 @@ fn main() -> Result<(), Box<dyn Error>> {
     if erase_preview_stats.transient_tiles != 1 {
         return Err(format!("unexpected erase preview stats: {erase_preview_stats:?}").into());
     }
-    mask.end_stroke()?;
+    let source_revision = resident.metadata().revision();
+    let committed = strokes
+        .commit(&mut resident, &mut target, &device, &queue)?
+        .ok_or("eraser unexpectedly produced no resident commit")?;
+    if committed.revision != source_revision.checked_next().ok_or("revision overflow")?
+        || committed.history_id.get() != 1
+        || resident.active_round_stroke().is_some()
+        || strokes.active_id().is_some()
+        || target.initialized_resident(top_left_slot) != Some(top_left_key)
+    {
+        return Err("resident eraser commit did not close its transaction exactly".into());
+    }
+    compositor.prepare(
+        &device,
+        &queue,
+        resident.metadata(),
+        resident.atlas(),
+        &target,
+        canvas_uniform(),
+    )?;
+    let committed_erase = render_preview(
+        &device,
+        &queue,
+        &compositor,
+        &composite_texture,
+        &composite_view,
+        &composite_readback,
+        bytes_per_row,
+        "committed erase",
+    )?;
+    expect_pixel_close(
+        &committed_erase,
+        bytes_per_row,
+        9,
+        TILE_SIZE - 1 - 11,
+        bottom_color,
+    )?;
 
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact transient_paint=exact transient_erase=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact",
         adapter.get_info().name
     );
     Ok(())
@@ -388,25 +432,6 @@ fn canvas_uniform() -> CanvasUniform {
         viewport_size: [PAGE_SIZE as f32, TILE_SIZE as f32],
         canvas_size: [PAGE_SIZE as f32, TILE_SIZE as f32],
     }
-}
-
-fn encode_mask_batch(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-    mask: &mut RoundMaskTarget,
-    batch: &sketchpad::gpu_round::RoundMaskBatch,
-    kind: &str,
-) -> Result<(), Box<dyn Error>> {
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some(match kind {
-            "paint" => "GPU Resident Paint Preview Mask",
-            _ => "GPU Resident Erase Preview Mask",
-        }),
-    });
-    mask.encode_batch(device, queue, &mut encoder, batch)?;
-    queue.submit([encoder.finish()]);
-    mask.encoded_batch_submitted()?;
-    Ok(())
 }
 
 fn render_preview(

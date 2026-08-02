@@ -20,6 +20,7 @@ pub mod gpu_recovery_journal;
 pub mod gpu_recovery_replay;
 pub mod gpu_recovery_timeline;
 pub mod gpu_resident_document;
+pub mod gpu_resident_round_stroke;
 pub mod gpu_revision_tasks;
 pub mod gpu_round;
 pub mod gpu_round_recovery;
