@@ -118,6 +118,19 @@ the exact command back on its original side. Recording during a pending swap
 is rejected. Pure tests cover branch clearing order, both budgets, oversize
 rejection, and finish/cancel behavior.
 
+Asynchronous CPU reconciliation now has its first non-GPU planning layer.
+Each revision reuses the exact undo-region identities and packs initialized
+`Rgba32Float` regions into explicitly bounded readback batches. The default
+cap is 16 MiB in flight. Regions larger than that cap split only at 16-pixel
+block-row boundaries, so every buffer row remains naturally 256-byte aligned;
+a synthetic 2,048-pixel full-tile region splits into four exact 16 MiB
+batches. Ordinary 128-pixel tiles coalesce until the cap. Logically absent
+residents become zero-byte metadata records instead of needless transparent
+pixel copies. Checked tests cover packing, splitting, byte/block totals,
+absent residents, and a budget smaller than one block. GPU copy encoding,
+asynchronous mapping, ordered revision application, and the CPU mirror itself
+are the next connections.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,
