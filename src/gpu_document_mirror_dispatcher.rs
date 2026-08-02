@@ -1,13 +1,16 @@
 use crate::{
     document::DocumentRevision,
     gpu_document_mirror::{
-        GpuCpuMirror, GpuCpuMirrorSnapshot, GpuMirrorReadbackError, GpuMirrorReadbackPlan,
-        GpuMirrorReconcileError, GpuMirrorReconciler, GpuMirrorRevisionCapture,
-        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        GpuCpuMirror, GpuCpuMirrorSnapshot, GpuMirrorPatchBatch, GpuMirrorReadbackError,
+        GpuMirrorReadbackPlan, GpuMirrorReconcileError, GpuMirrorReconciler,
+        GpuMirrorRevisionCapture, DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
     },
     gpu_document_undo::GPU_UNDO_BLOCK_BYTES,
+    gpu_raster_recovery::{
+        GpuExactRasterRecoveryTransition, GpuExactRasterRecoveryTransitionError,
+    },
 };
-use std::{collections::VecDeque, error::Error, fmt};
+use std::{collections::VecDeque, error::Error, fmt, mem};
 
 pub const DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_GPU_MIRROR_STAGING_BYTES: u64 = DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT;
@@ -15,6 +18,8 @@ pub const DEFAULT_GPU_MIRROR_STAGING_BYTES: u64 = DEFAULT_RECONCILIATION_BYTES_I
 pub struct GpuMirrorDispatcher {
     reconciler: GpuMirrorReconciler,
     captures: VecDeque<GpuMirrorRevisionCapture>,
+    plans: VecDeque<GpuMirrorReadbackPlan>,
+    mapped_batches: Vec<GpuMirrorPatchBatch>,
     resident_snapshot_bytes: u64,
     max_snapshot_bytes: u64,
     max_staging_bytes: u64,
@@ -44,6 +49,8 @@ impl GpuMirrorDispatcher {
         Ok(Self {
             reconciler: GpuMirrorReconciler::new(width, height, tile_size, initial_revision)?,
             captures: VecDeque::new(),
+            plans: VecDeque::new(),
+            mapped_batches: Vec::new(),
             resident_snapshot_bytes: 0,
             max_snapshot_bytes,
             max_staging_bytes,
@@ -120,6 +127,7 @@ impl GpuMirrorDispatcher {
             .checked_add(capture.byte_len())
             .expect("capacity checking proved that mirror snapshot bytes fit");
         self.captures.push_back(capture);
+        self.plans.push_back(plan.clone());
         Ok(())
     }
 
@@ -169,6 +177,27 @@ impl GpuMirrorDispatcher {
         let revision = patch.revision();
         let batch_index = patch.index();
         let byte_len = patch.byte_len();
+        self.mapped_batches.push(patch.clone());
+        let recovery_transition = if revision_complete {
+            let plan = self
+                .plans
+                .front()
+                .expect("every dispatched mirror capture retains its validated plan");
+            let batches = mem::take(&mut self.mapped_batches);
+            match GpuExactRasterRecoveryTransition::from_mirror_revision(
+                &self.reconciler.snapshot(),
+                plan,
+                batches,
+            ) {
+                Ok(transition) => Some(transition),
+                Err(failure) => {
+                    self.mapped_batches = failure.batches;
+                    return Err(GpuMirrorDispatchError::RecoveryTransition(failure.error));
+                }
+            }
+        } else {
+            None
+        };
         let applied_revisions = self.reconciler.complete_batch(patch)?;
         self.resident_snapshot_bytes = self
             .resident_snapshot_bytes
@@ -181,12 +210,14 @@ impl GpuMirrorDispatcher {
                 ));
             }
             self.captures.pop_front();
+            self.plans.pop_front();
         }
         Ok(Some(GpuMirrorDispatchCompletion {
             revision,
             batch_index,
             byte_len,
             applied_revisions,
+            recovery_transition,
         }))
     }
 
@@ -234,12 +265,13 @@ impl GpuMirrorDispatcher {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GpuMirrorDispatchCompletion {
     pub revision: DocumentRevision,
     pub batch_index: u32,
     pub byte_len: u64,
     pub applied_revisions: Vec<DocumentRevision>,
+    pub recovery_transition: Option<GpuExactRasterRecoveryTransition>,
 }
 
 pub struct GpuMirrorEnqueueFailure {
@@ -307,6 +339,7 @@ pub enum GpuMirrorDispatchError {
     CompletedRevisionNotApplied(DocumentRevision),
     Readback(GpuMirrorReadbackError),
     Reconcile(GpuMirrorReconcileError),
+    RecoveryTransition(GpuExactRasterRecoveryTransitionError),
 }
 
 impl fmt::Display for GpuMirrorDispatchError {
@@ -362,6 +395,7 @@ impl fmt::Display for GpuMirrorDispatchError {
             ),
             Self::Readback(error) => error.fmt(formatter),
             Self::Reconcile(error) => error.fmt(formatter),
+            Self::RecoveryTransition(error) => error.fmt(formatter),
         }
     }
 }
@@ -371,6 +405,7 @@ impl Error for GpuMirrorDispatchError {
         match self {
             Self::Readback(error) => Some(error),
             Self::Reconcile(error) => Some(error),
+            Self::RecoveryTransition(error) => Some(error),
             _ => None,
         }
     }
@@ -415,6 +450,7 @@ mod tests {
         )
         .unwrap();
         GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::INITIAL,
             DocumentRevision::from_raw(1),
             &capture,
             &[GpuMementoResidentState {

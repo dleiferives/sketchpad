@@ -6,6 +6,7 @@ use sketchpad::{
     gpu_document_mirror_dispatcher::GpuMirrorDispatcher,
     gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
     gpu_document_undo::{GpuDocumentMemento, GPU_UNDO_BLOCK_BYTES},
+    gpu_raster_recovery::replay_exact_raster_recovery_command,
     gpu_round::RoundMaskScheduler,
     gpu_round_recovery::{replay_round_recovery_command, GpuRoundRecoveryCommand},
     gpu_round_target::RoundMaskTarget,
@@ -377,6 +378,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     document.create_layer("Mirror Revision")?;
     let mirror_revision = document.revision();
     let mirror_plan = GpuMirrorReadbackPlan::from_memento(
+        DocumentRevision::INITIAL,
         mirror_revision,
         history.pending_memento_mut()?,
         2 * GPU_UNDO_BLOCK_BYTES,
@@ -473,6 +475,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut mapped_batches = 0;
     let mut applied_revisions = Vec::new();
+    let mut recovery_transition = None;
     while mirror_dispatcher.pending_revision_count() != 0 {
         let mut mirror_readback_encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -497,8 +500,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             || completion.batch_index != mapped_batches
             || completion.byte_len != 8_192
             || (mapped_batches == 0 && !completion.applied_revisions.is_empty())
+            || completion.recovery_transition.is_some() != (mapped_batches == 1)
         {
             return Err(format!("unexpected mirror completion: {completion:?}").into());
+        }
+        if let Some(transition) = completion.recovery_transition {
+            if recovery_transition.replace(transition).is_some() {
+                return Err("GPU mirror emitted more than one recovery transition".into());
+            }
         }
         mapped_batches += 1;
         applied_revisions.extend(completion.applied_revisions);
@@ -509,6 +518,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         || mirror_dispatcher.staging_byte_len() != 0
         || applied_revisions != [mirror_revision]
         || mirror_dispatcher.mirror().revision() != mirror_revision
+        || recovery_transition
+            .as_ref()
+            .is_none_or(|transition| transition.revision() != mirror_revision)
     {
         return Err("GPU mirror revision did not reconcile atomically".into());
     }
@@ -529,6 +541,36 @@ fn main() -> Result<(), Box<dyn Error>> {
         ],
         [0.075, 0.15, 0.3, 0.375],
     )?;
+    let recovery_transition = recovery_transition
+        .as_ref()
+        .ok_or("GPU mirror did not retain an exact recovery transition")?;
+    let mut recovered_raster = RasterLayer::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE)?;
+    replay_exact_raster_recovery_command(
+        layer,
+        &mut recovered_raster,
+        recovery_transition.after(),
+    )?;
+    let recovered_pixel = recovered_raster
+        .pixel(64, 64)
+        .ok_or("missing recovered pixel")?;
+    expect_color(
+        "recovery transition after-state",
+        [
+            recovered_pixel.r,
+            recovered_pixel.g,
+            recovered_pixel.b,
+            recovered_pixel.a,
+        ],
+        [0.075, 0.15, 0.3, 0.375],
+    )?;
+    replay_exact_raster_recovery_command(
+        layer,
+        &mut recovered_raster,
+        recovery_transition.before(),
+    )?;
+    if recovered_raster.allocated_tile_count() != 0 {
+        return Err("recovery transition did not restore its explicit empty source".into());
+    }
     let mirror_snapshot = mirror_dispatcher.snapshot();
     if mirror_snapshot.revision() != mirror_revision
         || mirror_snapshot.tile_pixels(mirror_key) != Some(mirrored_tile)

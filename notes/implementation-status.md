@@ -227,8 +227,16 @@ GPU result. It validates base ordering, tile geometry, complete batch identity,
 finite pixels, and byte accounting while returning the mapped batches on
 failure. First-paint absence is an explicit before-state. Pure replay tests
 apply after then before and recover exact present pixels or sparse absence.
-The mirror dispatcher and bounded history still need to hand these pairs to
-the matching GPU history IDs before this closes the live pre-map interval.
+
+Readback plans now name both their exact source and target revisions. The
+reconciler rejects gaps or a false source before registering work, and mapped
+patches reject non-finite channels before changing the sparse CPU mirror. The
+dispatcher retains each accepted plan plus shared mapped batches, constructs
+the two-sided spill before advancing the mirror, and returns it only with the
+completed revision. The GPU correctness smoke now contains an after/before
+oracle for that returned spill, though this slice was compile-checked rather
+than run against hardware. Bounded history still needs to bind the spill to
+the matching GPU history ID before this closes the live pre-map interval.
 
 That work also exposed and fixed a partial-edge invariant: a logical canvas
 whose dimensions are not multiples of 128 may legitimately produce a padded

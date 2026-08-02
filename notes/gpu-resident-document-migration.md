@@ -174,8 +174,10 @@ The pre-map GPU-only undo interval remains an explicit incomplete case rather
 than being mistaken for a metadata or layer-snapshot problem. Its CPU spill
 representation is an exact two-sided transition: copy the before-blocks from
 the preceding immutable mirror and retain the mapped after-blocks under shared
-ownership. Live integration must associate that pair with the GPU history ID
-before allowing the newer mirror base to retire the semantic command.
+ownership. Every readback plan names that precise source revision, and the
+dispatcher constructs the pair before it lets reconciliation advance the
+mirror. Live integration must associate the returned pair with the GPU history
+ID before allowing the newer mirror base to retire the semantic command.
 
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered

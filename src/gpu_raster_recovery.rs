@@ -122,11 +122,11 @@ impl GpuExactRasterRecoveryTransition {
         plan: &GpuMirrorReadbackPlan,
         batches: Vec<GpuMirrorPatchBatch>,
     ) -> Result<Self, Box<GpuExactRasterRecoveryTransitionFailure>> {
-        if before.revision() >= plan.revision() {
+        if before.revision() != plan.source_revision() {
             return Err(transition_failure(
-                GpuExactRasterRecoveryTransitionError::BaseNotOlder {
+                GpuExactRasterRecoveryTransitionError::BaseRevisionMismatch {
                     base: before.revision(),
-                    transition: plan.revision(),
+                    source: plan.source_revision(),
                 },
                 batches,
             ));
@@ -312,9 +312,9 @@ impl Error for GpuExactRasterRecoveryTransitionFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuExactRasterRecoveryTransitionError {
-    BaseNotOlder {
+    BaseRevisionMismatch {
         base: DocumentRevision,
-        transition: DocumentRevision,
+        source: DocumentRevision,
     },
     TileSizeMismatch {
         base: u32,
@@ -329,10 +329,10 @@ pub enum GpuExactRasterRecoveryTransitionError {
 impl fmt::Display for GpuExactRasterRecoveryTransitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::BaseNotOlder { base, transition } => write!(
+            Self::BaseRevisionMismatch { base, source } => write!(
                 formatter,
-                "GPU recovery transition revision {} is not newer than CPU base {}",
-                transition.get(),
+                "GPU recovery transition starts at revision {}, not CPU base {}",
+                source.get(),
                 base.get()
             ),
             Self::TileSizeMismatch { base, transition } => write!(
@@ -1136,6 +1136,7 @@ mod tests {
         )
         .unwrap();
         let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::from_raw(revision - 1),
             DocumentRevision::from_raw(revision),
             &capture,
             &[GpuMementoResidentState {
@@ -1255,6 +1256,7 @@ mod tests {
         .unwrap();
         let revision = DocumentRevision::from_raw(4);
         let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::INITIAL,
             revision,
             &capture,
             &[GpuMementoResidentState {
@@ -1358,9 +1360,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(
             failure.error,
-            GpuExactRasterRecoveryTransitionError::BaseNotOlder {
+            GpuExactRasterRecoveryTransitionError::BaseRevisionMismatch {
                 base: DocumentRevision::from_raw(1),
-                transition: DocumentRevision::from_raw(1),
+                source: DocumentRevision::INITIAL,
             }
         );
         assert_eq!(failure.batches.len(), 1);

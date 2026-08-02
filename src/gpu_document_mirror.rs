@@ -80,6 +80,7 @@ impl GpuMirrorBatchPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GpuMirrorReadbackPlan {
     layout: AtlasLayout,
+    source_revision: DocumentRevision,
     revision: DocumentRevision,
     batches: Vec<GpuMirrorBatchPlan>,
     byte_len: u64,
@@ -88,11 +89,13 @@ pub struct GpuMirrorReadbackPlan {
 
 impl GpuMirrorReadbackPlan {
     pub fn from_memento(
+        source_revision: DocumentRevision,
         revision: DocumentRevision,
         memento: &GpuDocumentMemento,
         max_batch_bytes: u64,
     ) -> Result<Self, GpuMirrorPlanError> {
         Self::from_capture(
+            source_revision,
             revision,
             memento.plan(),
             memento.resident_states(),
@@ -101,11 +104,18 @@ impl GpuMirrorReadbackPlan {
     }
 
     pub fn from_capture(
+        source_revision: DocumentRevision,
         revision: DocumentRevision,
         capture: &GpuUndoCapturePlan,
         resident_states: &[GpuMementoResidentState],
         max_batch_bytes: u64,
     ) -> Result<Self, GpuMirrorPlanError> {
+        if revision <= source_revision {
+            return Err(GpuMirrorPlanError::RevisionNotNewer {
+                source: source_revision,
+                target: revision,
+            });
+        }
         if max_batch_bytes < GPU_UNDO_BLOCK_BYTES {
             return Err(GpuMirrorPlanError::BatchBudgetTooSmall {
                 requested: max_batch_bytes,
@@ -185,6 +195,7 @@ impl GpuMirrorReadbackPlan {
             .try_fold(0_u32, |total, batch| total.checked_add(batch.block_count));
         Ok(Self {
             layout: capture.layout(),
+            source_revision,
             revision,
             batches,
             byte_len: byte_len.ok_or(GpuMirrorPlanError::ArithmeticOverflow)?,
@@ -194,6 +205,10 @@ impl GpuMirrorReadbackPlan {
 
     pub const fn layout(&self) -> AtlasLayout {
         self.layout
+    }
+
+    pub const fn source_revision(&self) -> DocumentRevision {
+        self.source_revision
     }
 
     pub const fn revision(&self) -> DocumentRevision {
@@ -867,6 +882,17 @@ impl GpuCpuMirror {
                         actual: region.pixels.len(),
                     });
                 }
+                if let Some((index, _)) = region.pixels.iter().enumerate().find(|(_, pixel)| {
+                    !pixel.r.is_finite()
+                        || !pixel.g.is_finite()
+                        || !pixel.b.is_finite()
+                        || !pixel.a.is_finite()
+                }) {
+                    return Err(GpuMirrorReconcileError::NonFinitePixel {
+                        key: region.key,
+                        index,
+                    });
+                }
             }
         }
         Ok(())
@@ -986,6 +1012,12 @@ impl GpuMirrorReconciler {
             return Err(GpuMirrorReconcileError::TileSizeMismatch {
                 expected: self.mirror.tile_size,
                 actual: plan.layout().tile_size(),
+            });
+        }
+        if plan.source_revision() != self.latest_registered {
+            return Err(GpuMirrorReconcileError::SourceRevisionMismatch {
+                expected: self.latest_registered,
+                actual: plan.source_revision(),
             });
         }
         if plan.revision() <= self.latest_registered {
@@ -1189,6 +1221,10 @@ fn checked_u32(value: usize) -> Result<u32, GpuMirrorPlanError> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuMirrorPlanError {
+    RevisionNotNewer {
+        source: DocumentRevision,
+        target: DocumentRevision,
+    },
     BatchBudgetTooSmall {
         requested: u64,
         minimum: u64,
@@ -1214,6 +1250,12 @@ pub enum GpuMirrorPlanError {
 impl fmt::Display for GpuMirrorPlanError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RevisionNotNewer { source, target } => write!(
+                formatter,
+                "GPU mirror target revision {} is not newer than source {}",
+                target.get(),
+                source.get()
+            ),
             Self::BatchBudgetTooSmall { requested, minimum } => write!(
                 formatter,
                 "GPU mirror batch budget {requested} is smaller than one {minimum}-byte block"
@@ -1357,6 +1399,10 @@ pub enum GpuMirrorReconcileError {
         expected: u32,
         actual: u32,
     },
+    SourceRevisionMismatch {
+        expected: DocumentRevision,
+        actual: DocumentRevision,
+    },
     RevisionNotNewer {
         latest: DocumentRevision,
         requested: DocumentRevision,
@@ -1401,6 +1447,10 @@ pub enum GpuMirrorReconcileError {
         expected: usize,
         actual: usize,
     },
+    NonFinitePixel {
+        key: LayerTileKey,
+        index: usize,
+    },
 }
 
 impl fmt::Display for GpuMirrorReconcileError {
@@ -1412,6 +1462,12 @@ impl fmt::Display for GpuMirrorReconcileError {
             Self::TileSizeMismatch { expected, actual } => write!(
                 formatter,
                 "GPU CPU mirror expected {expected}-pixel tiles, got {actual}"
+            ),
+            Self::SourceRevisionMismatch { expected, actual } => write!(
+                formatter,
+                "GPU mirror plan starts at revision {}, expected {}",
+                actual.get(),
+                expected.get()
             ),
             Self::RevisionNotNewer { latest, requested } => write!(
                 formatter,
@@ -1496,6 +1552,10 @@ impl fmt::Display for GpuMirrorReconcileError {
                 formatter,
                 "GPU mirror patch for {key:?} has {actual} pixels, expected {expected}"
             ),
+            Self::NonFinitePixel { key, index } => write!(
+                formatter,
+                "GPU mirror patch for {key:?} has a non-finite pixel at index {index}"
+            ),
         }
     }
 }
@@ -1566,6 +1626,7 @@ mod tests {
         let key = capture.regions()[0].key;
         (
             GpuMirrorReadbackPlan::from_capture(
+                DocumentRevision::from_raw(revision - 1),
                 DocumentRevision::from_raw(revision),
                 &capture,
                 &states,
@@ -1608,6 +1669,7 @@ mod tests {
         let (capture, states) = capture_and_states(layout, &damages);
         let plan = GpuMirrorReadbackPlan::from_capture(
             DocumentRevision::INITIAL,
+            DocumentRevision::from_raw(1),
             &capture,
             &states,
             2 * 128 * 128 * 16,
@@ -1628,6 +1690,7 @@ mod tests {
         let (capture, states) = capture_and_states(layout, &[(TileCoord::new(0, 0), damage, true)]);
         let plan = GpuMirrorReadbackPlan::from_capture(
             DocumentRevision::INITIAL,
+            DocumentRevision::from_raw(1),
             &capture,
             &states,
             DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
@@ -1657,6 +1720,7 @@ mod tests {
             capture_and_states(layout, &[(TileCoord::new(0, 0), damage, false)]);
         let plan = GpuMirrorReadbackPlan::from_capture(
             DocumentRevision::INITIAL,
+            DocumentRevision::from_raw(1),
             &capture,
             &states,
             DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
@@ -1682,6 +1746,7 @@ mod tests {
         assert_eq!(
             GpuMirrorReadbackPlan::from_capture(
                 DocumentRevision::INITIAL,
+                DocumentRevision::from_raw(1),
                 &capture,
                 &states,
                 GPU_UNDO_BLOCK_BYTES - 1,
@@ -1812,11 +1877,61 @@ mod tests {
         assert_eq!(reconciler.mirror().revision(), DocumentRevision::INITIAL);
         assert_eq!(reconciler.pending_revision_count(), 1);
 
+        let mut nonfinite = solid_patch(&plan.batches()[0], LinearRgba::TRANSPARENT);
+        Arc::make_mut(&mut nonfinite.regions[0].pixels)[0].r = f32::NAN;
+        assert!(matches!(
+            reconciler.complete_batch(nonfinite),
+            Err(GpuMirrorReconcileError::NonFinitePixel { .. })
+        ));
+        assert_eq!(reconciler.mirror().revision(), DocumentRevision::INITIAL);
+        assert_eq!(reconciler.pending_revision_count(), 1);
+
         assert_eq!(
             reconciler
                 .complete_batch(solid_patch(&plan.batches()[0], LinearRgba::TRANSPARENT))
                 .unwrap(),
             vec![DocumentRevision::from_raw(1)]
+        );
+    }
+
+    #[test]
+    fn revision_plans_name_the_exact_source_state() {
+        let (second, _) = one_tile_plan(2, true);
+        assert_eq!(second.source_revision(), DocumentRevision::from_raw(1));
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        assert!(matches!(
+            reconciler.register_plan(&second),
+            Err(GpuMirrorReconcileError::SourceRevisionMismatch {
+                expected,
+                actual,
+            }) if expected == DocumentRevision::INITIAL
+                && actual == DocumentRevision::from_raw(1)
+        ));
+        assert_eq!(reconciler.pending_revision_count(), 0);
+
+        let layout = AtlasLayout::document_default();
+        let (capture, states) = capture_and_states(
+            layout,
+            &[(
+                TileCoord::new(0, 0),
+                RectU32::from_xywh(0, 0, 16, 16).unwrap(),
+                true,
+            )],
+        );
+        assert_eq!(
+            GpuMirrorReadbackPlan::from_capture(
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(1),
+                &capture,
+                &states,
+                DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+            )
+            .unwrap_err(),
+            GpuMirrorPlanError::RevisionNotNewer {
+                source: DocumentRevision::from_raw(1),
+                target: DocumentRevision::from_raw(1),
+            }
         );
     }
 
@@ -1832,6 +1947,7 @@ mod tests {
             )],
         );
         let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::INITIAL,
             DocumentRevision::from_raw(1),
             &capture,
             &states,
@@ -1858,6 +1974,7 @@ mod tests {
             &[(tile, RectU32::from_xywh(120, 120, 2, 2).unwrap(), true)],
         );
         let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::INITIAL,
             DocumentRevision::from_raw(1),
             &capture,
             &states,
