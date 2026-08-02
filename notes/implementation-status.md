@@ -1,11 +1,33 @@
 # Implementation Status
 
-Status: live implementation ledger, 2026-07-28. This note records what the
+Status: live implementation ledger, 2026-08-02. This note records what the
 current executable actually does. Product intent remains in
 [first-usable-product.md](first-usable-product.md); research claims and future
 possibilities belong in the subject notes.
 
-Selected next architecture, 2026-08-01: replace the CPU
+Live cutover checkpoint, 2026-08-02: on hardware with full-float blending and
+the selected 128 px tile geometry, the application now bootstraps its layered
+document into `GpuResidentDocument` and makes that owner authoritative for
+interactive pixels. Hard-round paint and erase feed continuous round commands
+into the resident mask, preview in ordered layer composition, and commit
+directly to full-float atlas pages without a pen-up readback. Surface frames
+draw paper/pasteboard, the resident layer compositor, cursor, and UI in order.
+Exact undo/redo uses the resident history transaction once its asynchronous
+two-sided recovery spill is ready. The event loop advances one bounded mirror
+readback batch at a time without waiting.
+
+Resident autosave freezes the current metadata/recovery timeline and sends CPU
+replay, composition, checkpoint encoding, and atomic replacement to the
+bounded background worker. A later revision cannot be marked saved by an older
+completion. Explicit save and close-time recovery use the same exact snapshot;
+PNG export reconstructs that revision instead of reading the stale legacy
+composite. During this transition, natural brushes, layer mutation, document
+replacement/import, and color picking are intentionally unavailable in
+resident mode. The legacy `Document` remains immutable display metadata and a
+fallback only; the application never treats it as a second writable pixel
+authority.
+
+Selected architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
 page-batched GPU-resident layer and continuous-mask design in
 [GPU-resident document and continuous brush migration](gpu-resident-document-migration.md).
@@ -26,8 +48,8 @@ contracts tested independently. Detached payloads remain live exactly while
 undo/redo can reach them and are reclaimed when a new branch makes them
 unreachable. Existing layered checkpoint bytes and observable
 undo/composition behavior are unchanged, and release tests pass on Atlas. The
-inventory below continues to describe the executable at commit `373b0e7`; the
-new stroke contract is not wired into live drawing yet.
+historical inventory below records the incremental proofs that led to the live
+boundary above.
 
 The first GPU-atlas foundation is also non-live: a deterministic sparse
 planner maps `(LayerId, TileCoord)` into stable row-major slots on lazy 2D
@@ -206,8 +228,9 @@ it then finishes history/recovery and enqueues reconciliation as one boundary.
 Ordinary commits and swaps also retain an ordered mirror purpose (`History(id)`
 or `ReconcileOnly`) beside each capture.
 
-That bounded mirror driver now exists inside `GpuResidentDocument`. It owns the
-encoder for one oldest-revision staging copy, acknowledges submission, starts
+That bounded mirror driver now exists inside `GpuResidentDocument` and is
+driven by the application event loop. It owns the encoder for one oldest-
+revision staging copy, acknowledges submission, starts
 callback mapping without waiting, and exposes polling separately. Incomplete
 batches report their exact bytes and applied revisions. A last batch creates
 the exact transition/snapshot handoff and commits it to recovery before the
@@ -216,8 +239,8 @@ document, including mapped pixels and completion metadata, and can be retried;
 the stored error is observable for policy/UI reporting. Purpose resolution
 also handles history eviction during long mapping: a still-tracked ID receives
 its two-sided spill, while an already-evicted ID becomes reconcile-only. A pure
-regression test covers both sides of that lifetime change. The application
-event loop has not yet been cut over to call this driver or poll the device.
+regression test covers both sides of that lifetime change. The loop polls the
+device without waiting and schedules another opportunity while work remains.
 
 The remaining external color target is now identity-bound before it is moved
 behind the owner API. Each `GpuDocumentTarget` receives a process-unique ID;
@@ -303,9 +326,10 @@ acknowledgement after `Queue::submit`. The Atlas Intel UHD 630 smoke now uses
 this owner rather than a duplicate planner: it paints into a provisional tile,
 proves preview-only residency, cancels and observes reclamation, starts a
 second eraser stroke, previews the lower layer, commits it as history entry 1,
-and reads back the committed result exactly. The application is not switched
-to this path yet, and the final dirty-updated exact stable composite cache
-remains to be built. Command batches currently submit immediately; display-
+and reads back the committed result exactly. The application now uses this
+path for hard-round paint and erase; the final dirty-updated exact stable
+composite cache remains to be built. Command batches currently submit
+immediately; display-
 opportunity coalescing remains a later event-loop policy above this owner.
 
 The resident owner can now freeze an exact application-facing snapshot at its
@@ -330,7 +354,8 @@ results; failure leaves dirty state claimed by no revision, and the worker can
 accept later work. Dropping the owner joins any active write rather than
 detaching filesystem mutation past application shutdown. Tests prove
 `R1 active / R2 pending / R3 replaces R2`, stale-success behavior, exact final
-file contents, and repeated failure against a non-directory path. The current
+file contents, and repeated failure against a non-directory path. The live
+resident recovery path now uses this worker. The current
 `.sketchpad` file format deliberately begins a new session at revision zero
 when reopened, so live saved-revision identity remains task metadata rather
 than a serialized file field.
@@ -1209,7 +1234,8 @@ This is an architectural integration checkpoint, not yet the usable painter:
   container proven by recovery, not the eventual scalable schema: it has no
   embedded preview or serialized undo history, and the active named path is
   session-local rather than restored from recovery after restart;
-- checkpoint encoding and disk I/O are synchronous after the idle delay and
+- resident autosave replay, checkpoint encoding, and disk I/O run on the
+  bounded worker; explicit save and shutdown recovery remain synchronous and
   still need large-document timing and disk-full/kill testing;
 - PNG I/O has explicit sRGB transfer behavior, but there is no general ICC,
   wide-gamut, or HDR color-management path;
@@ -1223,9 +1249,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
   diameter boundary; more brush families and devices require their own
   footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
-- hard round, eraser, flat, pencil, bristle, and fallback palette-knife work
-  remains CPU-only; the eligible palette knife has a GPU-owned live
-  transaction and one asynchronous full-float commit at pen-up;
+- hard round and eraser are GPU-resident on selected live hardware. Flat,
+  pencil, bristle, palette knife, layer edits, import/open, and color picking
+  are temporarily disabled there rather than mutating stale CPU fallback data;
 - repeated dab/tile intersections are not yet coalesced in the retained CPU
   brush paths;
 - live physical-input diagnostics now separate hover and contact for relative

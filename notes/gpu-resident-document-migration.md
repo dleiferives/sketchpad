@@ -314,15 +314,40 @@ encode, or touch the filesystem. Mirror materialization installs the immutable
 tile references directly into the worker raster; it does not copy every pixel
 before the checkpoint encoder reads it.
 
-This boundary is now implemented below the application loop. A resident
+This boundary is now implemented and connected to the application loop. A resident
 snapshot freezes current metadata plus the mirror-base/forward-journal timeline
 even when reconciliation is behind. The background checkpoint owner keeps one
 active task and only the newest pending task, reports success against the
 current interactive revision, and joins an active writer on shutdown. Pure
 tests cover revision coalescing and failed atomic replacement; the resident
 hardware smoke recovers the current committed eraser from an immediate
-snapshot. Wiring the existing autosave/manual-save UI to this owner is still
-part of the application-state cutover.
+snapshot. The live autosave path requests these immutable snapshots, manual
+save builds from the same exact revision, and only a successful completion
+matching the interactive revision clears recovery dirtiness.
+
+## Live Application Authority Checkpoint
+
+The first application cutover deliberately has one writable pixel authority.
+On a compatible adapter, startup uploads the existing layered CPU document
+into the resident atlas and thereafter routes hard-round paint, hard-round
+erase, presentation, exact undo/redo, recovery, manual document save, and PNG
+export through the resident revision. The old CPU document stays immutable so
+layer names and fallback state remain available, but it is never updated in
+parallel and is never used to save or export resident strokes.
+
+The event loop submits round command batches directly from input, composites
+the active scalar mask at the active layer's ordered position, and commits at
+pen-up without mapping. It also advances the oldest mirror capture one bounded
+batch at a time and polls mapping nonblockingly. Undo/redo is exposed only
+after that history entry has its exact two-sided spill; visible GPU mutation
+therefore cannot outrun device-loss recovery.
+
+Unmigrated actions fail closed. Natural brushes, structural layer mutation,
+opening/replacing a document, PNG import, and composite color picking are not
+allowed to touch the legacy CPU pixels while the resident owner is active.
+They must return through resident metadata/history transactions, GPU sampling,
+or an explicit exact snapshot-and-rebootstrap operation. This temporary
+restriction is a correctness boundary, not the intended product surface.
 
 ## Ordered Implementation
 
@@ -346,33 +371,36 @@ part of the application-state cutover.
    emits layer-major/page-minor batches, applies visibility and opacity, clips
    partial edge tiles, validates target resident identity, and source-overs
    premultiplied pixels without flattening layers. Active full-flow paint and
-   eraser presentation is also complete inside this isolated compositor. The
+   eraser presentation is also complete and is the selected live application
+   compositor. The
    scalar mask is applied to the active layer before that layer's opacity and
    ordered source-over, including a transparent base for a newly allocated
    tile. It changes neither committed color pixels nor history. Hardware
    readback matches the CPU material oracle for both paint and erase. Cancel
    must return every provisional atlas allocation recorded by the active
    transaction; an intentionally chained smoke caught the stale-allocation
-   failure that results if this rollback is omitted. The live active-stroke
-   owner, application presentation cutover, and selected dirty-updated
-   full-float stable composite cache remain.
+   failure that results if this rollback is omitted. The selected dirty-
+   updated full-float stable composite cache remains.
 4. Add stable/tail round masks, live paint/erase presentation, GPU commit, and
    exact block undo. The first union-mask transaction is complete below the
    application boundary: one reusable owner serializes begin/batches/cancel or
    commit, owns provisional atlas rollback, presents through the ordered
    active-layer compositor, and hands a completed stroke to the existing exact
-   undo/recovery/mirror transaction. Atlas hardware proves cancel, paint
+   undo/recovery/mirror transaction. The live application routes hard-round
+   paint and erase through it. Atlas hardware proves cancel, paint
    preview, eraser preview, and committed eraser readback. Stable-prefix versus
-   replaceable-tail masks, optical-density flow, frame-opportunity batching,
-   and event-loop cutover remain.
+   replaceable-tail masks, optical-density flow, and frame-opportunity batching
+   remain.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss
    journal replay, and GPU color sampling. Reconciliation, exact recovery
    snapshots, and a bounded background layered-checkpoint worker are complete
-   below the application boundary. The live loop still needs to drive mirror
-   polling and replace its legacy autosave worker with the revisioned owner;
-   GPU color sampling remains.
-6. Make the GPU document path the default. Temporarily hide the unmigrated
-   natural brushes rather than adding CPU/GPU ownership stalls.
+   below the application boundary and the live loop now drives mirror polling
+   and the revisioned autosave owner. GPU color sampling remains.
+6. [First slice complete] Make the GPU document path the default. The selected
+   hardware path is authoritative for hard-round paint/erase, history,
+   presentation, recovery, save, and export. Temporarily hide the unmigrated
+   natural brushes and structural mutations rather than adding CPU/GPU
+   ownership stalls.
 7. Restore flat and knife as connected oriented ribbons, pencil as a
    grain-modulated density ribbon, and bristle as bounded strand ribbons.
 8. Remove each corresponding dab implementation after its replacement passes

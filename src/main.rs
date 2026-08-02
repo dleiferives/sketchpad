@@ -6,9 +6,16 @@ use app_ui::{UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiSnapshot, U
 use keybindings::{KeyBindings, KeyChord, KeyCommand};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
-    brush::{BrushError, BrushSample, HardRoundBrush, HardRoundStroke},
+    brush::{BrushError, BrushSample, HardRoundBrush, HardRoundMode, HardRoundStroke},
     checkpoint::{self, CheckpointError},
     document::{Document, LayerId},
+    gpu_atlas::AtlasLayout,
+    gpu_checkpoint_worker::GpuCheckpointWorker,
+    gpu_document_compositor::GpuDocumentCompositor,
+    gpu_document_history::GpuHistoryDirection,
+    gpu_document_target::GpuDocumentTarget,
+    gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
+    gpu_resident_round_stroke::GpuResidentRoundStrokeEngine,
     gpu_stroke::{commit_source_over_tiles, ContinuousBladeStroke},
     gpu_stroke_target::{PendingStrokeReadback, SparseStrokeTarget},
     image_io::{self, ExportRegion},
@@ -25,6 +32,7 @@ use sketchpad::{
         WorldRect,
     },
     raster::{Damage, GestureId, LinearRgba, RasterLayer, DEFAULT_TILE_SIZE},
+    stroke::{ContinuousRoundPath, RoundBrushRecipeV1, StrokeMaterial, TimedBrushSample},
 };
 use std::{
     env, io,
@@ -127,6 +135,16 @@ struct Gpu {
     config: wgpu::SurfaceConfiguration,
     canvas: RasterDisplayPipeline,
     stroke_target: Option<SparseStrokeTarget>,
+    resident: Option<ResidentGpuCanvas>,
+}
+
+struct ResidentGpuCanvas {
+    document: GpuResidentDocument,
+    target: GpuDocumentTarget,
+    strokes: GpuResidentRoundStrokeEngine,
+    compositor: GpuDocumentCompositor,
+    checkpoint: GpuCheckpointWorker,
+    mirror_readback_in_flight: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -199,7 +217,13 @@ enum ActiveStroke {
     Pencil(PencilStroke),
     PaletteKnife(PaletteKnifeStroke),
     GpuPaletteKnife(GpuPaletteKnifeStroke),
+    GpuResidentRound(GpuResidentRoundStroke),
     Bristle(BristleStroke),
+}
+
+struct GpuResidentRoundStroke {
+    path: ContinuousRoundPath,
+    started: Instant,
 }
 
 struct GpuPaletteKnifeStroke {
@@ -221,6 +245,7 @@ impl ActiveStroke {
             Self::Pencil(stroke) => Some(stroke.gesture_id()),
             Self::PaletteKnife(stroke) => Some(stroke.gesture_id()),
             Self::GpuPaletteKnife(_) => None,
+            Self::GpuResidentRound(_) => None,
             Self::Bristle(stroke) => Some(stroke.gesture_id()),
         }
     }
@@ -238,6 +263,9 @@ impl ActiveStroke {
             Self::GpuPaletteKnife(_) => {
                 unreachable!("a GPU stroke must not enter the CPU mutation path")
             }
+            Self::GpuResidentRound(_) => {
+                unreachable!("a resident GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.update(layer, sample),
         }
     }
@@ -249,6 +277,7 @@ impl ActiveStroke {
             Self::Pencil(stroke) => stroke.dabs_emitted(),
             Self::PaletteKnife(stroke) => stroke.dabs_emitted(),
             Self::GpuPaletteKnife(stroke) => stroke.blade.total_sweeps(),
+            Self::GpuResidentRound(stroke) => stroke.path.commands_emitted(),
             Self::Bristle(stroke) => stroke.dabs_emitted(),
         }
     }
@@ -261,6 +290,9 @@ impl ActiveStroke {
             Self::PaletteKnife(stroke) => stroke.finalize(layer),
             Self::GpuPaletteKnife(_) => {
                 unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
+            Self::GpuResidentRound(_) => {
+                unreachable!("a resident GPU stroke must not enter the CPU mutation path")
             }
             Self::Bristle(stroke) => stroke.finalize(layer),
         }
@@ -275,6 +307,9 @@ impl ActiveStroke {
             Self::GpuPaletteKnife(_) => {
                 unreachable!("a GPU stroke must not enter the CPU mutation path")
             }
+            Self::GpuResidentRound(_) => {
+                unreachable!("a resident GPU stroke must not enter the CPU mutation path")
+            }
             Self::Bristle(stroke) => stroke.finish(layer),
         }
     }
@@ -287,6 +322,9 @@ impl ActiveStroke {
             Self::PaletteKnife(stroke) => stroke.cancel(layer),
             Self::GpuPaletteKnife(_) => {
                 unreachable!("a GPU stroke must not enter the CPU mutation path")
+            }
+            Self::GpuResidentRound(_) => {
+                unreachable!("a resident GPU stroke must not enter the CPU mutation path")
             }
             Self::Bristle(stroke) => stroke.cancel(layer),
         }
@@ -582,6 +620,23 @@ impl App {
         }
     }
 
+    fn gpu_resident_document(&self) -> Option<&GpuResidentDocument> {
+        self.gpu
+            .as_ref()
+            .and_then(|gpu| gpu.resident.as_ref())
+            .map(|resident| &resident.document)
+    }
+
+    fn reject_legacy_document_action(&self, action: &str) -> bool {
+        if self.gpu_resident_document().is_none() {
+            return false;
+        }
+        log::warn!(
+            "{action} is temporarily unavailable while the GPU-resident document owns pixels"
+        );
+        true
+    }
+
     fn ui_snapshot(&self) -> UiSnapshot {
         let tool = match (self.mouse_tool, self.paint_engine) {
             (ToolKind::Eraser, _) => UiTool::Eraser,
@@ -605,8 +660,22 @@ impl App {
             recent_colors,
             recent_color_count,
             active_layer: self.document.active_layer_id(),
-            undo_available: self.document.undo_depth() > 0,
-            redo_available: self.document.redo_depth() > 0,
+            undo_available: self.gpu_resident_document().map_or_else(
+                || self.document.undo_depth() > 0,
+                |document| {
+                    document.history().undo_depth() > 0
+                        && document.mirror().pending_revision_count() == 0
+                        && document.pending_mirror_handoff_error().is_none()
+                },
+            ),
+            redo_available: self.gpu_resident_document().map_or_else(
+                || self.document.redo_depth() > 0,
+                |document| {
+                    document.history().redo_depth() > 0
+                        && document.mirror().pending_revision_count() == 0
+                        && document.pending_mirror_handoff_error().is_none()
+                },
+            ),
             keybindings_save_error: self.keybindings_save_error,
         }
     }
@@ -747,6 +816,13 @@ impl App {
 
     fn select_ui_tool(&mut self, tool: UiTool) {
         if self.active_stroke.is_some() {
+            return;
+        }
+        if self.gpu_resident_document().is_some() && !matches!(tool, UiTool::Pen | UiTool::Eraser) {
+            log::warn!(
+                "the {:?} brush is temporarily unavailable during the GPU-resident cutover",
+                tool
+            );
             return;
         }
         match tool {
@@ -973,6 +1049,12 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
+        if self.gpu_resident_document().is_some() {
+            self.paint_engine = PaintEngine::HardRound;
+            log::warn!("only the hard-round brush is enabled during the GPU-resident cutover");
+            self.request_redraw();
+            return;
+        }
         self.paint_engine = match self.paint_engine {
             PaintEngine::HardRound => PaintEngine::Flat,
             PaintEngine::Flat => PaintEngine::Pencil,
@@ -989,6 +1071,9 @@ impl App {
     }
 
     fn pick_color(&mut self, screen: [f32; 2]) {
+        if self.reject_legacy_document_action("color picking") {
+            return;
+        }
         let world = self.camera().world_from_screen(screen);
         if world[0] < 0.0
             || world[1] < 0.0
@@ -1077,65 +1162,126 @@ impl App {
         };
         let brush = self.brush_for_tool(tool);
         let sample = BrushSample::with_tilt(world, pressure, tilt);
+        let resident_round = matches!(
+            (tool, self.paint_engine),
+            (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound)
+        ) && self.gpu.as_ref().is_some_and(|gpu| gpu.resident.is_some());
+        if self.gpu_resident_document().is_some() && !resident_round {
+            log::warn!(
+                "only hard-round paint and erase are enabled during the GPU-resident cutover"
+            );
+            return;
+        }
         let gpu_palette_knife = tool == ToolKind::Pen
             && self.paint_engine == PaintEngine::PaletteKnife
             && self.gpu_palette_knife_eligible(brush);
-        let stroke: Result<ActiveStroke, String> = match (tool, self.paint_engine) {
-            (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
-                HardRoundStroke::begin(self.document.active_layer_mut(), brush, sample)
-                    .map(ActiveStroke::HardRound)
-                    .map_err(|error| error.to_string())
-            }
-            (ToolKind::Pen, PaintEngine::Flat) => {
-                let flat = flat_brush_from_paint(brush);
-                FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
-                    .map(ActiveStroke::Flat)
-                    .map_err(|error| error.to_string())
-            }
-            (ToolKind::Pen, PaintEngine::Pencil) => {
-                let pencil = pencil_brush_from_paint(brush);
-                PencilStroke::begin(self.document.active_layer_mut(), pencil, sample)
-                    .map(ActiveStroke::Pencil)
-                    .map_err(|error| error.to_string())
-            }
-            (ToolKind::Pen, PaintEngine::PaletteKnife) if gpu_palette_knife => (|| {
-                let knife = palette_knife_from_paint(brush);
-                let blade = ContinuousBladeStroke::begin(
-                    knife,
-                    [self.document.width(), self.document.height()],
-                    self.document.tile_size(),
-                    sample,
-                )
+        let stroke: Result<ActiveStroke, String> = if resident_round {
+            (|| {
+                let material = match brush.mode() {
+                    HardRoundMode::Paint => {
+                        StrokeMaterial::paint(brush.color(), brush.opacity(), 1.0)
+                    }
+                    HardRoundMode::Erase => StrokeMaterial::eraser(brush.opacity(), 1.0),
+                }
                 .map_err(|error| error.to_string())?;
-                let target = self
+                let recipe = RoundBrushRecipeV1::new(material, brush.diameter())
+                    .map_err(|error| error.to_string())?;
+                let timed = TimedBrushSample::new(
+                    world,
+                    pressure.clamp(0.0, 1.0),
+                    [tilt[0].clamp(-1.0, 1.0), tilt[1].clamp(-1.0, 1.0)],
+                    0,
+                );
+                let mut path =
+                    ContinuousRoundPath::begin(recipe, timed).map_err(|error| error.to_string())?;
+                let gpu = self
                     .gpu
                     .as_mut()
-                    .and_then(|gpu| gpu.stroke_target.as_mut())
-                    .expect("GPU knife eligibility requires a sparse stroke target");
-                target
-                    .begin(blade.color())
+                    .expect("resident round eligibility requires a GPU");
+                let resident = gpu
+                    .resident
+                    .as_mut()
+                    .expect("resident round eligibility requires a resident canvas");
+                resident
+                    .strokes
+                    .begin(&mut resident.document, &resident.target, recipe)
                     .map_err(|error| error.to_string())?;
-                Ok(ActiveStroke::GpuPaletteKnife(GpuPaletteKnifeStroke {
-                    blade,
-                    phase: GpuStrokePhase::Drawing,
+                let batch = path.take_batch();
+                if let Err(error) = resident.strokes.submit_commands(
+                    &mut resident.document,
+                    &gpu.device,
+                    &gpu.queue,
+                    batch.commands(),
+                ) {
+                    let _ = resident.strokes.cancel(&mut resident.document);
+                    return Err(error.to_string());
+                }
+                Ok(ActiveStroke::GpuResidentRound(GpuResidentRoundStroke {
+                    path,
+                    started: Instant::now(),
                 }))
-            })(),
-            (ToolKind::Pen, PaintEngine::PaletteKnife) => {
-                let knife = palette_knife_from_paint(brush);
-                PaletteKnifeStroke::begin(self.document.active_layer_mut(), knife, sample)
-                    .map(ActiveStroke::PaletteKnife)
-                    .map_err(|error| error.to_string())
-            }
-            (ToolKind::Pen, PaintEngine::Bristle) => {
-                let bristle = bristle_brush_from_paint(brush);
-                BristleStroke::begin(self.document.active_layer_mut(), bristle, sample)
-                    .map(ActiveStroke::Bristle)
-                    .map_err(|error| error.to_string())
+            })()
+        } else {
+            match (tool, self.paint_engine) {
+                (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
+                    HardRoundStroke::begin(self.document.active_layer_mut(), brush, sample)
+                        .map(ActiveStroke::HardRound)
+                        .map_err(|error| error.to_string())
+                }
+                (ToolKind::Pen, PaintEngine::Flat) => {
+                    let flat = flat_brush_from_paint(brush);
+                    FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
+                        .map(ActiveStroke::Flat)
+                        .map_err(|error| error.to_string())
+                }
+                (ToolKind::Pen, PaintEngine::Pencil) => {
+                    let pencil = pencil_brush_from_paint(brush);
+                    PencilStroke::begin(self.document.active_layer_mut(), pencil, sample)
+                        .map(ActiveStroke::Pencil)
+                        .map_err(|error| error.to_string())
+                }
+                (ToolKind::Pen, PaintEngine::PaletteKnife) if gpu_palette_knife => (|| {
+                    let knife = palette_knife_from_paint(brush);
+                    let blade = ContinuousBladeStroke::begin(
+                        knife,
+                        [self.document.width(), self.document.height()],
+                        self.document.tile_size(),
+                        sample,
+                    )
+                    .map_err(|error| error.to_string())?;
+                    let target = self
+                        .gpu
+                        .as_mut()
+                        .and_then(|gpu| gpu.stroke_target.as_mut())
+                        .expect("GPU knife eligibility requires a sparse stroke target");
+                    target
+                        .begin(blade.color())
+                        .map_err(|error| error.to_string())?;
+                    Ok(ActiveStroke::GpuPaletteKnife(GpuPaletteKnifeStroke {
+                        blade,
+                        phase: GpuStrokePhase::Drawing,
+                    }))
+                })(),
+                (ToolKind::Pen, PaintEngine::PaletteKnife) => {
+                    let knife = palette_knife_from_paint(brush);
+                    PaletteKnifeStroke::begin(self.document.active_layer_mut(), knife, sample)
+                        .map(ActiveStroke::PaletteKnife)
+                        .map_err(|error| error.to_string())
+                }
+                (ToolKind::Pen, PaintEngine::Bristle) => {
+                    let bristle = bristle_brush_from_paint(brush);
+                    BristleStroke::begin(self.document.active_layer_mut(), bristle, sample)
+                        .map(ActiveStroke::Bristle)
+                        .map_err(|error| error.to_string())
+                }
             }
         };
         match stroke {
             Ok(stroke) => {
-                let gpu_stroke = matches!(&stroke, ActiveStroke::GpuPaletteKnife(_));
+                let gpu_stroke = matches!(
+                    &stroke,
+                    ActiveStroke::GpuPaletteKnife(_) | ActiveStroke::GpuResidentRound(_)
+                );
                 self.active_stroke = Some(stroke);
                 self.active_pointer = Some(owner);
                 self.flush_active_damage();
@@ -1149,10 +1295,10 @@ impl App {
 
     fn gpu_palette_knife_eligible(&self, brush: HardRoundBrush) -> bool {
         if brush.opacity() != 1.0
-            || !self
+            || self
                 .gpu
                 .as_ref()
-                .is_some_and(|gpu| gpu.stroke_target.is_some())
+                .is_none_or(|gpu| gpu.stroke_target.is_none())
         {
             return false;
         }
@@ -1167,6 +1313,42 @@ impl App {
                 let before = stroke.dabs_emitted();
                 let sample = BrushSample::with_tilt(world, pressure.clamp(0.0, 1.0), tilt);
                 let result = match &mut *stroke {
+                    ActiveStroke::GpuResidentRound(stroke) => {
+                        let timed = TimedBrushSample::new(
+                            world,
+                            pressure.clamp(0.0, 1.0),
+                            [tilt[0].clamp(-1.0, 1.0), tilt[1].clamp(-1.0, 1.0)],
+                            stroke
+                                .started
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                        match stroke.path.update(timed) {
+                            Err(error) => Err(error.to_string()),
+                            Ok(()) => {
+                                let batch = stroke.path.take_batch();
+                                let gpu = self
+                                    .gpu
+                                    .as_mut()
+                                    .expect("a resident stroke retains its GPU");
+                                let resident = gpu
+                                    .resident
+                                    .as_mut()
+                                    .expect("a resident stroke retains its canvas");
+                                resident
+                                    .strokes
+                                    .submit_commands(
+                                        &mut resident.document,
+                                        &gpu.device,
+                                        &gpu.queue,
+                                        batch.commands(),
+                                    )
+                                    .map(|_| ())
+                                    .map_err(|error| error.to_string())
+                            }
+                        }
+                    }
                     ActiveStroke::GpuPaletteKnife(stroke) => match stroke.phase {
                         GpuStrokePhase::Drawing => stroke
                             .blade
@@ -1194,12 +1376,65 @@ impl App {
             return;
         }
         self.flush_active_damage();
-        if matches!(&self.active_stroke, Some(ActiveStroke::GpuPaletteKnife(_))) {
+        if matches!(
+            &self.active_stroke,
+            Some(ActiveStroke::GpuPaletteKnife(_) | ActiveStroke::GpuResidentRound(_))
+        ) {
             self.request_redraw();
         }
     }
 
     fn finish_stroke(&mut self) {
+        if matches!(&self.active_stroke, Some(ActiveStroke::GpuResidentRound(_))) {
+            let Some(ActiveStroke::GpuResidentRound(mut stroke)) = self.active_stroke.take() else {
+                unreachable!("the resident stroke variant was checked")
+            };
+            self.active_pointer = None;
+            let result = (|| -> Result<bool, String> {
+                stroke.path.finish().map_err(|error| error.to_string())?;
+                let batch = stroke.path.take_batch();
+                let gpu = self
+                    .gpu
+                    .as_mut()
+                    .expect("a resident stroke retains its GPU");
+                let resident = gpu
+                    .resident
+                    .as_mut()
+                    .expect("a resident stroke retains its canvas");
+                resident
+                    .strokes
+                    .submit_commands(
+                        &mut resident.document,
+                        &gpu.device,
+                        &gpu.queue,
+                        batch.commands(),
+                    )
+                    .map_err(|error| error.to_string())?;
+                resident
+                    .strokes
+                    .commit(
+                        &mut resident.document,
+                        &mut resident.target,
+                        &gpu.device,
+                        &gpu.queue,
+                    )
+                    .map(|commit| commit.is_some())
+                    .map_err(|error| error.to_string())
+            })();
+            match result {
+                Ok(true) => self.mark_document_dirty(),
+                Ok(false) => self.request_redraw(),
+                Err(error) => {
+                    log::error!("could not commit resident GPU stroke: {error}");
+                    if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut())
+                    {
+                        let _ = resident.strokes.cancel(&mut resident.document);
+                    }
+                    self.request_redraw();
+                }
+            }
+            return;
+        }
         if let Some(ActiveStroke::GpuPaletteKnife(stroke)) = &mut self.active_stroke {
             if !matches!(&stroke.phase, GpuStrokePhase::Drawing) {
                 return;
@@ -1255,6 +1490,15 @@ impl App {
             return;
         };
         self.active_pointer = None;
+        if matches!(&stroke, ActiveStroke::GpuResidentRound(_)) {
+            if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+                if let Err(error) = resident.strokes.cancel(&mut resident.document) {
+                    log::error!("could not cancel resident GPU stroke: {error}");
+                }
+            }
+            self.request_redraw();
+            return;
+        }
         if matches!(&stroke, ActiveStroke::GpuPaletteKnife(_)) {
             if let Some(target) = self.gpu.as_mut().and_then(|gpu| gpu.stroke_target.as_mut()) {
                 if let Err(error) = target.begin([0.0; 4]) {
@@ -1345,6 +1589,70 @@ impl App {
         }
     }
 
+    fn drive_gpu_resident_mirror(&mut self) {
+        let Some(gpu) = &mut self.gpu else {
+            return;
+        };
+        let Some(resident) = &mut gpu.resident else {
+            return;
+        };
+
+        if resident.mirror_readback_in_flight {
+            if let Err(error) = gpu.device.poll(wgpu::PollType::Poll) {
+                log::error!("could not poll GPU-resident mirror readback: {error}");
+                return;
+            }
+            match resident.document.try_finish_mirror() {
+                Ok(Some(completion)) => {
+                    resident.mirror_readback_in_flight = false;
+                    if let Some(ui) = &mut self.ui {
+                        ui.mark_dirty();
+                    }
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                    log::debug!(
+                        "GPU-resident mirror batch completed: revision={} batch={} bytes={} applied_revisions={:?}",
+                        completion.revision.get(),
+                        completion.batch_index,
+                        completion.byte_len,
+                        completion.applied_revisions
+                    );
+                }
+                Ok(None) => return,
+                Err(error) => {
+                    log::error!("GPU-resident mirror completion failed: {error}");
+                    return;
+                }
+            }
+        }
+
+        if resident.document.mirror().pending_revision_count() == 0 {
+            return;
+        }
+        let encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GPU Resident Mirror Readback"),
+            });
+        match resident
+            .document
+            .prepare_next_mirror_readback(&gpu.device, encoder)
+        {
+            Ok(Some(prepared)) => {
+                match resident
+                    .document
+                    .submit_mirror_readback(&gpu.queue, prepared)
+                {
+                    Ok(_) => resident.mirror_readback_in_flight = true,
+                    Err(error) => log::error!("could not submit GPU-resident mirror: {error}"),
+                }
+            }
+            Ok(None) => {}
+            Err(error) => log::error!("could not prepare GPU-resident mirror: {error}"),
+        }
+    }
+
     fn flush_active_damage(&mut self) {
         let Some(gesture) = self
             .active_stroke
@@ -1399,6 +1707,10 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
+        if self.gpu_resident_document().is_some() {
+            self.swap_gpu_resident_history(GpuHistoryDirection::Undo);
+            return;
+        }
         match self.document.undo() {
             Ok(Some(damage)) => {
                 if !damage.is_empty() {
@@ -1415,6 +1727,10 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
+        if self.gpu_resident_document().is_some() {
+            self.swap_gpu_resident_history(GpuHistoryDirection::Redo);
+            return;
+        }
         match self.document.redo() {
             Ok(Some(damage)) => {
                 if !damage.is_empty() {
@@ -1427,8 +1743,53 @@ impl App {
         }
     }
 
+    fn swap_gpu_resident_history(&mut self, direction: GpuHistoryDirection) {
+        let result = {
+            let gpu = self.gpu.as_mut().expect("resident history requires a GPU");
+            let resident = gpu
+                .resident
+                .as_mut()
+                .expect("resident history requires its document owner");
+            let encoder = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("GPU Resident History Swap"),
+                });
+            match resident.document.prepare_history_swap(
+                &mut resident.target,
+                &gpu.device,
+                encoder,
+                direction,
+            ) {
+                Ok(Some(prepared)) => resident
+                    .document
+                    .submit_history_swap(&gpu.queue, &mut resident.target, prepared)
+                    .map(Some)
+                    .map_err(|failure| failure.error.to_string()),
+                Ok(None) => Ok(None),
+                Err(failure) => Err(failure.error.to_string()),
+            }
+        };
+        match result {
+            Ok(Some(commit)) => {
+                log::info!(
+                    "GPU-resident history swap committed: direction={:?} revision={} history_id={}",
+                    commit.direction,
+                    commit.revision.get(),
+                    commit.history_id.get()
+                );
+                self.mark_document_dirty();
+            }
+            Ok(None) => {}
+            Err(error) => log::warn!(
+                "GPU-resident {:?} is not ready without blocking: {error}",
+                direction
+            ),
+        }
+    }
+
     fn create_layer(&mut self) {
-        if self.active_stroke.is_some() {
+        if self.active_stroke.is_some() || self.reject_legacy_document_action("create layer") {
             return;
         }
         let name = format!("Layer {}", self.document.layers().len() + 1);
@@ -1443,7 +1804,7 @@ impl App {
     }
 
     fn duplicate_active_layer(&mut self) {
-        if self.active_stroke.is_some() {
+        if self.active_stroke.is_some() || self.reject_legacy_document_action("duplicate layer") {
             return;
         }
         let source = self.document.active_layer_id();
@@ -1458,7 +1819,7 @@ impl App {
     }
 
     fn delete_active_layer(&mut self) {
-        if self.active_stroke.is_some() {
+        if self.active_stroke.is_some() || self.reject_legacy_document_action("delete layer") {
             return;
         }
         let layer = self.document.active_layer_id();
@@ -1478,7 +1839,9 @@ impl App {
     }
 
     fn toggle_layer_visibility(&mut self, layer: LayerId) {
-        if self.active_stroke.is_some() {
+        if self.active_stroke.is_some()
+            || self.reject_legacy_document_action("change layer visibility")
+        {
             return;
         }
         let visible = self.document.layer(layer).map(|layer| layer.visible());
@@ -1499,7 +1862,10 @@ impl App {
     }
 
     fn adjust_layer_opacity(&mut self, layer: LayerId, delta: f32) {
-        if self.active_stroke.is_some() || !delta.is_finite() {
+        if self.active_stroke.is_some()
+            || !delta.is_finite()
+            || self.reject_legacy_document_action("change layer opacity")
+        {
             return;
         }
         let opacity = self.document.layer(layer).map(|layer| layer.opacity());
@@ -1521,7 +1887,10 @@ impl App {
     }
 
     fn select_layer(&mut self, layer: LayerId) {
-        if self.active_stroke.is_some() || layer == self.document.active_layer_id() {
+        if self.active_stroke.is_some()
+            || self.reject_legacy_document_action("select layer")
+            || layer == self.document.active_layer_id()
+        {
             return;
         }
         match self.document.set_active_layer(layer) {
@@ -1546,7 +1915,7 @@ impl App {
     }
 
     fn move_active_layer(&mut self, offset: isize) {
-        if self.active_stroke.is_some() {
+        if self.active_stroke.is_some() || self.reject_legacy_document_action("move layer") {
             return;
         }
         let current = self.document.active_layer_index();
@@ -1572,7 +1941,10 @@ impl App {
             self.update_window_title(None);
             return;
         }
-        self.recovery_revision = self.recovery_revision.wrapping_add(1);
+        self.recovery_revision = self.gpu_resident_document().map_or_else(
+            || self.recovery_revision.wrapping_add(1),
+            |document| document.revision().get(),
+        );
         self.persistence.document_changed();
         self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
         self.update_window_title(None);
@@ -1695,6 +2067,48 @@ impl App {
         if !self.persistence_enabled || self.active_stroke.is_some() {
             return false;
         }
+        if self.gpu_resident_document().is_some() {
+            let path = self.persistence.recovery_path().to_owned();
+            let started = Instant::now();
+            let result = {
+                let resident = self
+                    .gpu
+                    .as_mut()
+                    .and_then(|gpu| gpu.resident.as_mut())
+                    .expect("resident mode was checked");
+                resident.checkpoint = GpuCheckpointWorker::new(path.clone());
+                resident
+                    .document
+                    .recovery_snapshot()
+                    .build_checkpoint()
+                    .map_err(|error| error.to_string())
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .save_atomic(&path)
+                            .map_err(|error| error.to_string())
+                    })
+            };
+            return match result {
+                Ok(summary) => {
+                    self.persistence.recovery_saved();
+                    self.recovery_due = None;
+                    log::info!(
+                        "GPU-resident checkpoint saved: path={path:?} bytes={} layers={} tiles={} elapsed_ms={}",
+                        summary.encoded_bytes,
+                        summary.layer_count,
+                        summary.tile_count,
+                        started.elapsed().as_millis()
+                    );
+                    self.update_window_title(None);
+                    true
+                }
+                Err(error) => {
+                    self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                    log::error!("GPU-resident checkpoint save failed: path={path:?}: {error}");
+                    false
+                }
+            };
+        }
         self.finish_recovery_checkpoint(true);
         if !self.persistence.recovery_dirty() {
             return true;
@@ -1732,6 +2146,35 @@ impl App {
         }
         let path = ensure_sketchpad_extension(path);
         let started = Instant::now();
+        if let Some(document) = self.gpu_resident_document() {
+            let result = document
+                .recovery_snapshot()
+                .build_checkpoint()
+                .map_err(|error| error.to_string())
+                .and_then(|checkpoint| {
+                    checkpoint
+                        .save_atomic(&path)
+                        .map_err(|error| error.to_string())
+                });
+            return match result {
+                Ok(summary) => {
+                    self.persistence.document_saved(path.clone());
+                    log::info!(
+                        "GPU-resident document saved: path={path:?} bytes={} layers={} tiles={} elapsed_ms={}",
+                        summary.encoded_bytes,
+                        summary.layer_count,
+                        summary.tile_count,
+                        started.elapsed().as_millis()
+                    );
+                    self.update_window_title(None);
+                    true
+                }
+                Err(error) => {
+                    log::error!("GPU-resident document save failed: path={path:?}: {error}");
+                    false
+                }
+            };
+        }
         match checkpoint::save_document_atomic(&path, &self.document) {
             Ok(summary) => {
                 self.persistence.document_saved(path.clone());
@@ -1841,6 +2284,9 @@ impl App {
     }
 
     fn choose_document_open(&mut self) {
+        if self.reject_legacy_document_action("open document") {
+            return;
+        }
         if !self.persistence_enabled
             || self.active_stroke.is_some()
             || self.sampling_pointer.is_some()
@@ -1909,7 +2355,20 @@ impl App {
             return;
         }
         let started = Instant::now();
-        match image_io::export_png_file_atomic(path, self.document.composite(), region) {
+        let recovered;
+        let raster = if let Some(document) = self.gpu_resident_document() {
+            recovered = match document.recovery_snapshot().recover_document() {
+                Ok(recovered) => recovered,
+                Err(error) => {
+                    log::error!("GPU-resident PNG export recovery failed: {error}");
+                    return;
+                }
+            };
+            recovered.document().composite()
+        } else {
+            self.document.composite()
+        };
+        match image_io::export_png_file_atomic(path, raster, region) {
             Ok(summary) => log::info!(
                 "PNG exported: path={path:?} region={region:?} dimensions={}x{} pixels={} bytes={} elapsed_ms={}",
                 summary.width,
@@ -1923,7 +2382,10 @@ impl App {
     }
 
     fn choose_png_import(&mut self) {
-        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
+        if self.active_stroke.is_some()
+            || self.sampling_pointer.is_some()
+            || self.reject_legacy_document_action("import PNG")
+        {
             return;
         }
         let mut dialog = rfd::FileDialog::new()
@@ -2001,6 +2463,83 @@ impl App {
     }
 
     fn maybe_autosave(&mut self) {
+        if self.gpu_resident_document().is_some() {
+            let interactive_revision = self
+                .gpu_resident_document()
+                .expect("resident mode was checked")
+                .revision();
+            let completion = self
+                .gpu
+                .as_mut()
+                .and_then(|gpu| gpu.resident.as_mut())
+                .expect("resident mode was checked")
+                .checkpoint
+                .poll(interactive_revision);
+            match completion {
+                Ok(Some(completion)) => match completion.result {
+                    Ok(summary) => {
+                        if completion.saved_current_revision {
+                            self.persistence.recovery_saved();
+                            self.recovery_due = None;
+                        }
+                        log::info!(
+                            "GPU-resident checkpoint completed: revision={} current={} bytes={} layers={} tiles={} next={:?}",
+                            completion.revision.get(),
+                            completion.saved_current_revision,
+                            summary.encoded_bytes,
+                            summary.layer_count,
+                            summary.tile_count,
+                            completion.next_started.map(|revision| revision.get())
+                        );
+                    }
+                    Err(error) => {
+                        if completion.revision == interactive_revision {
+                            self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                        }
+                        log::error!(
+                            "GPU-resident checkpoint failed: revision={} current={}: {error}",
+                            completion.revision.get(),
+                            completion.saved_current_revision
+                        );
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                    log::error!("GPU-resident checkpoint worker failed: {error}");
+                }
+            }
+            if self.persistence_enabled
+                && self.persistence.recovery_dirty()
+                && self.active_stroke.is_none()
+                && self
+                    .recovery_due
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                let snapshot = self
+                    .gpu_resident_document()
+                    .expect("resident mode was checked")
+                    .recovery_snapshot();
+                let request = self
+                    .gpu
+                    .as_mut()
+                    .and_then(|gpu| gpu.resident.as_mut())
+                    .expect("resident mode was checked")
+                    .checkpoint
+                    .request(snapshot);
+                match request {
+                    Ok(request) => {
+                        self.recovery_due = None;
+                        log::info!("GPU-resident checkpoint requested: {request:?}");
+                    }
+                    Err(error) => {
+                        self.recovery_due = Some(Instant::now() + AUTOSAVE_RETRY_DELAY);
+                        log::error!("could not request GPU-resident checkpoint: {error}");
+                    }
+                }
+            }
+            return;
+        }
         self.finish_recovery_checkpoint(false);
         if self.persistence_enabled
             && self.persistence.recovery_dirty()
@@ -2199,7 +2738,12 @@ impl App {
         self.center[1] += previous_world[1] - current_world[1];
     }
 
-    fn init(window: Arc<Window>, tile_size: u32, presentation: PresentationOptions) -> Gpu {
+    fn init(
+        window: Arc<Window>,
+        document: &Document,
+        recovery_path: PathBuf,
+        presentation: PresentationOptions,
+    ) -> Gpu {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             flags: Default::default(),
@@ -2292,11 +2836,59 @@ impl App {
             paint_format.flags
         );
 
+        let tile_size = document.tile_size();
         let canvas = RasterDisplayPipeline::new(&device, format, tile_size);
         let stroke_target = gpu_strokes_supported.then(|| {
             SparseStrokeTarget::new(&device, CANVAS_WIDTH, CANVAS_HEIGHT, tile_size, 16, format)
                 .expect("a reported full-float stroke path must create its sparse target")
         });
+        let resident = if gpu_strokes_supported
+            && tile_size == AtlasLayout::document_default().tile_size()
+        {
+            (|| -> Result<ResidentGpuCanvas, String> {
+                let mut target = GpuDocumentTarget::new(&device, AtlasLayout::document_default())
+                    .map_err(|error| error.to_string())?;
+                let bootstrap = GpuResidentDocument::from_cpu_document(
+                    document,
+                    &mut target,
+                    &device,
+                    &queue,
+                    GpuResidentDocumentLimits::default(),
+                )
+                .map_err(|error| error.to_string())?;
+                log::info!(
+                    "GPU-resident document bootstrapped: {:?}",
+                    bootstrap.stats()
+                );
+                let resident_document = bootstrap.into_document();
+                let strokes = GpuResidentRoundStrokeEngine::new(&device, &resident_document)
+                    .map_err(|error| error.to_string())?;
+                let compositor = GpuDocumentCompositor::new(&device, format, &target);
+                Ok(ResidentGpuCanvas {
+                    document: resident_document,
+                    target,
+                    strokes,
+                    compositor,
+                    checkpoint: GpuCheckpointWorker::new(recovery_path),
+                    mirror_readback_in_flight: false,
+                })
+            })()
+            .map_err(|error| {
+                log::error!(
+                    "GPU-resident document initialization failed; retaining CPU renderer: {error}"
+                );
+                error
+            })
+            .ok()
+        } else {
+            log::warn!(
+                "GPU-resident document unavailable: float32_blend={} tile_size={} required_tile_size={}",
+                gpu_strokes_supported,
+                tile_size,
+                AtlasLayout::document_default().tile_size()
+            );
+            None
+        };
         Gpu {
             surface,
             device,
@@ -2304,6 +2896,7 @@ impl App {
             config,
             canvas,
             stroke_target,
+            resident,
         }
     }
 
@@ -2438,12 +3031,6 @@ impl App {
                 .as_ref()
                 .map_or(1.0, |window| window.scale_factor() as f32),
         };
-        gpu.canvas.prepare_visible(
-            &gpu.device,
-            &gpu.queue,
-            self.document.composite(),
-            camera.view_bounds(),
-        );
         let canvas_uniform = CanvasUniform {
             center: camera.center,
             zoom: camera.zoom,
@@ -2451,6 +3038,42 @@ impl App {
             viewport_size: [gpu.config.width as f32, gpu.config.height as f32],
             canvas_size: camera.canvas_size,
         };
+        let resident_prepare = if let Some(resident) = &mut gpu.resident {
+            if matches!(&self.active_stroke, Some(ActiveStroke::GpuResidentRound(_))) {
+                resident.strokes.prepare_composite(
+                    &resident.document,
+                    &resident.target,
+                    &mut resident.compositor,
+                    &gpu.device,
+                    &gpu.queue,
+                    canvas_uniform,
+                )
+            } else {
+                resident
+                    .compositor
+                    .prepare(
+                        &gpu.device,
+                        &gpu.queue,
+                        resident.document.metadata(),
+                        resident.document.atlas(),
+                        &resident.target,
+                        canvas_uniform,
+                    )
+                    .map_err(Into::into)
+            }
+        } else {
+            gpu.canvas.prepare_visible(
+                &gpu.device,
+                &gpu.queue,
+                self.document.composite(),
+                camera.view_bounds(),
+            );
+            Ok(Default::default())
+        };
+        if let Err(error) = resident_prepare {
+            log::error!("could not prepare GPU-resident document presentation: {error}");
+            return;
+        }
         gpu.canvas.write_camera(&gpu.queue, canvas_uniform);
         if let Some(target) = &mut gpu.stroke_target {
             target.prepare_presentation(&gpu.queue, canvas_uniform);
@@ -2476,9 +3099,14 @@ impl App {
                 timestamp_writes: None,
                 multiview_mask: None,
             });
-            gpu.canvas.draw_canvas(&mut pass);
-            if let Some(target) = &gpu.stroke_target {
-                target.draw(&mut pass);
+            if let Some(resident) = &gpu.resident {
+                gpu.canvas.draw_background(&mut pass);
+                resident.compositor.draw(&mut pass);
+            } else {
+                gpu.canvas.draw_canvas(&mut pass);
+                if let Some(target) = &gpu.stroke_target {
+                    target.draw(&mut pass);
+                }
             }
             gpu.canvas.draw_cursor(&mut pass);
             ui.draw(&mut pass.forget_lifetime(), &screen);
@@ -2813,7 +3441,12 @@ impl ApplicationHandler<TabletEvent> for App {
                 .unwrap(),
         );
 
-        let gpu = App::init(window.clone(), self.document.tile_size(), self.presentation);
+        let gpu = App::init(
+            window.clone(),
+            &self.document,
+            self.persistence.recovery_path().to_owned(),
+            self.presentation,
+        );
         let ui = UiOverlay::new(&window, &gpu.device, gpu.config.format);
         #[cfg(target_os = "linux")]
         match x11_tablet::start(&window, self.tablet_proxy.clone()) {
@@ -3122,6 +3755,7 @@ impl ApplicationHandler<TabletEvent> for App {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.report_live_metrics();
         self.poll_gpu_stroke_commit();
+        self.drive_gpu_resident_mirror();
         self.maybe_autosave();
 
         let now = Instant::now();
@@ -3154,6 +3788,20 @@ impl ApplicationHandler<TabletEvent> for App {
             }
         }
         if self.recovery_job.is_some() {
+            let poll_due = Instant::now() + AUTOSAVE_POLL_INTERVAL;
+            deadline = Some(
+                deadline
+                    .map(|existing| existing.min(poll_due))
+                    .unwrap_or(poll_due),
+            );
+        }
+        if self.gpu.as_ref().is_some_and(|gpu| {
+            gpu.resident.as_ref().is_some_and(|resident| {
+                resident.mirror_readback_in_flight
+                    || resident.document.mirror().pending_revision_count() > 0
+                    || !resident.checkpoint.is_idle()
+            })
+        }) {
             let poll_due = Instant::now() + AUTOSAVE_POLL_INTERVAL;
             deadline = Some(
                 deadline
