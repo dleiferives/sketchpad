@@ -123,6 +123,19 @@ device loss, the application reconstructs from the exact mirror plus that
 journal. The journal is not synchronously written per stroke; the existing
 approximately two-second autosave crash window remains.
 
+"Complete" is a stronger condition than naming an operation. In particular,
+`Undo(command_id)` is not replayable from a mirror newer than that command's
+pre-state: the base contains the painted result but does not contain the pixels
+that undo must restore. Every post-base journal record must therefore be a
+forward-applicable transition from the immediately preceding revision. Round
+paint/erase can retain its versioned recipe and continuous path commands.
+Undo/redo that reaches across the mirror base must instead retain either the
+exact resulting blocks, or an older exact replay base plus the referenced
+semantic command and inverse history. Structural deletion and imported raster
+content have the same ownership requirement. The implementation must choose
+and budget one of those representations before claiming device-loss recovery;
+a direction-only journal is explicitly insufficient.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the

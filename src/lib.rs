@@ -9,6 +9,7 @@ pub mod gpu_document_mirror;
 pub mod gpu_document_mirror_dispatcher;
 pub mod gpu_document_target;
 pub mod gpu_document_undo;
+pub mod gpu_recovery_journal;
 pub mod gpu_round;
 pub mod gpu_round_target;
 pub mod gpu_stroke;

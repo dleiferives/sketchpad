@@ -171,9 +171,23 @@ The Atlas isolation smoke runs this dispatcher at exact 16,384-byte snapshot
 and 8,192-byte staging limits. It rejects capacity for another capture while
 the first is resident, never exposes more than one 8,192-byte staging batch,
 and returns both counters to zero after reconciliation. The live application
-still does not enqueue captures or bind mirror revisions to save/export. A
-semantic journal must define the nonblocking response when snapshot capacity
-is exhausted; capture coalescing/backpressure, save race handling, and
+still does not enqueue captures or bind mirror revisions to save/export.
+
+The recovery journal now has a bounded, payload-generic revision core. It
+requires exactly one record for every interactive revision, offers capacity
+preflight before a GPU commit, never evicts an unreconciled record, and returns
+the exact command if recording fails. Defaults are 4,096 entries and 64 MiB.
+Mirror acknowledgement retires only records through an exact known revision
+and releases their declared bytes. `Arc`-backed snapshots retain a stable base,
+target, and command sequence while the live journal advances. Pure tests cover
+gap rejection, transactional byte exhaustion, partial retirement, snapshot
+isolation, and deterministic replay of a small state machine.
+
+The payload is intentionally not yet declared complete for drawing recovery.
+A direction-only undo record cannot reconstruct an undo whose target predates
+the mirror base; exact resulting blocks or a retained older replay base/inverse
+history are required. Typed round-stroke and structural payloads, that undo
+choice, capture coalescing/backpressure, save race handling, and simulated
 device-loss replay remain the rest of migration step 5.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
