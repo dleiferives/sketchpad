@@ -352,6 +352,24 @@ while the resident owner is active. They must return through resident
 metadata/history transactions or GPU sampling. This temporary restriction is
 a correctness boundary, not the intended product surface.
 
+Active-layer selection is the first resident metadata mutation. It validates
+that the identity exists and that no round-stroke guard is active, then changes
+only the resident active identity. Like the CPU contract, selection is not a
+document edit: it advances no revision, creates no undo entry, and records no
+recovery command. The UI layer list, active highlight, title, relative-layer
+navigation, and next stroke all read that same resident metadata.
+
+The remaining layer operations cannot reuse this exception. Visibility,
+opacity, ordering, rename, creation, duplication, deletion, and import are
+chronological revisioned edits. The current GPU history entry owns only a
+raster memento and every such ID expects a two-sided raster spill, while a
+metadata-only edit may have no pixel transition at all. The next structural
+slice must make the resident history value typed (`raster` versus metadata or
+layer presence), keep one global undo/redo order, and teach live recovery which
+history IDs require raster spill. Mutating metadata now and clearing or
+splitting history would make recovery superficially correct but user undo
+incorrect, so those actions remain gated.
+
 ## Ordered Implementation
 
 1. Separate document metadata/history from the current CPU raster backend

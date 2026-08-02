@@ -23,11 +23,14 @@ completion. Explicit save and close-time recovery use the same exact snapshot;
 PNG export reconstructs that revision instead of reading the stale legacy
 composite. Opening a document now bootstraps a complete replacement resident
 owner before publishing either the new CPU metadata or GPU state, so failure
-leaves the current canvas untouched. During this transition, natural brushes,
-layer mutation, PNG import, and color picking are intentionally unavailable in
-resident mode. The legacy `Document` remains immutable display metadata and a
-fallback only; the application never treats it as a second writable pixel
-authority.
+leaves the current canvas untouched. Active-layer selection is now resident
+metadata too: panel clicks and relative-layer keybindings change the layer used
+by the next GPU stroke without advancing revision or touching CPU pixels. The
+layer panel and title read resident metadata, so legacy selection is not
+shadow-mutated. During this transition, natural brushes, revisioned layer
+mutation, PNG import, and color picking are intentionally unavailable in
+resident mode. The legacy `Document` remains immutable fallback data; the
+application never treats it as a second writable pixel authority.
 
 Selected architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
@@ -1251,9 +1254,10 @@ This is an architectural integration checkpoint, not yet the usable painter:
   diameter boundary; more brush families and devices require their own
   footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
-- hard round and eraser are GPU-resident on selected live hardware. Flat,
-  pencil, bristle, palette knife, layer edits, PNG import, and color picking
-  are temporarily disabled there rather than mutating stale CPU fallback data;
+- hard round and eraser are GPU-resident on selected live hardware, and the
+  active layer can be selected there. Flat, pencil, bristle, palette knife,
+  revisioned layer edits, PNG import, and color picking are temporarily
+  disabled rather than mutating stale CPU fallback data;
 - repeated dab/tile intersections are not yet coalesced in the retained CPU
   brush paths;
 - live physical-input diagnostics now separate hover and contact for relative

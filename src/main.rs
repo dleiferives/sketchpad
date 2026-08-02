@@ -672,6 +672,31 @@ impl App {
             .map(|resident| &resident.document)
     }
 
+    fn active_layer_id(&self) -> LayerId {
+        self.gpu_resident_document().map_or_else(
+            || self.document.active_layer_id(),
+            |document| document.metadata().active_layer(),
+        )
+    }
+
+    fn active_layer_summary(&self) -> (&str, usize, usize) {
+        if let Some(document) = self.gpu_resident_document() {
+            let layers = document.metadata().layers();
+            let active = document.metadata().active_layer();
+            let index = layers
+                .iter()
+                .position(|layer| layer.id() == active)
+                .expect("resident active-layer identity remains in metadata");
+            return (layers[index].name(), index, layers.len());
+        }
+        let index = self.document.active_layer_index();
+        (
+            self.document.layers()[index].name(),
+            index,
+            self.document.layers().len(),
+        )
+    }
+
     fn reject_legacy_document_action(&self, action: &str) -> bool {
         if self.gpu_resident_document().is_none() {
             return false;
@@ -704,7 +729,7 @@ impl App {
             color_presets: COLOR_PRESETS,
             recent_colors,
             recent_color_count,
-            active_layer: self.document.active_layer_id(),
+            active_layer: self.active_layer_id(),
             undo_available: self.gpu_resident_document().map_or_else(
                 || self.document.undo_depth() > 0,
                 |document| {
@@ -1165,15 +1190,16 @@ impl App {
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or("Untitled");
+        let (active_layer_name, active_layer_index, layer_count) = self.active_layer_summary();
         window.set_title(&format!(
             "Sketchpad — {}{}{} — {} ({}/{}) — {} {:.0}px {:.0}% — color {}/{} \
              ({:.3},{:.3},{:.3}){}",
             document_name,
             dirty,
             recording,
-            self.document.layers()[self.document.active_layer_index()].name(),
-            self.document.active_layer_index() + 1,
-            self.document.layers().len(),
+            active_layer_name,
+            active_layer_index + 1,
+            layer_count,
             tool_label,
             brush.diameter(),
             brush.opacity() * 100.0,
@@ -1879,7 +1905,7 @@ impl App {
     }
 
     fn toggle_active_layer_visibility(&mut self) {
-        let layer = self.document.active_layer_id();
+        let layer = self.active_layer_id();
         self.toggle_layer_visibility(layer);
     }
 
@@ -1932,10 +1958,21 @@ impl App {
     }
 
     fn select_layer(&mut self, layer: LayerId) {
-        if self.active_stroke.is_some()
-            || self.reject_legacy_document_action("select layer")
-            || layer == self.document.active_layer_id()
+        if self.active_stroke.is_some() || layer == self.active_layer_id() {
+            return;
+        }
+        if let Some(resident) = self
+            .gpu
+            .as_mut()
+            .and_then(|gpu| gpu.resident.as_mut())
         {
+            match resident.document.set_active_layer(layer) {
+                Ok(()) => {
+                    self.invalidate_ui();
+                    self.update_window_title(None);
+                }
+                Err(error) => log::warn!("could not select resident layer: {error}"),
+            }
             return;
         }
         match self.document.set_active_layer(layer) {
@@ -1949,6 +1986,16 @@ impl App {
 
     fn select_relative_layer(&mut self, offset: isize) {
         if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(document) = self.gpu_resident_document() {
+            let layers = document.metadata().layers();
+            let current = layers
+                .iter()
+                .position(|layer| layer.id() == document.metadata().active_layer())
+                .expect("resident active-layer identity remains in metadata");
+            let destination = current.saturating_add_signed(offset).min(layers.len() - 1);
+            self.select_layer(layers[destination].id());
             return;
         }
         let current = self.document.active_layer_index();
@@ -2962,22 +3009,41 @@ impl App {
         }
         let snapshot = self.ui_snapshot();
         let document = &self.document;
+        let resident_document = self
+            .gpu
+            .as_ref()
+            .and_then(|gpu| gpu.resident.as_ref())
+            .map(|resident| &resident.document);
         let keybindings = &self.keybindings;
         let actions = match (&self.window, &mut self.ui) {
             (Some(window), Some(ui)) => ui.prepare(
                 window,
                 snapshot,
                 || {
-                    document
-                        .layers()
-                        .iter()
-                        .map(|layer| UiLayerSnapshot {
-                            id: layer.id(),
-                            name: layer.name(),
-                            visible: layer.visible(),
-                            opacity: layer.opacity(),
-                        })
-                        .collect()
+                    if let Some(document) = resident_document {
+                        document
+                            .metadata()
+                            .layers()
+                            .iter()
+                            .map(|layer| UiLayerSnapshot {
+                                id: layer.id(),
+                                name: layer.name(),
+                                visible: layer.visible(),
+                                opacity: layer.opacity(),
+                            })
+                            .collect()
+                    } else {
+                        document
+                            .layers()
+                            .iter()
+                            .map(|layer| UiLayerSnapshot {
+                                id: layer.id(),
+                                name: layer.name(),
+                                visible: layer.visible(),
+                                opacity: layer.opacity(),
+                            })
+                            .collect()
+                    }
                 },
                 || *keybindings,
             ),

@@ -164,12 +164,24 @@ impl DocumentMetadata {
     pub(crate) fn set_revision(&mut self, revision: DocumentRevision) {
         self.revision = revision;
     }
+
+    pub(crate) fn set_active_layer(
+        &mut self,
+        layer: LayerId,
+    ) -> Result<(), DocumentMetadataError> {
+        if !self.layers.iter().any(|candidate| candidate.id == layer) {
+            return Err(DocumentMetadataError::MissingLayer(layer));
+        }
+        self.active_layer = layer;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DocumentMetadataError {
     EmptyCanvas,
     InvalidTileSize,
+    MissingLayer(LayerId),
 }
 
 impl fmt::Display for DocumentMetadataError {
@@ -177,6 +189,9 @@ impl fmt::Display for DocumentMetadataError {
         match self {
             Self::EmptyCanvas => write!(formatter, "document metadata requires a nonempty canvas"),
             Self::InvalidTileSize => write!(formatter, "document metadata requires a tile size"),
+            Self::MissingLayer(layer) => {
+                write!(formatter, "document metadata has no layer {}", layer.get())
+            }
         }
     }
 }
@@ -230,5 +245,24 @@ mod tests {
             DocumentMetadata::new_blank(32, 32, 0, DocumentRevision::INITIAL),
             Err(DocumentMetadataError::InvalidTileSize)
         ));
+    }
+
+    #[test]
+    fn active_selection_changes_no_revision_and_rejects_missing_layers() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let first = document.active_layer_id();
+        let second = document.create_layer("Second").unwrap();
+        let mut metadata = DocumentMetadata::from_document(&document);
+        let revision = metadata.revision();
+
+        metadata.set_active_layer(first).unwrap();
+        assert_eq!(metadata.active_layer(), first);
+        assert_eq!(metadata.revision(), revision);
+        assert!(matches!(
+            metadata.set_active_layer(LayerId::from_raw(second.get() + 1)),
+            Err(DocumentMetadataError::MissingLayer(_))
+        ));
+        assert_eq!(metadata.active_layer(), first);
+        assert_eq!(metadata.revision(), revision);
     }
 }

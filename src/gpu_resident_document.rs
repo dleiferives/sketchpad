@@ -1,6 +1,6 @@
 use crate::{
     document::{Document, DocumentRevision},
-    document_metadata::DocumentMetadata,
+    document_metadata::{DocumentMetadata, DocumentMetadataError},
     gpu_atlas::{AtlasAllocation, AtlasError, AtlasLayout, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{
         GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
@@ -894,6 +894,15 @@ impl GpuResidentDocument {
             .expect("resident metadata and recovery timeline retain one exact revision")
     }
 
+    pub fn set_active_layer(
+        &mut self,
+        layer: crate::document::LayerId,
+    ) -> Result<(), GpuResidentDocumentError> {
+        self.check_active_round_stroke(None)?;
+        self.metadata.set_active_layer(layer)?;
+        Ok(())
+    }
+
     pub const fn revision(&self) -> DocumentRevision {
         self.metadata.revision()
     }
@@ -1205,6 +1214,7 @@ pub enum GpuResidentDocumentError {
     MirrorReadback(GpuMirrorReadbackError),
     MirrorDispatch(GpuMirrorDispatchError),
     Recovery(GpuLiveRecoveryError),
+    Metadata(DocumentMetadataError),
 }
 
 impl fmt::Display for GpuResidentDocumentError {
@@ -1278,6 +1288,7 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::MirrorReadback(error) => error.fmt(formatter),
             Self::MirrorDispatch(error) => error.fmt(formatter),
             Self::Recovery(error) => error.fmt(formatter),
+            Self::Metadata(error) => error.fmt(formatter),
         }
     }
 }
@@ -1294,6 +1305,7 @@ impl Error for GpuResidentDocumentError {
             Self::MirrorDispatch(error) => Some(error),
             Self::Recovery(error) => Some(error),
             Self::RoundMask(error) => Some(error),
+            Self::Metadata(error) => Some(error),
             _ => None,
         }
     }
@@ -1302,6 +1314,12 @@ impl Error for GpuResidentDocumentError {
 impl From<GpuDocumentHistoryError> for GpuResidentDocumentError {
     fn from(error: GpuDocumentHistoryError) -> Self {
         Self::History(error)
+    }
+}
+
+impl From<DocumentMetadataError> for GpuResidentDocumentError {
+    fn from(error: DocumentMetadataError) -> Self {
+        Self::Metadata(error)
     }
 }
 
@@ -1426,6 +1444,35 @@ mod tests {
                 actual
             }) if expected == document.target_id() && actual == wrong_target
         ));
+    }
+
+    #[test]
+    fn active_layer_selection_is_metadata_only_and_respects_the_stroke_guard() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut cpu = Document::new(48, 40, 8).unwrap();
+        let first = cpu.active_layer_id();
+        let second = cpu.create_layer("Second").unwrap();
+        let revision = cpu.revision();
+        let mut document = GpuResidentDocument::new_with_target_identity(
+            DocumentMetadata::from_document(&cpu),
+            layout,
+            GpuDocumentTargetId::from_raw(73),
+            limits(),
+        )
+        .unwrap();
+
+        document.set_active_layer(first).unwrap();
+        assert_eq!(document.metadata().active_layer(), first);
+        assert_eq!(document.revision(), revision);
+        assert_eq!(document.history().undo_depth(), 0);
+        assert_eq!(document.recovery().revision(), revision);
+
+        document.active_round_stroke = Some(GpuResidentRoundStrokeId(9));
+        assert!(matches!(
+            document.set_active_layer(second),
+            Err(GpuResidentDocumentError::ActiveRoundStrokeMismatch { .. })
+        ));
+        assert_eq!(document.metadata().active_layer(), first);
     }
 
     #[test]
