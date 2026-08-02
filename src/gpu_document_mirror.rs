@@ -1,12 +1,12 @@
 use crate::{
-    document::DocumentRevision,
+    document::{DocumentRevision, LayerId},
     gpu_atlas::{AtlasLayout, AtlasSlot, LayerTileKey},
     gpu_document_target::GpuDocumentTarget,
     gpu_document_undo::{
         GpuDocumentMemento, GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES,
         GPU_UNDO_BLOCK_SIZE, GPU_UNDO_PIXEL_BYTES,
     },
-    raster::{LinearRgba, RectU32},
+    raster::{LinearRgba, RasterError, RasterLayer, RectU32},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -730,6 +730,14 @@ impl GpuCpuMirrorSnapshot {
 
     pub fn tile_count(&self) -> usize {
         self.tiles.len()
+    }
+
+    pub fn raster_layer(&self, layer: LayerId) -> Result<RasterLayer, RasterError> {
+        let mut raster = RasterLayer::new(self.width, self.height, self.tile_size)?;
+        for (key, pixels) in self.tiles.iter().filter(|(key, _)| key.layer == layer) {
+            raster.restore_tile(key.tile, pixels.as_ref().to_vec().into_boxed_slice())?;
+        }
+        Ok(raster)
     }
 }
 

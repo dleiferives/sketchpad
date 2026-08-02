@@ -241,6 +241,23 @@ save or device-loss worker sees one stable base/target pair while the live
 timeline advances. Pure tests cover partial retirement, geometry/ahead-of-log
 failure, returned ownership, and snapshot survival after full retirement.
 
+The first simulated device-loss replay now consumes that immutable pair. A
+mirror base can materialize one sparse `RasterLayer` by stable `LayerId`.
+The typed raster journal unifies full-flow round semantics with exact mapped
+raster transitions and accounts for the enum's real inline size rather than
+double-counting a variant. Replay walks every global revision in order,
+applies only commands for the requested layer, accumulates damage/work stats,
+and clears the reconstruction-only CPU undo stack before returning the target
+revision. Pure loss simulations cover semantic paint followed by an exact
+full-float overwrite, commands interleaved across layers, and exact absence
+reclaiming a tile.
+
+This is not yet whole-document device-loss recovery: layer metadata and
+structural commands are not in the typed payload, and an undo/redo whose exact
+result is still mapping still needs the retained older anchor plus inverse
+history. Those unsupported cases remain explicit rather than falling back to
+a direction-only record.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,

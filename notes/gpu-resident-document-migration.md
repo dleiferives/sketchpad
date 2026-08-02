@@ -152,6 +152,13 @@ mirror ahead of the journal before replacing its immutable base or retiring
 any record. Snapshots retain both sides of the boundary with shared ownership,
 so background save/recovery work cannot race a later handoff.
 
+Device-loss reconstruction is per logical layer: materialize that layer's
+sparse mirror tiles, replay its round and exact-raster records while still
+walking the global revision sequence, then discard the temporary CPU history.
+This makes interleaved raster layers deterministic without pretending that
+unimplemented structural records can be skipped. Whole-document recovery is
+complete only when the metadata/structural payload joins the same sequence.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the
