@@ -677,6 +677,13 @@ impl GpuDocumentTarget {
         self.undo_swap_pending
     }
 
+    pub fn check_encoded_undo_swap(
+        &self,
+        encoded: &EncodedGpuUndoSwap,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.validate_undo_swap_token(encoded.serial)
+    }
+
     pub fn encode_undo_swap(
         &mut self,
         device: &wgpu::Device,

@@ -150,19 +150,7 @@ impl GpuLiveRecovery {
         &mut self,
         prepared: PreparedGpuHistoryRecoverySwap,
     ) -> Result<GpuHistoryRecoverySwapCommit, Box<GpuHistoryRecoverySwapCommitFailure>> {
-        let actual_source = self.timeline.target_revision();
-        let error = if actual_source != prepared.source_revision {
-            Some(GpuLiveRecoveryError::PreparedSourceChanged {
-                prepared: prepared.source_revision,
-                actual: actual_source,
-            })
-        } else {
-            self.timeline
-                .check_record(prepared.revision, prepared.byte_len)
-                .err()
-                .map(Into::into)
-        };
-        if let Some(error) = error {
+        if let Err(error) = self.check_prepared_history_swap(&prepared) {
             return Err(Box::new(GpuHistoryRecoverySwapCommitFailure {
                 error,
                 prepared,
@@ -188,6 +176,22 @@ impl GpuLiveRecovery {
             direction,
             revision,
         })
+    }
+
+    pub fn check_prepared_history_swap(
+        &self,
+        prepared: &PreparedGpuHistoryRecoverySwap,
+    ) -> Result<(), GpuLiveRecoveryError> {
+        let actual_source = self.timeline.target_revision();
+        if actual_source != prepared.source_revision {
+            return Err(GpuLiveRecoveryError::PreparedSourceChanged {
+                prepared: prepared.source_revision,
+                actual: actual_source,
+            });
+        }
+        self.timeline
+            .check_record(prepared.revision, prepared.byte_len)?;
+        Ok(())
     }
 
     pub fn prepare_mirror_handoff(

@@ -209,6 +209,13 @@ impl GpuDocumentHistory {
         self.core.begin(GpuHistoryDirection::Redo)
     }
 
+    pub fn check_begin(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<GpuHistoryId>, GpuDocumentHistoryError> {
+        self.core.check_begin(direction)
+    }
+
     pub fn pending_direction(&self) -> Option<GpuHistoryDirection> {
         self.core.pending.as_ref().map(|pending| pending.direction)
     }
@@ -444,18 +451,33 @@ impl<T> BoundedHistory<T> {
     }
 
     fn begin(&mut self, direction: GpuHistoryDirection) -> Result<bool, GpuDocumentHistoryError> {
-        if self.pending.is_some() {
-            return Err(GpuDocumentHistoryError::PendingOperation);
-        }
+        let Some(expected_id) = self.check_begin(direction)? else {
+            return Ok(false);
+        };
         let entry = match direction {
             GpuHistoryDirection::Undo => self.undo.pop_back(),
             GpuHistoryDirection::Redo => self.redo.pop_back(),
         };
         let Some(entry) = entry else {
-            return Ok(false);
+            unreachable!("history begin was checked immediately before removing its entry")
         };
+        debug_assert_eq!(entry.id, expected_id);
         self.pending = Some(PendingEntry { direction, entry });
         Ok(true)
+    }
+
+    fn check_begin(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<GpuHistoryId>, GpuDocumentHistoryError> {
+        if self.pending.is_some() {
+            return Err(GpuDocumentHistoryError::PendingOperation);
+        }
+        Ok(match direction {
+            GpuHistoryDirection::Undo => self.undo.back(),
+            GpuHistoryDirection::Redo => self.redo.back(),
+        }
+        .map(|entry| entry.id))
     }
 
     fn pending_id(&self) -> Option<GpuHistoryId> {
@@ -614,9 +636,22 @@ mod tests {
     fn pending_swap_finishes_or_cancels_without_changing_budget() {
         let mut history = BoundedHistory::new(8, 100).unwrap();
         let first = history.record(7, 12).unwrap().id;
+        assert_eq!(
+            history.check_begin(GpuHistoryDirection::Undo).unwrap(),
+            Some(first)
+        );
+        assert_eq!(
+            history.check_begin(GpuHistoryDirection::Redo).unwrap(),
+            None
+        );
+        assert_eq!(values(history.undo.make_contiguous()), vec![7]);
         assert!(history.begin(GpuHistoryDirection::Undo).unwrap());
         assert_eq!(history.pending_id(), Some(first));
         assert_eq!(history.pending.as_ref().unwrap().entry.id, first);
+        assert_eq!(
+            history.check_begin(GpuHistoryDirection::Undo),
+            Err(GpuDocumentHistoryError::PendingOperation)
+        );
         assert_eq!(history.resident_bytes, 12);
         assert_eq!(history.cancel_pending().unwrap(), first);
         assert_eq!(values(history.undo.make_contiguous()), vec![7]);

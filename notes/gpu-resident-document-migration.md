@@ -254,6 +254,21 @@ document path: undo/redo submission, mapped-readback driving, structural
 history, presentation/compositing, and application state cutover still have to
 join the same boundary.
 
+Undo and redo now enter that owner through a second prepared transaction. GPU
+history can name the next undo/redo ID without removing it, allowing recovery
+to prove that the two-sided exact spill is ready before history or target state
+changes. Only then does the owner move the entry to pending, encode the
+buffer/texture exchange, derive the post-swap mirror capture, and validate its
+capacity. Any failure before submission discards the command stream, swaps the
+resident metadata back, and restores the entry to its original history side.
+The prepared value owns the command encoder as well as the target token,
+recovery command, and mirror capture, so the final submission cannot mix a
+different command buffer into the atomic bundle. Successful submission finishes
+the history move, records the exact forward recovery patch, and marks the
+resulting mirror revision as reconcile-only; it does not create a second
+history spill for the same command. Mirror-purpose ordering is now retained
+beside the dispatcher queue, ready for the mapped-completion driver.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the

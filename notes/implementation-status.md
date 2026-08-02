@@ -192,6 +192,22 @@ CPU document and does not call this owner; the remaining cutover work is to
 coordinate undo/redo and mirror polling, add layer/presentation ownership, and
 bind the completed transaction path to input and application state.
 
+Exact GPU undo/redo has now entered the same non-live owner. History exposes a
+read-only next-swap identity, and live recovery exposes a reusable final
+preflight for its prepared forward patch. The owner refuses a swap before
+history mutation when the matching two-sided spill is still mapping. Once
+ready, it moves the entry to pending, encodes the GPU block exchange, plans and
+captures the post-swap mirror revision, and retains the encoder inside one
+opaque prepared value. Planning or capture failure restores both target
+resident metadata and the history side while dropping all unsubmitted GPU
+commands. Final submission rechecks target token, pending history identity and
+direction, recovery revision, and mirror capacity before one queue submission;
+it then finishes history/recovery and enqueues reconciliation as one boundary.
+Ordinary commits and swaps also retain an ordered mirror purpose (`History(id)`
+or `ReconcileOnly`) beside each capture. The application still needs a driver
+that stages/map-polls the oldest capture and atomically hands its completed
+snapshot/transition back to live recovery.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

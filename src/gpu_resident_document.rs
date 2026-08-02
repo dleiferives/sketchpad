@@ -2,8 +2,9 @@ use crate::{
     document::DocumentRevision,
     gpu_atlas::{AtlasLayout, SparseAtlasPlanner},
     gpu_document_history::{
-        GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryEntry, GpuHistoryRecordError,
-        GpuHistoryRecordPreview, DEFAULT_GPU_HISTORY_BYTES, DEFAULT_GPU_HISTORY_ENTRIES,
+        GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
+        GpuHistoryId, GpuHistoryRecordError, GpuHistoryRecordPreview, DEFAULT_GPU_HISTORY_BYTES,
+        DEFAULT_GPU_HISTORY_ENTRIES,
     },
     gpu_document_mirror::{
         encode_gpu_mirror_revision_capture, GpuMirrorPlanError, GpuMirrorReadbackError,
@@ -13,19 +14,23 @@ use crate::{
         GpuMirrorDispatchError, GpuMirrorDispatcher, DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES,
     },
     gpu_document_target::{
-        ColorCommitStats, EncodedGpuDocumentCommit, GpuDocumentTarget, GpuDocumentTargetError,
+        ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentTarget,
+        GpuDocumentTargetError, GpuUndoSwapStats,
     },
     gpu_history_recovery::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
         DEFAULT_GPU_HISTORY_RECOVERY_ENTRIES,
     },
-    gpu_live_recovery::{GpuLiveRecovery, GpuLiveRecoveryError, PreparedGpuHistoryRecoveryRecord},
+    gpu_live_recovery::{
+        GpuLiveRecovery, GpuLiveRecoveryError, GpuMirrorRecoveryPurpose,
+        PreparedGpuHistoryRecoveryRecord, PreparedGpuHistoryRecoverySwap,
+    },
     gpu_recovery_journal::{
         DEFAULT_GPU_RECOVERY_JOURNAL_BYTES, DEFAULT_GPU_RECOVERY_JOURNAL_ENTRIES,
     },
     gpu_recovery_replay::GpuRasterRecoveryCommand,
 };
-use std::{error::Error, fmt, iter};
+use std::{collections::VecDeque, error::Error, fmt, iter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuResidentDocumentLimits {
@@ -59,6 +64,7 @@ pub struct GpuResidentDocument {
     history: GpuDocumentHistory,
     mirror: GpuMirrorDispatcher,
     recovery: GpuLiveRecovery,
+    mirror_purposes: VecDeque<GpuMirrorRecoveryPurpose>,
 }
 
 impl GpuResidentDocument {
@@ -91,6 +97,7 @@ impl GpuResidentDocument {
             history,
             mirror,
             recovery,
+            mirror_purposes: VecDeque::new(),
         })
     }
 
@@ -231,6 +238,8 @@ impl GpuResidentDocument {
         self.mirror
             .enqueue(&prepared.plan, prepared.capture)
             .expect("mirror enqueue was checked immediately before submission");
+        self.mirror_purposes
+            .push_back(GpuMirrorRecoveryPurpose::History(history.id));
         Ok(GpuResidentDocumentCommit {
             revision: prepared.revision,
             history_id: history.id,
@@ -239,6 +248,193 @@ impl GpuResidentDocument {
             evicted_spills: recovery.evicted_spills,
             freed_spill_bytes: recovery.freed_spill_bytes,
         })
+    }
+
+    pub fn prepare_history_swap(
+        &mut self,
+        target: &mut GpuDocumentTarget,
+        device: &wgpu::Device,
+        mut encoder: wgpu::CommandEncoder,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<PreparedGpuResidentHistorySwap>, Box<GpuResidentHistorySwapPrepareFailure>>
+    {
+        let Some(revision) = self.revision().checked_next() else {
+            return Err(history_swap_prepare_failure(
+                GpuResidentDocumentError::RevisionExhausted,
+            ));
+        };
+        let history_id = match self.history.check_begin(direction) {
+            Ok(Some(id)) => id,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(history_swap_prepare_failure(error.into())),
+        };
+        let recovery = match self
+            .recovery
+            .prepare_history_swap(history_id, direction, revision)
+        {
+            Ok(recovery) => recovery,
+            Err(error) => return Err(history_swap_prepare_failure(error.into())),
+        };
+        let began = match direction {
+            GpuHistoryDirection::Undo => self.history.begin_undo(),
+            GpuHistoryDirection::Redo => self.history.begin_redo(),
+        }
+        .expect("GPU history was checked immediately before beginning a swap");
+        assert!(began, "a checked GPU history swap has an entry");
+        debug_assert_eq!(self.history.pending_id(), Some(history_id));
+
+        let encoded = {
+            let memento = self
+                .history
+                .pending_memento_mut()
+                .expect("a begun GPU history swap retains its memento");
+            match target.encode_undo_swap(device, &mut encoder, memento) {
+                Ok(encoded) => encoded,
+                Err(error) => {
+                    self.history
+                        .cancel_pending()
+                        .expect("failed GPU swap encoding leaves history pending");
+                    return Err(history_swap_prepare_failure(error.into()));
+                }
+            }
+        };
+        let plan = {
+            let memento = self
+                .history
+                .pending_memento_mut()
+                .expect("an encoded GPU history swap retains its memento");
+            GpuMirrorReadbackPlan::from_memento(
+                recovery.source_revision(),
+                revision,
+                memento,
+                self.mirror.max_staging_bytes(),
+            )
+        };
+        let plan = match plan {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.discard_encoded_history_swap(target, encoded);
+                return Err(history_swap_prepare_failure(error.into()));
+            }
+        };
+        if let Err(error) = self.mirror.check_plan(&plan) {
+            self.discard_encoded_history_swap(target, encoded);
+            return Err(history_swap_prepare_failure(error.into()));
+        }
+        let capture = match encode_gpu_mirror_revision_capture(target, device, &mut encoder, &plan)
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                self.discard_encoded_history_swap(target, encoded);
+                return Err(history_swap_prepare_failure(error.into()));
+            }
+        };
+        if let Err(error) = self.mirror.check_prepared_capture(&plan, &capture) {
+            self.discard_encoded_history_swap(target, encoded);
+            return Err(history_swap_prepare_failure(error.into()));
+        }
+        Ok(Some(PreparedGpuResidentHistorySwap {
+            revision,
+            history_id,
+            direction,
+            encoder,
+            encoded,
+            recovery,
+            plan,
+            capture,
+        }))
+    }
+
+    pub fn submit_history_swap(
+        &mut self,
+        queue: &wgpu::Queue,
+        target: &mut GpuDocumentTarget,
+        mut prepared: PreparedGpuResidentHistorySwap,
+    ) -> Result<GpuResidentHistorySwapCommit, Box<GpuResidentHistorySwapSubmitFailure>> {
+        if let Err(error) = self.check_prepared_history_swap(target, &prepared) {
+            return Err(Box::new(GpuResidentHistorySwapSubmitFailure {
+                error,
+                prepared,
+            }));
+        }
+
+        queue.submit(iter::once(prepared.encoder.finish()));
+        let stats = prepared.encoded.stats();
+        target
+            .undo_swap_submitted(prepared.encoded)
+            .expect("the resident history swap token was checked before submission");
+        let history_id = self
+            .history
+            .finish_pending()
+            .expect("the resident history swap was checked before submission");
+        let recovery = self
+            .recovery
+            .commit_history_swap(prepared.recovery)
+            .expect("live recovery was checked before history swap submission");
+        prepared
+            .capture
+            .capture_submitted()
+            .expect("a newly prepared mirror capture has not been acknowledged");
+        self.mirror
+            .enqueue(&prepared.plan, prepared.capture)
+            .expect("mirror enqueue was checked before history swap submission");
+        self.mirror_purposes
+            .push_back(GpuMirrorRecoveryPurpose::ReconcileOnly);
+        assert_eq!(history_id, prepared.history_id);
+        assert_eq!(recovery.id, prepared.history_id);
+        assert_eq!(recovery.direction, prepared.direction);
+        Ok(GpuResidentHistorySwapCommit {
+            revision: prepared.revision,
+            history_id,
+            direction: prepared.direction,
+            stats,
+        })
+    }
+
+    pub fn discard_history_swap(
+        &mut self,
+        target: &mut GpuDocumentTarget,
+        prepared: PreparedGpuResidentHistorySwap,
+    ) -> Result<GpuHistoryId, GpuResidentDocumentError> {
+        let PreparedGpuResidentHistorySwap { encoded, .. } = prepared;
+        let memento = self.history.pending_memento_mut()?;
+        target.undo_swap_discarded(encoded, memento)?;
+        Ok(self.history.cancel_pending()?)
+    }
+
+    fn discard_encoded_history_swap(
+        &mut self,
+        target: &mut GpuDocumentTarget,
+        encoded: EncodedGpuUndoSwap,
+    ) {
+        let memento = self
+            .history
+            .pending_memento_mut()
+            .expect("an encoded GPU swap retains its pending history memento");
+        target
+            .undo_swap_discarded(encoded, memento)
+            .expect("a newly encoded GPU swap can be discarded");
+        self.history
+            .cancel_pending()
+            .expect("discarding a newly encoded GPU swap restores pending history");
+    }
+
+    fn check_prepared_history_swap(
+        &self,
+        target: &GpuDocumentTarget,
+        prepared: &PreparedGpuResidentHistorySwap,
+    ) -> Result<(), GpuResidentDocumentError> {
+        target.check_encoded_undo_swap(&prepared.encoded)?;
+        if self.history.pending_id() != Some(prepared.history_id)
+            || self.history.pending_direction() != Some(prepared.direction)
+        {
+            return Err(GpuResidentDocumentError::HistorySwapChanged);
+        }
+        self.recovery
+            .check_prepared_history_swap(&prepared.recovery)?;
+        self.mirror
+            .check_prepared_capture(&prepared.plan, &prepared.capture)?;
+        Ok(())
     }
 
     fn check_prepared_commit(
@@ -279,6 +475,10 @@ impl GpuResidentDocument {
     pub const fn revision(&self) -> DocumentRevision {
         self.recovery.revision()
     }
+
+    pub fn pending_mirror_purpose_count(&self) -> usize {
+        self.mirror_purposes.len()
+    }
 }
 
 pub struct PreparedGpuResidentDocumentCommit {
@@ -314,11 +514,107 @@ impl PreparedGpuResidentDocumentCommit {
 
 pub struct GpuResidentDocumentCommit {
     pub revision: DocumentRevision,
-    pub history_id: crate::gpu_document_history::GpuHistoryId,
+    pub history_id: GpuHistoryId,
     pub stats: ColorCommitStats,
     pub evicted_history: Vec<GpuHistoryEntry>,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
     pub freed_spill_bytes: u64,
+}
+
+pub struct PreparedGpuResidentHistorySwap {
+    revision: DocumentRevision,
+    history_id: GpuHistoryId,
+    direction: GpuHistoryDirection,
+    encoder: wgpu::CommandEncoder,
+    encoded: EncodedGpuUndoSwap,
+    recovery: PreparedGpuHistoryRecoverySwap,
+    plan: GpuMirrorReadbackPlan,
+    capture: GpuMirrorRevisionCapture,
+}
+
+impl PreparedGpuResidentHistorySwap {
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub const fn history_id(&self) -> GpuHistoryId {
+        self.history_id
+    }
+
+    pub const fn direction(&self) -> GpuHistoryDirection {
+        self.direction
+    }
+
+    pub const fn stats(&self) -> GpuUndoSwapStats {
+        self.encoded.stats()
+    }
+}
+
+pub struct GpuResidentHistorySwapCommit {
+    pub revision: DocumentRevision,
+    pub history_id: GpuHistoryId,
+    pub direction: GpuHistoryDirection,
+    pub stats: GpuUndoSwapStats,
+}
+
+pub struct GpuResidentHistorySwapPrepareFailure {
+    pub error: GpuResidentDocumentError,
+}
+
+impl fmt::Debug for GpuResidentHistorySwapPrepareFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuResidentHistorySwapPrepareFailure")
+            .field("error", &self.error)
+            .finish()
+    }
+}
+
+impl fmt::Display for GpuResidentHistorySwapPrepareFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for GpuResidentHistorySwapPrepareFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+fn history_swap_prepare_failure(
+    error: GpuResidentDocumentError,
+) -> Box<GpuResidentHistorySwapPrepareFailure> {
+    Box::new(GpuResidentHistorySwapPrepareFailure { error })
+}
+
+pub struct GpuResidentHistorySwapSubmitFailure {
+    pub error: GpuResidentDocumentError,
+    pub prepared: PreparedGpuResidentHistorySwap,
+}
+
+impl fmt::Debug for GpuResidentHistorySwapSubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuResidentHistorySwapSubmitFailure")
+            .field("error", &self.error)
+            .field("revision", &self.prepared.revision)
+            .field("history_id", &self.prepared.history_id)
+            .field("direction", &self.prepared.direction)
+            .finish()
+    }
+}
+
+impl fmt::Display for GpuResidentHistorySwapSubmitFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for GpuResidentHistorySwapSubmitFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
 }
 
 pub struct GpuResidentDocumentPrepareFailure {
@@ -397,6 +693,7 @@ pub enum GpuResidentDocumentError {
         actual: AtlasLayout,
     },
     HistoryPreviewChanged,
+    HistorySwapChanged,
     History(GpuDocumentHistoryError),
     HistoryRecord(GpuHistoryRecordError),
     Target(GpuDocumentTargetError),
@@ -421,6 +718,9 @@ impl fmt::Display for GpuResidentDocumentError {
                     formatter,
                     "GPU history changed after document commit preparation"
                 )
+            }
+            Self::HistorySwapChanged => {
+                write!(formatter, "GPU history changed after swap preparation")
             }
             Self::History(error) => error.fmt(formatter),
             Self::HistoryRecord(error) => error.fmt(formatter),
@@ -534,6 +834,7 @@ mod tests {
         );
         assert_eq!(document.history().undo_depth(), 0);
         assert_eq!(document.mirror().pending_revision_count(), 0);
+        assert_eq!(document.pending_mirror_purpose_count(), 0);
     }
 
     #[test]
