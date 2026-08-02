@@ -162,6 +162,30 @@ impl GpuMirrorDispatcher {
         )?)
     }
 
+    pub fn check_layer_snapshot_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        command: &crate::gpu_layer_recovery::GpuExactLayerRecoveryCommand,
+    ) -> Result<(), GpuMirrorDispatchError> {
+        self.reconciler
+            .check_layer_snapshot_revision(source_revision, revision, command)?;
+        Ok(())
+    }
+
+    pub fn register_layer_snapshot_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        command: crate::gpu_layer_recovery::GpuExactLayerRecoveryCommand,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorDispatchError> {
+        Ok(self.reconciler.register_layer_snapshot_revision(
+            source_revision,
+            revision,
+            command,
+        )?)
+    }
+
     pub fn retire_layer_when_idle(&mut self, layer: crate::document::LayerId) -> usize {
         self.reconciler.retire_layer_when_idle(layer)
     }

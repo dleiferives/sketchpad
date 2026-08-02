@@ -84,8 +84,21 @@ logical resident identities if discarded. The hardware smoke compares every
 row of the source and destination tiles, reconstructs the duplicate after
 simulated device loss, and exercises metadata undo/redo.
 
-During this transition, natural brushes, layer rename, PNG import, and color
-picking are intentionally unavailable in
+PNG layer import is live in resident mode. Decoding still happens in the
+established bounded CPU codec path, which produces centered premultiplied
+linear `Rgba32Float` sparse tiles. The resident owner then preflights geometry,
+history eviction, atlas capacity, exact whole-layer recovery, and an ordered
+mirror snapshot before issuing any upload. Each allocated tile is uploaded
+once with `Queue::write_texture`; the same immutable pixel allocation is
+shared by the recovery command and is installed into the mirror when that
+revision reaches the front of the reconciler. No GPU readback or legacy
+`Document` mutation occurs. After the writes there are no remaining fallible
+publication steps. The hardware smoke forces the import to grow a second atlas
+page, verifies the exact GPU pixel, reconstructs it after simulated device
+loss, and exercises presence undo/redo.
+
+During this transition, natural brushes, layer rename, and color picking are
+intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.
 
@@ -653,9 +666,8 @@ revision. Another keeps imported pixels immutable while the live layer
 continues changing.
 
 Application integration now retains that payload for resident duplication and
-reuses the ordinary presence edit for undo/redo while the copied atlas payload
-remains dormant. Import still needs the corresponding external-payload
-transaction. An undo/redo result that exists only on the GPU and has not
+import, and reuses the ordinary presence edit for undo/redo while the atlas
+payload remains dormant. An undo/redo result that exists only on the GPU and has not
 finished mapping still needs the older inverse-capable anchor; the whole-layer
 payload does not hide that ownership requirement.
 
@@ -1319,9 +1331,10 @@ This is an architectural integration checkpoint, not yet the usable painter:
   footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
 - hard round and eraser are GPU-resident on selected live hardware, and the
-  active layer can be selected there. Flat, pencil, bristle, palette knife,
-  revisioned layer edits, PNG import, and color picking are temporarily
-  disabled rather than mutating stale CPU fallback data;
+  active layer, revisioned layer properties/presence/order, duplication, and
+  PNG import are resident there. Flat, pencil, bristle, palette knife, layer
+  rename, and color picking are temporarily disabled rather than mutating
+  stale CPU fallback data;
 - repeated dab/tile intersections are not yet coalesced in the retained CPU
   brush paths;
 - live physical-input diagnostics now separate hover and contact for relative

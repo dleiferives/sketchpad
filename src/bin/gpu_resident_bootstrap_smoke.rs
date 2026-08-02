@@ -7,7 +7,7 @@ use sketchpad::{
     gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
     gpu_resident_round_stroke::GpuResidentRoundStrokeEngine,
     pipeline::CanvasUniform,
-    raster::{LinearRgba, TileCoord},
+    raster::{LinearRgba, RasterLayer, TileCoord},
     stroke::{RoundBrushRecipeV1, RoundContact, RoundPathCommand, StrokeMaterial},
 };
 use std::{error::Error, mem::size_of, sync::mpsc};
@@ -45,7 +45,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let top_color = LinearRgba::from_straight(0.1, 0.4, 0.9, 0.75);
     paint_pixel(&mut cpu, 9, 11, top_color)?;
 
-    let layout = AtlasLayout::new(PAGE_SIZE, TILE_SIZE, 1)?;
+    let layout = AtlasLayout::new(PAGE_SIZE, TILE_SIZE, 2)?;
     let mut target = GpuDocumentTarget::new(&device, layout)?;
     let bootstrap = GpuResidentDocument::from_cpu_document(
         &cpu,
@@ -480,11 +480,81 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("resident clone redo did not restore duplicate metadata".into());
     }
 
+    let imported_color = LinearRgba::from_straight(0.25, 0.75, 0.2, 0.625);
+    let mut imported_raster = RasterLayer::new(PAGE_SIZE, TILE_SIZE, TILE_SIZE)?;
+    {
+        let mut gesture = imported_raster.scoped_gesture()?;
+        gesture.set_pixel(31, 47, imported_color)?;
+        gesture.commit()?;
+    }
+    let (imported_layer, import_commit) = resident.insert_raster_layer(
+        &mut target,
+        &device,
+        &queue,
+        "Imported",
+        imported_raster,
+    )?;
+    if import_commit.stats.uploaded_tiles != 1
+        || resident.metadata().active_layer() != imported_layer
+        || resident.metadata().layers().len() != 4
+    {
+        return Err("resident raster import did not publish one exact sparse tile".into());
+    }
+    let imported_slot = resident
+        .atlas()
+        .slot(LayerTileKey::new(imported_layer, TileCoord::new(0, 0)))
+        .ok_or("imported tile is not resident")?;
+    let imported_readback = read_page(
+        &device,
+        &queue,
+        &target,
+        imported_slot.page(),
+        bytes_per_row,
+    )?;
+    expect_pixel(
+        &imported_readback,
+        bytes_per_row,
+        imported_slot.origin()[0] + 31,
+        imported_slot.origin()[1] + 47,
+        imported_color,
+    )?;
+    let recovered_import = resident.recovery_snapshot().recover_document()?;
+    if recovered_import
+        .document()
+        .layer_raster(imported_layer)
+        .and_then(|raster| raster.pixel(31, 47))
+        != Some(imported_color)
+    {
+        return Err("resident raster import did not survive device-loss recovery".into());
+    }
+    resident
+        .swap_metadata_history(GpuHistoryDirection::Undo)?
+        .ok_or("resident import undo was unavailable")?;
+    if resident
+        .metadata()
+        .layers()
+        .iter()
+        .any(|layer| layer.id() == imported_layer)
+    {
+        return Err("resident import undo retained imported metadata".into());
+    }
+    resident
+        .swap_metadata_history(GpuHistoryDirection::Redo)?
+        .ok_or("resident import redo was unavailable")?;
+    if !resident
+        .metadata()
+        .layers()
+        .iter()
+        .any(|layer| layer.id() == imported_layer)
+    {
+        return Err("resident import redo did not restore imported metadata".into());
+    }
+
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=3 tiles=4 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact clone=gpu_exact recovery=exact undo_redo=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=4 tiles=5 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact clone=gpu_exact import=gpu_exact recovery=exact undo_redo=exact",
         adapter.get_info().name
     );
     Ok(())

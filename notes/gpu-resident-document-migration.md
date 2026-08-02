@@ -270,7 +270,7 @@ also returns the command encoder and prepared bundle, whose tokens can be
 split for explicit target rollback. The historical paragraph above describes
 the pre-cutover owner. Raster submission, mapped-readback driving,
 presentation, save/export, active-layer selection, and revisioned metadata
-controls are now live; remaining structural work is layer rename and import.
+controls are now live; the remaining structural layer operation is rename.
 Empty layer creation is also live as a
 metadata-only presence edit: it allocates a stable monotonic ID but no atlas
 resident, and the same edit removes/reinserts that identity during undo/redo.
@@ -299,6 +299,16 @@ The cost is two GPU tile transfers per initialized tile and one bounded scratch
 allocation per duplication, with no CPU pixel transfer. The encoded target
 token owns that scratch through queue submission and makes resident-identity
 publication explicitly submit/discard transactional.
+
+Imported PNG rasters now use the same publication boundary with a different
+transfer source. The bounded decoder already owns exact centered
+premultiplied-linear full-float sparse tiles, so the owner validates all
+history/recovery/mirror/atlas capacity first, uploads each allocated tile once,
+and publishes the presence edit only after the upload call has no remaining
+fallible successor. The mirror receives an ordered whole-layer snapshot effect
+backed by those same immutable CPU tile allocations instead of reading the
+pixels back from the GPU. Imports that require a new atlas page and subsequent
+presence undo/redo are covered by the release hardware smoke.
 
 Undo and redo now enter that owner through a second prepared transaction. GPU
 history can name the next undo/redo ID without removing it, allowing recovery
@@ -392,9 +402,9 @@ Document replacement is now an explicit snapshot-and-rebootstrap boundary. A
 candidate file is decoded and a complete replacement resident owner is
 bootstrapped before either the legacy metadata view or active GPU owner is
 published; any failure leaves the current canvas untouched. Other unmigrated
-actions fail closed. Natural brushes, structural layer mutation, PNG import,
-and composite color picking are not allowed to touch the legacy CPU pixels
-while the resident owner is active. They must return through resident
+actions fail closed. Natural brushes, layer rename, and composite color
+picking are not allowed to touch the legacy CPU pixels while the resident
+owner is active. They must return through resident
 metadata/history transactions or GPU sampling. This temporary restriction is
 a correctness boundary, not the intended product surface.
 
@@ -421,12 +431,10 @@ the corresponding after-state and advances revision again. Order changes move
 the stable identity without changing active selection. Malformed or stale
 values fail without publishing a partially changed layer array.
 
-The typed-history and presence-edit slices are complete. The next structural
-work should reuse duplication's preflight/publication boundary for imported
-raster payloads, then add rename as a small reversible metadata edit. Import
-must additionally validate and stage externally decoded pixels without
-publishing a layer identity until its atlas, recovery, history, and mirror
-owners can all accept the revision.
+The typed-history, presence-edit, duplication, and imported-payload slices are
+complete. The next structural work is rename as a small reversible metadata
+edit. The larger remaining cutover is natural-brush execution; that should not
+be mixed into the structural layer transaction code.
 
 ## Ordered Implementation
 

@@ -2636,7 +2636,6 @@ impl App {
     fn choose_png_import(&mut self) {
         if self.active_stroke.is_some()
             || self.sampling_pointer.is_some()
-            || self.reject_legacy_document_action("import PNG")
         {
             return;
         }
@@ -2693,6 +2692,40 @@ impl App {
         };
         let summary = imported.summary;
         let name = import_layer_name(path);
+        if let Some(gpu) = self.gpu.as_mut() {
+            if let Some(resident) = gpu.resident.as_mut() {
+                match resident.document.insert_raster_layer(
+                    &mut resident.target,
+                    &gpu.device,
+                    &gpu.queue,
+                    name,
+                    imported.raster,
+                ) {
+                    Ok((layer, commit)) => {
+                        log::info!(
+                            "PNG imported into resident document: path={path:?} layer={} source={}x{} decoded_bytes={} placed_pixels={} allocated_tiles={} uploaded_bytes={} assumed_srgb={} elapsed_ms={}",
+                            layer.get(),
+                            summary.source_width,
+                            summary.source_height,
+                            summary.decoded_bytes,
+                            summary.placed_pixels,
+                            commit.stats.uploaded_tiles,
+                            commit.stats.uploaded_bytes,
+                            summary.assumed_srgb,
+                            started.elapsed().as_millis(),
+                        );
+                        self.mark_document_dirty();
+                    }
+                    Err(failure) => {
+                        log::error!("could not insert resident PNG {path:?}: {failure}")
+                    }
+                }
+                return;
+            }
+        }
+        if self.reject_legacy_document_action("import PNG") {
+            return;
+        }
         match self.document.insert_raster_layer(name, imported.raster) {
             Ok((layer, damage)) => {
                 self.sync_composite_damage(&damage);

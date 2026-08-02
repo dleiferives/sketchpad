@@ -170,6 +170,13 @@ pub struct GpuDocumentBootstrapStats {
     pub uploaded_bytes: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDocumentResidentUploadStats {
+    pub retained_pages: u32,
+    pub uploaded_tiles: u32,
+    pub uploaded_bytes: u64,
+}
+
 pub struct EncodedGpuDocumentCommit {
     target_id: GpuDocumentTargetId,
     stats: ColorCommitStats,
@@ -469,6 +476,93 @@ impl GpuDocumentTarget {
         self.initialized_residents
             .extend(uploads.iter().map(|upload| (upload.slot, upload.key)));
         Ok(GpuDocumentBootstrapStats {
+            retained_pages: self.pages.len() as u32,
+            uploaded_tiles: uploads.len() as u32,
+            uploaded_bytes,
+        })
+    }
+
+    pub(crate) fn upload_residents(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uploads: &[GpuDocumentResidentUpload],
+    ) -> Result<GpuDocumentResidentUploadStats, GpuDocumentTargetError> {
+        if self.commit_pending {
+            return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
+        }
+        let pixel_count = usize::try_from(
+            self.layout
+                .tile_size()
+                .checked_mul(self.layout.tile_size())
+                .ok_or(GpuDocumentTargetError::BootstrapPixelCountOverflow)?,
+        )
+        .map_err(|_| GpuDocumentTargetError::BootstrapPixelCountOverflow)?;
+        let mut keys = HashSet::with_capacity(uploads.len());
+        let mut slots = HashSet::with_capacity(uploads.len());
+        for upload in uploads {
+            if !keys.insert(upload.key) {
+                return Err(GpuDocumentTargetError::DuplicateBootstrapResident(upload.key));
+            }
+            if !slots.insert(upload.slot) {
+                return Err(GpuDocumentTargetError::DuplicateBootstrapSlot(upload.slot));
+            }
+            let origin = upload.slot.origin();
+            let valid_x = origin[0]
+                .checked_add(self.layout.tile_size())
+                .is_some_and(|end| end <= self.layout.page_size());
+            let valid_y = origin[1]
+                .checked_add(self.layout.tile_size())
+                .is_some_and(|end| end <= self.layout.page_size());
+            if upload.slot.page().get() >= self.layout.max_pages() || !valid_x || !valid_y {
+                return Err(GpuDocumentTargetError::InvalidBootstrapSlot(upload.slot));
+            }
+            if upload.pixels.len() != pixel_count {
+                return Err(GpuDocumentTargetError::InvalidBootstrapPixelCount {
+                    key: upload.key,
+                    expected: pixel_count,
+                    actual: upload.pixels.len(),
+                });
+            }
+        }
+        if let Some(highest_page) = uploads.iter().map(|upload| upload.slot.page().get()).max() {
+            self.ensure_pages(device, highest_page)?;
+        }
+        let bytes_per_row = self
+            .layout
+            .tile_size()
+            .checked_mul(size_of::<LinearRgba>() as u32)
+            .ok_or(GpuDocumentTargetError::BootstrapByteCountOverflow)?;
+        let uploaded_bytes = u64::try_from(uploads.len())
+            .ok()
+            .and_then(|count| {
+                count
+                    .checked_mul(pixel_count as u64)
+                    .and_then(|pixels| pixels.checked_mul(size_of::<LinearRgba>() as u64))
+            })
+            .ok_or(GpuDocumentTargetError::BootstrapByteCountOverflow)?;
+        for upload in uploads {
+            let page = &self.pages[upload.slot.page().get() as usize];
+            queue.write_texture(
+                texture_copy(&page.texture, upload.slot.origin()),
+                bytemuck::cast_slice(upload.pixels.as_ref()),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(self.layout.tile_size()),
+                },
+                copy_extent([self.layout.tile_size(); 2]),
+            );
+        }
+        self.initialized_residents
+            .extend(uploads.iter().map(|upload| (upload.slot, upload.key)));
+        Ok(GpuDocumentResidentUploadStats {
             retained_pages: self.pages.len() as u32,
             uploaded_tiles: uploads.len() as u32,
             uploaded_bytes,

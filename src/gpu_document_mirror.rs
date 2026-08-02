@@ -2,6 +2,7 @@ use crate::{
     document::{Document, DocumentRevision, LayerId},
     gpu_atlas::{AtlasLayout, AtlasSlot, LayerTileKey},
     gpu_document_target::GpuDocumentTarget,
+    gpu_layer_recovery::GpuExactLayerRecoveryCommand,
     gpu_document_undo::{
         GpuDocumentMemento, GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES,
         GPU_UNDO_BLOCK_SIZE, GPU_UNDO_PIXEL_BYTES,
@@ -870,6 +871,20 @@ impl GpuCpuMirror {
         self.tiles.extend(copies);
     }
 
+    fn install_layer_snapshot(&mut self, command: GpuExactLayerRecoveryCommand) {
+        let layer = command.layer();
+        debug_assert!(self.tiles.keys().all(|key| key.layer != layer));
+        let raster = command
+            .raster_layer()
+            .expect("a prevalidated mirror layer snapshot retains valid raster geometry");
+        self.tiles.extend(
+            raster
+                .checkpoint_tiles()
+                .into_iter()
+                .map(|tile| (LayerTileKey::new(layer, tile.coord), tile.pixels)),
+        );
+    }
+
     pub fn tile_pixels(&self, key: LayerTileKey) -> Option<&[LinearRgba]> {
         self.tiles.get(&key).map(AsRef::as_ref)
     }
@@ -1039,7 +1054,7 @@ struct PendingMirrorRevision {
     effect: PendingMirrorEffect,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 enum PendingMirrorEffect {
     #[default]
     None,
@@ -1047,6 +1062,7 @@ enum PendingMirrorEffect {
         source: LayerId,
         destination: LayerId,
     },
+    LayerSnapshot(GpuExactLayerRecoveryCommand),
 }
 
 pub struct GpuMirrorReconciler {
@@ -1146,26 +1162,66 @@ impl GpuMirrorReconciler {
         if source == destination {
             return Err(GpuMirrorReconcileError::LayerCloneIdentity(source));
         }
-        let destination_exists = self
-            .mirror
-            .tiles
-            .keys()
-            .any(|key| key.layer == destination)
-            || self.pending.iter().any(|pending| {
-                matches!(
-                    pending.effect,
-                    PendingMirrorEffect::CloneLayer {
-                        destination: pending_destination,
-                        ..
-                    } if pending_destination == destination
-                )
-            });
-        if destination_exists {
+        if self.layer_destination_exists(destination) {
             return Err(GpuMirrorReconcileError::LayerCloneDestinationExists(
                 destination,
             ));
         }
         Ok(())
+    }
+
+    pub fn register_layer_snapshot_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        command: GpuExactLayerRecoveryCommand,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorReconcileError> {
+        self.check_layer_snapshot_revision(source_revision, revision, &command)?;
+        self.pending.push_back(PendingMirrorRevision {
+            revision,
+            expected_batches: Vec::new(),
+            batches: Vec::new(),
+            effect: PendingMirrorEffect::LayerSnapshot(command),
+        });
+        self.latest_registered = revision;
+        Ok(self.apply_ready(None)?.0)
+    }
+
+    pub fn check_layer_snapshot_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        command: &GpuExactLayerRecoveryCommand,
+    ) -> Result<(), GpuMirrorReconcileError> {
+        self.check_metadata_revision(source_revision, revision)?;
+        if command.dimensions() != [self.mirror.width, self.mirror.height]
+            || command.tile_size() != self.mirror.tile_size
+        {
+            return Err(GpuMirrorReconcileError::LayerSnapshotGeometryMismatch {
+                expected_dimensions: [self.mirror.width, self.mirror.height],
+                actual_dimensions: command.dimensions(),
+                expected_tile_size: self.mirror.tile_size,
+                actual_tile_size: command.tile_size(),
+            });
+        }
+        if self.layer_destination_exists(command.layer()) {
+            return Err(GpuMirrorReconcileError::LayerCloneDestinationExists(
+                command.layer(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn layer_destination_exists(&self, destination: LayerId) -> bool {
+        self.mirror.tiles.keys().any(|key| key.layer == destination)
+            || self.pending.iter().any(|pending| match &pending.effect {
+                PendingMirrorEffect::CloneLayer {
+                    destination: pending_destination,
+                    ..
+                } => *pending_destination == destination,
+                PendingMirrorEffect::LayerSnapshot(command) => command.layer() == destination,
+                PendingMirrorEffect::None => false,
+            })
     }
 
     pub fn check_metadata_revision(
@@ -1343,12 +1399,15 @@ impl GpuMirrorReconciler {
                 .collect();
             self.mirror
                 .apply_validated_revision(pending.revision, owned_batches);
-            if let PendingMirrorEffect::CloneLayer {
-                source,
-                destination,
-            } = pending.effect
-            {
-                self.mirror.clone_layer(source, destination);
+            match pending.effect {
+                PendingMirrorEffect::None => {}
+                PendingMirrorEffect::CloneLayer {
+                    source,
+                    destination,
+                } => self.mirror.clone_layer(source, destination),
+                PendingMirrorEffect::LayerSnapshot(command) => {
+                    self.mirror.install_layer_snapshot(command);
+                }
             }
             applied.push(pending.revision);
             if capture_revision == Some(pending.revision) {
@@ -1639,6 +1698,12 @@ pub enum GpuMirrorReconcileError {
     },
     LayerCloneIdentity(LayerId),
     LayerCloneDestinationExists(LayerId),
+    LayerSnapshotGeometryMismatch {
+        expected_dimensions: [u32; 2],
+        actual_dimensions: [u32; 2],
+        expected_tile_size: u32,
+        actual_tile_size: u32,
+    },
     EmptyRevisionPlan,
     MalformedRevisionPlan,
     UnknownRevision(DocumentRevision),
@@ -1721,6 +1786,21 @@ impl fmt::Display for GpuMirrorReconcileError {
                 formatter,
                 "GPU mirror clone destination layer {} already has pixels",
                 layer.get()
+            ),
+            Self::LayerSnapshotGeometryMismatch {
+                expected_dimensions,
+                actual_dimensions,
+                expected_tile_size,
+                actual_tile_size,
+            } => write!(
+                formatter,
+                "GPU mirror layer snapshot is {}x{} at tile size {}, expected {}x{} at tile size {}",
+                actual_dimensions[0],
+                actual_dimensions[1],
+                actual_tile_size,
+                expected_dimensions[0],
+                expected_dimensions[1],
+                expected_tile_size,
             ),
             Self::EmptyRevisionPlan => write!(formatter, "GPU mirror revision plan is empty"),
             Self::MalformedRevisionPlan => {
@@ -2195,6 +2275,43 @@ mod tests {
             reconciler.mirror().tiles.get(&source_key).unwrap(),
             reconciler.mirror().tiles.get(&destination_key).unwrap(),
         ));
+    }
+
+    #[test]
+    fn layer_snapshot_waits_in_revision_order_and_installs_exact_pixels() {
+        let red = LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0);
+        let blue = LinearRgba::premultiplied(0.0, 0.0, 1.0, 1.0);
+        let (raster_revision, source_key) = one_tile_plan(1, true);
+        let imported_layer = LayerId::from_raw(source_key.layer.get() + 20);
+        let imported_key = LayerTileKey::new(imported_layer, TileCoord::new(0, 0));
+        let mut imported = RasterLayer::new(128, 128, 128).unwrap();
+        {
+            let mut gesture = imported.scoped_gesture().unwrap();
+            gesture.set_pixel(7, 9, blue).unwrap();
+            gesture.commit().unwrap();
+        }
+        let command = GpuExactLayerRecoveryCommand::from_raster(imported_layer, &imported).unwrap();
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&raster_revision).unwrap();
+        assert!(reconciler
+            .register_layer_snapshot_revision(
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(2),
+                command,
+            )
+            .unwrap()
+            .is_empty());
+        assert!(reconciler.mirror().tile_pixels(imported_key).is_none());
+
+        reconciler
+            .complete_batch(solid_patch(&raster_revision.batches()[0], red))
+            .unwrap();
+        assert_eq!(reconciler.mirror().revision(), DocumentRevision::from_raw(2));
+        assert_eq!(
+            reconciler.mirror().tile_pixels(imported_key).unwrap()[9 * 128 + 7],
+            blue
+        );
     }
 
     #[test]

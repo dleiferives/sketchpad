@@ -23,7 +23,8 @@ use crate::{
     gpu_document_target::{
         ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentBootstrapStats,
         GpuDocumentResidentClone, GpuDocumentResidentCloneStats, GpuDocumentResidentUpload,
-        GpuDocumentTarget, GpuDocumentTargetError, GpuDocumentTargetId, GpuUndoSwapStats,
+        GpuDocumentResidentUploadStats, GpuDocumentTarget, GpuDocumentTargetError,
+        GpuDocumentTargetId, GpuUndoSwapStats,
     },
     gpu_history_recovery::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
@@ -42,6 +43,7 @@ use crate::{
         replay_gpu_raster_recovery, GpuRasterRecoveryCommand, GpuRasterRecoveryReplayError,
     },
     gpu_round::{RoundMaskBatch, RoundMaskError, RoundMaskScheduler},
+    raster::RasterLayer,
     stroke::RoundPathCommand,
 };
 use std::{
@@ -1132,6 +1134,138 @@ impl GpuResidentDocument {
         ))
     }
 
+    pub fn insert_raster_layer(
+        &mut self,
+        target: &mut GpuDocumentTarget,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        name: impl Into<String>,
+        raster: RasterLayer,
+    ) -> Result<(LayerId, GpuResidentLayerImportCommit), Box<GpuResidentMetadataEditFailure>> {
+        if let Err(error) = self.check_active_round_stroke(None) {
+            return Err(metadata_edit_failure(error, None));
+        }
+        if let Err(error) = self.check_target(target) {
+            return Err(metadata_edit_failure(error, None));
+        }
+        if raster.width() != self.metadata.width()
+            || raster.height() != self.metadata.height()
+            || raster.tile_size() != self.metadata.tile_size()
+        {
+            return Err(metadata_edit_failure(
+                GpuResidentDocumentError::ImportedLayerGeometryMismatch,
+                None,
+            ));
+        }
+        let edit = match self.metadata.prepare_create_layer(name) {
+            Ok(edit) => edit,
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        let layer = edit.layer();
+        let Some(revision) = self.revision().checked_next() else {
+            return Err(metadata_edit_failure(
+                GpuResidentDocumentError::RevisionExhausted,
+                Some(edit),
+            ));
+        };
+        let mut metadata = self.metadata.clone();
+        if let Err(error) =
+            metadata.apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision)
+        {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+        let history_preview = match self.history.check_metadata_record(&edit) {
+            Ok(preview) => preview,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        let layer_snapshot = match GpuExactLayerRecoveryCommand::from_raster(layer, &raster) {
+            Ok(command) => command,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        if let Err(error) = self.mirror.check_layer_snapshot_revision(
+            self.revision(),
+            revision,
+            &layer_snapshot,
+        ) {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+        let recovery = match self.recovery.prepare_structural_history_record(
+            history_preview.evicted_raster_ids(),
+            revision,
+            GpuRasterRecoveryCommand::from(layer_snapshot.clone()),
+        ) {
+            Ok(recovery) => recovery,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+
+        let mut tiles = raster.checkpoint_tiles();
+        tiles.sort_unstable_by_key(|tile| (tile.coord.y, tile.coord.x));
+        let keys = tiles
+            .iter()
+            .map(|tile| LayerTileKey::new(layer, tile.coord));
+        let allocations = match self.atlas.allocate_batch(keys) {
+            Ok(allocations) => allocations,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        debug_assert!(allocations.iter().all(|allocation| allocation.newly_allocated));
+        let uploads: Vec<_> = tiles
+            .into_iter()
+            .zip(&allocations)
+            .map(|(tile, allocation)| GpuDocumentResidentUpload {
+                key: allocation.key,
+                slot: allocation.slot,
+                pixels: tile.pixels,
+            })
+            .collect();
+        let stats = match target.upload_residents(device, queue, &uploads) {
+            Ok(stats) => stats,
+            Err(error) => {
+                for allocation in allocations.iter().rev() {
+                    self.atlas
+                        .release(allocation.key)
+                        .expect("failed resident import owns every destination allocation");
+                }
+                return Err(metadata_edit_failure(error.into(), Some(edit)));
+            }
+        };
+
+        let history = self
+            .history
+            .record_metadata(&mut self.atlas, edit)
+            .expect("import history was checked immediately before upload");
+        assert!(history_preview.matches_record(&history));
+        let recovery = self
+            .recovery
+            .commit_structural_history_record(recovery)
+            .expect("import recovery was checked immediately before upload");
+        self.mirror
+            .register_layer_snapshot_revision(self.revision(), revision, layer_snapshot)
+            .expect("mirror import snapshot was checked immediately before upload");
+        self.metadata = metadata;
+        assert!(history
+            .evicted
+            .iter()
+            .filter(|entry| entry.kind() == GpuHistoryEntryKind::Raster)
+            .map(GpuHistoryEntry::id)
+            .eq(recovery
+                .evicted_spills
+                .iter()
+                .map(GpuHistoryRecoveryEntry::id)));
+        let reclamation = self.reclaim_unreachable_layers(&history.evicted);
+        Ok((
+            layer,
+            GpuResidentLayerImportCommit {
+                revision,
+                history_id: history.id,
+                stats,
+                evicted_history: history.evicted,
+                evicted_spills: recovery.evicted_spills,
+                freed_spill_bytes: recovery.freed_spill_bytes,
+                reclamation,
+            },
+        ))
+    }
+
     pub fn delete_layer(
         &mut self,
         layer: crate::document::LayerId,
@@ -1411,6 +1545,16 @@ pub struct GpuResidentLayerCloneCommit {
     pub reclamation: GpuResidentLayerReclamation,
 }
 
+pub struct GpuResidentLayerImportCommit {
+    pub revision: DocumentRevision,
+    pub history_id: GpuHistoryId,
+    pub stats: GpuDocumentResidentUploadStats,
+    pub evicted_history: Vec<GpuHistoryEntry>,
+    pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
+    pub freed_spill_bytes: u64,
+    pub reclamation: GpuResidentLayerReclamation,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GpuResidentLayerReclamation {
     pub layers: usize,
@@ -1675,6 +1819,7 @@ impl Error for GpuResidentDocumentSubmitFailure {
 #[derive(Debug)]
 pub enum GpuResidentDocumentError {
     RevisionExhausted,
+    ImportedLayerGeometryMismatch,
     MirrorRevisionMismatch {
         metadata: DocumentRevision,
         mirror: DocumentRevision,
@@ -1727,6 +1872,9 @@ impl fmt::Display for GpuResidentDocumentError {
         match self {
             Self::RevisionExhausted => {
                 write!(formatter, "GPU document revision space is exhausted")
+            }
+            Self::ImportedLayerGeometryMismatch => {
+                write!(formatter, "imported raster geometry does not match the resident document")
             }
             Self::MirrorRevisionMismatch { metadata, mirror } => write!(
                 formatter,
