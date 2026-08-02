@@ -335,8 +335,17 @@ before the checkpoint encoder reads it.
    Ordered direct GPU composition is also complete as an isolated path: it
    emits layer-major/page-minor batches, applies visibility and opacity, clips
    partial edge tiles, validates target resident identity, and source-overs
-   premultiplied pixels without flattening layers. Live presentation and the
-   selected dirty-updated full-float stable composite cache remain.
+   premultiplied pixels without flattening layers. Active full-flow paint and
+   eraser presentation is also complete inside this isolated compositor. The
+   scalar mask is applied to the active layer before that layer's opacity and
+   ordered source-over, including a transparent base for a newly allocated
+   tile. It changes neither committed color pixels nor history. Hardware
+   readback matches the CPU material oracle for both paint and erase. Cancel
+   must return every provisional atlas allocation recorded by the active
+   transaction; an intentionally chained smoke caught the stale-allocation
+   failure that results if this rollback is omitted. The live active-stroke
+   owner, application presentation cutover, and selected dirty-updated
+   full-float stable composite cache remain.
 4. Add stable/tail round masks, live paint/erase presentation, GPU commit, and
    exact block undo.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss

@@ -344,11 +344,11 @@ impl GpuDocumentCompositor {
                     actual,
                 });
             }
-            active_tiles.insert((active.key, active.slot), actual.is_some());
+            active_tiles.insert(active.key, actual.is_some());
         }
         for (key, slot) in atlas.allocations() {
             let actual = target.initialized_resident(slot);
-            let is_transient = active_tiles.contains_key(&(key, slot));
+            let is_transient = active_tiles.contains_key(&key);
             if actual != Some(key) && !(is_transient && actual.is_none()) {
                 return Err(GpuDocumentCompositeError::ResidentMismatch {
                     slot,
@@ -536,7 +536,7 @@ impl GpuDocumentCompositor {
 fn build_plan(
     metadata: &DocumentMetadata,
     atlas: &SparseAtlasPlanner,
-    active_tiles: Option<&HashMap<(LayerTileKey, AtlasSlot), bool>>,
+    active_tiles: Option<&HashMap<LayerTileKey, bool>>,
 ) -> Result<(Vec<CompositeInstance>, Vec<CompositeBatch>, u32), GpuDocumentCompositeError> {
     let tile_size = metadata.tile_size();
     let mut instances = Vec::new();
@@ -578,9 +578,9 @@ fn build_plan(
             if origin_x >= metadata.width() || origin_y >= metadata.height() {
                 return Err(GpuDocumentCompositeError::TileOutOfBounds(key));
             }
-            let transient = active_tiles.is_some_and(|tiles| tiles.contains_key(&(key, slot)));
+            let transient = active_tiles.is_some_and(|tiles| tiles.contains_key(&key));
             let base_initialized = active_tiles
-                .and_then(|tiles| tiles.get(&(key, slot)))
+                .and_then(|tiles| tiles.get(&key))
                 .copied()
                 .unwrap_or(false);
             let binding = (slot.page(), transient);
@@ -853,10 +853,7 @@ mod tests {
         atlas
             .allocate(LayerTileKey::new(upper, TileCoord::new(0, 0)))
             .unwrap();
-        let active_tiles = HashMap::from([
-            ((active_base.key, active_base.slot), true),
-            ((active_blank.key, active_blank.slot), false),
-        ]);
+        let active_tiles = HashMap::from([(active_base.key, true), (active_blank.key, false)]);
 
         let (instances, batches, visible_layers) =
             build_plan(&metadata, &atlas, Some(&active_tiles)).unwrap();

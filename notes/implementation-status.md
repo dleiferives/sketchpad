@@ -249,7 +249,7 @@ empty ownership, unique keys and slots, layout bounds, and full tile payloads
 before issuing any queue write; its logical resident map is installed only
 after that preflight. Atlas-capacity failure discards the not-yet-published
 owner and leaves the target uninitialized. The Atlas Intel UHD 630 hardware
-smoke bootstrapped two layers/two tiles, copied the page back, and found both
+smoke bootstrapped two layers/three tiles, copied the page back, and found the
 premultiplied full-float pixels plus untouched transparency bit-exact. This is
 a correctness result, not a timing measurement. Presentation still reads the
 legacy flattened CPU cache.
@@ -265,8 +265,30 @@ logical-key/physical-slot association before writing instance data. The Atlas
 Intel UHD 630 hardware smoke composited overlapping pixels from two layers into
 an `Rgba32Float` target and matched the CPU oracle exactly. The smoke now also
 checks exact initial atlas upload and mirror ownership for three sparse tiles.
-This proves direct composition only. The application is not switched to it,
-and the final dirty-updated exact stable composite cache remains to be built.
+The same compositor now evaluates the active full-flow `R32Float` stroke mask
+at the active layer's ordered position. Paint source-overs into that layer;
+eraser destination-outs from that layer before lower and upper layers are
+combined. Untouched layers still use the direct color-page path. A transient
+tile may use an initialized committed base or transparent base, so the first
+mark in an empty logical tile is visible without clearing or committing its
+`Rgba32Float` slot. Preparation rejects a wrong active layer, stale atlas slot,
+unsubmitted mask batch, mismatched target, and optical-density flow rather
+than silently presenting different semantics. The Atlas Intel UHD 630 smoke
+matches the CPU material oracle for paint into a newly allocated transparent
+active-layer tile and for an eraser revealing the committed lower layer. It
+also proves that preview does not initialize the color target or create a
+history mutation.
+
+That smoke exposed and now records an important cancel boundary: a newly
+allocated preview tile must be released from the sparse planner when the
+stroke is discarded. Leaving it allocated caused the next unrelated stroke
+to fail resident validation because the key was neither committed nor active.
+The isolated smoke explicitly reclaims it and verifies slot identity. The
+future live active-stroke owner must retain the batch's `newly_allocated`
+records and perform the same rollback atomically; the compositor deliberately
+does not mutate allocation ownership. The application is not switched to this
+path yet, and the final dirty-updated exact stable composite cache remains to
+be built.
 
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
