@@ -147,6 +147,51 @@ struct ResidentGpuCanvas {
     mirror_readback_in_flight: bool,
 }
 
+impl ResidentGpuCanvas {
+    fn bootstrap(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        document: &Document,
+        recovery_path: PathBuf,
+    ) -> Result<Self, String> {
+        let layout = AtlasLayout::document_default();
+        if document.tile_size() != layout.tile_size() {
+            return Err(format!(
+                "document tile size {} does not match resident atlas tile size {}",
+                document.tile_size(),
+                layout.tile_size()
+            ));
+        }
+        let mut target =
+            GpuDocumentTarget::new(device, layout).map_err(|error| error.to_string())?;
+        let bootstrap = GpuResidentDocument::from_cpu_document(
+            document,
+            &mut target,
+            device,
+            queue,
+            GpuResidentDocumentLimits::default(),
+        )
+        .map_err(|error| error.to_string())?;
+        log::info!(
+            "GPU-resident document bootstrapped: {:?}",
+            bootstrap.stats()
+        );
+        let resident_document = bootstrap.into_document();
+        let strokes = GpuResidentRoundStrokeEngine::new(device, &resident_document)
+            .map_err(|error| error.to_string())?;
+        let compositor = GpuDocumentCompositor::new(device, surface_format, &target);
+        Ok(Self {
+            document: resident_document,
+            target,
+            strokes,
+            compositor,
+            checkpoint: GpuCheckpointWorker::new(recovery_path),
+            mirror_readback_in_flight: false,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PresentationOptions {
     present_mode: wgpu::PresentMode,
@@ -2284,9 +2329,6 @@ impl App {
     }
 
     fn choose_document_open(&mut self) {
-        if self.reject_legacy_document_action("open document") {
-            return;
-        }
         if !self.persistence_enabled
             || self.active_stroke.is_some()
             || self.sampling_pointer.is_some()
@@ -2323,12 +2365,39 @@ impl App {
                             .allocated_tile_count()
                     })
                     .sum();
+                let replacement_resident = match &mut self.gpu {
+                    Some(gpu) if gpu.resident.is_some() => ResidentGpuCanvas::bootstrap(
+                        &gpu.device,
+                        &gpu.queue,
+                        gpu.config.format,
+                        &document,
+                        self.persistence.recovery_path().to_owned(),
+                    )
+                    .map(Some),
+                    _ => Ok(None),
+                };
+                let replacement_resident = match replacement_resident {
+                    Ok(resident) => resident,
+                    Err(error) => {
+                        log::error!(
+                            "document open left the current canvas unchanged because resident bootstrap failed: path={path:?}: {error}"
+                        );
+                        return;
+                    }
+                };
                 self.document = document;
                 if let Some(gpu) = &mut self.gpu {
+                    if let Some(resident) = replacement_resident {
+                        gpu.resident = Some(resident);
+                    }
                     gpu.canvas.clear_residency();
                 }
                 self.persistence.document_opened(path.clone());
-                self.recovery_revision = self.recovery_revision.wrapping_add(1);
+                self.recovery_revision = self
+                    .gpu_resident_document()
+                    .map_or_else(|| self.recovery_revision.wrapping_add(1), |document| {
+                        document.revision().get()
+                    });
                 self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
                 self.metrics.gpu_baseline = self
                     .gpu
@@ -2842,37 +2911,8 @@ impl App {
             SparseStrokeTarget::new(&device, CANVAS_WIDTH, CANVAS_HEIGHT, tile_size, 16, format)
                 .expect("a reported full-float stroke path must create its sparse target")
         });
-        let resident = if gpu_strokes_supported
-            && tile_size == AtlasLayout::document_default().tile_size()
-        {
-            (|| -> Result<ResidentGpuCanvas, String> {
-                let mut target = GpuDocumentTarget::new(&device, AtlasLayout::document_default())
-                    .map_err(|error| error.to_string())?;
-                let bootstrap = GpuResidentDocument::from_cpu_document(
-                    document,
-                    &mut target,
-                    &device,
-                    &queue,
-                    GpuResidentDocumentLimits::default(),
-                )
-                .map_err(|error| error.to_string())?;
-                log::info!(
-                    "GPU-resident document bootstrapped: {:?}",
-                    bootstrap.stats()
-                );
-                let resident_document = bootstrap.into_document();
-                let strokes = GpuResidentRoundStrokeEngine::new(&device, &resident_document)
-                    .map_err(|error| error.to_string())?;
-                let compositor = GpuDocumentCompositor::new(&device, format, &target);
-                Ok(ResidentGpuCanvas {
-                    document: resident_document,
-                    target,
-                    strokes,
-                    compositor,
-                    checkpoint: GpuCheckpointWorker::new(recovery_path),
-                    mirror_readback_in_flight: false,
-                })
-            })()
+        let resident = if gpu_strokes_supported {
+            ResidentGpuCanvas::bootstrap(&device, &queue, format, document, recovery_path)
             .map_err(|error| {
                 log::error!(
                     "GPU-resident document initialization failed; retaining CPU renderer: {error}"

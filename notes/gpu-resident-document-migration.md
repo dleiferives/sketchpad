@@ -342,12 +342,15 @@ batch at a time and polls mapping nonblockingly. Undo/redo is exposed only
 after that history entry has its exact two-sided spill; visible GPU mutation
 therefore cannot outrun device-loss recovery.
 
-Unmigrated actions fail closed. Natural brushes, structural layer mutation,
-opening/replacing a document, PNG import, and composite color picking are not
-allowed to touch the legacy CPU pixels while the resident owner is active.
-They must return through resident metadata/history transactions, GPU sampling,
-or an explicit exact snapshot-and-rebootstrap operation. This temporary
-restriction is a correctness boundary, not the intended product surface.
+Document replacement is now an explicit snapshot-and-rebootstrap boundary. A
+candidate file is decoded and a complete replacement resident owner is
+bootstrapped before either the legacy metadata view or active GPU owner is
+published; any failure leaves the current canvas untouched. Other unmigrated
+actions fail closed. Natural brushes, structural layer mutation, PNG import,
+and composite color picking are not allowed to touch the legacy CPU pixels
+while the resident owner is active. They must return through resident
+metadata/history transactions or GPU sampling. This temporary restriction is
+a correctness boundary, not the intended product surface.
 
 ## Ordered Implementation
 

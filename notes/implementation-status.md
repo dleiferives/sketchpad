@@ -21,8 +21,10 @@ replay, composition, checkpoint encoding, and atomic replacement to the
 bounded background worker. A later revision cannot be marked saved by an older
 completion. Explicit save and close-time recovery use the same exact snapshot;
 PNG export reconstructs that revision instead of reading the stale legacy
-composite. During this transition, natural brushes, layer mutation, document
-replacement/import, and color picking are intentionally unavailable in
+composite. Opening a document now bootstraps a complete replacement resident
+owner before publishing either the new CPU metadata or GPU state, so failure
+leaves the current canvas untouched. During this transition, natural brushes,
+layer mutation, PNG import, and color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable display metadata and a
 fallback only; the application never treats it as a second writable pixel
 authority.
@@ -1250,7 +1252,7 @@ This is an architectural integration checkpoint, not yet the usable painter:
   footprint matrix before generalizing the policy;
 - arbitrary general edits still use full-tile content-bound rescans;
 - hard round and eraser are GPU-resident on selected live hardware. Flat,
-  pencil, bristle, palette knife, layer edits, import/open, and color picking
+  pencil, bristle, palette knife, layer edits, PNG import, and color picking
   are temporarily disabled there rather than mutating stale CPU fallback data;
 - repeated dab/tile intersections are not yet coalesced in the retained CPU
   brush paths;
