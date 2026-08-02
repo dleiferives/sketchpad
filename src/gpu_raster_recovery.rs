@@ -1,6 +1,8 @@
 use crate::{
     document::{DocumentRevision, LayerId},
-    gpu_document_mirror::{GpuMirrorPatchBatch, GpuMirrorPatchRegion, GpuMirrorReadbackPlan},
+    gpu_document_mirror::{
+        GpuCpuMirrorSnapshot, GpuMirrorPatchBatch, GpuMirrorPatchRegion, GpuMirrorReadbackPlan,
+    },
     gpu_document_undo::GPU_UNDO_BLOCK_SIZE,
     raster::{Damage, LinearRgba, RasterLayer, RectU32, TileCoord},
 };
@@ -103,6 +105,260 @@ impl GpuExactRasterRecoveryCommand {
 
     pub const fn retained_byte_len(&self) -> u64 {
         self.retained_byte_len
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct GpuExactRasterRecoveryTransition {
+    revision: DocumentRevision,
+    before: GpuExactRasterRecoveryCommand,
+    after: GpuExactRasterRecoveryCommand,
+    retained_byte_len: u64,
+}
+
+impl GpuExactRasterRecoveryTransition {
+    pub fn from_mirror_revision(
+        before: &GpuCpuMirrorSnapshot,
+        plan: &GpuMirrorReadbackPlan,
+        batches: Vec<GpuMirrorPatchBatch>,
+    ) -> Result<Self, Box<GpuExactRasterRecoveryTransitionFailure>> {
+        if before.revision() >= plan.revision() {
+            return Err(transition_failure(
+                GpuExactRasterRecoveryTransitionError::BaseNotOlder {
+                    base: before.revision(),
+                    transition: plan.revision(),
+                },
+                batches,
+            ));
+        }
+        if before.tile_size() != plan.layout().tile_size() {
+            return Err(transition_failure(
+                GpuExactRasterRecoveryTransitionError::TileSizeMismatch {
+                    base: before.tile_size(),
+                    transition: plan.layout().tile_size(),
+                },
+                batches,
+            ));
+        }
+        if let Err(error) = validate_mirror_batches(plan, &batches) {
+            return Err(transition_failure(
+                GpuExactRasterRecoveryTransitionError::After(error),
+                batches,
+            ));
+        }
+        let borrowed: Vec<_> = batches.iter().flat_map(|batch| batch.regions()).collect();
+        if let Err(error) = validate_regions(plan.layout().tile_size(), &borrowed) {
+            return Err(transition_failure(
+                GpuExactRasterRecoveryTransitionError::After(
+                    GpuExactRasterRecoveryMirrorError::Command(error),
+                ),
+                batches,
+            ));
+        }
+
+        let before_regions = match capture_snapshot_regions(before, plan) {
+            Ok(regions) => regions,
+            Err(error) => return Err(transition_failure(error, batches)),
+        };
+        let before_command = match Self::build_before(plan.layout().tile_size(), before_regions) {
+            Ok(command) => command,
+            Err(error) => return Err(transition_failure(error, batches)),
+        };
+        let after = match GpuExactRasterRecoveryCommand::from_mirror_revision(plan, batches) {
+            Ok(command) => command,
+            Err(failure) => {
+                return Err(transition_failure(
+                    GpuExactRasterRecoveryTransitionError::After(failure.error),
+                    failure.batches,
+                ));
+            }
+        };
+        debug_assert_eq!(before_command.layer(), after.layer());
+        let retained_byte_len = transition_retained_byte_len(&before_command, &after)
+            .expect("validated addressable recovery commands have representable combined bytes");
+        Ok(Self {
+            revision: plan.revision(),
+            before: before_command,
+            after,
+            retained_byte_len,
+        })
+    }
+
+    fn build_before(
+        tile_size: u32,
+        regions: Vec<GpuMirrorPatchRegion>,
+    ) -> Result<GpuExactRasterRecoveryCommand, GpuExactRasterRecoveryTransitionError> {
+        GpuExactRasterRecoveryCommand::from_regions(tile_size, regions)
+            .map_err(|failure| GpuExactRasterRecoveryTransitionError::Before(failure.error))
+    }
+
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub const fn layer(&self) -> LayerId {
+        self.before.layer()
+    }
+
+    pub const fn before(&self) -> &GpuExactRasterRecoveryCommand {
+        &self.before
+    }
+
+    pub const fn after(&self) -> &GpuExactRasterRecoveryCommand {
+        &self.after
+    }
+
+    pub const fn retained_byte_len(&self) -> u64 {
+        self.retained_byte_len
+    }
+
+    pub fn into_commands(self) -> (GpuExactRasterRecoveryCommand, GpuExactRasterRecoveryCommand) {
+        (self.before, self.after)
+    }
+}
+
+fn capture_snapshot_regions(
+    snapshot: &GpuCpuMirrorSnapshot,
+    plan: &GpuMirrorReadbackPlan,
+) -> Result<Vec<GpuMirrorPatchRegion>, GpuExactRasterRecoveryTransitionError> {
+    let region_count = plan
+        .batches()
+        .iter()
+        .try_fold(0_usize, |count, batch| {
+            count.checked_add(batch.regions().len())
+        })
+        .ok_or(GpuExactRasterRecoveryTransitionError::ByteCountOverflow)?;
+    let mut captured = Vec::with_capacity(region_count);
+    for region in plan.batches().iter().flat_map(|batch| batch.regions()) {
+        if snapshot.tile_bounds(region.key.tile).is_none() {
+            return Err(GpuExactRasterRecoveryTransitionError::TileOutOfBounds(
+                region.key.tile,
+            ));
+        }
+        let existing = snapshot.tile_pixels(region.key);
+        let pixels = existing.map_or_else(
+            || Arc::from([]),
+            |tile| {
+                let stride = snapshot.tile_size() as usize;
+                let width = region.local_bounds.width() as usize;
+                let mut pixels = Vec::with_capacity(region.local_bounds.area() as usize);
+                for y in region.local_bounds.min_y()..region.local_bounds.max_y() {
+                    let start = y as usize * stride + region.local_bounds.min_x() as usize;
+                    pixels.extend_from_slice(&tile[start..start + width]);
+                }
+                pixels.into()
+            },
+        );
+        captured.push(GpuMirrorPatchRegion {
+            key: region.key,
+            local_bounds: region.local_bounds,
+            initialized: existing.is_some(),
+            pixels,
+        });
+    }
+    Ok(captured)
+}
+
+fn transition_retained_byte_len(
+    before: &GpuExactRasterRecoveryCommand,
+    after: &GpuExactRasterRecoveryCommand,
+) -> Option<u64> {
+    (size_of::<GpuExactRasterRecoveryTransition>() as u64)
+        .checked_add(
+            before
+                .retained_byte_len()
+                .checked_sub(size_of::<GpuExactRasterRecoveryCommand>() as u64)?,
+        )?
+        .checked_add(
+            after
+                .retained_byte_len()
+                .checked_sub(size_of::<GpuExactRasterRecoveryCommand>() as u64)?,
+        )
+}
+
+fn transition_failure(
+    error: GpuExactRasterRecoveryTransitionError,
+    batches: Vec<GpuMirrorPatchBatch>,
+) -> Box<GpuExactRasterRecoveryTransitionFailure> {
+    Box::new(GpuExactRasterRecoveryTransitionFailure { error, batches })
+}
+
+pub struct GpuExactRasterRecoveryTransitionFailure {
+    pub error: GpuExactRasterRecoveryTransitionError,
+    pub batches: Vec<GpuMirrorPatchBatch>,
+}
+
+impl fmt::Debug for GpuExactRasterRecoveryTransitionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuExactRasterRecoveryTransitionFailure")
+            .field("error", &self.error)
+            .field("batch_count", &self.batches.len())
+            .finish()
+    }
+}
+
+impl fmt::Display for GpuExactRasterRecoveryTransitionFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for GpuExactRasterRecoveryTransitionFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuExactRasterRecoveryTransitionError {
+    BaseNotOlder {
+        base: DocumentRevision,
+        transition: DocumentRevision,
+    },
+    TileSizeMismatch {
+        base: u32,
+        transition: u32,
+    },
+    TileOutOfBounds(TileCoord),
+    Before(GpuExactRasterRecoveryBuildError),
+    After(GpuExactRasterRecoveryMirrorError),
+    ByteCountOverflow,
+}
+
+impl fmt::Display for GpuExactRasterRecoveryTransitionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BaseNotOlder { base, transition } => write!(
+                formatter,
+                "GPU recovery transition revision {} is not newer than CPU base {}",
+                transition.get(),
+                base.get()
+            ),
+            Self::TileSizeMismatch { base, transition } => write!(
+                formatter,
+                "GPU recovery transition tile size {transition} does not match CPU base {base}"
+            ),
+            Self::TileOutOfBounds(tile) => {
+                write!(
+                    formatter,
+                    "GPU recovery transition tile {tile:?} is outside the CPU base"
+                )
+            }
+            Self::Before(error) => write!(formatter, "invalid recovery before-state: {error}"),
+            Self::After(error) => write!(formatter, "invalid recovery after-state: {error}"),
+            Self::ByteCountOverflow => write!(formatter, "GPU recovery transition bytes overflow"),
+        }
+    }
+}
+
+impl Error for GpuExactRasterRecoveryTransitionError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Before(error) => Some(error),
+            Self::After(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -813,7 +1069,7 @@ mod tests {
     use super::*;
     use crate::{
         gpu_atlas::{AtlasLayout, LayerTileKey, SparseAtlasPlanner},
-        gpu_document_mirror::GpuMirrorBatchPlan,
+        gpu_document_mirror::{GpuMirrorBatchPlan, GpuMirrorReconciler},
         gpu_document_undo::{GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES},
         gpu_round_target::ActiveRoundMaskTile,
     };
@@ -862,6 +1118,36 @@ mod tests {
             regions,
             plan.byte_len(),
         )
+    }
+
+    fn one_tile_plan(revision: u64, initialized: bool) -> (GpuMirrorReadbackPlan, LayerTileKey) {
+        let layout = AtlasLayout::new(64, 32, 1).unwrap();
+        let layer = LayerId::from_raw(11);
+        let key = LayerTileKey::new(layer, TileCoord::new(0, 0));
+        let mut atlas = SparseAtlasPlanner::new(layout);
+        let slot = atlas.allocate(key).unwrap().slot;
+        let capture = GpuUndoCapturePlan::from_active_tiles(
+            layout,
+            &[ActiveRoundMaskTile {
+                key,
+                slot,
+                local_damage: RectU32::from_xywh(0, 0, 32, 32).unwrap(),
+            }],
+        )
+        .unwrap();
+        let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::from_raw(revision),
+            &capture,
+            &[GpuMementoResidentState {
+                key,
+                slot,
+                document_initialized: initialized,
+                memento_initialized: !initialized,
+            }],
+            4 * GPU_UNDO_BLOCK_BYTES,
+        )
+        .unwrap();
+        (plan, key)
     }
 
     #[test]
@@ -1001,6 +1287,84 @@ mod tests {
             GpuExactRasterRecoveryMirrorError::DuplicateBatch(0)
         );
         assert_eq!(failure.batches.len(), 2);
+    }
+
+    #[test]
+    fn transition_owns_exact_before_and_after_blocks() {
+        let (first_plan, key) = one_tile_plan(1, true);
+        let mut reconciler =
+            GpuMirrorReconciler::new(32, 32, 32, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&first_plan).unwrap();
+        reconciler
+            .complete_batch(patch_batch(&first_plan.batches()[0], RED))
+            .unwrap();
+        let base = reconciler.snapshot();
+        let (second_plan, _) = one_tile_plan(2, true);
+        let transition = GpuExactRasterRecoveryTransition::from_mirror_revision(
+            &base,
+            &second_plan,
+            vec![patch_batch(&second_plan.batches()[0], BLUE)],
+        )
+        .unwrap();
+
+        assert_eq!(transition.revision(), DocumentRevision::from_raw(2));
+        assert_eq!(transition.layer(), key.layer);
+        assert!(transition.retained_byte_len() >= 2 * 32 * 32 * 16);
+        let cloned = transition.clone();
+        assert!(Arc::ptr_eq(
+            &transition.after.tiles[0].regions[0].pixels,
+            &cloned.after.tiles[0].regions[0].pixels
+        ));
+
+        let mut raster = base.raster_layer(key.layer).unwrap();
+        replay_exact_raster_recovery_command(key.layer, &mut raster, transition.after()).unwrap();
+        assert_eq!(raster.pixel(8, 8), Some(BLUE));
+        replay_exact_raster_recovery_command(key.layer, &mut raster, transition.before()).unwrap();
+        assert_eq!(raster.pixel(8, 8), Some(RED));
+    }
+
+    #[test]
+    fn first_paint_transition_retains_absence_and_returns_batches_on_failure() {
+        let base =
+            crate::gpu_document_mirror::GpuCpuMirror::new(32, 32, 32, DocumentRevision::INITIAL)
+                .unwrap()
+                .snapshot();
+        let (plan, key) = one_tile_plan(1, true);
+        let transition = GpuExactRasterRecoveryTransition::from_mirror_revision(
+            &base,
+            &plan,
+            vec![patch_batch(&plan.batches()[0], BLUE)],
+        )
+        .unwrap();
+        let mut raster = base.raster_layer(key.layer).unwrap();
+        replay_exact_raster_recovery_command(key.layer, &mut raster, transition.after()).unwrap();
+        assert_eq!(raster.allocated_tile_count(), 1);
+        replay_exact_raster_recovery_command(key.layer, &mut raster, transition.before()).unwrap();
+        assert_eq!(raster.allocated_tile_count(), 0);
+
+        let batches = vec![patch_batch(&plan.batches()[0], BLUE)];
+        let failure = GpuExactRasterRecoveryTransition::from_mirror_revision(
+            &crate::gpu_document_mirror::GpuCpuMirror::new(
+                32,
+                32,
+                32,
+                DocumentRevision::from_raw(1),
+            )
+            .unwrap()
+            .snapshot(),
+            &plan,
+            batches,
+        )
+        .unwrap_err();
+        assert_eq!(
+            failure.error,
+            GpuExactRasterRecoveryTransitionError::BaseNotOlder {
+                base: DocumentRevision::from_raw(1),
+                transition: DocumentRevision::from_raw(1),
+            }
+        );
+        assert_eq!(failure.batches.len(), 1);
+        assert_eq!(failure.batches[0].regions()[0].pixels[0], BLUE);
     }
 
     #[test]

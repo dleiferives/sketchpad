@@ -220,6 +220,16 @@ CPU history spill therefore copies only region metadata; it does not deep-copy
 the mapped full-float blocks. Replay still performs the one required copy into
 a mutable destination tile.
 
+The CPU spill value now pairs both exact sides of one reconciled raster
+revision. Its before-side is captured from the immutable CPU mirror over the
+same block-aligned region shape; its after-side takes ownership of the mapped
+GPU result. It validates base ordering, tile geometry, complete batch identity,
+finite pixels, and byte accounting while returning the mapped batches on
+failure. First-paint absence is an explicit before-state. Pure replay tests
+apply after then before and recover exact present pixels or sparse absence.
+The mirror dispatcher and bounded history still need to hand these pairs to
+the matching GPU history IDs before this closes the live pre-map interval.
+
 That work also exposed and fixed a partial-edge invariant: a logical canvas
 whose dimensions are not multiples of 128 may legitimately produce a padded
 16-pixel GPU undo block. Reconciliation now accepts padding inside the

@@ -6,7 +6,7 @@ use crate::{
         GpuDocumentMemento, GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES,
         GPU_UNDO_BLOCK_SIZE, GPU_UNDO_PIXEL_BYTES,
     },
-    raster::{LinearRgba, RasterError, RasterLayer, RectU32},
+    raster::{LinearRgba, RasterError, RasterLayer, RectU32, TileCoord},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -726,6 +726,20 @@ impl GpuCpuMirrorSnapshot {
 
     pub fn tile_pixels(&self, key: LayerTileKey) -> Option<&[LinearRgba]> {
         self.tiles.get(&key).map(AsRef::as_ref)
+    }
+
+    pub fn tile_bounds(&self, coord: TileCoord) -> Option<RectU32> {
+        let origin_x = coord.x.checked_mul(self.tile_size)?;
+        let origin_y = coord.y.checked_mul(self.tile_size)?;
+        if origin_x >= self.width || origin_y >= self.height {
+            return None;
+        }
+        RectU32::from_xywh(
+            origin_x,
+            origin_y,
+            self.tile_size.min(self.width - origin_x),
+            self.tile_size.min(self.height - origin_y),
+        )
     }
 
     pub fn tile_count(&self) -> usize {
