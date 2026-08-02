@@ -266,6 +266,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             [0.0; 4],
         )?;
     }
+    if color.initialized_resident(left_slot).is_some()
+        || color.initialized_resident(right_slot).is_some()
+    {
+        return Err("undoing first paint left logically initialized residents".into());
+    }
 
     let (redo_paint_stats, after_redo_paint) = history_swap_and_read(
         &swap_readback,
@@ -284,6 +289,38 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
         [0.1, 0.2, 0.4, 0.5],
     )?;
+    if color.initialized_resident(left_slot) != Some(left_key)
+        || color.initialized_resident(right_slot) != Some(right_key)
+    {
+        return Err("redoing first paint did not restore logical residents".into());
+    }
+
+    if !history.begin_undo()? {
+        return Err("discard control could not stage paint undo".into());
+    }
+    let mut discarded_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Document Commit Smoke Discarded Undo"),
+    });
+    let discarded_swap = {
+        let memento = history.pending_memento_mut()?;
+        color.encode_undo_swap(&device, &mut discarded_encoder, memento)?
+    };
+    if color.initialized_resident(left_slot).is_some()
+        || color.initialized_resident(right_slot).is_some()
+    {
+        return Err("staged first-paint undo did not exchange resident metadata".into());
+    }
+    drop(discarded_encoder);
+    {
+        let memento = history.pending_memento_mut()?;
+        color.undo_swap_discarded(discarded_swap, memento)?;
+    }
+    history.cancel_pending()?;
+    if color.initialized_resident(left_slot) != Some(left_key)
+        || color.initialized_resident(right_slot) != Some(right_key)
+    {
+        return Err("discarded first-paint undo did not restore resident metadata".into());
+    }
 
     let (redo_erase_stats, after_redo_erase) = history_swap_and_read(
         &swap_readback,
@@ -438,7 +475,8 @@ fn swap_and_read(
     let readback = readback_buffer(device, label, bytes_per_row);
     let mut encoder =
         device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
-    let stats = color.encode_undo_swap(device, &mut encoder, memento)?;
+    let encoded = color.encode_undo_swap(device, &mut encoder, memento)?;
+    let stats = encoded.stats();
     encoder.copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
             texture: color
@@ -463,7 +501,7 @@ fn swap_and_read(
         },
     );
     queue.submit(iter::once(encoder.finish()));
-    color.undo_swap_submitted()?;
+    color.undo_swap_submitted(encoded)?;
     Ok((stats, map_readback(device, &readback)?))
 }
 

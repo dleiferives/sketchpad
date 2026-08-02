@@ -99,6 +99,9 @@ pub struct GpuDocumentTarget {
     undo_scratch_buffer: wgpu::Buffer,
     undo_scratch_capacity: u64,
     undo_swap_pending: bool,
+    pending_undo_swap_serial: Option<u64>,
+    next_undo_swap_serial: u64,
+    pending_undo_resident_changes: Vec<(AtlasSlot, Option<LayerTileKey>)>,
 }
 
 pub struct EncodedGpuDocumentCommit {
@@ -126,6 +129,17 @@ pub struct GpuUndoSwapStats {
     pub copy_regions: u32,
     pub blocks: u32,
     pub bytes_copied: u64,
+}
+
+pub struct EncodedGpuUndoSwap {
+    stats: GpuUndoSwapStats,
+    serial: u64,
+}
+
+impl EncodedGpuUndoSwap {
+    pub const fn stats(&self) -> GpuUndoSwapStats {
+        self.stats
+    }
 }
 
 impl GpuDocumentTarget {
@@ -258,6 +272,9 @@ impl GpuDocumentTarget {
             undo_scratch_buffer,
             undo_scratch_capacity: INITIAL_UNDO_SCRATCH_BYTES,
             undo_swap_pending: false,
+            pending_undo_swap_serial: None,
+            next_undo_swap_serial: 1,
+            pending_undo_resident_changes: Vec::new(),
         })
     }
 
@@ -277,6 +294,10 @@ impl GpuDocumentTarget {
 
     pub fn page_view(&self, page: AtlasPageId) -> Option<&wgpu::TextureView> {
         self.pages.get(page.get() as usize).map(|page| &page.view)
+    }
+
+    pub fn initialized_resident(&self, slot: AtlasSlot) -> Option<LayerTileKey> {
+        self.initialized_residents.get(&slot).copied()
     }
 
     pub const fn commit_is_pending(&self) -> bool {
@@ -495,8 +516,13 @@ impl GpuDocumentTarget {
         let memento = if capture_undo {
             let plan = GpuUndoCapturePlan::from_active_tiles(self.layout, &active_tiles)
                 .map_err(GpuDocumentTargetError::UndoPlan)?;
+            let prior_initialized = plan
+                .regions()
+                .iter()
+                .map(|region| self.initialized_residents.get(&region.slot) == Some(&region.key))
+                .collect();
             Some(
-                GpuDocumentMemento::new(device, plan)
+                GpuDocumentMemento::new(device, plan, prior_initialized)
                     .map_err(GpuDocumentTargetError::UndoResource)?,
             )
         } else {
@@ -645,7 +671,7 @@ impl GpuDocumentTarget {
         device: &wgpu::Device,
         encoder: &mut wgpu::CommandEncoder,
         memento: &mut GpuDocumentMemento,
-    ) -> Result<GpuUndoSwapStats, GpuDocumentTargetError> {
+    ) -> Result<EncodedGpuUndoSwap, GpuDocumentTargetError> {
         if self.commit_pending {
             return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
         }
@@ -658,12 +684,19 @@ impl GpuDocumentTarget {
                 actual: memento.plan().layout(),
             });
         }
-        for region in memento.plan().regions() {
+        for (region, state) in memento
+            .plan()
+            .regions()
+            .iter()
+            .zip(memento.resident_states())
+        {
+            debug_assert_eq!((state.key, state.slot), (region.key, region.slot));
             let actual = self.initialized_residents.get(&region.slot).copied();
-            if actual != Some(region.key) {
+            let expected = state.document_initialized.then_some(region.key);
+            if actual != expected {
                 return Err(GpuDocumentTargetError::UndoResidentMismatch {
                     slot: region.slot,
-                    expected: region.key,
+                    expected,
                     actual,
                 });
             }
@@ -677,6 +710,10 @@ impl GpuDocumentTarget {
             .byte_len()
             .checked_mul(3)
             .ok_or(GpuDocumentTargetError::UndoCopySizeOverflow)?;
+        let swap_serial = self.next_undo_swap_serial;
+        let next_swap_serial = swap_serial
+            .checked_add(1)
+            .ok_or(GpuDocumentTargetError::UndoSwapSerialOverflow)?;
 
         for region in memento.plan().regions() {
             let page = &self.pages[region.slot.page().get() as usize];
@@ -714,24 +751,72 @@ impl GpuDocumentTarget {
             );
         }
 
+        debug_assert!(self.pending_undo_resident_changes.is_empty());
+        for state in memento.resident_states() {
+            let previous = self.initialized_residents.get(&state.slot).copied();
+            if state.memento_initialized {
+                self.initialized_residents.insert(state.slot, state.key);
+            } else {
+                self.initialized_residents.remove(&state.slot);
+            }
+            self.pending_undo_resident_changes
+                .push((state.slot, previous));
+        }
+        memento.swap_resident_states();
         self.undo_swap_pending = true;
-        Ok(GpuUndoSwapStats {
-            copy_regions,
-            blocks: memento.block_count(),
-            bytes_copied,
+        self.pending_undo_swap_serial = Some(swap_serial);
+        self.next_undo_swap_serial = next_swap_serial;
+        Ok(EncodedGpuUndoSwap {
+            serial: swap_serial,
+            stats: GpuUndoSwapStats {
+                copy_regions,
+                blocks: memento.block_count(),
+                bytes_copied,
+            },
         })
     }
 
-    pub fn undo_swap_submitted(&mut self) -> Result<(), GpuDocumentTargetError> {
-        if !self.undo_swap_pending {
-            return Err(GpuDocumentTargetError::NoEncodedUndoSwap);
-        }
+    pub fn undo_swap_submitted(
+        &mut self,
+        encoded: EncodedGpuUndoSwap,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.validate_undo_swap_token(encoded.serial)?;
         self.undo_swap_pending = false;
+        self.pending_undo_swap_serial = None;
+        self.pending_undo_resident_changes.clear();
         Ok(())
     }
 
-    pub fn undo_swap_discarded(&mut self) -> Result<(), GpuDocumentTargetError> {
-        self.undo_swap_submitted()
+    pub fn undo_swap_discarded(
+        &mut self,
+        encoded: EncodedGpuUndoSwap,
+        memento: &mut GpuDocumentMemento,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.validate_undo_swap_token(encoded.serial)?;
+        for (slot, previous) in self.pending_undo_resident_changes.drain(..).rev() {
+            match previous {
+                Some(key) => {
+                    self.initialized_residents.insert(slot, key);
+                }
+                None => {
+                    self.initialized_residents.remove(&slot);
+                }
+            }
+        }
+        memento.swap_resident_states();
+        self.undo_swap_pending = false;
+        self.pending_undo_swap_serial = None;
+        Ok(())
+    }
+
+    fn validate_undo_swap_token(&self, serial: u64) -> Result<(), GpuDocumentTargetError> {
+        if !self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::NoEncodedUndoSwap);
+        }
+        if self.pending_undo_swap_serial != Some(serial) {
+            return Err(GpuDocumentTargetError::UndoSwapTokenMismatch);
+        }
+        Ok(())
     }
 
     fn ensure_pages(
@@ -938,9 +1023,11 @@ pub enum GpuDocumentTargetError {
     UndoResource(GpuUndoResourceError),
     UndoSwapAwaitingSubmission,
     NoEncodedUndoSwap,
+    UndoSwapTokenMismatch,
+    UndoSwapSerialOverflow,
     UndoResidentMismatch {
         slot: AtlasSlot,
-        expected: LayerTileKey,
+        expected: Option<LayerTileKey>,
         actual: Option<LayerTileKey>,
     },
     MissingMaskPage(AtlasPageId),
@@ -1005,13 +1092,15 @@ impl fmt::Display for GpuDocumentTargetError {
                 write!(formatter, "a GPU undo swap is awaiting submission")
             }
             Self::NoEncodedUndoSwap => write!(formatter, "no GPU undo swap is pending"),
+            Self::UndoSwapTokenMismatch => write!(formatter, "GPU undo swap token does not match"),
+            Self::UndoSwapSerialOverflow => write!(formatter, "GPU undo swap serial overflows"),
             Self::UndoResidentMismatch {
                 slot,
                 expected,
                 actual,
             } => write!(
                 formatter,
-                "GPU undo slot {slot:?} expected {expected:?}, found {actual:?}"
+                "GPU undo slot {slot:?} expected resident {expected:?}, found {actual:?}"
             ),
             Self::MissingMaskPage(page) => {
                 write!(formatter, "round mask page {} does not exist", page.get())

@@ -39,12 +39,22 @@ pub struct GpuUndoCapturePlan {
 pub struct GpuDocumentMemento {
     plan: GpuUndoCapturePlan,
     buffer: wgpu::Buffer,
+    resident_states: Vec<GpuMementoResidentState>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuMementoResidentState {
+    pub key: LayerTileKey,
+    pub slot: AtlasSlot,
+    pub document_initialized: bool,
+    pub memento_initialized: bool,
 }
 
 impl GpuDocumentMemento {
     pub(crate) fn new(
         device: &wgpu::Device,
         plan: GpuUndoCapturePlan,
+        prior_initialized: Vec<bool>,
     ) -> Result<Self, GpuUndoResourceError> {
         if plan.is_empty() {
             return Err(GpuUndoResourceError::EmptyCapture);
@@ -55,13 +65,34 @@ impl GpuDocumentMemento {
                 maximum: device.limits().max_buffer_size,
             });
         }
+        if prior_initialized.len() != plan.regions().len() {
+            return Err(GpuUndoResourceError::ResidentStateCountMismatch {
+                expected: plan.regions().len(),
+                actual: prior_initialized.len(),
+            });
+        }
+        let resident_states = plan
+            .regions()
+            .iter()
+            .zip(prior_initialized)
+            .map(|(region, memento_initialized)| GpuMementoResidentState {
+                key: region.key,
+                slot: region.slot,
+                document_initialized: true,
+                memento_initialized,
+            })
+            .collect();
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU Document Exact Undo Memento"),
             size: plan.byte_len(),
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
-        Ok(Self { plan, buffer })
+        Ok(Self {
+            plan,
+            buffer,
+            resident_states,
+        })
     }
 
     pub fn plan(&self) -> &GpuUndoCapturePlan {
@@ -74,6 +105,19 @@ impl GpuDocumentMemento {
 
     pub const fn byte_len(&self) -> u64 {
         self.plan.byte_len()
+    }
+
+    pub fn resident_states(&self) -> &[GpuMementoResidentState] {
+        &self.resident_states
+    }
+
+    pub(crate) fn swap_resident_states(&mut self) {
+        for state in &mut self.resident_states {
+            std::mem::swap(
+                &mut state.document_initialized,
+                &mut state.memento_initialized,
+            );
+        }
     }
 
     pub(crate) const fn buffer(&self) -> &wgpu::Buffer {
@@ -290,6 +334,7 @@ impl Error for GpuUndoPlanError {}
 pub enum GpuUndoResourceError {
     EmptyCapture,
     BufferTooLarge { requested: u64, maximum: u64 },
+    ResidentStateCountMismatch { expected: usize, actual: usize },
 }
 
 impl fmt::Display for GpuUndoResourceError {
@@ -299,6 +344,10 @@ impl fmt::Display for GpuUndoResourceError {
             Self::BufferTooLarge { requested, maximum } => write!(
                 formatter,
                 "GPU undo buffer {requested} exceeds device limit {maximum}"
+            ),
+            Self::ResidentStateCountMismatch { expected, actual } => write!(
+                formatter,
+                "GPU undo has {actual} resident states, expected {expected}"
             ),
         }
     }

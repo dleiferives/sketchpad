@@ -67,8 +67,8 @@ and application cutover are not connected yet.
 Exact GPU pixel undo now has a deterministic copy planner, backing buffers,
 and a non-live bounded history owner. Each conservative tile-local damage
 rectangle rounds outward to `16 x 16` full-float blocks. One block is exactly
-4 KiB, and
-its 16-pixel `Rgba32Float` row is exactly WebGPU's 256-byte copy-row alignment.
+4 KiB; its 16-pixel `Rgba32Float` row is exactly WebGPU's 256-byte copy-row
+alignment.
 Adjacent selected blocks for one tile coalesce into one rectangular copy
 region: a full 128-pixel tile remains 64 accounting blocks / 256 KiB but needs
 one texture-buffer copy command rather than 64. Plans are ordered by physical
@@ -87,8 +87,17 @@ therefore exact redo on its next invocation. A pending commit or swap blocks
 shared-resource reuse, and a swap fails before encoding if any physical slot
 no longer names the recorded logical resident. GPU history budgeting, slot
 pinning, and swap sequencing now exist below the application boundary;
-absent-tile occupancy exchange, revision commands, CPU spill, and live history
+revision commands, CPU spill, nonempty-content reclamation, and live history
 integration remain.
+
+Mementos also exchange initialized-resident metadata, not only pixels. The
+first commit to a logical tile records an absent prior resident; undo restores
+transparent blocks and removes that logical color occupant while its history
+pin keeps the physical atlas slot reserved. Redo restores both pixels and the
+same logical identity. Existing-resident edits exchange `present -> present`.
+Metadata changes are staged with a serial-checked encoded-swap token: submit
+keeps them, while discard restores both the document map and the memento's
+direction before another operation may begin.
 
 The sparse atlas now has checked reference-counted history pins as the first
 part of that layer. A memento can pin its exact logical resident/physical-slot
@@ -154,6 +163,12 @@ the entries without changing either byte accounting or pin counts. Explicit
 history clear returns both entries, reports zero resident history bytes, and
 releases all three atlas pins. The pixel assertions remain exact after routing
 through the pending history protocol.
+
+That hardware sequence now additionally asserts that undoing the first paint
+makes both color residents logically absent and redo restores their exact
+`(LayerId, TileCoord)` identities. A control encodes another first-paint undo,
+observes the staged absent metadata, drops its command encoder, and explicitly
+discards the swap; both resident identities and the history side are restored.
 
 ## Current Executable
 
