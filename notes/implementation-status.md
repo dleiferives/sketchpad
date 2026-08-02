@@ -308,6 +308,33 @@ to this path yet, and the final dirty-updated exact stable composite cache
 remains to be built. Command batches currently submit immediately; display-
 opportunity coalescing remains a later event-loop policy above this owner.
 
+The resident owner can now freeze an exact application-facing snapshot at its
+current interactive revision without waiting for the CPU mirror to catch up.
+The immutable value pairs the same `DocumentMetadata` revision with the live
+recovery timeline's exact mirror base and forward journal. Materializing layer
+rasters, recomputing their visible composite, checkpoint encoding, and atomic
+filesystem replacement can therefore happen away from the event/render
+thread while later GPU strokes continue. The Atlas hardware smoke freezes the
+state immediately after a resident eraser commit—before driving mirror
+readback—and CPU recovery reproduces both its revision and revealed lower-layer
+pixel exactly.
+
+`GpuCheckpointWorker` is the first consumer of that boundary. It permits one
+active background save plus one coalesced newest pending revision. A third
+request replaces only the pending payload; it never interrupts or aliases the
+active snapshot. Completion compares the task's retained live revision with
+the then-current interactive revision, so only a successful save of that exact
+revision may clear dirty state. Encoding, recovery replay, composite rebuild,
+and disk I/O run on the worker. Save failure and worker panic are explicit
+results; failure leaves dirty state claimed by no revision, and the worker can
+accept later work. Dropping the owner joins any active write rather than
+detaching filesystem mutation past application shutdown. Tests prove
+`R1 active / R2 pending / R3 replaces R2`, stale-success behavior, exact final
+file contents, and repeated failure against a non-directory path. The current
+`.sketchpad` file format deliberately begins a new session at revision zero
+when reopened, so live saved-revision identity remains task metadata rather
+than a serialized file field.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

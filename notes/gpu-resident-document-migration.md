@@ -314,6 +314,16 @@ encode, or touch the filesystem. Mirror materialization installs the immutable
 tile references directly into the worker raster; it does not copy every pixel
 before the checkpoint encoder reads it.
 
+This boundary is now implemented below the application loop. A resident
+snapshot freezes current metadata plus the mirror-base/forward-journal timeline
+even when reconciliation is behind. The background checkpoint owner keeps one
+active task and only the newest pending task, reports success against the
+current interactive revision, and joins an active writer on shutdown. Pure
+tests cover revision coalescing and failed atomic replacement; the resident
+hardware smoke recovers the current committed eraser from an immediate
+snapshot. Wiring the existing autosave/manual-save UI to this owner is still
+part of the application-state cutover.
+
 ## Ordered Implementation
 
 1. Separate document metadata/history from the current CPU raster backend
@@ -356,7 +366,11 @@ before the checkpoint encoder reads it.
    replaceable-tail masks, optical-density flow, frame-opportunity batching,
    and event-loop cutover remain.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss
-   journal replay, and GPU color sampling.
+   journal replay, and GPU color sampling. Reconciliation, exact recovery
+   snapshots, and a bounded background layered-checkpoint worker are complete
+   below the application boundary. The live loop still needs to drive mirror
+   polling and replace its legacy autosave worker with the revisioned owner;
+   GPU color sampling remains.
 6. Make the GPU document path the default. Temporarily hide the unmigrated
    natural brushes rather than adding CPU/GPU ownership stalls.
 7. Restore flat and knife as connected oriented ribbons, pencil as a
