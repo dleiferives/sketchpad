@@ -363,12 +363,21 @@ The remaining layer operations cannot reuse this exception. Visibility,
 opacity, ordering, rename, creation, duplication, deletion, and import are
 chronological revisioned edits. The current GPU history entry owns only a
 raster memento and every such ID expects a two-sided raster spill, while a
-metadata-only edit may have no pixel transition at all. The next structural
-slice must make the resident history value typed (`raster` versus metadata or
-layer presence), keep one global undo/redo order, and teach live recovery which
-history IDs require raster spill. Mutating metadata now and clearing or
-splitting history would make recovery superficially correct but user undo
-incorrect, so those actions remain gated.
+metadata-only edit may have no pixel transition at all.
+
+Visibility, opacity, and ordering now have a shared reversible metadata-edit
+value below the owner. Preparation validates layer identity, opacity/index
+bounds, and no-op state without mutation. Application requires the exact
+prepared before-state and exact next revision; reverse application requires
+the corresponding after-state and advances revision again. Order changes move
+the stable identity without changing active selection. Malformed or stale
+values fail without publishing a partially changed layer array.
+
+The next structural slice must make the resident history value typed (`raster`
+versus metadata or layer presence), keep one global undo/redo order, and teach
+live recovery which history IDs require raster spill. Mutating live metadata
+now and clearing or splitting history would make recovery superficially
+correct but user undo incorrect, so those actions remain gated.
 
 ## Ordered Implementation
 

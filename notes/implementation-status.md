@@ -32,6 +32,13 @@ mutation, PNG import, and color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.
 
+The non-live foundation for the next revisioned layer slice now defines
+reversible visibility, opacity, and ordering edits over `DocumentMetadata`.
+They are prepared without mutation, require the exact expected side plus exact
+next revision when applied, reverse through the same value, preserve stable
+active identity across moves, and reject invalid/stale state transactionally.
+They are not yet recorded by GPU history or callable from the live UI.
+
 Selected architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
 page-batched GPU-resident layer and continuous-mask design in

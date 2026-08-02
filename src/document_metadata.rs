@@ -43,6 +43,45 @@ pub struct DocumentMetadata {
     retained_byte_len: u64,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DocumentMetadataEdit {
+    Visibility {
+        layer: LayerId,
+        before: bool,
+        after: bool,
+    },
+    Opacity {
+        layer: LayerId,
+        before: f32,
+        after: f32,
+    },
+    Move {
+        layer: LayerId,
+        before: usize,
+        after: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocumentMetadataEditDirection {
+    Forward,
+    Reverse,
+}
+
+impl DocumentMetadataEdit {
+    pub const fn layer(&self) -> LayerId {
+        match self {
+            Self::Visibility { layer, .. }
+            | Self::Opacity { layer, .. }
+            | Self::Move { layer, .. } => *layer,
+        }
+    }
+
+    pub const fn retained_byte_len(&self) -> u64 {
+        size_of::<Self>() as u64
+    }
+}
+
 impl DocumentMetadata {
     pub fn from_document(document: &Document) -> Self {
         let layers: Vec<_> = document
@@ -175,6 +214,148 @@ impl DocumentMetadata {
         self.active_layer = layer;
         Ok(())
     }
+
+    pub fn prepare_layer_visibility(
+        &self,
+        layer: LayerId,
+        visible: bool,
+    ) -> Result<Option<DocumentMetadataEdit>, DocumentMetadataError> {
+        let current = self.require_layer(layer)?.visible;
+        Ok((current != visible).then_some(DocumentMetadataEdit::Visibility {
+            layer,
+            before: current,
+            after: visible,
+        }))
+    }
+
+    pub fn prepare_layer_opacity(
+        &self,
+        layer: LayerId,
+        opacity: f32,
+    ) -> Result<Option<DocumentMetadataEdit>, DocumentMetadataError> {
+        if !opacity.is_finite() || !(0.0..=1.0).contains(&opacity) {
+            return Err(DocumentMetadataError::InvalidOpacity);
+        }
+        let current = self.require_layer(layer)?.opacity;
+        Ok((current != opacity).then_some(DocumentMetadataEdit::Opacity {
+            layer,
+            before: current,
+            after: opacity,
+        }))
+    }
+
+    pub fn prepare_layer_move(
+        &self,
+        layer: LayerId,
+        destination: usize,
+    ) -> Result<Option<DocumentMetadataEdit>, DocumentMetadataError> {
+        if destination >= self.layers.len() {
+            return Err(DocumentMetadataError::LayerIndexOutOfBounds(destination));
+        }
+        let current = self.require_layer_index(layer)?;
+        Ok((current != destination).then_some(DocumentMetadataEdit::Move {
+            layer,
+            before: current,
+            after: destination,
+        }))
+    }
+
+    pub fn apply_edit(
+        &mut self,
+        edit: &DocumentMetadataEdit,
+        direction: DocumentMetadataEditDirection,
+        revision: DocumentRevision,
+    ) -> Result<(), DocumentMetadataError> {
+        if self.revision.checked_next() != Some(revision) {
+            return Err(DocumentMetadataError::RevisionNotNext {
+                current: self.revision,
+                requested: revision,
+            });
+        }
+        let mut layers = self.layers.to_vec();
+        match edit {
+            DocumentMetadataEdit::Visibility {
+                layer,
+                before,
+                after,
+            } => {
+                let index = self.require_layer_index(*layer)?;
+                let (expected, replacement) = edit_sides(*before, *after, direction);
+                if layers[index].visible != expected {
+                    return Err(DocumentMetadataError::EditStateChanged(*layer));
+                }
+                layers[index].visible = replacement;
+            }
+            DocumentMetadataEdit::Opacity {
+                layer,
+                before,
+                after,
+            } => {
+                let index = self.require_layer_index(*layer)?;
+                let (expected, replacement) = edit_sides(*before, *after, direction);
+                if !expected.is_finite()
+                    || !(0.0..=1.0).contains(&expected)
+                    || !replacement.is_finite()
+                    || !(0.0..=1.0).contains(&replacement)
+                {
+                    return Err(DocumentMetadataError::InvalidOpacity);
+                }
+                if layers[index].opacity != expected {
+                    return Err(DocumentMetadataError::EditStateChanged(*layer));
+                }
+                layers[index].opacity = replacement;
+            }
+            DocumentMetadataEdit::Move {
+                layer,
+                before,
+                after,
+            } => {
+                let (expected, destination) = edit_sides(*before, *after, direction);
+                if expected >= layers.len() || destination >= layers.len() {
+                    return Err(DocumentMetadataError::LayerIndexOutOfBounds(
+                        expected.max(destination),
+                    ));
+                }
+                let current = self.require_layer_index(*layer)?;
+                if current != expected {
+                    return Err(DocumentMetadataError::EditStateChanged(*layer));
+                }
+                let moved = layers.remove(current);
+                layers.insert(destination, moved);
+            }
+        }
+        self.layers = layers.into();
+        self.revision = revision;
+        Ok(())
+    }
+
+    fn require_layer(
+        &self,
+        layer: LayerId,
+    ) -> Result<&DocumentLayerMetadata, DocumentMetadataError> {
+        self.layers
+            .iter()
+            .find(|candidate| candidate.id == layer)
+            .ok_or(DocumentMetadataError::MissingLayer(layer))
+    }
+
+    fn require_layer_index(&self, layer: LayerId) -> Result<usize, DocumentMetadataError> {
+        self.layers
+            .iter()
+            .position(|candidate| candidate.id == layer)
+            .ok_or(DocumentMetadataError::MissingLayer(layer))
+    }
+}
+
+fn edit_sides<T: Copy>(
+    before: T,
+    after: T,
+    direction: DocumentMetadataEditDirection,
+) -> (T, T) {
+    match direction {
+        DocumentMetadataEditDirection::Forward => (before, after),
+        DocumentMetadataEditDirection::Reverse => (after, before),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,6 +363,13 @@ pub enum DocumentMetadataError {
     EmptyCanvas,
     InvalidTileSize,
     MissingLayer(LayerId),
+    InvalidOpacity,
+    LayerIndexOutOfBounds(usize),
+    RevisionNotNext {
+        current: DocumentRevision,
+        requested: DocumentRevision,
+    },
+    EditStateChanged(LayerId),
 }
 
 impl fmt::Display for DocumentMetadataError {
@@ -192,6 +380,21 @@ impl fmt::Display for DocumentMetadataError {
             Self::MissingLayer(layer) => {
                 write!(formatter, "document metadata has no layer {}", layer.get())
             }
+            Self::InvalidOpacity => write!(formatter, "document metadata opacity is invalid"),
+            Self::LayerIndexOutOfBounds(index) => {
+                write!(formatter, "document metadata layer index {index} is out of bounds")
+            }
+            Self::RevisionNotNext { current, requested } => write!(
+                formatter,
+                "document metadata revision {} cannot advance directly to {}",
+                current.get(),
+                requested.get()
+            ),
+            Self::EditStateChanged(layer) => write!(
+                formatter,
+                "document metadata layer {} changed after edit preparation",
+                layer.get()
+            ),
         }
     }
 }
@@ -264,5 +467,92 @@ mod tests {
         ));
         assert_eq!(metadata.active_layer(), first);
         assert_eq!(metadata.revision(), revision);
+    }
+
+    #[test]
+    fn reversible_property_edits_require_exact_state_and_next_revision() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let first = document.active_layer_id();
+        let second = document.create_layer("Second").unwrap();
+        let mut metadata = DocumentMetadata::from_document(&document);
+
+        let visibility = metadata
+            .prepare_layer_visibility(first, false)
+            .unwrap()
+            .unwrap();
+        let revision_1 = metadata.revision().checked_next().unwrap();
+        metadata
+            .apply_edit(
+                &visibility,
+                DocumentMetadataEditDirection::Forward,
+                revision_1,
+            )
+            .unwrap();
+        assert!(!metadata.require_layer(first).unwrap().visible());
+        assert!(matches!(
+            metadata.apply_edit(
+                &visibility,
+                DocumentMetadataEditDirection::Forward,
+                revision_1.checked_next().unwrap()
+            ),
+            Err(DocumentMetadataError::EditStateChanged(layer)) if layer == first
+        ));
+
+        let revision_2 = revision_1.checked_next().unwrap();
+        metadata
+            .apply_edit(
+                &visibility,
+                DocumentMetadataEditDirection::Reverse,
+                revision_2,
+            )
+            .unwrap();
+        assert!(metadata.require_layer(first).unwrap().visible());
+
+        let opacity = metadata
+            .prepare_layer_opacity(second, 0.25)
+            .unwrap()
+            .unwrap();
+        let revision_3 = revision_2.checked_next().unwrap();
+        metadata
+            .apply_edit(
+                &opacity,
+                DocumentMetadataEditDirection::Forward,
+                revision_3,
+            )
+            .unwrap();
+        assert_eq!(metadata.require_layer(second).unwrap().opacity(), 0.25);
+        assert_eq!(metadata.active_layer(), second);
+    }
+
+    #[test]
+    fn reversible_move_preserves_active_identity_and_layer_order() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let first = document.active_layer_id();
+        let second = document.create_layer("Second").unwrap();
+        let mut metadata = DocumentMetadata::from_document(&document);
+        let edit = metadata.prepare_layer_move(second, 0).unwrap().unwrap();
+        let revision_1 = metadata.revision().checked_next().unwrap();
+
+        metadata
+            .apply_edit(
+                &edit,
+                DocumentMetadataEditDirection::Forward,
+                revision_1,
+            )
+            .unwrap();
+        assert_eq!(metadata.layers()[0].id(), second);
+        assert_eq!(metadata.layers()[1].id(), first);
+        assert_eq!(metadata.active_layer(), second);
+
+        metadata
+            .apply_edit(
+                &edit,
+                DocumentMetadataEditDirection::Reverse,
+                revision_1.checked_next().unwrap(),
+            )
+            .unwrap();
+        assert_eq!(metadata.layers()[0].id(), first);
+        assert_eq!(metadata.layers()[1].id(), second);
+        assert_eq!(metadata.active_layer(), second);
     }
 }
