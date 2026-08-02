@@ -254,26 +254,35 @@ enum ReadbackMapState {
     Finished,
 }
 
-pub struct PendingGpuMirrorReadback {
+struct PendingGpuMirrorReadback {
     plan: GpuMirrorBatchPlan,
+    snapshot: Option<wgpu::Buffer>,
     buffer: Option<wgpu::Buffer>,
     map_state: ReadbackMapState,
 }
 
+struct CapturedGpuMirrorBatch {
+    plan: GpuMirrorBatchPlan,
+    snapshot: Option<wgpu::Buffer>,
+}
+
+pub struct GpuMirrorRevisionCapture {
+    revision: DocumentRevision,
+    byte_len: u64,
+    block_count: u32,
+    remaining_byte_len: u64,
+    capture_submitted: bool,
+    queued: VecDeque<CapturedGpuMirrorBatch>,
+    active: Option<PendingGpuMirrorReadback>,
+    active_submitted: bool,
+}
+
 impl PendingGpuMirrorReadback {
-    pub const fn revision(&self) -> DocumentRevision {
-        self.plan.revision()
-    }
-
-    pub const fn index(&self) -> u32 {
-        self.plan.index()
-    }
-
-    pub const fn byte_len(&self) -> u64 {
+    const fn byte_len(&self) -> u64 {
         self.plan.byte_len()
     }
 
-    pub fn begin_map(&mut self) -> Result<(), GpuMirrorReadbackError> {
+    fn begin_map(&mut self) -> Result<(), GpuMirrorReadbackError> {
         if !matches!(self.map_state, ReadbackMapState::NotStarted) {
             return Err(GpuMirrorReadbackError::MapAlreadyStarted);
         }
@@ -290,7 +299,7 @@ impl PendingGpuMirrorReadback {
         Ok(())
     }
 
-    pub fn try_finish(&mut self) -> Result<Option<GpuMirrorPatchBatch>, GpuMirrorReadbackError> {
+    fn try_finish(&mut self) -> Result<Option<GpuMirrorPatchBatch>, GpuMirrorReadbackError> {
         let map_result = match &self.map_state {
             ReadbackMapState::NotStarted => {
                 return Err(GpuMirrorReadbackError::MapNotStarted);
@@ -335,14 +344,204 @@ impl PendingGpuMirrorReadback {
             byte_len: self.plan.byte_len,
         }))
     }
+
+    fn into_captured(self) -> CapturedGpuMirrorBatch {
+        CapturedGpuMirrorBatch {
+            plan: self.plan,
+            snapshot: self.snapshot,
+        }
+    }
 }
 
-pub fn encode_gpu_mirror_batch(
+impl GpuMirrorRevisionCapture {
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub const fn byte_len(&self) -> u64 {
+        self.byte_len
+    }
+
+    pub const fn block_count(&self) -> u32 {
+        self.block_count
+    }
+
+    pub const fn remaining_byte_len(&self) -> u64 {
+        self.remaining_byte_len
+    }
+
+    pub fn remaining_batch_count(&self) -> usize {
+        self.queued.len() + usize::from(self.active.is_some())
+    }
+
+    pub const fn staging_byte_len(&self) -> u64 {
+        match &self.active {
+            Some(active) => active.byte_len(),
+            None => 0,
+        }
+    }
+
+    pub fn is_complete(&self) -> bool {
+        self.queued.is_empty() && self.active.is_none()
+    }
+
+    pub fn capture_submitted(&mut self) -> Result<(), GpuMirrorReadbackError> {
+        if self.capture_submitted {
+            return Err(GpuMirrorReadbackError::CaptureAlreadySubmitted);
+        }
+        self.capture_submitted = true;
+        Ok(())
+    }
+
+    pub fn encode_next_readback(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<bool, GpuMirrorReadbackError> {
+        if !self.capture_submitted {
+            return Err(GpuMirrorReadbackError::CaptureNotSubmitted);
+        }
+        if self.active.is_some() {
+            return Err(GpuMirrorReadbackError::ReadbackAlreadyPrepared);
+        }
+        let Some(captured) = self.queued.pop_front() else {
+            return Ok(false);
+        };
+        let requested = captured.plan.byte_len();
+        if requested > device.limits().max_buffer_size {
+            self.queued.push_front(captured);
+            return Err(GpuMirrorReadbackError::BufferTooLarge {
+                requested,
+                maximum: device.limits().max_buffer_size,
+            });
+        }
+        let buffer = (captured.plan.byte_len() != 0).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU Document CPU Mirror Staging Readback"),
+                size: captured.plan.byte_len(),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        if let (Some(snapshot), Some(buffer)) = (&captured.snapshot, &buffer) {
+            encoder.copy_buffer_to_buffer(snapshot, 0, buffer, 0, captured.plan.byte_len());
+        }
+        self.active = Some(PendingGpuMirrorReadback {
+            plan: captured.plan,
+            snapshot: captured.snapshot,
+            buffer,
+            map_state: ReadbackMapState::NotStarted,
+        });
+        self.active_submitted = false;
+        Ok(true)
+    }
+
+    pub fn readback_submitted(&mut self) -> Result<(), GpuMirrorReadbackError> {
+        if self.active.is_none() {
+            return Err(GpuMirrorReadbackError::NoReadbackPrepared);
+        }
+        if self.active_submitted {
+            return Err(GpuMirrorReadbackError::ReadbackAlreadySubmitted);
+        }
+        self.active_submitted = true;
+        Ok(())
+    }
+
+    pub fn readback_discarded(&mut self) -> Result<(), GpuMirrorReadbackError> {
+        if self.active_submitted {
+            return Err(GpuMirrorReadbackError::CannotDiscardSubmittedReadback);
+        }
+        let active = self
+            .active
+            .take()
+            .ok_or(GpuMirrorReadbackError::NoReadbackPrepared)?;
+        self.queued.push_front(active.into_captured());
+        Ok(())
+    }
+
+    pub fn begin_map(&mut self) -> Result<(), GpuMirrorReadbackError> {
+        if !self.active_submitted {
+            return Err(if self.active.is_some() {
+                GpuMirrorReadbackError::ReadbackNotSubmitted
+            } else {
+                GpuMirrorReadbackError::NoReadbackPrepared
+            });
+        }
+        self.active
+            .as_mut()
+            .expect("a submitted readback remains active")
+            .begin_map()
+    }
+
+    pub fn try_finish(&mut self) -> Result<Option<GpuMirrorPatchBatch>, GpuMirrorReadbackError> {
+        if !self.active_submitted {
+            return Err(if self.active.is_some() {
+                GpuMirrorReadbackError::ReadbackNotSubmitted
+            } else {
+                GpuMirrorReadbackError::NoReadbackPrepared
+            });
+        }
+        let patch = self
+            .active
+            .as_mut()
+            .expect("a submitted readback remains active")
+            .try_finish()?;
+        let Some(patch) = patch else {
+            return Ok(None);
+        };
+        let completed_bytes = self
+            .active
+            .take()
+            .expect("the completed readback remains active")
+            .byte_len();
+        self.active_submitted = false;
+        self.remaining_byte_len = self
+            .remaining_byte_len
+            .checked_sub(completed_bytes)
+            .expect("completed mirror batches are part of the revision total");
+        Ok(Some(patch))
+    }
+}
+
+pub fn encode_gpu_mirror_revision_capture(
     target: &GpuDocumentTarget,
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
-    plan: GpuMirrorBatchPlan,
-) -> Result<PendingGpuMirrorReadback, GpuMirrorReadbackError> {
+    plan: &GpuMirrorReadbackPlan,
+) -> Result<GpuMirrorRevisionCapture, GpuMirrorReadbackError> {
+    if plan.batches().is_empty() {
+        return Err(GpuMirrorReadbackError::EmptyRevisionPlan);
+    }
+    for batch in plan.batches() {
+        validate_gpu_mirror_batch(target, device, batch)?;
+    }
+
+    let mut queued = VecDeque::with_capacity(plan.batches().len());
+    for batch in plan.batches() {
+        queued.push_back(capture_gpu_mirror_batch(
+            target,
+            device,
+            encoder,
+            batch.clone(),
+        ));
+    }
+    Ok(GpuMirrorRevisionCapture {
+        revision: plan.revision(),
+        byte_len: plan.byte_len(),
+        block_count: plan.block_count(),
+        remaining_byte_len: plan.byte_len(),
+        capture_submitted: false,
+        queued,
+        active: None,
+        active_submitted: false,
+    })
+}
+
+fn validate_gpu_mirror_batch(
+    target: &GpuDocumentTarget,
+    device: &wgpu::Device,
+    plan: &GpuMirrorBatchPlan,
+) -> Result<(), GpuMirrorReadbackError> {
     if plan.layout() != target.layout() {
         return Err(GpuMirrorReadbackError::LayoutMismatch {
             expected: target.layout(),
@@ -371,16 +570,24 @@ pub fn encode_gpu_mirror_batch(
             ));
         }
     }
+    Ok(())
+}
 
-    let buffer = (plan.byte_len() != 0).then(|| {
+fn capture_gpu_mirror_batch(
+    target: &GpuDocumentTarget,
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    plan: GpuMirrorBatchPlan,
+) -> CapturedGpuMirrorBatch {
+    let snapshot = (plan.byte_len() != 0).then(|| {
         device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GPU Document CPU Mirror Readback"),
+            label: Some("GPU Document Immutable Mirror Snapshot"),
             size: plan.byte_len(),
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         })
     });
-    if let Some(buffer) = &buffer {
+    if let Some(snapshot) = &snapshot {
         for region in plan.regions().iter().filter(|region| region.initialized) {
             encoder.copy_texture_to_buffer(
                 wgpu::TexelCopyTextureInfo {
@@ -396,7 +603,7 @@ pub fn encode_gpu_mirror_batch(
                     aspect: wgpu::TextureAspect::All,
                 },
                 wgpu::TexelCopyBufferInfo {
-                    buffer,
+                    buffer: snapshot,
                     layout: wgpu::TexelCopyBufferLayout {
                         offset: region
                             .buffer_offset
@@ -413,11 +620,7 @@ pub fn encode_gpu_mirror_batch(
             );
         }
     }
-    Ok(PendingGpuMirrorReadback {
-        plan,
-        buffer,
-        map_state: ReadbackMapState::NotStarted,
-    })
+    CapturedGpuMirrorBatch { plan, snapshot }
 }
 
 fn decode_regions(
@@ -958,6 +1161,14 @@ pub enum GpuMirrorReadbackError {
         actual: Option<LayerTileKey>,
     },
     MissingColorPage(u32),
+    EmptyRevisionPlan,
+    CaptureAlreadySubmitted,
+    CaptureNotSubmitted,
+    ReadbackAlreadyPrepared,
+    NoReadbackPrepared,
+    ReadbackNotSubmitted,
+    ReadbackAlreadySubmitted,
+    CannotDiscardSubmittedReadback,
     MapAlreadyStarted,
     MapNotStarted,
     MapAlreadyFinished,
@@ -989,6 +1200,38 @@ impl fmt::Display for GpuMirrorReadbackError {
             Self::MissingColorPage(page) => {
                 write!(formatter, "GPU mirror color page {page} does not exist")
             }
+            Self::EmptyRevisionPlan => write!(formatter, "GPU mirror revision plan is empty"),
+            Self::CaptureAlreadySubmitted => {
+                write!(
+                    formatter,
+                    "GPU mirror revision capture was already submitted"
+                )
+            }
+            Self::CaptureNotSubmitted => {
+                write!(formatter, "GPU mirror revision capture was not submitted")
+            }
+            Self::ReadbackAlreadyPrepared => {
+                write!(
+                    formatter,
+                    "a GPU mirror staging readback is already prepared"
+                )
+            }
+            Self::NoReadbackPrepared => {
+                write!(formatter, "no GPU mirror staging readback is prepared")
+            }
+            Self::ReadbackNotSubmitted => {
+                write!(formatter, "GPU mirror staging readback was not submitted")
+            }
+            Self::ReadbackAlreadySubmitted => {
+                write!(
+                    formatter,
+                    "GPU mirror staging readback was already submitted"
+                )
+            }
+            Self::CannotDiscardSubmittedReadback => write!(
+                formatter,
+                "a submitted GPU mirror staging readback cannot be discarded"
+            ),
             Self::MapAlreadyStarted => write!(formatter, "GPU mirror mapping already started"),
             Self::MapNotStarted => write!(formatter, "GPU mirror mapping has not started"),
             Self::MapAlreadyFinished => write!(formatter, "GPU mirror mapping already finished"),

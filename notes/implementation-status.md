@@ -129,31 +129,39 @@ Logically absent residents become zero-byte metadata records instead of
 needless transparent pixel copies.
 
 The GPU boundary validates atlas layout, logical resident identity, physical
-slot, color-page existence, and device buffer limits before encoding copies.
+slot, color-page existence, and device buffer limits before encoding any copy.
+At the commit boundary it copies every batch into immutable GPU-only snapshot
+buffers in one command stream. Subsequent drawing can therefore mutate the
+live atlas without changing a pending revision. Snapshot batches later pass
+through one bounded `MAP_READ` staging buffer at a time. Capture and staging
+submission have explicit acknowledgement, and an unsubmitted staging copy can
+be discarded back to the front of the queue without losing its snapshot.
 Mapping is callback-driven and polled without imposing a wait in the API;
 mapped full-float bytes become owned patch regions and the buffer is unmapped
-on either successful decoding or a terminal decode error. A revision-ordered
-reconciler accepts completed batches in any order but applies only a complete
-oldest revision. Its CPU store remains sparse, removes logically absent tiles,
-and uses `Arc` copy-on-write tiles so save/export can hold an immutable exact
-revision while later reconciliation proceeds.
+on either successful decoding or a terminal decode error.
+
+A revision-ordered reconciler accepts completed batches in any order but
+applies only a complete oldest revision. Its CPU store remains sparse, removes
+logically absent tiles, and uses `Arc` copy-on-write tiles so save/export can
+hold an immutable exact revision while later reconciliation proceeds.
 
 Pure checks cover packing, splitting, byte/block totals, absent residents, a
 budget smaller than one block, out-of-order completion, malformed-patch retry,
 sparse removal, and snapshot isolation. The Atlas Intel UHD 630 correctness
-smoke additionally copied and asynchronously mapped the eraser transaction's
-exact 16,384-byte `Rgba32Float` region, reconciled it atomically, and found the
-expected premultiplied `[0.075, 0.15, 0.3, 0.375]` center in both the mapped
-patch and the revisioned CPU tile. This is a correctness result, not a timing
-measurement.
+smoke additionally captured the eraser transaction as two 8,192-byte GPU
+snapshots, then undid the eraser in the live atlas before either snapshot was
+staged for the CPU. Sequential bounded mapping still reconstructed the exact
+16,384-byte erased revision atomically and found the expected premultiplied
+`[0.075, 0.15, 0.3, 0.375]` center in both the mapped patch and revisioned CPU
+tile. This proves snapshot isolation across a later GPU mutation. It is a
+correctness result, not a timing measurement.
 
 The live application still does not dispatch these batches or bind mirror
-revisions to save/export. Multi-batch revision capture must be made immutable
-at the commit boundary before later GPU writes are allowed; otherwise batches
-copied at different times could describe different interactive revisions.
-The bounded dispatcher, immutable GPU reconciliation source, semantic journal,
-save race handling, and device-loss replay remain the rest of migration step
-5.
+revisions to save/export. The dispatcher must enforce the staging cap globally
+across multiple pending revision captures, account immutable snapshot bytes,
+and define backpressure/coalescing when reconciliation falls behind. That
+dispatcher, the semantic journal, save race handling, and device-loss replay
+remain the rest of migration step 5.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,

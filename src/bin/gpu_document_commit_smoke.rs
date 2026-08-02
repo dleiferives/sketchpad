@@ -3,11 +3,11 @@ use sketchpad::{
     gpu_atlas::{AtlasLayout, AtlasPageId, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{GpuDocumentHistory, GpuHistoryDirection},
     gpu_document_mirror::{
-        encode_gpu_mirror_batch, GpuMirrorPatchRegion, GpuMirrorReadbackPlan, GpuMirrorReconciler,
-        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        encode_gpu_mirror_revision_capture, GpuMirrorPatchRegion, GpuMirrorReadbackPlan,
+        GpuMirrorReconciler,
     },
     gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
-    gpu_document_undo::GpuDocumentMemento,
+    gpu_document_undo::{GpuDocumentMemento, GPU_UNDO_BLOCK_BYTES},
     gpu_round::RoundMaskScheduler,
     gpu_round_target::RoundMaskTarget,
     raster::TileCoord,
@@ -352,44 +352,127 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mirror_plan = GpuMirrorReadbackPlan::from_memento(
         mirror_revision,
         history.pending_memento_mut()?,
-        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        2 * GPU_UNDO_BLOCK_BYTES,
     )?;
     history.cancel_pending()?;
-    if mirror_plan.batches().len() != 1 || mirror_plan.byte_len() != 16_384 {
+    if mirror_plan.batches().len() != 2
+        || mirror_plan.byte_len() != 16_384
+        || mirror_plan
+            .batches()
+            .iter()
+            .any(|batch| batch.byte_len() != 8_192)
+    {
         return Err(format!("unexpected mirror plan: {mirror_plan:?}").into());
     }
-    let mut mirror_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("GPU Document Commit Smoke Mirror Readback"),
-    });
-    let mut pending_mirror = encode_gpu_mirror_batch(
+    let mirror_key = mirror_plan.batches()[0].regions()[0].key;
+    let mut mirror_capture_encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GPU Document Commit Smoke Immutable Mirror Capture"),
+        });
+    let mut mirror_capture = encode_gpu_mirror_revision_capture(
         &color,
         &device,
-        &mut mirror_encoder,
-        mirror_plan.batches()[0].clone(),
+        &mut mirror_capture_encoder,
+        &mirror_plan,
     )?;
-    queue.submit(iter::once(mirror_encoder.finish()));
-    pending_mirror.begin_map()?;
-    device.poll(wgpu::PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    })?;
-    let mirror_patch = pending_mirror
-        .try_finish()?
-        .ok_or("GPU mirror map did not finish after a blocking poll")?;
-    if mirror_patch.byte_len() != 16_384 || mirror_patch.regions().len() != 1 {
-        return Err(format!("unexpected mirror patch: {mirror_patch:?}").into());
+    if mirror_capture.revision() != mirror_revision
+        || mirror_capture.byte_len() != 16_384
+        || mirror_capture.block_count() != 4
+        || mirror_capture.remaining_batch_count() != 2
+    {
+        return Err("unexpected immutable GPU mirror capture".into());
     }
-    expect_color(
-        "mirrored erased center",
-        read_patch_color(&mirror_patch.regions()[0], 64, 64)?,
-        [0.075, 0.15, 0.3, 0.375],
+    let mut premature_readback_encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GPU Document Commit Smoke Premature Mirror Readback"),
+        });
+    if mirror_capture
+        .encode_next_readback(&device, &mut premature_readback_encoder)
+        .is_ok()
+    {
+        return Err("GPU mirror allowed readback before capture submission".into());
+    }
+    drop(premature_readback_encoder);
+    queue.submit(iter::once(mirror_capture_encoder.finish()));
+    mirror_capture.capture_submitted()?;
+
+    let mut discarded_readback_encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GPU Document Commit Smoke Discarded Mirror Readback"),
+        });
+    if !mirror_capture.encode_next_readback(&device, &mut discarded_readback_encoder)? {
+        return Err("GPU mirror did not prepare its discard control".into());
+    }
+    mirror_capture.readback_discarded()?;
+    drop(discarded_readback_encoder);
+    if mirror_capture.remaining_batch_count() != 2 || mirror_capture.staging_byte_len() != 0 {
+        return Err("discarded GPU mirror readback did not restore its snapshot".into());
+    }
+
+    let (mirror_control_undo_stats, after_mirror_control_undo) = history_swap_and_read(
+        &swap_readback,
+        &mut color,
+        &mut history,
+        GpuHistoryDirection::Undo,
+        "GPU Document Commit Smoke Mutate After Mirror Capture",
     )?;
-    let mirror_key = mirror_patch.regions()[0].key;
+    expect_color(
+        "target mutated after mirror capture",
+        read_color(
+            &after_mirror_control_undo,
+            color_bytes_per_row,
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        )?,
+        [0.1, 0.2, 0.4, 0.5],
+    )?;
+
     let mut reconciler =
         GpuMirrorReconciler::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE, DocumentRevision::INITIAL)?;
     reconciler.register_plan(&mirror_plan)?;
-    let applied_revisions = reconciler.complete_batch(mirror_patch)?;
-    if applied_revisions != [mirror_revision]
+    let mut mapped_center = false;
+    let mut mapped_batches = 0;
+    let mut applied_revisions = Vec::new();
+    while !mirror_capture.is_complete() {
+        let mut mirror_readback_encoder =
+            device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("GPU Document Commit Smoke Bounded Mirror Readback"),
+            });
+        if !mirror_capture.encode_next_readback(&device, &mut mirror_readback_encoder)?
+            || mirror_capture.staging_byte_len() != 8_192
+        {
+            return Err("GPU mirror did not prepare one bounded staging batch".into());
+        }
+        queue.submit(iter::once(mirror_readback_encoder.finish()));
+        mirror_capture.readback_submitted()?;
+        mirror_capture.begin_map()?;
+        device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        })?;
+        let mirror_patch = mirror_capture
+            .try_finish()?
+            .ok_or("GPU mirror map did not finish after a blocking poll")?;
+        if mirror_patch.byte_len() != 8_192 || mirror_patch.regions().len() != 1 {
+            return Err(format!("unexpected mirror patch: {mirror_patch:?}").into());
+        }
+        if mirror_patch.regions()[0].local_bounds.contains(64, 64) {
+            expect_color(
+                "immutable mirrored erased center",
+                read_patch_color(&mirror_patch.regions()[0], 64, 64)?,
+                [0.075, 0.15, 0.3, 0.375],
+            )?;
+            mapped_center = true;
+        }
+        mapped_batches += 1;
+        applied_revisions.extend(reconciler.complete_batch(mirror_patch)?);
+    }
+    if !mapped_center
+        || mapped_batches != 2
+        || mirror_capture.remaining_batch_count() != 0
+        || mirror_capture.remaining_byte_len() != 0
+        || mirror_capture.staging_byte_len() != 0
+        || applied_revisions != [mirror_revision]
         || reconciler.mirror().revision() != mirror_revision
         || reconciler.pending_revision_count() != 0
     {
@@ -418,6 +501,24 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         return Err("GPU mirror snapshot did not preserve the reconciled revision".into());
     }
+
+    let (mirror_control_redo_stats, after_mirror_control_redo) = history_swap_and_read(
+        &swap_readback,
+        &mut color,
+        &mut history,
+        GpuHistoryDirection::Redo,
+        "GPU Document Commit Smoke Restore After Mirror Capture",
+    )?;
+    expect_color(
+        "target restored after mirror capture",
+        read_color(
+            &after_mirror_control_redo,
+            color_bytes_per_row,
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        )?,
+        [0.075, 0.15, 0.3, 0.375],
+    )?;
 
     if history.undo_depth() != 2 || history.redo_depth() != 0 {
         return Err("GPU undo/redo history depths did not round-trip".into());
@@ -463,11 +564,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     expect_swap_stats("undo paint", undo_paint_stats, 2, 20, 245_760)?;
     expect_swap_stats("redo paint", redo_paint_stats, 2, 20, 245_760)?;
     expect_swap_stats("redo erase", redo_erase_stats, 1, 4, 49_152)?;
+    expect_swap_stats(
+        "post-capture undo erase",
+        mirror_control_undo_stats,
+        1,
+        4,
+        49_152,
+    )?;
+    expect_swap_stats(
+        "post-capture redo erase",
+        mirror_control_redo_stats,
+        1,
+        4,
+        49_152,
+    )?;
 
     println!(
         "gpu_document_commit_smoke adapter={:?} paint={paint_stats:?} erase={erase_stats:?} \
          source_over=exact destination_out=exact lazy_clear=exact undo_redo=exact \
-         mirror_readback=exact mirror_reconcile=exact",
+         mirror_capture_isolation=exact mirror_readback=bounded mirror_reconcile=exact",
         adapter.get_info().name,
     );
     Ok(())
