@@ -413,12 +413,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         TILE_SIZE - 1 - 11,
         bottom_color,
     )?;
+    let recovered = resident.recovery_snapshot().recover_document()?;
+    let recovered_pixel = recovered
+        .document()
+        .composite()
+        .pixel(9, 11)
+        .ok_or("recovered committed pixel is missing")?;
+    if recovered.document().revision() != resident.metadata().revision()
+        || recovered_pixel != bottom_color
+    {
+        return Err("current resident snapshot did not recover the committed eraser".into());
+    }
 
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact",
         adapter.get_info().name
     );
     Ok(())

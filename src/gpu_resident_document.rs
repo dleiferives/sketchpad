@@ -16,6 +16,7 @@ use crate::{
         GpuMirrorDispatchCompletion, GpuMirrorDispatchError, GpuMirrorDispatcher,
         DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES,
     },
+    gpu_document_recovery::GpuDocumentRecoverySnapshot,
     gpu_document_target::{
         ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentBootstrapStats,
         GpuDocumentResidentUpload, GpuDocumentTarget, GpuDocumentTargetError, GpuDocumentTargetId,
@@ -888,6 +889,11 @@ impl GpuResidentDocument {
         &self.recovery
     }
 
+    pub fn recovery_snapshot(&self) -> GpuDocumentRecoverySnapshot {
+        GpuDocumentRecoverySnapshot::new(self.metadata.clone(), self.recovery.timeline().snapshot())
+            .expect("resident metadata and recovery timeline retain one exact revision")
+    }
+
     pub const fn revision(&self) -> DocumentRevision {
         self.metadata.revision()
     }
@@ -1526,6 +1532,28 @@ mod tests {
         document.finish_round_stroke(id).unwrap();
         assert_eq!(document.atlas().resident_tile_count(), 0);
         assert_eq!(document.active_round_stroke(), None);
+    }
+
+    #[test]
+    fn resident_snapshot_materializes_the_owned_revision_without_aliasing_metadata() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::from_raw(7), limits()).unwrap();
+        let snapshot = document.recovery_snapshot();
+        document
+            .metadata
+            .set_revision(DocumentRevision::from_raw(8));
+
+        assert_eq!(snapshot.revision(), DocumentRevision::from_raw(7));
+        let recovered = snapshot.recover_document().unwrap();
+        assert_eq!(
+            recovered.document().revision(),
+            DocumentRevision::from_raw(7)
+        );
+        assert_eq!(recovered.document().layers().len(), 1);
+        assert_eq!(
+            recovered.document().active_layer().allocated_tile_count(),
+            0
+        );
     }
 
     #[test]
