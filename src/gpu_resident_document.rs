@@ -941,6 +941,21 @@ impl GpuResidentDocument {
         self.apply_metadata_edit(edit).map(Some)
     }
 
+    pub fn create_layer(
+        &mut self,
+        name: impl Into<String>,
+    ) -> Result<
+        (crate::document::LayerId, GpuResidentMetadataCommit),
+        Box<GpuResidentMetadataEditFailure>,
+    > {
+        let edit = match self.metadata.prepare_create_layer(name) {
+            Ok(edit) => edit,
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        let layer = edit.layer();
+        self.apply_metadata_edit(edit).map(|commit| (layer, commit))
+    }
+
     pub fn set_layer_opacity(
         &mut self,
         layer: crate::document::LayerId,
@@ -1850,6 +1865,48 @@ mod tests {
         assert!(document.metadata().layers()[0].visible());
         assert_eq!(document.history().undo_depth(), 0);
         assert_eq!(document.recovery().revision(), DocumentRevision::INITIAL);
+    }
+
+    #[test]
+    fn empty_layer_creation_is_reversible_without_raster_or_mirror_work() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let original = document.metadata().active_layer();
+
+        let (created, commit) = document.create_layer("Ink").unwrap();
+        assert_ne!(created, original);
+        assert_eq!(document.metadata().active_layer(), created);
+        assert_eq!(document.metadata().layers().len(), 2);
+        assert_eq!(document.metadata().layers()[1].name(), "Ink");
+        assert_eq!(document.atlas().resident_tile_count(), 0);
+        assert_eq!(document.mirror().pending_revision_count(), 0);
+        assert_eq!(document.recovery().revision(), commit.revision);
+
+        document.set_active_layer(original).unwrap();
+        let undone = document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("creation is undoable after selection changes");
+        assert_eq!(undone.history_id, commit.history_id);
+        assert_eq!(document.metadata().layers().len(), 1);
+        assert_eq!(document.metadata().active_layer(), original);
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Redo)
+            .unwrap()
+            .expect("creation is redoable");
+        assert_eq!(document.metadata().layers().len(), 2);
+        assert_eq!(document.metadata().active_layer(), created);
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap();
+        let (newer, _) = document.create_layer("Paint").unwrap();
+        assert!(
+            newer.get() > created.get(),
+            "undone layer IDs are not reused"
+        );
+        assert_eq!(document.history().redo_depth(), 0);
     }
 
     #[test]

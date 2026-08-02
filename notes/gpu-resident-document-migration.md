@@ -271,7 +271,9 @@ split for explicit target rollback. The historical paragraph above describes
 the pre-cutover owner. Raster submission, mapped-readback driving,
 presentation, save/export, active-layer selection, and the first revisioned
 metadata controls are now live; remaining structural work is layer
-creation/deletion/duplication/rename and import.
+deletion/duplication/rename and import. Empty layer creation is also live as a
+metadata-only presence edit: it allocates a stable monotonic ID but no atlas
+resident, and the same edit removes/reinserts that identity during undo/redo.
 
 Undo and redo now enter that owner through a second prepared transaction. GPU
 history can name the next undo/redo ID without removing it, allowing recovery

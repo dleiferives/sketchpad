@@ -1872,7 +1872,21 @@ impl App {
     }
 
     fn create_layer(&mut self) {
-        if self.active_stroke.is_some() || self.reject_legacy_document_action("create layer") {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            let ordinal = resident.document.metadata().layers().len() + 1;
+            match resident.document.create_layer(format!("Layer {ordinal}")) {
+                Ok((layer, _)) => {
+                    log::info!("created resident layer {}", layer.get());
+                    self.mark_document_dirty();
+                }
+                Err(failure) => log::error!("could not create resident layer: {failure}"),
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("create layer") {
             return;
         }
         let name = format!("Layer {}", self.document.layers().len() + 1);

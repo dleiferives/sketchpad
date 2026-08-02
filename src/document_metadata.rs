@@ -39,12 +39,20 @@ pub struct DocumentMetadata {
     height: u32,
     tile_size: u32,
     active_layer: LayerId,
+    next_layer_id: u64,
     layers: Arc<[DocumentLayerMetadata]>,
     retained_byte_len: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DocumentMetadataEdit {
+    Presence {
+        layer: DocumentLayerMetadata,
+        index: usize,
+        before_active: LayerId,
+        after_active: LayerId,
+        present_after: bool,
+    },
     Visibility {
         layer: LayerId,
         before: bool,
@@ -71,14 +79,21 @@ pub enum DocumentMetadataEditDirection {
 impl DocumentMetadataEdit {
     pub const fn layer(&self) -> LayerId {
         match self {
+            Self::Presence { layer, .. } => layer.id,
             Self::Visibility { layer, .. }
             | Self::Opacity { layer, .. }
             | Self::Move { layer, .. } => *layer,
         }
     }
 
-    pub const fn retained_byte_len(&self) -> u64 {
-        size_of::<Self>() as u64
+    pub fn retained_byte_len(&self) -> u64 {
+        let name_bytes = match self {
+            Self::Presence { layer, .. } => layer.name.len() as u64,
+            _ => 0,
+        };
+        (size_of::<Self>() as u64)
+            .checked_add(name_bytes)
+            .expect("one metadata edit fits in addressable memory")
     }
 }
 
@@ -100,6 +115,7 @@ impl DocumentMetadata {
             document.height(),
             document.tile_size(),
             document.active_layer_id(),
+            document.next_layer_id_raw(),
             layers,
         )
     }
@@ -123,6 +139,7 @@ impl DocumentMetadata {
             height,
             tile_size,
             active_layer,
+            2,
             vec![DocumentLayerMetadata {
                 id: active_layer,
                 name: "Layer 1".to_owned(),
@@ -138,6 +155,7 @@ impl DocumentMetadata {
         height: u32,
         tile_size: u32,
         active_layer: LayerId,
+        next_layer_id: u64,
         layers: Vec<DocumentLayerMetadata>,
     ) -> Self {
         let name_bytes = layers
@@ -163,6 +181,7 @@ impl DocumentMetadata {
             height,
             tile_size,
             active_layer,
+            next_layer_id,
             layers: layers.into(),
             retained_byte_len,
         }
@@ -228,6 +247,37 @@ impl DocumentMetadata {
         }))
     }
 
+    pub fn prepare_create_layer(
+        &self,
+        name: impl Into<String>,
+    ) -> Result<DocumentMetadataEdit, DocumentMetadataError> {
+        let name = name.into();
+        if name.trim().is_empty() {
+            return Err(DocumentMetadataError::EmptyLayerName);
+        }
+        let next_layer_id = self
+            .next_layer_id
+            .checked_add(1)
+            .ok_or(DocumentMetadataError::LayerIdExhausted)?;
+        let id = LayerId::from_raw(self.next_layer_id);
+        if id.get() == 0 || self.layers.iter().any(|layer| layer.id == id) {
+            return Err(DocumentMetadataError::LayerIdExhausted);
+        }
+        debug_assert_ne!(next_layer_id, 0);
+        Ok(DocumentMetadataEdit::Presence {
+            layer: DocumentLayerMetadata {
+                id,
+                name,
+                visible: true,
+                opacity: 1.0,
+            },
+            index: self.require_layer_index(self.active_layer)? + 1,
+            before_active: self.active_layer,
+            after_active: id,
+            present_after: true,
+        })
+    }
+
     pub fn prepare_layer_opacity(
         &self,
         layer: LayerId,
@@ -274,6 +324,50 @@ impl DocumentMetadata {
         }
         let mut layers = self.layers.to_vec();
         match edit {
+            DocumentMetadataEdit::Presence {
+                layer,
+                index,
+                before_active,
+                after_active,
+                present_after,
+            } => {
+                let (replacement_active, should_be_present) = match direction {
+                    DocumentMetadataEditDirection::Forward => (*after_active, *present_after),
+                    DocumentMetadataEditDirection::Reverse => (*before_active, !*present_after),
+                };
+                if should_be_present {
+                    if *index > layers.len() {
+                        return Err(DocumentMetadataError::LayerIndexOutOfBounds(*index));
+                    }
+                    if layers.iter().any(|candidate| candidate.id == layer.id) {
+                        return Err(DocumentMetadataError::DuplicateLayer(layer.id));
+                    }
+                    layers.insert(*index, layer.clone());
+                    if self.next_layer_id <= layer.id.get() {
+                        self.next_layer_id = layer
+                            .id
+                            .get()
+                            .checked_add(1)
+                            .ok_or(DocumentMetadataError::LayerIdExhausted)?;
+                    }
+                } else {
+                    if layers.len() == 1 {
+                        return Err(DocumentMetadataError::CannotDeleteLastLayer);
+                    }
+                    let actual = self.require_layer_index(layer.id)?;
+                    if actual != *index || layers[actual] != *layer {
+                        return Err(DocumentMetadataError::EditStateChanged(layer.id));
+                    }
+                    layers.remove(actual);
+                }
+                if !layers
+                    .iter()
+                    .any(|candidate| candidate.id == replacement_active)
+                {
+                    return Err(DocumentMetadataError::MissingLayer(replacement_active));
+                }
+                self.active_layer = replacement_active;
+            }
             DocumentMetadataEdit::Visibility {
                 layer,
                 before,
@@ -363,6 +457,10 @@ pub enum DocumentMetadataError {
     EmptyCanvas,
     InvalidTileSize,
     MissingLayer(LayerId),
+    DuplicateLayer(LayerId),
+    EmptyLayerName,
+    LayerIdExhausted,
+    CannotDeleteLastLayer,
     InvalidOpacity,
     LayerIndexOutOfBounds(usize),
     RevisionNotNext {
@@ -379,6 +477,16 @@ impl fmt::Display for DocumentMetadataError {
             Self::InvalidTileSize => write!(formatter, "document metadata requires a tile size"),
             Self::MissingLayer(layer) => {
                 write!(formatter, "document metadata has no layer {}", layer.get())
+            }
+            Self::DuplicateLayer(layer) => {
+                write!(formatter, "document metadata repeats layer {}", layer.get())
+            }
+            Self::EmptyLayerName => write!(formatter, "document metadata layer name is empty"),
+            Self::LayerIdExhausted => {
+                write!(formatter, "document metadata layer IDs are exhausted")
+            }
+            Self::CannotDeleteLastLayer => {
+                write!(formatter, "document metadata cannot delete its last layer")
             }
             Self::InvalidOpacity => write!(formatter, "document metadata opacity is invalid"),
             Self::LayerIndexOutOfBounds(index) => {
@@ -554,5 +662,35 @@ mod tests {
         assert_eq!(metadata.layers()[0].id(), first);
         assert_eq!(metadata.layers()[1].id(), second);
         assert_eq!(metadata.active_layer(), second);
+    }
+
+    #[test]
+    fn reversible_presence_keeps_stable_identity_and_monotonic_allocation() {
+        let mut metadata =
+            DocumentMetadata::new_blank(64, 64, 16, DocumentRevision::INITIAL).unwrap();
+        let original = metadata.active_layer();
+        let edit = metadata.prepare_create_layer("Ink").unwrap();
+        let created = edit.layer();
+        let revision_1 = metadata.revision().checked_next().unwrap();
+        metadata
+            .apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision_1)
+            .unwrap();
+        assert_eq!(metadata.layers().len(), 2);
+        assert_eq!(metadata.active_layer(), created);
+
+        metadata.set_active_layer(original).unwrap();
+        let revision_2 = revision_1.checked_next().unwrap();
+        metadata
+            .apply_edit(&edit, DocumentMetadataEditDirection::Reverse, revision_2)
+            .unwrap();
+        assert_eq!(metadata.layers().len(), 1);
+        assert_eq!(metadata.active_layer(), original);
+
+        let next = metadata.prepare_create_layer("Paint").unwrap();
+        assert!(next.layer().get() > created.get());
+        assert!(matches!(
+            metadata.prepare_create_layer("   "),
+            Err(DocumentMetadataError::EmptyLayerName)
+        ));
     }
 }

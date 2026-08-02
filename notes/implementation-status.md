@@ -43,7 +43,14 @@ raster boundary before advancing across the metadata revision, preventing a
 later revision label from being paired with an earlier raster transition. The
 existing panel and key commands now call this resident path.
 
-During this transition, natural brushes, layer creation/deletion/duplication,
+Empty layer creation is live through the same presence-edit representation.
+It inserts above the active layer, selects a monotonic stable ID, advances one
+metadata/recovery revision, and allocates no raster tile or mirror capture.
+Undo removes that metadata and redo restores the same ID; selection-only
+changes between creation and undo do not invalidate the command. Branching
+after the undo allocates a newer ID rather than reusing the unreachable one.
+
+During this transition, natural brushes, layer deletion/duplication/rename,
 PNG import, and color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.

@@ -272,6 +272,10 @@ impl Document {
         self.active_layer
     }
 
+    pub(crate) const fn next_layer_id_raw(&self) -> u64 {
+        self.next_layer_id
+    }
+
     pub fn active_layer_index(&self) -> usize {
         self.layer_index(self.active_layer)
             .expect("the active layer must belong to the document")
