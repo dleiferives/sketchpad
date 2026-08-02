@@ -1,6 +1,7 @@
 use sketchpad::{
     document::Document,
     gpu_atlas::{AtlasLayout, AtlasPageId, LayerTileKey, SparseAtlasPlanner},
+    gpu_document_history::{GpuDocumentHistory, GpuHistoryDirection},
     gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
     gpu_document_undo::GpuDocumentMemento,
     gpu_round::RoundMaskScheduler,
@@ -41,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut scheduler = RoundMaskScheduler::new([PAGE_SIZE; 2], layer, layout)?;
     let mut mask = RoundMaskTarget::new(&device, layout)?;
     let mut color = GpuDocumentTarget::new(&device, layout)?;
+    let mut history = GpuDocumentHistory::new(8, 1024 * 1024)?;
 
     let first = contact([64.0, 64.0], 8.0, 0);
     let last = contact([192.0, 64.0], 8.0, 1);
@@ -81,7 +83,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("the painted stroke unexpectedly produced no commit")?;
     let paint_stats = encoded_paint.stats();
     queue.submit(iter::once(paint_encoder.finish()));
-    let mut paint_memento = color.commit_submitted_with_memento(encoded_paint)?;
+    let paint_memento = color.commit_submitted_with_memento(encoded_paint)?;
+    let paint_record = history
+        .record(&mut atlas, paint_memento)
+        .map_err(|failure| failure.error.to_string())?;
+    if paint_record.id.get() != 1 || !paint_record.evicted.is_empty() {
+        return Err("unexpected first GPU history record".into());
+    }
 
     let eraser_contact = contact([64.0, 64.0], 4.0, 3);
     let eraser_batch = scheduler.schedule(
@@ -148,16 +156,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     queue.submit(iter::once(erase_encoder.finish()));
-    let mut erase_memento = color.commit_submitted_with_memento(encoded_erase)?;
+    let erase_memento = color.commit_submitted_with_memento(encoded_erase)?;
+    let erase_record = history
+        .record(&mut atlas, erase_memento)
+        .map_err(|failure| failure.error.to_string())?;
+    if erase_record.id.get() != 2 || !erase_record.evicted.is_empty() {
+        return Err("unexpected second GPU history record".into());
+    }
 
     let color_bytes = map_readback(&device, &color_readback)?;
 
+    let left_key = LayerTileKey::new(layer, TileCoord::new(0, 0));
+    let right_key = LayerTileKey::new(layer, TileCoord::new(1, 0));
     let left_slot = atlas
-        .slot(LayerTileKey::new(layer, TileCoord::new(0, 0)))
+        .slot(left_key)
         .expect("the painted left tile must remain resident");
     let right_slot = atlas
-        .slot(LayerTileKey::new(layer, TileCoord::new(1, 0)))
+        .slot(right_key)
         .expect("the painted right tile must remain resident");
+    if history.resident_bytes() != 98_304
+        || history.undo_depth() != 2
+        || history.redo_depth() != 0
+        || atlas.pin_count(left_key) != 2
+        || atlas.pin_count(right_key) != 1
+    {
+        return Err("GPU history budget or atlas pins do not match two commits".into());
+    }
     let erased = read_color(
         &color_bytes,
         color_bytes_per_row,
@@ -188,13 +212,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     expect_color("retained right sweep", retained_right, [0.1, 0.2, 0.4, 0.5])?;
     expect_color("cleared outside", transparent, [0.0; 4])?;
 
-    let (undo_erase_stats, after_undo_erase) = swap_and_read(
-        &device,
-        &queue,
-        &mut color,
-        &mut erase_memento,
+    let swap_readback = SwapReadback {
+        device: &device,
+        queue: &queue,
         page,
-        color_bytes_per_row,
+        bytes_per_row: color_bytes_per_row,
+    };
+    let (undo_erase_stats, after_undo_erase) = history_swap_and_read(
+        &swap_readback,
+        &mut color,
+        &mut history,
+        GpuHistoryDirection::Undo,
         "GPU Document Commit Smoke Undo Erase",
     )?;
     expect_color(
@@ -208,13 +236,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         [0.1, 0.2, 0.4, 0.5],
     )?;
 
-    let (undo_paint_stats, after_undo_paint) = swap_and_read(
-        &device,
-        &queue,
+    let (undo_paint_stats, after_undo_paint) = history_swap_and_read(
+        &swap_readback,
         &mut color,
-        &mut paint_memento,
-        page,
-        color_bytes_per_row,
+        &mut history,
+        GpuHistoryDirection::Undo,
         "GPU Document Commit Smoke Undo Paint",
     )?;
     for (label, x, y) in [
@@ -241,13 +267,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?;
     }
 
-    let (redo_paint_stats, after_redo_paint) = swap_and_read(
-        &device,
-        &queue,
+    let (redo_paint_stats, after_redo_paint) = history_swap_and_read(
+        &swap_readback,
         &mut color,
-        &mut paint_memento,
-        page,
-        color_bytes_per_row,
+        &mut history,
+        GpuHistoryDirection::Redo,
         "GPU Document Commit Smoke Redo Paint",
     )?;
     expect_color(
@@ -261,13 +285,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         [0.1, 0.2, 0.4, 0.5],
     )?;
 
-    let (redo_erase_stats, after_redo_erase) = swap_and_read(
-        &device,
-        &queue,
+    let (redo_erase_stats, after_redo_erase) = history_swap_and_read(
+        &swap_readback,
         &mut color,
-        &mut erase_memento,
-        page,
-        color_bytes_per_row,
+        &mut history,
+        GpuHistoryDirection::Redo,
         "GPU Document Commit Smoke Redo Erase",
     )?;
     expect_color(
@@ -280,6 +302,17 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
         [0.075, 0.15, 0.3, 0.375],
     )?;
+    if history.undo_depth() != 2 || history.redo_depth() != 0 {
+        return Err("GPU undo/redo history depths did not round-trip".into());
+    }
+    let cleared_history = history.clear(&mut atlas)?;
+    if cleared_history.len() != 2
+        || history.resident_bytes() != 0
+        || atlas.pin_count(left_key) != 0
+        || atlas.pin_count(right_key) != 0
+    {
+        return Err("clearing GPU history did not release its byte budget and pins".into());
+    }
 
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
@@ -346,6 +379,51 @@ fn require_format_support(adapter: &wgpu::Adapter) -> Result<(), Box<dyn Error>>
         }
     }
     Ok(())
+}
+
+struct SwapReadback<'a> {
+    device: &'a wgpu::Device,
+    queue: &'a wgpu::Queue,
+    page: AtlasPageId,
+    bytes_per_row: u32,
+}
+
+fn history_swap_and_read(
+    readback: &SwapReadback<'_>,
+    color: &mut GpuDocumentTarget,
+    history: &mut GpuDocumentHistory,
+    direction: GpuHistoryDirection,
+    label: &str,
+) -> Result<(GpuUndoSwapStats, Vec<u8>), Box<dyn Error>> {
+    let began = match direction {
+        GpuHistoryDirection::Undo => history.begin_undo()?,
+        GpuHistoryDirection::Redo => history.begin_redo()?,
+    };
+    if !began {
+        return Err(format!("no {direction:?} entry was available").into());
+    }
+    let result = {
+        let memento = history.pending_memento_mut()?;
+        swap_and_read(
+            readback.device,
+            readback.queue,
+            color,
+            memento,
+            readback.page,
+            readback.bytes_per_row,
+            label,
+        )
+    };
+    match result {
+        Ok(readback) => {
+            history.finish_pending()?;
+            Ok(readback)
+        }
+        Err(error) => {
+            history.cancel_pending()?;
+            Err(error)
+        }
+    }
 }
 
 fn swap_and_read(

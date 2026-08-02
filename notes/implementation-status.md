@@ -64,9 +64,10 @@ encoded commit is submitted or discarded. Live presentation, optical-density
 accumulation, document-history sequencing, allocation/occupancy restoration,
 and application cutover are not connected yet.
 
-Exact GPU pixel undo now has a deterministic copy planner and backing buffers,
-but not yet its live history command. Each conservative tile-local damage rectangle
-rounds outward to `16 x 16` full-float blocks. One block is exactly 4 KiB, and
+Exact GPU pixel undo now has a deterministic copy planner, backing buffers,
+and a non-live bounded history owner. Each conservative tile-local damage
+rectangle rounds outward to `16 x 16` full-float blocks. One block is exactly
+4 KiB, and
 its 16-pixel `Rgba32Float` row is exactly WebGPU's 256-byte copy-row alignment.
 Adjacent selected blocks for one tile coalesce into one rectangular copy
 region: a full 128-pixel tile remains 64 accounting blocks / 256 KiB but needs
@@ -85,16 +86,28 @@ then replaces the memento with the prior current pixels. The same operation is
 therefore exact redo on its next invocation. A pending commit or swap blocks
 shared-resource reuse, and a swap fails before encoding if any physical slot
 no longer names the recorded logical resident. GPU history budgeting, slot
-pinning, absent-tile occupancy exchange, revision commands, and CPU spill are
-the remaining history layer above this pixel-exchange primitive.
+pinning, and swap sequencing now exist below the application boundary;
+absent-tile occupancy exchange, revision commands, CPU spill, and live history
+integration remain.
 
 The sparse atlas now has checked reference-counted history pins as the first
 part of that layer. A memento can pin its exact logical resident/physical-slot
 pair; neither single-tile nor whole-layer release can recycle a pinned slot.
 Whole-layer release validates every key before mutation, so encountering one
 pin cannot partially release its siblings. The last unpin restores ordinary
-slot reclamation. No live path creates these pins yet; the history owner is
-the next connection.
+slot reclamation. The non-live GPU history owner now creates one pin per
+memento resident, keeps pins while an entry moves between undo and redo, and
+releases them on branch clearing, budget eviction, or explicit history clear.
+
+That owner defaults to the declared 256 entries / 64 MiB. A new command clears
+redo and returns its evicted mementos for the future exact CPU-spill path; byte
+or entry pressure evicts oldest undo commands deterministically. A memento
+larger than the entire budget is returned unchanged rather than silently
+dropping undo. Undo and redo move through an explicit pending state: successful
+GPU submission finishes the move, while encoding/submission discard can put
+the exact command back on its original side. Recording during a pending swap
+is rejected. Pure tests cover branch clearing order, both budgets, oversize
+rejection, and finish/cancel behavior.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
@@ -133,6 +146,14 @@ and redo erase. Every checked pixel matched its original full-float value at
 every state. Each swap transfers three times its stored bytes because it
 captures current pixels, restores target pixels, and replaces the memento;
 that traffic is a correctness counter, not a benchmark result.
+
+The same smoke now records those two real GPU buffers in the bounded owner.
+Their resident total is 98,304 bytes. Paint pins both tile residents, eraser
+adds a second pin to the left tile, and the complete undo/redo sequence moves
+the entries without changing either byte accounting or pin counts. Explicit
+history clear returns both entries, reports zero resident history bytes, and
+releases all three atlas pins. The pixel assertions remain exact after routing
+through the pending history protocol.
 
 ## Current Executable
 
