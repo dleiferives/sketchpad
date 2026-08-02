@@ -125,6 +125,13 @@ owner can use that preview to check recovery-spill replacement, journal space,
 and mirror capacity while the encoded commit is still discardable; successful
 submission must produce the same ID and eviction sequence.
 
+The encoded color-commit token exposes its memento only by immutable borrow.
+That permits history preview and source/target readback planning without
+releasing ownership before submission. Mirror dispatch likewise validates
+reconciler source/target ordering, geometry, capture identity, snapshot budget,
+and staging budget without registering the plan. Enqueue after submission
+reuses that complete check.
+
 The spill owner accepts that predicted eviction set as one replacement
 operation. It first proves that every evicted ID is unique and still tracked,
 that the proposed ID and consecutive revision pair are unused, and that the

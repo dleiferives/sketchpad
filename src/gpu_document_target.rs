@@ -122,6 +122,10 @@ impl EncodedGpuDocumentCommit {
     pub const fn undo_byte_len(&self) -> u64 {
         self.memento.byte_len()
     }
+
+    pub const fn memento(&self) -> &GpuDocumentMemento {
+        &self.memento
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

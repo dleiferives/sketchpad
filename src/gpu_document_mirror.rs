@@ -1008,6 +1008,22 @@ impl GpuMirrorReconciler {
         &mut self,
         plan: &GpuMirrorReadbackPlan,
     ) -> Result<(), GpuMirrorReconcileError> {
+        self.check_register_plan(plan)?;
+        self.pending.push_back(PendingMirrorRevision {
+            revision: plan.revision(),
+            expected_batches: plan.batches().to_vec(),
+            batches: std::iter::repeat_with(|| None)
+                .take(plan.batches().len())
+                .collect(),
+        });
+        self.latest_registered = plan.revision();
+        Ok(())
+    }
+
+    pub fn check_register_plan(
+        &self,
+        plan: &GpuMirrorReadbackPlan,
+    ) -> Result<(), GpuMirrorReconcileError> {
         if plan.layout().tile_size() != self.mirror.tile_size {
             return Err(GpuMirrorReconcileError::TileSizeMismatch {
                 expected: self.mirror.tile_size,
@@ -1035,14 +1051,6 @@ impl GpuMirrorReconciler {
             }
         }
         self.mirror.validate_plan(plan)?;
-        self.pending.push_back(PendingMirrorRevision {
-            revision: plan.revision(),
-            expected_batches: plan.batches().to_vec(),
-            batches: std::iter::repeat_with(|| None)
-                .take(plan.batches().len())
-                .collect(),
-        });
-        self.latest_registered = plan.revision();
         Ok(())
     }
 
@@ -1767,7 +1775,11 @@ mod tests {
         let (second, _) = one_tile_plan(2, true);
         let mut reconciler =
             GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.check_register_plan(&first).unwrap();
+        assert_eq!(reconciler.pending_revision_count(), 0);
         reconciler.register_plan(&first).unwrap();
+        reconciler.check_register_plan(&second).unwrap();
+        assert_eq!(reconciler.pending_revision_count(), 1);
         reconciler.register_plan(&second).unwrap();
 
         assert!(reconciler

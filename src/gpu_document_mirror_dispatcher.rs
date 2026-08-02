@@ -96,6 +96,23 @@ impl GpuMirrorDispatcher {
         Ok(())
     }
 
+    pub fn check_plan(&self, plan: &GpuMirrorReadbackPlan) -> Result<(), GpuMirrorDispatchError> {
+        self.check_capacity(plan)?;
+        self.reconciler.check_register_plan(plan)?;
+        Ok(())
+    }
+
+    pub fn check_prepared_capture(
+        &self,
+        plan: &GpuMirrorReadbackPlan,
+        capture: &GpuMirrorRevisionCapture,
+    ) -> Result<(), GpuMirrorDispatchError> {
+        if !capture.matches_plan(plan) {
+            return Err(GpuMirrorDispatchError::CapturePlanMismatch);
+        }
+        self.check_plan(plan)
+    }
+
     pub fn enqueue(
         &mut self,
         plan: &GpuMirrorReadbackPlan,
@@ -107,21 +124,12 @@ impl GpuMirrorDispatcher {
                 capture,
             }));
         }
-        if !capture.matches_plan(plan) {
-            return Err(Box::new(GpuMirrorEnqueueFailure {
-                error: GpuMirrorDispatchError::CapturePlanMismatch,
-                capture,
-            }));
-        }
-        if let Err(error) = self.check_capacity(plan) {
+        if let Err(error) = self.check_prepared_capture(plan, &capture) {
             return Err(Box::new(GpuMirrorEnqueueFailure { error, capture }));
         }
-        if let Err(error) = self.reconciler.register_plan(plan) {
-            return Err(Box::new(GpuMirrorEnqueueFailure {
-                error: error.into(),
-                capture,
-            }));
-        }
+        self.reconciler
+            .register_plan(plan)
+            .expect("the mirror enqueue plan was checked before registration");
         self.resident_snapshot_bytes = self
             .resident_snapshot_bytes
             .checked_add(capture.byte_len())
@@ -500,6 +508,8 @@ mod tests {
             GpuMirrorDispatcher::new(128, 128, 128, DocumentRevision::INITIAL, 16_384, 8_192)
                 .unwrap();
         assert!(exact.check_capacity(&plan).is_ok());
+        assert!(exact.check_plan(&plan).is_ok());
+        assert_eq!(exact.pending_revision_count(), 0);
 
         let snapshot_too_small =
             GpuMirrorDispatcher::new(128, 128, 128, DocumentRevision::INITIAL, 8_192, 8_192)

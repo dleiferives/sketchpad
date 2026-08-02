@@ -72,6 +72,15 @@ impl GpuHistoryRecordPreview {
     pub fn evicted_ids(&self) -> &[GpuHistoryId] {
         &self.evicted_ids
     }
+
+    pub fn matches_record(&self, record: &GpuHistoryRecord) -> bool {
+        self.id == record.id
+            && self
+                .evicted_ids
+                .iter()
+                .copied()
+                .eq(record.evicted.iter().map(GpuHistoryEntry::id))
+    }
 }
 
 pub struct GpuHistoryRecordFailure {

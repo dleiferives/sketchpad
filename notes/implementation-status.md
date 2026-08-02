@@ -130,6 +130,16 @@ before submitting GPU work rather than discovering a recoverability failure
 after pixels are visible. Pure tests cover combined redo clearing, oldest-undo
 eviction, stable ordering, pin mismatch, and absence of preflight mutation.
 
+The encoded GPU color-commit token now lends its still-owned memento for that
+preflight. History can derive its stable ID/eviction preview and mirror code can
+derive exact source/target batches before target submission acknowledges the
+token. Mirror reconciliation and dispatch now expose non-mutating full-plan
+checks in addition to raw byte-capacity checks; they validate revision source,
+target ordering, tile geometry, batch identity, capture identity, snapshot
+budget, and staging budget without registering work. Enqueue reuses the same
+check after capture submission. Tests prove the preview leaves reconciler and
+dispatcher queues empty.
+
 The recovery-spill owner now previews and commits the corresponding ID
 replacement as one operation. It rejects repeated or untracked eviction IDs,
 duplicate new identity, nonconsecutive revisions, and post-eviction entry
