@@ -1,5 +1,9 @@
 use crate::{
     document::{DocumentRevision, LayerId},
+    gpu_layer_recovery::{
+        replay_exact_layer_recovery_command, GpuExactLayerRecoveryCommand,
+        GpuExactLayerRecoveryReplayError,
+    },
     gpu_raster_recovery::{
         replay_exact_raster_recovery_command, GpuExactRasterRecoveryCommand,
         GpuExactRasterRecoveryReplayError,
@@ -16,6 +20,7 @@ use std::{error::Error, fmt, mem::size_of};
 pub enum GpuRasterRecoveryCommand {
     Round(GpuRoundRecoveryCommand),
     Exact(GpuExactRasterRecoveryCommand),
+    LayerSnapshot(GpuExactLayerRecoveryCommand),
     MetadataOnly,
 }
 
@@ -24,6 +29,7 @@ impl GpuRasterRecoveryCommand {
         match self {
             Self::Round(command) => Some(command.layer()),
             Self::Exact(command) => Some(command.layer()),
+            Self::LayerSnapshot(command) => Some(command.layer()),
             Self::MetadataOnly => None,
         }
     }
@@ -36,6 +42,10 @@ impl GpuRasterRecoveryCommand {
             ),
             Self::Exact(command) => (
                 size_of::<GpuExactRasterRecoveryCommand>() as u64,
+                command.retained_byte_len(),
+            ),
+            Self::LayerSnapshot(command) => (
+                size_of::<GpuExactLayerRecoveryCommand>() as u64,
                 command.retained_byte_len(),
             ),
             Self::MetadataOnly => (size_of::<Self>() as u64, size_of::<Self>() as u64),
@@ -56,6 +66,12 @@ impl From<GpuRoundRecoveryCommand> for GpuRasterRecoveryCommand {
 impl From<GpuExactRasterRecoveryCommand> for GpuRasterRecoveryCommand {
     fn from(command: GpuExactRasterRecoveryCommand) -> Self {
         Self::Exact(command)
+    }
+}
+
+impl From<GpuExactLayerRecoveryCommand> for GpuRasterRecoveryCommand {
+    fn from(command: GpuExactLayerRecoveryCommand) -> Self {
+        Self::LayerSnapshot(command)
     }
 }
 
@@ -96,6 +112,16 @@ pub fn replay_gpu_raster_recovery(
                 if let Some(command_damage) = replay.damage {
                     merge_damage(&mut damage, &command_damage);
                 }
+            }
+            GpuRasterRecoveryCommand::LayerSnapshot(command) => {
+                let replay = replay_exact_layer_recovery_command(layer, &mut raster, command)?;
+                stats.layer_snapshots_applied = stats.layer_snapshots_applied.saturating_add(1);
+                stats.snapshot_tiles_installed = stats
+                    .snapshot_tiles_installed
+                    .saturating_add(replay.tiles_installed);
+                stats.snapshot_tiles_discarded = stats
+                    .snapshot_tiles_discarded
+                    .saturating_add(replay.previous_tiles_discarded);
             }
             GpuRasterRecoveryCommand::MetadataOnly => {
                 unreachable!("metadata-only recovery commands were skipped before dispatch")
@@ -151,6 +177,9 @@ pub struct GpuRasterRecoveryStats {
     pub pixels_changed: u64,
     pub tiles_written: u32,
     pub tiles_removed: u32,
+    pub layer_snapshots_applied: u32,
+    pub snapshot_tiles_installed: u32,
+    pub snapshot_tiles_discarded: u32,
 }
 
 #[derive(Debug)]
@@ -158,6 +187,7 @@ pub enum GpuRasterRecoveryReplayError {
     Raster(RasterError),
     Round(GpuRoundRecoveryReplayError),
     Exact(GpuExactRasterRecoveryReplayError),
+    LayerSnapshot(GpuExactLayerRecoveryReplayError),
 }
 
 impl fmt::Display for GpuRasterRecoveryReplayError {
@@ -166,6 +196,7 @@ impl fmt::Display for GpuRasterRecoveryReplayError {
             Self::Raster(error) => error.fmt(formatter),
             Self::Round(error) => error.fmt(formatter),
             Self::Exact(error) => error.fmt(formatter),
+            Self::LayerSnapshot(error) => error.fmt(formatter),
         }
     }
 }
@@ -176,6 +207,7 @@ impl Error for GpuRasterRecoveryReplayError {
             Self::Raster(error) => Some(error),
             Self::Round(error) => Some(error),
             Self::Exact(error) => Some(error),
+            Self::LayerSnapshot(error) => Some(error),
         }
     }
 }
@@ -198,15 +230,22 @@ impl From<GpuExactRasterRecoveryReplayError> for GpuRasterRecoveryReplayError {
     }
 }
 
+impl From<GpuExactLayerRecoveryReplayError> for GpuRasterRecoveryReplayError {
+    fn from(error: GpuExactLayerRecoveryReplayError) -> Self {
+        Self::LayerSnapshot(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
         gpu_atlas::LayerTileKey,
         gpu_document_mirror::{GpuCpuMirror, GpuMirrorPatchRegion},
+        gpu_layer_recovery::GpuExactLayerRecoveryCommand,
         gpu_raster_recovery::GpuExactRasterRecoveryCommand,
         gpu_recovery_timeline::GpuRecoveryTimeline,
-        raster::{LinearRgba, RectU32, TileCoord},
+        raster::{LinearRgba, RasterLayer, RectU32, TileCoord},
         stroke::{RoundBrushRecipeV1, RoundContact, RoundPathCommand, StrokeMaterial},
     };
 
@@ -310,5 +349,31 @@ mod tests {
         assert_eq!(recovered.stats().commands_applied, 2);
         assert_eq!(recovered.stats().commands_skipped, 1);
         assert_eq!(recovered.stats().tiles_removed, 1);
+    }
+
+    #[test]
+    fn exact_layer_snapshot_can_seed_later_semantic_strokes() {
+        let layer = LayerId::from_raw(4);
+        let imported = LinearRgba::premultiplied(0.1, 0.2, 0.3, 0.75);
+        let mut source = RasterLayer::new(32, 32, 16).unwrap();
+        let gesture = source.begin_gesture().unwrap();
+        source.set_pixel(gesture, 20, 4, imported).unwrap();
+        source.commit_gesture(gesture).unwrap();
+        let snapshot = GpuExactLayerRecoveryCommand::from_raster(layer, &source).unwrap();
+        let mut timeline = GpuRecoveryTimeline::new(empty_base(), 8, 1_000_000).unwrap();
+        record(&mut timeline, 1, snapshot);
+        record(&mut timeline, 2, dot(layer, [1.0, 0.0, 0.0]));
+
+        let recovered = replay_gpu_raster_recovery(&timeline.snapshot(), layer).unwrap();
+
+        assert_eq!(recovered.raster().pixel(20, 4), Some(imported));
+        assert_ne!(
+            recovered.raster().pixel(8, 8),
+            Some(LinearRgba::TRANSPARENT)
+        );
+        assert_eq!(recovered.stats().layer_snapshots_applied, 1);
+        assert_eq!(recovered.stats().snapshot_tiles_installed, 1);
+        assert_eq!(recovered.stats().snapshot_tiles_discarded, 0);
+        assert_eq!(recovered.stats().commands_applied, 2);
     }
 }

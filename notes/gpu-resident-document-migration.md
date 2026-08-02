@@ -158,9 +158,20 @@ walking the global revision sequence, then discard the temporary CPU history.
 This makes interleaved raster layers deterministic. CPU-canonical metadata is
 captured immutably at the same target revision; structural-only revisions use
 explicit no-raster boundaries, and recovery rebuilds layer order/properties
-before recompositing an editable document. Imported/deleted raster ownership
-and the pre-map undo interval remain explicit incomplete cases rather than
-being mistaken for metadata problems.
+before recompositing an editable document.
+
+Imports, duplicates, and restoring a deleted layer use one additional forward
+transition: an exact sparse whole-layer snapshot. It retains canonical tile
+coordinates and shared full-float copy-on-write pixels, replaces the preceding
+layer state transactionally, and can seed later semantic strokes. A deletion
+needs no raster transition while the layer is absent, but its structural
+history must retain this exact snapshot so undo can reintroduce it even after
+the mirror base has advanced past the deletion. Capture rejects an active
+gesture and non-finite pixels, and journal accounting conservatively charges
+the complete logical tile storage even when references are shared.
+
+The pre-map GPU-only undo interval remains an explicit incomplete case rather
+than being mistaken for a metadata or layer-snapshot problem.
 
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered

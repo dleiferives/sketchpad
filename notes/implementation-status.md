@@ -284,10 +284,20 @@ layer-local pixels, and final revision. This also gives the background task
 queue a complete revision-tagged payload for the currently supported raster
 commands.
 
-Imported-layer pixels, undoing deletion across an already-advanced base, and
-an undo/redo result that has not finished mapping still need exact owned raster
-content or the older inverse-capable anchor. The metadata snapshot does not
-hide those content-ownership requirements.
+Exact sparse whole-layer ownership now covers imports, duplicates, and
+restoring a deleted layer. The typed command snapshots canonical tile order,
+shares immutable full-float pixel allocations, rejects mid-gesture and
+non-finite capture, conservatively accounts for the complete retained tile
+storage, and transactionally replaces the preceding layer before later
+semantic strokes replay. A loss simulation advances the mirror base through a
+deletion, then restores the missing layer from this command at the next
+revision. Another keeps imported pixels immutable while the live layer
+continues changing.
+
+Application integration must retain that payload in structural history and
+reuse it when an absent layer is restored. An undo/redo result that exists only
+on the GPU and has not finished mapping still needs the older inverse-capable
+anchor; the whole-layer payload does not hide that ownership requirement.
 
 The same immutable document payload can now build the existing layered
 checkpoint entirely off the live path. Worker-side reconstruction produces a

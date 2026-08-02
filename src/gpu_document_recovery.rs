@@ -185,6 +185,9 @@ impl GpuDocumentRecoverySnapshot {
             stats.pixels_changed = stats
                 .pixels_changed
                 .saturating_add(recovered.stats().pixels_changed);
+            stats.layer_snapshots_applied = stats
+                .layer_snapshots_applied
+                .saturating_add(recovered.stats().layer_snapshots_applied);
             parts.push(DocumentLayerParts {
                 id: layer.id,
                 name: layer.name.clone(),
@@ -275,6 +278,7 @@ pub struct GpuDocumentRecoveryStats {
     pub commands_applied: u64,
     pub pixels_evaluated: u64,
     pub pixels_changed: u64,
+    pub layer_snapshots_applied: u32,
 }
 
 pub struct GpuDocumentRecoverySnapshotFailure {
@@ -430,10 +434,11 @@ mod tests {
     use super::*;
     use crate::{
         gpu_document_mirror::GpuCpuMirror,
+        gpu_layer_recovery::GpuExactLayerRecoveryCommand,
         gpu_recovery_journal::GpuRecoveryJournalError,
         gpu_recovery_timeline::GpuRecoveryTimeline,
         gpu_round_recovery::GpuRoundRecoveryCommand,
-        raster::LinearRgba,
+        raster::{LinearRgba, RasterLayer},
         stroke::{RoundBrushRecipeV1, RoundContact, RoundPathCommand, StrokeMaterial},
     };
 
@@ -594,5 +599,109 @@ mod tests {
             failure.error,
             GpuDocumentRecoverySnapshotError::RevisionMismatch { .. }
         ));
+    }
+
+    #[test]
+    fn imported_sparse_layer_pixels_survive_loss_and_later_live_mutation() {
+        let original = LinearRgba::premultiplied(0.2, 0.4, 0.6, 0.8);
+        let later = LinearRgba::premultiplied(0.8, 0.4, 0.2, 0.8);
+        let mut document = Document::new(32, 32, 16).unwrap();
+        let mut imported = RasterLayer::new(32, 32, 16).unwrap();
+        let gesture = imported.begin_gesture().unwrap();
+        imported.set_pixel(gesture, 20, 4, original).unwrap();
+        imported.commit_gesture(gesture).unwrap();
+        let (imported_id, _) = document.insert_raster_layer("Imported", imported).unwrap();
+
+        let base = GpuCpuMirror::new(32, 32, 16, DocumentRevision::INITIAL)
+            .unwrap()
+            .snapshot();
+        let mut timeline = GpuRecoveryTimeline::new(base, 4, 1_000_000).unwrap();
+        let imported_snapshot = GpuExactLayerRecoveryCommand::from_raster(
+            imported_id,
+            document.layer_raster(imported_id).unwrap(),
+        )
+        .unwrap();
+        record(&mut timeline, document.revision(), imported_snapshot.into()).unwrap();
+        let snapshot = GpuDocumentRecoverySnapshot::new(
+            GpuDocumentMetadataSnapshot::from_document(&document),
+            timeline.snapshot(),
+        )
+        .unwrap();
+
+        let gesture = document.active_layer_mut().begin_gesture().unwrap();
+        document
+            .active_layer_mut()
+            .set_pixel(gesture, 20, 4, later)
+            .unwrap();
+        document.active_layer_mut().commit_gesture(gesture).unwrap();
+        document.record_active_raster_edit().unwrap();
+
+        let recovered = snapshot.recover_document().unwrap();
+        assert_eq!(
+            recovered.document().revision(),
+            DocumentRevision::from_raw(1)
+        );
+        assert_eq!(
+            recovered
+                .document()
+                .layer_raster(imported_id)
+                .unwrap()
+                .pixel(20, 4),
+            Some(original)
+        );
+        assert_eq!(
+            document.layer_raster(imported_id).unwrap().pixel(20, 4),
+            Some(later)
+        );
+        assert_eq!(recovered.stats().layer_snapshots_applied, 1);
+        assert_eq!(recovered.stats().commands_applied, 1);
+        assert_eq!(recovered.stats().command_visits, 2);
+    }
+
+    #[test]
+    fn exact_layer_snapshot_restores_a_deletion_after_the_base_advanced() {
+        let color = LinearRgba::premultiplied(0.4, 0.2, 0.1, 0.5);
+        let mut document = Document::new(32, 32, 16).unwrap();
+        let mut imported = RasterLayer::new(32, 32, 16).unwrap();
+        let gesture = imported.begin_gesture().unwrap();
+        imported.set_pixel(gesture, 20, 4, color).unwrap();
+        imported.commit_gesture(gesture).unwrap();
+        let (restored_id, _) = document.insert_raster_layer("Reference", imported).unwrap();
+        document.delete_layer(restored_id).unwrap();
+        assert_eq!(document.revision(), DocumentRevision::from_raw(2));
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.revision(), DocumentRevision::from_raw(3));
+
+        let base = GpuCpuMirror::new(32, 32, 16, DocumentRevision::from_raw(2))
+            .unwrap()
+            .snapshot();
+        let mut timeline = GpuRecoveryTimeline::new(base, 4, 1_000_000).unwrap();
+        let restored = GpuExactLayerRecoveryCommand::from_raster(
+            restored_id,
+            document.layer_raster(restored_id).unwrap(),
+        )
+        .unwrap();
+        record(&mut timeline, document.revision(), restored.into()).unwrap();
+        let snapshot = GpuDocumentRecoverySnapshot::new(
+            GpuDocumentMetadataSnapshot::from_document(&document),
+            timeline.snapshot(),
+        )
+        .unwrap();
+
+        let recovered = snapshot.recover_document().unwrap();
+        assert_eq!(
+            recovered.document().revision(),
+            DocumentRevision::from_raw(3)
+        );
+        assert_eq!(recovered.document().layers().len(), 2);
+        assert_eq!(
+            recovered
+                .document()
+                .layer_raster(restored_id)
+                .unwrap()
+                .pixel(20, 4),
+            Some(color)
+        );
+        assert_eq!(recovered.stats().layer_snapshots_applied, 1);
     }
 }
