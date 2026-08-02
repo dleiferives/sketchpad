@@ -5,6 +5,24 @@ use std::{collections::HashSet, error::Error, fmt, mem};
 
 pub const MAX_DOCUMENT_HISTORY_ENTRIES: usize = 256;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DocumentRevision(u64);
+
+impl DocumentRevision {
+    pub const INITIAL: Self = Self(0);
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    fn advance(&mut self) {
+        self.0 = self
+            .0
+            .checked_add(1)
+            .expect("document revision space is exhausted");
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct LayerId(u64);
 
@@ -67,6 +85,7 @@ pub struct Document {
     composite_stats: CompositeStats,
     history_undo: Vec<DocumentEdit>,
     history_redo: Vec<DocumentEdit>,
+    revision: DocumentRevision,
 }
 
 enum DocumentEdit {
@@ -131,6 +150,7 @@ impl Document {
             composite_stats: CompositeStats::default(),
             history_undo: Vec::new(),
             history_redo: Vec::new(),
+            revision: DocumentRevision::INITIAL,
         })
     }
 
@@ -161,6 +181,7 @@ impl Document {
             composite_stats: CompositeStats::default(),
             history_undo: Vec::new(),
             history_redo: Vec::new(),
+            revision: DocumentRevision::INITIAL,
         })
     }
 
@@ -217,6 +238,7 @@ impl Document {
             composite_stats: CompositeStats::default(),
             history_undo: Vec::new(),
             history_redo: Vec::new(),
+            revision: DocumentRevision::INITIAL,
         };
         document.recompose_all()?;
         document.reset_composite_stats();
@@ -279,6 +301,10 @@ impl Document {
 
     pub fn redo_depth(&self) -> usize {
         self.history_redo.len()
+    }
+
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
     }
 
     pub fn set_active_layer(&mut self, id: LayerId) -> Result<(), DocumentError> {
@@ -531,6 +557,7 @@ impl Document {
         match self.apply_edit(&mut edit, false) {
             Ok(damage) => {
                 self.history_redo.push(edit);
+                self.revision.advance();
                 Ok(Some(damage))
             }
             Err(error) => {
@@ -547,6 +574,7 @@ impl Document {
         match self.apply_edit(&mut edit, true) {
             Ok(damage) => {
                 self.history_undo.push(edit);
+                self.revision.advance();
                 Ok(Some(damage))
             }
             Err(error) => {
@@ -662,6 +690,7 @@ impl Document {
                 );
             }
         }
+        self.revision.advance();
     }
 
     fn clear_document_redo(&mut self) {
@@ -982,10 +1011,36 @@ mod tests {
     #[test]
     fn new_document_has_one_empty_active_layer() {
         let document = Document::new(32, 24, 8).unwrap();
+        assert_eq!(document.revision(), DocumentRevision::INITIAL);
         assert_eq!(document.layers().len(), 1);
         assert_eq!(document.layers()[0].id(), document.active_layer_id());
         assert_eq!(document.layers()[0].name(), "Layer 1");
         assert_eq!(document.composite().allocated_tile_count(), 0);
+    }
+
+    #[test]
+    fn revision_identifies_each_committed_state_transition() {
+        let mut document = Document::new(16, 16, 8).unwrap();
+        let layer = document.active_layer_id();
+
+        document.set_active_layer(layer).unwrap();
+        assert_eq!(document.revision().get(), 0);
+
+        document.rename_layer(layer, "Ink").unwrap();
+        assert_eq!(document.revision().get(), 1);
+        document.rename_layer(layer, "Ink").unwrap();
+        assert_eq!(document.revision().get(), 1);
+
+        paint_recorded(&mut document, 2, 3, color(1.0, 0.0, 0.0, 1.0));
+        assert_eq!(document.revision().get(), 2);
+
+        document.undo().unwrap().unwrap();
+        assert_eq!(document.revision().get(), 3);
+        document.redo().unwrap().unwrap();
+        assert_eq!(document.revision().get(), 4);
+
+        assert!(document.redo().unwrap().is_none());
+        assert_eq!(document.revision().get(), 4);
     }
 
     #[test]
