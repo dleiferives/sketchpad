@@ -307,7 +307,7 @@ mod tests {
                 key: LayerTileKey::new(layer, TileCoord::new(0, 0)),
                 local_bounds: RectU32::from_xywh(0, 0, 16, 16).unwrap(),
                 initialized: true,
-                pixels: vec![exact_blue; 16 * 16].into_boxed_slice(),
+                pixels: vec![exact_blue; 16 * 16].into(),
             }],
         )
         .unwrap();
@@ -336,7 +336,7 @@ mod tests {
                 key: LayerTileKey::new(selected, TileCoord::new(0, 0)),
                 local_bounds: RectU32::from_xywh(0, 0, 16, 16).unwrap(),
                 initialized: false,
-                pixels: Box::new([]),
+                pixels: Vec::new().into(),
             }],
         )
         .unwrap();

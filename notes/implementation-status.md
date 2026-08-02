@@ -214,6 +214,12 @@ before mutation, copies exact channel bits while preserving untouched pixels,
 handles a resulting absent tile explicitly, reports actual changed-pixel
 damage, and creates no accidental CPU undo history.
 
+Mapped patch regions and the exact recovery command now share their immutable
+pixel slices by `Arc`. Creating a journal snapshot, recovery owner, or future
+CPU history spill therefore copies only region metadata; it does not deep-copy
+the mapped full-float blocks. Replay still performs the one required copy into
+a mutable destination tile.
+
 That work also exposed and fixed a partial-edge invariant: a logical canvas
 whose dimensions are not multiples of 128 may legitimately produce a padded
 16-pixel GPU undo block. Reconciliation now accepts padding inside the

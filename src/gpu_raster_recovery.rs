@@ -4,7 +4,7 @@ use crate::{
     gpu_document_undo::GPU_UNDO_BLOCK_SIZE,
     raster::{Damage, LinearRgba, RasterLayer, RectU32, TileCoord},
 };
-use std::{collections::BTreeMap, error::Error, fmt, mem::size_of};
+use std::{collections::BTreeMap, error::Error, fmt, mem::size_of, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuExactRasterRecoveryCommand {
@@ -26,7 +26,7 @@ struct GpuExactRasterRecoveryTile {
 #[derive(Clone, Debug, PartialEq)]
 struct GpuExactRasterRecoveryRegion {
     local_bounds: RectU32,
-    pixels: Box<[LinearRgba]>,
+    pixels: Arc<[LinearRgba]>,
 }
 
 impl GpuExactRasterRecoveryCommand {
@@ -837,7 +837,7 @@ mod tests {
             key: LayerTileKey::new(layer, tile),
             local_bounds: bounds,
             initialized,
-            pixels: vec![pixel; count].into_boxed_slice(),
+            pixels: vec![pixel; count].into(),
         }
     }
 
@@ -850,9 +850,9 @@ mod tests {
                 local_bounds: expected.local_bounds,
                 initialized: expected.initialized,
                 pixels: if expected.initialized {
-                    vec![pixel; expected.local_bounds.area() as usize].into_boxed_slice()
+                    vec![pixel; expected.local_bounds.area() as usize].into()
                 } else {
-                    Box::new([])
+                    Vec::new().into()
                 },
             })
             .collect();
@@ -888,6 +888,11 @@ mod tests {
         assert_eq!(command.region_count(), 2);
         assert_eq!(command.pixel_count(), 512);
         assert!(command.retained_byte_len() >= 512 * size_of::<LinearRgba>() as u64);
+        let cloned = command.clone();
+        assert!(Arc::ptr_eq(
+            &command.tiles[0].regions[0].pixels,
+            &cloned.tiles[0].regions[0].pixels
+        ));
 
         let overlap = vec![
             region(

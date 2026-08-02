@@ -218,7 +218,7 @@ pub struct GpuMirrorPatchRegion {
     pub key: LayerTileKey,
     pub local_bounds: RectU32,
     pub initialized: bool,
-    pub pixels: Box<[LinearRgba]>,
+    pub pixels: Arc<[LinearRgba]>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -688,9 +688,9 @@ fn decode_regions(
             if pixels.len() != expected_pixels {
                 return Err(GpuMirrorReadbackError::InvalidMappedRegion);
             }
-            pixels.to_vec().into_boxed_slice()
+            pixels.to_vec().into()
         } else {
-            Box::new([])
+            Vec::new().into()
         };
         patches.push(GpuMirrorPatchRegion {
             key: region.key,
@@ -1574,9 +1574,9 @@ mod tests {
                     local_bounds: region.local_bounds,
                     initialized: region.initialized,
                     pixels: if region.initialized {
-                        vec![pixel; region.local_bounds.area() as usize].into_boxed_slice()
+                        vec![pixel; region.local_bounds.area() as usize].into()
                     } else {
-                        Box::new([])
+                        Vec::new().into()
                     },
                 })
                 .collect(),
@@ -1790,7 +1790,7 @@ mod tests {
             GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
         reconciler.register_plan(&plan).unwrap();
         let mut malformed = solid_patch(&plan.batches()[0], LinearRgba::TRANSPARENT);
-        malformed.regions[0].pixels = Box::new([]);
+        malformed.regions[0].pixels = Vec::new().into();
         assert!(matches!(
             reconciler.complete_batch(malformed),
             Err(GpuMirrorReconcileError::InvalidPixelCount { .. })
