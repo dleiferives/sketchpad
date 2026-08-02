@@ -139,6 +139,19 @@ ready pairs, returns ownership of every removed spill, and installs the new ID
 as pending. Tests prove that preview is non-mutating, ready-byte accounting is
 released exactly once, and malformed eviction sets cannot partially branch.
 
+The first non-live `GpuLiveRecovery` coordinator now combines that spill
+index with the forward recovery timeline. New raster history is a two-phase
+operation: preparation validates the consecutive journal record and predicted
+GPU-history replacement without mutation, then commit rechecks the source and
+updates both owners. A stale prepared token returns its complete recovery
+command and cannot add a second revision. Undo/redo preparation requires a
+ready two-sided spill, chooses before for undo or after for redo, and owns that
+exact forward patch before any GPU swap needs to be submitted. A pending spill
+therefore produces an explicit queueable error with no revision change. Pure
+tests cover successful commit, branch/budget replacement, stale tokens,
+returned command ownership, pending inverse rejection, and exact undo-side
+selection. Mirror completion is the next half to join this coordinator.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

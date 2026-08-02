@@ -210,6 +210,17 @@ the association and expensive transition ownership explicit. The live owner
 must perform these calls atomically and must not advance the recovery anchor
 past an ID whose transition is still pending.
 
+The first live recovery coordinator now owns the timeline and spill index as
+one state. A new raster history entry is prepared against the current target
+revision using the GPU-history preview's ID and eviction sequence; preparation
+changes nothing and returns the complete recovery command on failure. Commit
+then applies the already-validated spill replacement and consecutive journal
+record together. Undo/redo preparation is intentionally unavailable while the
+referenced exact pair is pending. Once ready, undo clones the before patch and
+redo clones the after patch into the next forward recovery record. The UI may
+queue that discrete action, but it must not submit a GPU swap first and hope
+the inverse becomes recoverable later.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the
