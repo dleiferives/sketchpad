@@ -78,7 +78,7 @@ restores a valid whole document or leaves the prior file intact.
 - [x] Add temporary keyboard commands before building the graphical panel.
 - [x] Show active layer, layer count, and modified state in existing feedback.
 - [x] Prevent structural commands during an active brush transaction.
-- [ ] Add the graphical layer panel after command semantics are proven.
+- [x] Add the graphical layer panel after command semantics are proven.
   Begin with the bounded embedded-egui experiment and promotion gate in
   [Immediate-mode UI overlay architecture](ui-overlay-architecture.md);
   preserve the same `UiAction` boundary for the custom fallback.
@@ -174,7 +174,7 @@ without upright jitter; saved traces replay exactly.
 - [x] Eight-entry session-local recent colors with deterministic MRU behavior
   and keyboard traversal.
 - [x] Minimal brush/preset selector.
-- [ ] Layer panel.
+- [x] Layer panel.
 - [x] Native PNG import/export dialogs.
 - [x] Native document open dialog.
 - [ ] Canvas rotation controls.

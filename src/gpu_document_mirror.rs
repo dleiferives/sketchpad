@@ -717,7 +717,7 @@ fn decode_regions(
     Ok(patches)
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct GpuCpuMirrorSnapshot {
     revision: DocumentRevision,
     width: u32,
@@ -1060,6 +1060,41 @@ impl GpuMirrorReconciler {
         Ok(())
     }
 
+    pub fn register_metadata_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorReconcileError> {
+        self.check_metadata_revision(source_revision, revision)?;
+        self.pending.push_back(PendingMirrorRevision {
+            revision,
+            expected_batches: Vec::new(),
+            batches: Vec::new(),
+        });
+        self.latest_registered = revision;
+        Ok(self.apply_ready(None)?.0)
+    }
+
+    pub fn check_metadata_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<(), GpuMirrorReconcileError> {
+        if source_revision != self.latest_registered {
+            return Err(GpuMirrorReconcileError::SourceRevisionMismatch {
+                expected: self.latest_registered,
+                actual: source_revision,
+            });
+        }
+        if revision <= self.latest_registered {
+            return Err(GpuMirrorReconcileError::RevisionNotNewer {
+                latest: self.latest_registered,
+                requested: revision,
+            });
+        }
+        Ok(())
+    }
+
     pub fn check_register_plan(
         &self,
         plan: &GpuMirrorReadbackPlan,
@@ -1098,6 +1133,27 @@ impl GpuMirrorReconciler {
         &mut self,
         batch: GpuMirrorPatchBatch,
     ) -> Result<Vec<DocumentRevision>, GpuMirrorReconcileError> {
+        Ok(self.complete_batch_inner(batch, None)?.0)
+    }
+
+    pub(crate) fn complete_batch_capturing(
+        &mut self,
+        batch: GpuMirrorPatchBatch,
+        capture_revision: DocumentRevision,
+    ) -> Result<(Vec<DocumentRevision>, GpuCpuMirrorSnapshot), GpuMirrorReconcileError> {
+        let (applied, snapshot) = self.complete_batch_inner(batch, Some(capture_revision))?;
+        Ok((
+            applied,
+            snapshot.expect("the completed registered revision produced its exact snapshot"),
+        ))
+    }
+
+    fn complete_batch_inner(
+        &mut self,
+        batch: GpuMirrorPatchBatch,
+        capture_revision: Option<DocumentRevision>,
+    ) -> Result<(Vec<DocumentRevision>, Option<GpuCpuMirrorSnapshot>), GpuMirrorReconcileError>
+    {
         self.mirror.validate_revision(batch.revision(), &[&batch])?;
         let pending = self
             .pending
@@ -1143,7 +1199,7 @@ impl GpuMirrorReconciler {
             });
         }
         pending.batches[index] = Some(batch);
-        self.apply_ready()
+        self.apply_ready(capture_revision)
     }
 
     pub const fn mirror(&self) -> &GpuCpuMirror {
@@ -1158,8 +1214,13 @@ impl GpuMirrorReconciler {
         self.pending.len()
     }
 
-    fn apply_ready(&mut self) -> Result<Vec<DocumentRevision>, GpuMirrorReconcileError> {
+    fn apply_ready(
+        &mut self,
+        capture_revision: Option<DocumentRevision>,
+    ) -> Result<(Vec<DocumentRevision>, Option<GpuCpuMirrorSnapshot>), GpuMirrorReconcileError>
+    {
         let mut applied = Vec::new();
+        let mut captured = None;
         loop {
             let Some(front) = self.pending.front() else {
                 break;
@@ -1185,8 +1246,11 @@ impl GpuMirrorReconciler {
             self.mirror
                 .apply_validated_revision(pending.revision, owned_batches);
             applied.push(pending.revision);
+            if capture_revision == Some(pending.revision) {
+                captured = Some(self.mirror.snapshot());
+            }
         }
-        Ok(applied)
+        Ok((applied, captured))
     }
 }
 
@@ -1900,6 +1964,52 @@ mod tests {
         assert_eq!(reconciler.mirror().revision().get(), 2);
         let pixel = reconciler.mirror().tile_pixels(key).unwrap()[16 * 128 + 16];
         assert_eq!(pixel, blue);
+    }
+
+    #[test]
+    fn metadata_revision_waits_behind_raster_then_advances_without_a_patch() {
+        let red = LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0);
+        let (raster, key) = one_tile_plan(1, true);
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&raster).unwrap();
+
+        assert!(reconciler
+            .register_metadata_revision(
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(2),
+            )
+            .unwrap()
+            .is_empty());
+        assert_eq!(reconciler.pending_revision_count(), 2);
+        assert_eq!(reconciler.mirror().revision(), DocumentRevision::INITIAL);
+
+        let (applied, raster_snapshot) = reconciler
+            .complete_batch_capturing(
+                solid_patch(&raster.batches()[0], red),
+                DocumentRevision::from_raw(1),
+            )
+            .unwrap();
+        assert_eq!(
+            applied,
+            vec![DocumentRevision::from_raw(1), DocumentRevision::from_raw(2)]
+        );
+        assert_eq!(raster_snapshot.revision(), DocumentRevision::from_raw(1));
+        assert_eq!(
+            raster_snapshot.tile_pixels(key).unwrap()[16 * 128 + 16],
+            red
+        );
+        assert_eq!(
+            reconciler.mirror().revision(),
+            DocumentRevision::from_raw(2)
+        );
+        assert_eq!(
+            reconciler.mirror().tile_pixels(key).unwrap()[16 * 128 + 16],
+            red
+        );
+
+        let (next_raster, _) = one_tile_plan(3, true);
+        reconciler.check_register_plan(&next_raster).unwrap();
     }
 
     #[test]

@@ -27,17 +27,31 @@ leaves the current canvas untouched. Active-layer selection is now resident
 metadata too: panel clicks and relative-layer keybindings change the layer used
 by the next GPU stroke without advancing revision or touching CPU pixels. The
 layer panel and title read resident metadata, so legacy selection is not
-shadow-mutated. During this transition, natural brushes, revisioned layer
-mutation, PNG import, and color picking are intentionally unavailable in
+shadow-mutated.
+
+Visibility, opacity, and layer ordering now form the first live revisioned
+metadata slice. Raster mementos and reversible metadata edits occupy one
+bounded chronological GPU history, so a stroke followed by a visibility
+change still undoes in user order. Metadata entries carry no atlas pins or
+recovery spill; when their branch/capacity insertion evicts raster entries,
+only those raster IDs are removed from the exact spill owner. Metadata
+undo/redo applies the same checked edit in reverse/forward direction and emits
+an explicit no-raster recovery boundary. The CPU mirror registers these
+pixel-identical revisions without scheduling a GPU copy. If one is queued
+behind a raster readback, dispatch retains the shared exact snapshot at the
+raster boundary before advancing across the metadata revision, preventing a
+later revision label from being paired with an earlier raster transition. The
+existing panel and key commands now call this resident path.
+
+During this transition, natural brushes, layer creation/deletion/duplication,
+PNG import, and color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.
 
-The non-live foundation for the next revisioned layer slice now defines
-reversible visibility, opacity, and ordering edits over `DocumentMetadata`.
-They are prepared without mutation, require the exact expected side plus exact
-next revision when applied, reverse through the same value, preserve stable
-active identity across moves, and reject invalid/stale state transactionally.
-They are not yet recorded by GPU history or callable from the live UI.
+The reversible metadata edits are prepared without mutation, require the exact
+expected side plus exact next revision when applied, reverse through the same
+value, preserve stable active identity across moves, and reject invalid/stale
+state transactionally.
 
 Selected architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the

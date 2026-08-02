@@ -111,6 +111,26 @@ impl GpuMirrorDispatcher {
         Ok(())
     }
 
+    pub fn check_metadata_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<(), GpuMirrorDispatchError> {
+        self.reconciler
+            .check_metadata_revision(source_revision, revision)?;
+        Ok(())
+    }
+
+    pub fn register_metadata_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorDispatchError> {
+        Ok(self
+            .reconciler
+            .register_metadata_revision(source_revision, revision)?)
+    }
+
     pub fn check_prepared_capture(
         &self,
         plan: &GpuMirrorReadbackPlan,
@@ -215,13 +235,20 @@ impl GpuMirrorDispatcher {
         } else {
             None
         };
-        let applied_revisions = self.reconciler.complete_batch(patch)?;
+        let (applied_revisions, recovery_snapshot) = if revision_complete {
+            let (applied, snapshot) = self
+                .reconciler
+                .complete_batch_capturing(patch, completed_revision)?;
+            (applied, Some(snapshot))
+        } else {
+            (self.reconciler.complete_batch(patch)?, None)
+        };
         self.resident_snapshot_bytes = self
             .resident_snapshot_bytes
             .checked_sub(byte_len)
             .expect("a completed mirror batch owns its accounted snapshot bytes");
         if revision_complete {
-            if applied_revisions.last().copied() != Some(completed_revision) {
+            if !applied_revisions.contains(&completed_revision) {
                 return Err(GpuMirrorDispatchError::CompletedRevisionNotApplied(
                     completed_revision,
                 ));
@@ -235,6 +262,7 @@ impl GpuMirrorDispatcher {
             byte_len,
             applied_revisions,
             recovery_transition,
+            recovery_snapshot,
         }))
     }
 
@@ -289,6 +317,7 @@ pub struct GpuMirrorDispatchCompletion {
     pub byte_len: u64,
     pub applied_revisions: Vec<DocumentRevision>,
     pub recovery_transition: Option<GpuExactRasterRecoveryTransition>,
+    pub recovery_snapshot: Option<GpuCpuMirrorSnapshot>,
 }
 
 pub struct GpuMirrorEnqueueFailure {

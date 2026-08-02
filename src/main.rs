@@ -12,7 +12,7 @@ use sketchpad::{
     gpu_atlas::AtlasLayout,
     gpu_checkpoint_worker::GpuCheckpointWorker,
     gpu_document_compositor::GpuDocumentCompositor,
-    gpu_document_history::GpuHistoryDirection,
+    gpu_document_history::{GpuHistoryDirection, GpuHistoryEntryKind},
     gpu_document_target::GpuDocumentTarget,
     gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
     gpu_resident_round_stroke::GpuResidentRoundStrokeEngine,
@@ -1821,33 +1821,45 @@ impl App {
                 .resident
                 .as_mut()
                 .expect("resident history requires its document owner");
-            let encoder = gpu
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("GPU Resident History Swap"),
-                });
-            match resident.document.prepare_history_swap(
-                &mut resident.target,
-                &gpu.device,
-                encoder,
-                direction,
-            ) {
-                Ok(Some(prepared)) => resident
+            match resident.document.next_history_kind(direction) {
+                Ok(Some(GpuHistoryEntryKind::Metadata)) => resident
                     .document
-                    .submit_history_swap(&gpu.queue, &mut resident.target, prepared)
-                    .map(Some)
-                    .map_err(|failure| failure.error.to_string()),
+                    .swap_metadata_history(direction)
+                    .map(|commit| {
+                        commit.map(|commit| (commit.revision, commit.history_id, "metadata"))
+                    })
+                    .map_err(|error| error.to_string()),
+                Ok(Some(GpuHistoryEntryKind::Raster)) => {
+                    let encoder =
+                        gpu.device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("GPU Resident History Swap"),
+                            });
+                    match resident.document.prepare_history_swap(
+                        &mut resident.target,
+                        &gpu.device,
+                        encoder,
+                        direction,
+                    ) {
+                        Ok(Some(prepared)) => resident
+                            .document
+                            .submit_history_swap(&gpu.queue, &mut resident.target, prepared)
+                            .map(|commit| Some((commit.revision, commit.history_id, "raster")))
+                            .map_err(|failure| failure.error.to_string()),
+                        Ok(None) => Ok(None),
+                        Err(failure) => Err(failure.error.to_string()),
+                    }
+                }
                 Ok(None) => Ok(None),
-                Err(failure) => Err(failure.error.to_string()),
+                Err(error) => Err(error.to_string()),
             }
         };
         match result {
-            Ok(Some(commit)) => {
+            Ok(Some((revision, history_id, kind))) => {
                 log::info!(
-                    "GPU-resident history swap committed: direction={:?} revision={} history_id={}",
-                    commit.direction,
-                    commit.revision.get(),
-                    commit.history_id.get()
+                    "GPU-resident history swap committed: kind={kind} direction={direction:?} revision={} history_id={}",
+                    revision.get(),
+                    history_id.get()
                 );
                 self.mark_document_dirty();
             }
@@ -1910,9 +1922,34 @@ impl App {
     }
 
     fn toggle_layer_visibility(&mut self, layer: LayerId) {
-        if self.active_stroke.is_some()
-            || self.reject_legacy_document_action("change layer visibility")
-        {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            let visible = resident
+                .document
+                .metadata()
+                .layers()
+                .iter()
+                .find(|candidate| candidate.id() == layer)
+                .map(|candidate| candidate.visible());
+            let Some(visible) = visible else {
+                log::warn!(
+                    "could not change visibility of missing resident layer {}",
+                    layer.get()
+                );
+                return;
+            };
+            match resident.document.set_layer_visibility(layer, !visible) {
+                Ok(Some(_)) => self.mark_document_dirty(),
+                Ok(None) => {}
+                Err(failure) => {
+                    log::error!("could not change resident layer visibility: {failure}")
+                }
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("change layer visibility") {
             return;
         }
         let visible = self.document.layer(layer).map(|layer| layer.visible());
@@ -1933,10 +1970,33 @@ impl App {
     }
 
     fn adjust_layer_opacity(&mut self, layer: LayerId, delta: f32) {
-        if self.active_stroke.is_some()
-            || !delta.is_finite()
-            || self.reject_legacy_document_action("change layer opacity")
-        {
+        if self.active_stroke.is_some() || !delta.is_finite() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            let opacity = resident
+                .document
+                .metadata()
+                .layers()
+                .iter()
+                .find(|candidate| candidate.id() == layer)
+                .map(|candidate| candidate.opacity());
+            let Some(opacity) = opacity else {
+                log::warn!(
+                    "could not change opacity of missing resident layer {}",
+                    layer.get()
+                );
+                return;
+            };
+            let adjusted = (opacity + delta).clamp(0.0, 1.0);
+            match resident.document.set_layer_opacity(layer, adjusted) {
+                Ok(Some(_)) => self.mark_document_dirty(),
+                Ok(None) => {}
+                Err(failure) => log::error!("could not change resident layer opacity: {failure}"),
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("change layer opacity") {
             return;
         }
         let opacity = self.document.layer(layer).map(|layer| layer.opacity());
@@ -2007,7 +2067,28 @@ impl App {
     }
 
     fn move_active_layer(&mut self, offset: isize) {
-        if self.active_stroke.is_some() || self.reject_legacy_document_action("move layer") {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            let metadata = resident.document.metadata();
+            let layer = metadata.active_layer();
+            let current = metadata
+                .layers()
+                .iter()
+                .position(|candidate| candidate.id() == layer)
+                .expect("resident active layer remains in metadata");
+            let destination = current
+                .saturating_add_signed(offset)
+                .min(metadata.layers().len() - 1);
+            match resident.document.move_layer(layer, destination) {
+                Ok(Some(_)) => self.mark_document_dirty(),
+                Ok(None) => {}
+                Err(failure) => log::error!("could not reorder resident layer: {failure}"),
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("move layer") {
             return;
         }
         let current = self.document.active_layer_index();

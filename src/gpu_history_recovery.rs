@@ -79,21 +79,7 @@ impl GpuHistoryRecoverySpills {
             });
         }
 
-        let mut seen = BTreeSet::new();
-        let mut freed_bytes = 0_u64;
-        for &evicted_id in evicted_ids {
-            if !seen.insert(evicted_id) {
-                return Err(GpuHistoryRecoveryError::DuplicateEvictedHistoryId(
-                    evicted_id,
-                ));
-            }
-            let entry = self.entries.get(&evicted_id).ok_or(
-                GpuHistoryRecoveryError::UntrackedEvictedHistoryId(evicted_id),
-            )?;
-            freed_bytes = freed_bytes
-                .checked_add(entry.retained_byte_len())
-                .ok_or(GpuHistoryRecoveryError::ByteCountOverflow)?;
-        }
+        let freed_bytes = self.check_remove_all(evicted_ids)?;
         let retained = self
             .entries
             .len()
@@ -110,6 +96,46 @@ impl GpuHistoryRecoverySpills {
             id,
             evicted_ids: evicted_ids.into(),
             freed_bytes,
+        })
+    }
+
+    pub fn check_remove_all(
+        &self,
+        evicted_ids: &[GpuHistoryId],
+    ) -> Result<u64, GpuHistoryRecoveryError> {
+        let mut seen = BTreeSet::new();
+        let mut freed_bytes = 0_u64;
+        for &evicted_id in evicted_ids {
+            if !seen.insert(evicted_id) {
+                return Err(GpuHistoryRecoveryError::DuplicateEvictedHistoryId(
+                    evicted_id,
+                ));
+            }
+            let entry = self.entries.get(&evicted_id).ok_or(
+                GpuHistoryRecoveryError::UntrackedEvictedHistoryId(evicted_id),
+            )?;
+            freed_bytes = freed_bytes
+                .checked_add(entry.retained_byte_len())
+                .ok_or(GpuHistoryRecoveryError::ByteCountOverflow)?;
+        }
+        Ok(freed_bytes)
+    }
+
+    pub fn remove_all(
+        &mut self,
+        evicted_ids: &[GpuHistoryId],
+    ) -> Result<GpuHistoryRecoveryRemoval, GpuHistoryRecoveryError> {
+        let freed_bytes = self.check_remove_all(evicted_ids)?;
+        let mut evicted = Vec::with_capacity(evicted_ids.len());
+        for &id in evicted_ids {
+            evicted.push(
+                self.remove(id)
+                    .expect("the removal preview validated every evicted history ID"),
+            );
+        }
+        Ok(GpuHistoryRecoveryRemoval {
+            freed_bytes,
+            evicted,
         })
     }
 
@@ -351,6 +377,11 @@ impl GpuHistoryRecoveryReplacementPreview {
 
 pub struct GpuHistoryRecoveryReplacement {
     pub id: GpuHistoryId,
+    pub freed_bytes: u64,
+    pub evicted: Vec<GpuHistoryRecoveryEntry>,
+}
+
+pub struct GpuHistoryRecoveryRemoval {
     pub freed_bytes: u64,
     pub evicted: Vec<GpuHistoryRecoveryEntry>,
 }

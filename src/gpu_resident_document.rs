@@ -1,11 +1,14 @@
 use crate::{
     document::{Document, DocumentRevision},
-    document_metadata::{DocumentMetadata, DocumentMetadataError},
+    document_metadata::{
+        DocumentMetadata, DocumentMetadataEdit, DocumentMetadataEditDirection,
+        DocumentMetadataError,
+    },
     gpu_atlas::{AtlasAllocation, AtlasError, AtlasLayout, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{
         GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
-        GpuHistoryId, GpuHistoryRecordError, GpuHistoryRecordPreview, DEFAULT_GPU_HISTORY_BYTES,
-        DEFAULT_GPU_HISTORY_ENTRIES,
+        GpuHistoryEntryKind, GpuHistoryId, GpuHistoryRecordError, GpuHistoryRecordPreview,
+        DEFAULT_GPU_HISTORY_BYTES, DEFAULT_GPU_HISTORY_ENTRIES,
     },
     gpu_document_mirror::{
         encode_gpu_mirror_revision_capture, GpuCpuMirror, GpuCpuMirrorSnapshot, GpuMirrorPlanError,
@@ -290,7 +293,7 @@ impl GpuResidentDocument {
         }
         let recovery = match self.recovery.prepare_history_record(
             history.id(),
-            history.evicted_ids(),
+            history.evicted_raster_ids(),
             revision,
             recovery_command,
         ) {
@@ -369,10 +372,15 @@ impl GpuResidentDocument {
             .commit_history_record(prepared.recovery)
             .expect("live recovery was checked immediately before submission");
         assert_eq!(history.id, recovery.id);
-        assert!(history.evicted.iter().map(GpuHistoryEntry::id).eq(recovery
-            .evicted_spills
+        assert!(history
+            .evicted
             .iter()
-            .map(GpuHistoryRecoveryEntry::id)));
+            .filter(|entry| entry.kind() == GpuHistoryEntryKind::Raster)
+            .map(GpuHistoryEntry::id)
+            .eq(recovery
+                .evicted_spills
+                .iter()
+                .map(GpuHistoryRecoveryEntry::id)));
         self.mirror
             .enqueue(&prepared.plan, prepared.capture)
             .expect("mirror enqueue was checked immediately before submission");
@@ -413,6 +421,20 @@ impl GpuResidentDocument {
             Ok(None) => return Ok(None),
             Err(error) => return Err(history_swap_prepare_failure(error.into())),
         };
+        if self
+            .history
+            .check_begin_kind(direction)
+            .expect("the same checked history boundary has no pending operation")
+            != Some(GpuHistoryEntryKind::Raster)
+        {
+            return Err(history_swap_prepare_failure(
+                GpuDocumentHistoryError::EntryKindMismatch {
+                    expected: GpuHistoryEntryKind::Raster,
+                    actual: GpuHistoryEntryKind::Metadata,
+                }
+                .into(),
+            ));
+        }
         let recovery = match self
             .recovery
             .prepare_history_swap(history_id, direction, revision)
@@ -652,8 +674,10 @@ impl GpuResidentDocument {
             byte_len,
             applied_revisions,
             recovery_transition,
+            recovery_snapshot,
         } = completion;
         let Some(transition) = recovery_transition else {
+            debug_assert!(recovery_snapshot.is_none());
             return Ok(Some(GpuResidentMirrorCompletion {
                 revision,
                 batch_index,
@@ -672,7 +696,8 @@ impl GpuResidentDocument {
             byte_len,
             applied_revisions,
             requested_purpose,
-            snapshot: self.mirror.snapshot(),
+            snapshot: recovery_snapshot
+                .expect("a completed mirror transition retains its exact revision snapshot"),
             transition,
             last_error: None,
         });
@@ -903,6 +928,178 @@ impl GpuResidentDocument {
         Ok(())
     }
 
+    pub fn set_layer_visibility(
+        &mut self,
+        layer: crate::document::LayerId,
+        visible: bool,
+    ) -> Result<Option<GpuResidentMetadataCommit>, Box<GpuResidentMetadataEditFailure>> {
+        let edit = match self.metadata.prepare_layer_visibility(layer, visible) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        self.apply_metadata_edit(edit).map(Some)
+    }
+
+    pub fn set_layer_opacity(
+        &mut self,
+        layer: crate::document::LayerId,
+        opacity: f32,
+    ) -> Result<Option<GpuResidentMetadataCommit>, Box<GpuResidentMetadataEditFailure>> {
+        let edit = match self.metadata.prepare_layer_opacity(layer, opacity) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        self.apply_metadata_edit(edit).map(Some)
+    }
+
+    pub fn move_layer(
+        &mut self,
+        layer: crate::document::LayerId,
+        destination: usize,
+    ) -> Result<Option<GpuResidentMetadataCommit>, Box<GpuResidentMetadataEditFailure>> {
+        let edit = match self.metadata.prepare_layer_move(layer, destination) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        self.apply_metadata_edit(edit).map(Some)
+    }
+
+    pub fn apply_metadata_edit(
+        &mut self,
+        edit: DocumentMetadataEdit,
+    ) -> Result<GpuResidentMetadataCommit, Box<GpuResidentMetadataEditFailure>> {
+        if let Err(error) = self.check_active_round_stroke(None) {
+            return Err(metadata_edit_failure(error, Some(edit)));
+        }
+        let Some(revision) = self.revision().checked_next() else {
+            return Err(metadata_edit_failure(
+                GpuResidentDocumentError::RevisionExhausted,
+                Some(edit),
+            ));
+        };
+        let mut metadata = self.metadata.clone();
+        if let Err(error) =
+            metadata.apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision)
+        {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+        let history_preview = match self.history.check_metadata_record(&edit) {
+            Ok(preview) => preview,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        let recovery = match self
+            .recovery
+            .prepare_metadata_history_record(history_preview.evicted_raster_ids(), revision)
+        {
+            Ok(recovery) => recovery,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        if let Err(error) = self
+            .mirror
+            .check_metadata_revision(self.revision(), revision)
+        {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+
+        let history = self
+            .history
+            .record_metadata(&mut self.atlas, edit)
+            .expect("metadata history was checked immediately before recording");
+        assert!(history_preview.matches_record(&history));
+        let recovery = self
+            .recovery
+            .commit_metadata_history_record(recovery)
+            .expect("metadata recovery was checked immediately before recording");
+        self.mirror
+            .register_metadata_revision(self.revision(), revision)
+            .expect("metadata mirror revision was checked immediately before recording");
+        self.metadata = metadata;
+        assert!(history
+            .evicted
+            .iter()
+            .filter(|entry| entry.kind() == GpuHistoryEntryKind::Raster)
+            .map(GpuHistoryEntry::id)
+            .eq(recovery
+                .evicted_spills
+                .iter()
+                .map(GpuHistoryRecoveryEntry::id)));
+        Ok(GpuResidentMetadataCommit {
+            revision,
+            history_id: history.id,
+            evicted_history: history.evicted,
+            evicted_spills: recovery.evicted_spills,
+            freed_spill_bytes: recovery.freed_spill_bytes,
+        })
+    }
+
+    pub fn next_history_kind(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<GpuHistoryEntryKind>, GpuResidentDocumentError> {
+        Ok(self.history.check_begin_kind(direction)?)
+    }
+
+    pub fn swap_metadata_history(
+        &mut self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<GpuResidentMetadataHistorySwapCommit>, GpuResidentDocumentError> {
+        self.check_active_round_stroke(None)?;
+        let Some(history_id) = self.history.check_begin(direction)? else {
+            return Ok(None);
+        };
+        let edit = self
+            .history
+            .next_metadata_edit(direction)?
+            .expect("the same nonempty history boundary retains its metadata edit")
+            .clone();
+        let revision = self
+            .revision()
+            .checked_next()
+            .ok_or(GpuResidentDocumentError::RevisionExhausted)?;
+        let edit_direction = match direction {
+            GpuHistoryDirection::Undo => DocumentMetadataEditDirection::Reverse,
+            GpuHistoryDirection::Redo => DocumentMetadataEditDirection::Forward,
+        };
+        let mut metadata = self.metadata.clone();
+        metadata.apply_edit(&edit, edit_direction, revision)?;
+        let recovery = self
+            .recovery
+            .prepare_metadata_history_record(&[], revision)?;
+        self.mirror
+            .check_metadata_revision(self.revision(), revision)?;
+
+        let began = match direction {
+            GpuHistoryDirection::Undo => self.history.begin_undo(),
+            GpuHistoryDirection::Redo => self.history.begin_redo(),
+        }
+        .expect("metadata history was checked immediately before beginning a swap");
+        assert!(began, "a checked metadata history swap has an entry");
+        let recovery = self
+            .recovery
+            .commit_metadata_history_record(recovery)
+            .expect("metadata recovery was checked immediately before history swap");
+        self.mirror
+            .register_metadata_revision(self.revision(), revision)
+            .expect("metadata mirror revision was checked immediately before history swap");
+        let finished_id = self
+            .history
+            .finish_pending()
+            .expect("the begun metadata history swap remains pending");
+        assert_eq!(finished_id, history_id);
+        self.metadata = metadata;
+        Ok(Some(GpuResidentMetadataHistorySwapCommit {
+            revision,
+            history_id,
+            direction,
+            edit,
+            evicted_spills: recovery.evicted_spills,
+            freed_spill_bytes: recovery.freed_spill_bytes,
+        }))
+    }
+
     pub const fn revision(&self) -> DocumentRevision {
         self.metadata.revision()
     }
@@ -954,6 +1151,23 @@ pub struct GpuResidentDocumentCommit {
     pub history_id: GpuHistoryId,
     pub stats: ColorCommitStats,
     pub evicted_history: Vec<GpuHistoryEntry>,
+    pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
+    pub freed_spill_bytes: u64,
+}
+
+pub struct GpuResidentMetadataCommit {
+    pub revision: DocumentRevision,
+    pub history_id: GpuHistoryId,
+    pub evicted_history: Vec<GpuHistoryEntry>,
+    pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
+    pub freed_spill_bytes: u64,
+}
+
+pub struct GpuResidentMetadataHistorySwapCommit {
+    pub revision: DocumentRevision,
+    pub history_id: GpuHistoryId,
+    pub direction: GpuHistoryDirection,
+    pub edit: DocumentMetadataEdit,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
     pub freed_spill_bytes: u64,
 }
@@ -1039,6 +1253,40 @@ struct PendingGpuResidentMirrorHandoff {
     snapshot: GpuCpuMirrorSnapshot,
     transition: GpuExactRasterRecoveryTransition,
     last_error: Option<GpuLiveRecoveryError>,
+}
+
+pub struct GpuResidentMetadataEditFailure {
+    pub error: GpuResidentDocumentError,
+    pub edit: Option<DocumentMetadataEdit>,
+}
+
+impl fmt::Debug for GpuResidentMetadataEditFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GpuResidentMetadataEditFailure")
+            .field("error", &self.error)
+            .field("edit", &self.edit)
+            .finish()
+    }
+}
+
+impl fmt::Display for GpuResidentMetadataEditFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl Error for GpuResidentMetadataEditFailure {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+fn metadata_edit_failure(
+    error: GpuResidentDocumentError,
+    edit: Option<DocumentMetadataEdit>,
+) -> Box<GpuResidentMetadataEditFailure> {
+    Box::new(GpuResidentMetadataEditFailure { error, edit })
 }
 
 pub struct GpuResidentHistorySwapPrepareFailure {
@@ -1473,6 +1721,135 @@ mod tests {
             Err(GpuResidentDocumentError::ActiveRoundStrokeMismatch { .. })
         ));
         assert_eq!(document.metadata().active_layer(), first);
+    }
+
+    #[test]
+    fn metadata_edits_commit_one_shared_history_and_recovery_revision() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut cpu = Document::new(48, 40, 8).unwrap();
+        let first = cpu.active_layer_id();
+        let second = cpu.create_layer("Second").unwrap();
+        let initial_revision = cpu.revision();
+        let mut document = GpuResidentDocument::new_with_target_identity(
+            DocumentMetadata::from_document(&cpu),
+            layout,
+            GpuDocumentTargetId::from_raw(73),
+            limits(),
+        )
+        .unwrap();
+
+        let visibility = document
+            .set_layer_visibility(second, false)
+            .unwrap()
+            .expect("visibility changed");
+        assert_eq!(
+            visibility.revision,
+            initial_revision.checked_next().unwrap()
+        );
+        assert_eq!(document.history().undo_depth(), 1);
+        assert!(!document.metadata().layers()[1].visible());
+        assert_eq!(document.recovery().revision(), visibility.revision);
+        assert_eq!(document.mirror().snapshot().revision(), visibility.revision);
+        assert!(document.recovery().spills().is_empty());
+        assert!(visibility.evicted_history.is_empty());
+        assert!(visibility.evicted_spills.is_empty());
+
+        let opacity = document
+            .set_layer_opacity(second, 0.25)
+            .unwrap()
+            .expect("opacity changed");
+        assert_eq!(
+            opacity.revision,
+            visibility.revision.checked_next().unwrap()
+        );
+        assert_eq!(document.history().undo_depth(), 2);
+        assert_eq!(document.metadata().layers()[1].opacity(), 0.25);
+
+        let moved = document
+            .move_layer(second, 0)
+            .unwrap()
+            .expect("layer moved");
+        assert_eq!(moved.revision, opacity.revision.checked_next().unwrap());
+        assert_eq!(document.metadata().layers()[0].id(), second);
+        assert_eq!(document.metadata().layers()[1].id(), first);
+        assert_eq!(document.recovery_snapshot().revision(), moved.revision);
+
+        assert!(document.move_layer(second, 0).unwrap().is_none());
+        assert_eq!(document.revision(), moved.revision);
+        let failure = document
+            .set_layer_opacity(second, f32::NAN)
+            .err()
+            .expect("non-finite opacity is rejected");
+        assert!(failure.edit.is_none());
+        assert!(matches!(
+            failure.error,
+            GpuResidentDocumentError::Metadata(DocumentMetadataError::InvalidOpacity)
+        ));
+        assert_eq!(document.revision(), moved.revision);
+
+        let undo_move = document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("move is undoable");
+        assert_eq!(undo_move.history_id, moved.history_id);
+        assert_eq!(document.metadata().layers()[0].id(), first);
+        assert_eq!(document.metadata().layers()[1].id(), second);
+        assert_eq!(document.history().undo_depth(), 2);
+        assert_eq!(document.history().redo_depth(), 1);
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("opacity is undoable");
+        assert_eq!(document.metadata().layers()[1].opacity(), 1.0);
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("visibility is undoable");
+        assert!(document.metadata().layers()[1].visible());
+        assert_eq!(document.history().undo_depth(), 0);
+        assert_eq!(document.history().redo_depth(), 3);
+
+        let redo_visibility = document
+            .swap_metadata_history(GpuHistoryDirection::Redo)
+            .unwrap()
+            .expect("visibility is redoable");
+        assert!(!document.metadata().layers()[1].visible());
+        assert_eq!(document.recovery().revision(), redo_visibility.revision);
+        assert_eq!(
+            document.mirror().snapshot().revision(),
+            redo_visibility.revision
+        );
+        assert_eq!(
+            document.recovery_snapshot().revision(),
+            redo_visibility.revision
+        );
+    }
+
+    #[test]
+    fn metadata_edit_is_rejected_unchanged_during_an_active_stroke() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let layer = document.metadata().active_layer();
+        let edit = document
+            .metadata()
+            .prepare_layer_visibility(layer, false)
+            .unwrap()
+            .unwrap();
+        document.active_round_stroke = Some(GpuResidentRoundStrokeId(9));
+
+        let failure = document
+            .apply_metadata_edit(edit.clone())
+            .err()
+            .expect("active stroke blocks metadata mutation");
+        assert_eq!(failure.edit, Some(edit));
+        assert!(matches!(
+            failure.error,
+            GpuResidentDocumentError::ActiveRoundStrokeMismatch { .. }
+        ));
+        assert!(document.metadata().layers()[0].visible());
+        assert_eq!(document.history().undo_depth(), 0);
+        assert_eq!(document.recovery().revision(), DocumentRevision::INITIAL);
     }
 
     #[test]

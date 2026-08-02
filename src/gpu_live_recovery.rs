@@ -68,6 +68,67 @@ impl GpuLiveRecovery {
         })
     }
 
+    pub fn prepare_metadata_history_record(
+        &self,
+        evicted_raster_ids: &[GpuHistoryId],
+        revision: DocumentRevision,
+    ) -> Result<PreparedGpuMetadataHistoryRecoveryRecord, GpuLiveRecoveryError> {
+        let source_revision = self.timeline.target_revision();
+        let byte_len = GpuRasterRecoveryCommand::MetadataOnly.retained_byte_len();
+        self.timeline.check_record(revision, byte_len)?;
+        let freed_spill_bytes = self.spills.check_remove_all(evicted_raster_ids)?;
+        Ok(PreparedGpuMetadataHistoryRecoveryRecord {
+            evicted_raster_ids: evicted_raster_ids.into(),
+            source_revision,
+            revision,
+            byte_len,
+            freed_spill_bytes,
+        })
+    }
+
+    pub fn commit_metadata_history_record(
+        &mut self,
+        prepared: PreparedGpuMetadataHistoryRecoveryRecord,
+    ) -> Result<GpuMetadataHistoryRecoveryRecordCommit, GpuLiveRecoveryError> {
+        self.check_prepared_metadata_history_record(&prepared)?;
+        let removal = self.spills.remove_all(&prepared.evicted_raster_ids)?;
+        if self
+            .timeline
+            .record(
+                prepared.revision,
+                prepared.byte_len,
+                GpuRasterRecoveryCommand::MetadataOnly,
+            )
+            .is_err()
+        {
+            unreachable!("the metadata recovery record was rechecked before journal insertion")
+        }
+        debug_assert_eq!(removal.freed_bytes, prepared.freed_spill_bytes);
+        Ok(GpuMetadataHistoryRecoveryRecordCommit {
+            revision: prepared.revision,
+            freed_spill_bytes: removal.freed_bytes,
+            evicted_spills: removal.evicted,
+        })
+    }
+
+    pub fn check_prepared_metadata_history_record(
+        &self,
+        prepared: &PreparedGpuMetadataHistoryRecoveryRecord,
+    ) -> Result<(), GpuLiveRecoveryError> {
+        let actual_source = self.timeline.target_revision();
+        if actual_source != prepared.source_revision {
+            return Err(GpuLiveRecoveryError::PreparedSourceChanged {
+                prepared: prepared.source_revision,
+                actual: actual_source,
+            });
+        }
+        self.timeline
+            .check_record(prepared.revision, prepared.byte_len)?;
+        let freed_spill_bytes = self.spills.check_remove_all(&prepared.evicted_raster_ids)?;
+        debug_assert_eq!(freed_spill_bytes, prepared.freed_spill_bytes);
+        Ok(())
+    }
+
     pub fn commit_history_record(
         &mut self,
         prepared: PreparedGpuHistoryRecoveryRecord,
@@ -330,6 +391,33 @@ pub struct PreparedGpuHistoryRecoveryRecord {
     command: GpuRasterRecoveryCommand,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreparedGpuMetadataHistoryRecoveryRecord {
+    evicted_raster_ids: Box<[GpuHistoryId]>,
+    source_revision: DocumentRevision,
+    revision: DocumentRevision,
+    byte_len: u64,
+    freed_spill_bytes: u64,
+}
+
+impl PreparedGpuMetadataHistoryRecoveryRecord {
+    pub fn evicted_raster_ids(&self) -> &[GpuHistoryId] {
+        &self.evicted_raster_ids
+    }
+
+    pub const fn source_revision(&self) -> DocumentRevision {
+        self.source_revision
+    }
+
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub const fn freed_spill_bytes(&self) -> u64 {
+        self.freed_spill_bytes
+    }
+}
+
 impl PreparedGpuHistoryRecoveryRecord {
     pub const fn id(&self) -> GpuHistoryId {
         self.id
@@ -402,6 +490,12 @@ impl PreparedGpuHistoryRecoverySwap {
 
 pub struct GpuHistoryRecoveryRecordCommit {
     pub id: GpuHistoryId,
+    pub revision: DocumentRevision,
+    pub freed_spill_bytes: u64,
+    pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
+}
+
+pub struct GpuMetadataHistoryRecoveryRecordCommit {
     pub revision: DocumentRevision,
     pub freed_spill_bytes: u64,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
@@ -800,6 +894,45 @@ mod tests {
         reconciler.register_plan(&plan).unwrap();
         reconciler.complete_batch(mapped).unwrap();
         (transition, reconciler.snapshot())
+    }
+
+    #[test]
+    fn metadata_record_advances_timeline_and_removes_only_evicted_raster_spills() {
+        let mut state = empty_state(2);
+        let raster_id = GpuHistoryId::from_raw(1);
+        let raster = state
+            .prepare_history_record(
+                raster_id,
+                &[],
+                revision(1),
+                GpuRasterRecoveryCommand::MetadataOnly,
+            )
+            .unwrap();
+        state.commit_history_record(raster).unwrap();
+        assert!(state.spills().entry(raster_id).is_some());
+
+        let prepared = state
+            .prepare_metadata_history_record(&[raster_id], revision(2))
+            .unwrap();
+        assert_eq!(prepared.evicted_raster_ids(), &[raster_id]);
+        assert_eq!(state.revision(), revision(1));
+        assert!(state.spills().entry(raster_id).is_some());
+
+        let committed = state.commit_metadata_history_record(prepared).unwrap();
+        assert_eq!(committed.revision, revision(2));
+        assert_eq!(committed.evicted_spills[0].id(), raster_id);
+        assert!(state.spills().is_empty());
+        assert_eq!(state.revision(), revision(2));
+        assert_eq!(
+            state
+                .timeline()
+                .journal()
+                .records()
+                .last()
+                .unwrap()
+                .command(),
+            &GpuRasterRecoveryCommand::MetadataOnly
+        );
     }
 
     fn ready_state() -> (GpuLiveRecovery, GpuHistoryId) {

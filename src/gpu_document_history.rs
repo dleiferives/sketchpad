@@ -1,4 +1,5 @@
 use crate::{
+    document_metadata::DocumentMetadataEdit,
     gpu_atlas::{AtlasError, AtlasSlot, LayerTileKey, SparseAtlasPlanner},
     gpu_document_undo::GpuDocumentMemento,
 };
@@ -31,8 +32,49 @@ pub enum GpuHistoryDirection {
     Redo,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuHistoryEntryKind {
+    Raster,
+    Metadata,
+}
+
+pub enum GpuDocumentHistoryValue {
+    Raster(GpuDocumentMemento),
+    Metadata(DocumentMetadataEdit),
+}
+
+impl GpuDocumentHistoryValue {
+    pub const fn kind(&self) -> GpuHistoryEntryKind {
+        match self {
+            Self::Raster(_) => GpuHistoryEntryKind::Raster,
+            Self::Metadata(_) => GpuHistoryEntryKind::Metadata,
+        }
+    }
+
+    pub fn raster_memento(&self) -> Option<&GpuDocumentMemento> {
+        match self {
+            Self::Raster(memento) => Some(memento),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    pub fn raster_memento_mut(&mut self) -> Option<&mut GpuDocumentMemento> {
+        match self {
+            Self::Raster(memento) => Some(memento),
+            Self::Metadata(_) => None,
+        }
+    }
+
+    pub const fn metadata_edit(&self) -> Option<&DocumentMetadataEdit> {
+        match self {
+            Self::Raster(_) => None,
+            Self::Metadata(edit) => Some(edit),
+        }
+    }
+}
+
 pub struct GpuHistoryEntry {
-    inner: WeightedEntry<GpuDocumentMemento>,
+    inner: WeightedEntry<GpuDocumentHistoryValue>,
 }
 
 impl GpuHistoryEntry {
@@ -44,11 +86,19 @@ impl GpuHistoryEntry {
         self.inner.byte_len
     }
 
-    pub const fn memento(&self) -> &GpuDocumentMemento {
-        &self.inner.value
+    pub const fn kind(&self) -> GpuHistoryEntryKind {
+        self.inner.value.kind()
     }
 
-    pub fn into_memento(self) -> GpuDocumentMemento {
+    pub fn raster_memento(&self) -> Option<&GpuDocumentMemento> {
+        self.inner.value.raster_memento()
+    }
+
+    pub const fn metadata_edit(&self) -> Option<&DocumentMetadataEdit> {
+        self.inner.value.metadata_edit()
+    }
+
+    pub fn into_value(self) -> GpuDocumentHistoryValue {
         self.inner.value
     }
 }
@@ -62,6 +112,7 @@ pub struct GpuHistoryRecord {
 pub struct GpuHistoryRecordPreview {
     id: GpuHistoryId,
     evicted_ids: Box<[GpuHistoryId]>,
+    evicted_raster_ids: Box<[GpuHistoryId]>,
 }
 
 impl GpuHistoryRecordPreview {
@@ -71,6 +122,10 @@ impl GpuHistoryRecordPreview {
 
     pub fn evicted_ids(&self) -> &[GpuHistoryId] {
         &self.evicted_ids
+    }
+
+    pub fn evicted_raster_ids(&self) -> &[GpuHistoryId] {
+        &self.evicted_raster_ids
     }
 
     pub fn matches_record(&self, record: &GpuHistoryRecord) -> bool {
@@ -88,8 +143,14 @@ pub struct GpuHistoryRecordFailure {
     pub memento: GpuDocumentMemento,
 }
 
+#[derive(Debug)]
+pub struct GpuMetadataHistoryRecordFailure {
+    pub error: GpuHistoryRecordError,
+    pub edit: DocumentMetadataEdit,
+}
+
 pub struct GpuDocumentHistory {
-    core: BoundedHistory<GpuDocumentMemento>,
+    core: BoundedHistory<GpuDocumentHistoryValue>,
 }
 
 impl GpuDocumentHistory {
@@ -127,7 +188,10 @@ impl GpuDocumentHistory {
             }
             pinned.push((key, slot));
         }
-        match self.core.record(memento, byte_len) {
+        match self
+            .core
+            .record(GpuDocumentHistoryValue::Raster(memento), byte_len)
+        {
             Ok(record) => {
                 debug_assert_eq!(record.id, preview.id);
                 debug_assert_eq!(
@@ -139,7 +203,7 @@ impl GpuDocumentHistory {
                     preview.evicted_ids.as_ref()
                 );
                 for entry in &record.evicted {
-                    unpin_memento(atlas, &entry.value);
+                    unpin_value(atlas, &entry.value);
                 }
                 Ok(GpuHistoryRecord {
                     id: record.id,
@@ -156,9 +220,12 @@ impl GpuDocumentHistory {
                         .unpin(key)
                         .expect("failed record rollback owns every pin it removes");
                 }
+                let GpuDocumentHistoryValue::Raster(memento) = failure.value else {
+                    unreachable!("raster history record returns its raster value on failure")
+                };
                 Err(Box::new(GpuHistoryRecordFailure {
                     error: GpuHistoryRecordError::History(failure.error),
-                    memento: failure.value,
+                    memento,
                 }))
             }
         }
@@ -180,6 +247,72 @@ impl GpuDocumentHistory {
         }
         Ok(GpuHistoryRecordPreview {
             id: preview.id,
+            evicted_raster_ids: self.evicted_raster_ids(&preview.evicted_ids),
+            evicted_ids: preview.evicted_ids.into_boxed_slice(),
+        })
+    }
+
+    pub fn record_metadata(
+        &mut self,
+        atlas: &mut SparseAtlasPlanner,
+        edit: DocumentMetadataEdit,
+    ) -> Result<GpuHistoryRecord, Box<GpuMetadataHistoryRecordFailure>> {
+        let preview = match self.check_metadata_record(&edit) {
+            Ok(preview) => preview,
+            Err(error) => {
+                return Err(Box::new(GpuMetadataHistoryRecordFailure { error, edit }));
+            }
+        };
+        let byte_len = edit.retained_byte_len();
+        match self
+            .core
+            .record(GpuDocumentHistoryValue::Metadata(edit), byte_len)
+        {
+            Ok(record) => {
+                debug_assert_eq!(record.id, preview.id);
+                debug_assert_eq!(
+                    record
+                        .evicted
+                        .iter()
+                        .map(|entry| entry.id)
+                        .collect::<Vec<_>>(),
+                    preview.evicted_ids.as_ref()
+                );
+                for entry in &record.evicted {
+                    unpin_value(atlas, &entry.value);
+                }
+                Ok(GpuHistoryRecord {
+                    id: record.id,
+                    evicted: record
+                        .evicted
+                        .into_iter()
+                        .map(|inner| GpuHistoryEntry { inner })
+                        .collect(),
+                })
+            }
+            Err(failure) => {
+                let GpuDocumentHistoryValue::Metadata(edit) = failure.value else {
+                    unreachable!("metadata history record returns its metadata value on failure")
+                };
+                Err(Box::new(GpuMetadataHistoryRecordFailure {
+                    error: GpuHistoryRecordError::History(failure.error),
+                    edit,
+                }))
+            }
+        }
+    }
+
+    pub fn check_metadata_record(
+        &self,
+        edit: &DocumentMetadataEdit,
+    ) -> Result<GpuHistoryRecordPreview, GpuHistoryRecordError> {
+        let preview = self
+            .core
+            .check_record(edit.retained_byte_len())
+            .map_err(GpuHistoryRecordError::History)?;
+        Ok(GpuHistoryRecordPreview {
+            id: preview.id,
+            evicted_raster_ids: self.evicted_raster_ids(&preview.evicted_ids),
             evicted_ids: preview.evicted_ids.into_boxed_slice(),
         })
     }
@@ -193,7 +326,7 @@ impl GpuDocumentHistory {
         }
         let entries = self.core.drain_all();
         for entry in &entries {
-            unpin_memento(atlas, &entry.value);
+            unpin_value(atlas, &entry.value);
         }
         Ok(entries
             .into_iter()
@@ -216,6 +349,33 @@ impl GpuDocumentHistory {
         self.core.check_begin(direction)
     }
 
+    pub fn check_begin_kind(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<GpuHistoryEntryKind>, GpuDocumentHistoryError> {
+        Ok(self
+            .core
+            .check_begin_entry(direction)?
+            .map(|entry| entry.value.kind()))
+    }
+
+    pub fn next_metadata_edit(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<&DocumentMetadataEdit>, GpuDocumentHistoryError> {
+        let Some(entry) = self.core.check_begin_entry(direction)? else {
+            return Ok(None);
+        };
+        entry
+            .value
+            .metadata_edit()
+            .map(Some)
+            .ok_or(GpuDocumentHistoryError::EntryKindMismatch {
+                expected: GpuHistoryEntryKind::Metadata,
+                actual: GpuHistoryEntryKind::Raster,
+            })
+    }
+
     pub fn pending_direction(&self) -> Option<GpuHistoryDirection> {
         self.core.pending.as_ref().map(|pending| pending.direction)
     }
@@ -230,8 +390,30 @@ impl GpuDocumentHistory {
         self.core
             .pending
             .as_mut()
-            .map(|pending| &mut pending.entry.value)
-            .ok_or(GpuDocumentHistoryError::NoPendingOperation)
+            .ok_or(GpuDocumentHistoryError::NoPendingOperation)?
+            .entry
+            .value
+            .raster_memento_mut()
+            .ok_or(GpuDocumentHistoryError::EntryKindMismatch {
+                expected: GpuHistoryEntryKind::Raster,
+                actual: GpuHistoryEntryKind::Metadata,
+            })
+    }
+
+    pub fn pending_metadata_edit(&self) -> Result<&DocumentMetadataEdit, GpuDocumentHistoryError> {
+        let value = &self
+            .core
+            .pending
+            .as_ref()
+            .ok_or(GpuDocumentHistoryError::NoPendingOperation)?
+            .entry
+            .value;
+        value
+            .metadata_edit()
+            .ok_or(GpuDocumentHistoryError::EntryKindMismatch {
+                expected: GpuHistoryEntryKind::Metadata,
+                actual: GpuHistoryEntryKind::Raster,
+            })
     }
 
     pub fn finish_pending(&mut self) -> Result<GpuHistoryId, GpuDocumentHistoryError> {
@@ -261,6 +443,17 @@ impl GpuDocumentHistory {
     pub const fn max_entries(&self) -> usize {
         self.core.max_entries
     }
+
+    fn evicted_raster_ids(&self, ids: &[GpuHistoryId]) -> Box<[GpuHistoryId]> {
+        ids.iter()
+            .copied()
+            .filter(|id| {
+                self.core
+                    .value_for_id(*id)
+                    .is_some_and(|value| value.kind() == GpuHistoryEntryKind::Raster)
+            })
+            .collect()
+    }
 }
 
 fn memento_residents(memento: &GpuDocumentMemento) -> Vec<(LayerTileKey, AtlasSlot)> {
@@ -276,11 +469,13 @@ fn memento_residents(memento: &GpuDocumentMemento) -> Vec<(LayerTileKey, AtlasSl
         .collect()
 }
 
-fn unpin_memento(atlas: &mut SparseAtlasPlanner, memento: &GpuDocumentMemento) {
-    for (key, _) in memento_residents(memento) {
-        atlas
-            .unpin(key)
-            .expect("retained GPU history owns every resident pin it removes");
+fn unpin_value(atlas: &mut SparseAtlasPlanner, value: &GpuDocumentHistoryValue) {
+    if let GpuDocumentHistoryValue::Raster(memento) = value {
+        for (key, _) in memento_residents(memento) {
+            atlas
+                .unpin(key)
+                .expect("retained GPU history owns every resident pin it removes");
+        }
     }
 }
 
@@ -470,18 +665,32 @@ impl<T> BoundedHistory<T> {
         &self,
         direction: GpuHistoryDirection,
     ) -> Result<Option<GpuHistoryId>, GpuDocumentHistoryError> {
+        Ok(self.check_begin_entry(direction)?.map(|entry| entry.id))
+    }
+
+    fn check_begin_entry(
+        &self,
+        direction: GpuHistoryDirection,
+    ) -> Result<Option<&WeightedEntry<T>>, GpuDocumentHistoryError> {
         if self.pending.is_some() {
             return Err(GpuDocumentHistoryError::PendingOperation);
         }
         Ok(match direction {
             GpuHistoryDirection::Undo => self.undo.back(),
             GpuHistoryDirection::Redo => self.redo.back(),
-        }
-        .map(|entry| entry.id))
+        })
     }
 
     fn pending_id(&self) -> Option<GpuHistoryId> {
         self.pending.as_ref().map(|pending| pending.entry.id)
+    }
+
+    fn value_for_id(&self, id: GpuHistoryId) -> Option<&T> {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .find(|entry| entry.id == id)
+            .map(|entry| &entry.value)
     }
 
     fn finish_pending(&mut self) -> Result<GpuHistoryId, GpuDocumentHistoryError> {
@@ -542,11 +751,18 @@ pub enum GpuDocumentHistoryError {
     InvalidMaximumEntries,
     InvalidByteBudget,
     EmptyMemento,
-    MementoExceedsBudget { requested: u64, maximum: u64 },
+    MementoExceedsBudget {
+        requested: u64,
+        maximum: u64,
+    },
     HistoryIdOverflow,
     ByteCountOverflow,
     PendingOperation,
     NoPendingOperation,
+    EntryKindMismatch {
+        expected: GpuHistoryEntryKind,
+        actual: GpuHistoryEntryKind,
+    },
 }
 
 impl fmt::Display for GpuDocumentHistoryError {
@@ -565,6 +781,10 @@ impl fmt::Display for GpuDocumentHistoryError {
             Self::ByteCountOverflow => write!(formatter, "GPU history byte count overflows"),
             Self::PendingOperation => write!(formatter, "a GPU history operation is pending"),
             Self::NoPendingOperation => write!(formatter, "no GPU history operation is pending"),
+            Self::EntryKindMismatch { expected, actual } => write!(
+                formatter,
+                "GPU history entry is {actual:?}, expected {expected:?}"
+            ),
         }
     }
 }
@@ -574,6 +794,7 @@ impl Error for GpuDocumentHistoryError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{document::LayerId, gpu_atlas::AtlasLayout};
 
     fn values(entries: &[WeightedEntry<u32>]) -> Vec<u32> {
         entries.iter().map(|entry| entry.value).collect()
@@ -686,5 +907,95 @@ mod tests {
         assert_eq!(failure.value, 3);
         assert_eq!(failure.error, GpuDocumentHistoryError::PendingOperation);
         assert_eq!(history.cancel_pending().unwrap().get(), 1);
+    }
+
+    #[test]
+    fn metadata_entries_share_ordering_and_budget_without_atlas_pins() {
+        let entry_bytes = DocumentMetadataEdit::Visibility {
+            layer: LayerId::from_raw(1),
+            before: true,
+            after: false,
+        }
+        .retained_byte_len();
+        let mut history = GpuDocumentHistory::new(2, entry_bytes * 2).unwrap();
+        let mut atlas = SparseAtlasPlanner::new(AtlasLayout::new(128, 128, 1).unwrap());
+        let first_edit = DocumentMetadataEdit::Visibility {
+            layer: LayerId::from_raw(1),
+            before: true,
+            after: false,
+        };
+        let second_edit = DocumentMetadataEdit::Opacity {
+            layer: LayerId::from_raw(1),
+            before: 1.0,
+            after: 0.5,
+        };
+        let third_edit = DocumentMetadataEdit::Move {
+            layer: LayerId::from_raw(1),
+            before: 0,
+            after: 1,
+        };
+
+        let first = history
+            .record_metadata(&mut atlas, first_edit.clone())
+            .unwrap();
+        let second = history
+            .record_metadata(&mut atlas, second_edit.clone())
+            .unwrap();
+        assert_eq!(first.id.get(), 1);
+        assert_eq!(second.id.get(), 2);
+        assert_eq!(history.resident_bytes(), entry_bytes * 2);
+
+        let preview = history.check_metadata_record(&third_edit).unwrap();
+        assert_eq!(preview.evicted_ids(), &[first.id]);
+        assert!(preview.evicted_raster_ids().is_empty());
+        let third = history.record_metadata(&mut atlas, third_edit).unwrap();
+        assert!(preview.matches_record(&third));
+        assert_eq!(third.evicted[0].kind(), GpuHistoryEntryKind::Metadata);
+        assert_eq!(third.evicted[0].metadata_edit(), Some(&first_edit));
+
+        assert!(history.begin_undo().unwrap());
+        assert!(matches!(
+            history.pending_metadata_edit(),
+            Ok(DocumentMetadataEdit::Move { .. })
+        ));
+        assert!(matches!(
+            history.pending_memento_mut(),
+            Err(GpuDocumentHistoryError::EntryKindMismatch {
+                expected: GpuHistoryEntryKind::Raster,
+                actual: GpuHistoryEntryKind::Metadata,
+            })
+        ));
+        history.finish_pending().unwrap();
+
+        assert!(history.begin_undo().unwrap());
+        assert_eq!(history.pending_metadata_edit(), Ok(&second_edit));
+        history.finish_pending().unwrap();
+        assert!(history.begin_redo().unwrap());
+        assert_eq!(history.pending_metadata_edit(), Ok(&second_edit));
+        history.cancel_pending().unwrap();
+    }
+
+    #[test]
+    fn failed_metadata_record_returns_the_edit_unchanged() {
+        let edit = DocumentMetadataEdit::Visibility {
+            layer: LayerId::from_raw(1),
+            before: true,
+            after: false,
+        };
+        let mut history = GpuDocumentHistory::new(1, 1).unwrap();
+        let mut atlas = SparseAtlasPlanner::new(AtlasLayout::new(128, 128, 1).unwrap());
+        let failure = history
+            .record_metadata(&mut atlas, edit.clone())
+            .err()
+            .expect("the metadata entry exceeds the one-byte history budget");
+        assert_eq!(failure.edit, edit);
+        assert_eq!(
+            failure.error,
+            GpuHistoryRecordError::History(GpuDocumentHistoryError::MementoExceedsBudget {
+                requested: edit.retained_byte_len(),
+                maximum: 1,
+            })
+        );
+        assert_eq!(history.undo_depth(), 0);
     }
 }

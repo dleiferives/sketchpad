@@ -117,6 +117,24 @@ GPU raster history stores exact before-blocks plus tile allocation/occupancy
 metadata. Undo and redo exchange exact GPU blocks and then schedule ordinary
 asynchronous mirror reconciliation.
 
+Raster and reversible layer-metadata actions share one bounded chronological
+history. A typed entry distinguishes exact raster mementos from visibility,
+opacity, and ordering edits; only raster entries pin atlas residents and own
+two-sided CPU recovery spills. History preflight therefore reports both the
+complete eviction sequence and its raster-only subset. A metadata insertion
+can clear redo or evict old undo entries in exact user order while removing
+only the raster subset from the spill index. Metadata undo/redo applies the
+same checked edit in reverse/forward direction and records `MetadataOnly` in
+the forward recovery timeline rather than manufacturing pixel work.
+
+The mirror reconciler registers pixel-identical metadata revisions as empty
+ordered boundaries. They may wait behind an unfinished raster revision and
+then advance in the same ready drain. The dispatcher must capture the shared
+CPU snapshot immediately after applying the completed raster revision and
+before applying any following empty metadata boundary; otherwise recovery
+would pair a raster transition for revision N with a snapshot labelled N+1.
+This intermediate snapshot is cheap because sparse tile arrays are shared.
+
 A live submission must preflight every fallible owner before it reaches
 `Queue::submit`. GPU history therefore previews the stable ID of the proposed
 entry and the exact redo/oldest-undo IDs that branch and capacity policy would
@@ -249,10 +267,11 @@ history entry, advances recovery, and enqueues the exact mirror capture with no
 remaining data-dependent failure. A rejected preparation returns both the
 encoded color token and semantic recovery command; a rejected final preflight
 also returns the command encoder and prepared bundle, whose tokens can be
-split for explicit target rollback. This owner is not yet the application's
-document path: undo/redo submission, mapped-readback driving, structural
-history, presentation/compositing, and application state cutover still have to
-join the same boundary.
+split for explicit target rollback. The historical paragraph above describes
+the pre-cutover owner. Raster submission, mapped-readback driving,
+presentation, save/export, active-layer selection, and the first revisioned
+metadata controls are now live; remaining structural work is layer
+creation/deletion/duplication/rename and import.
 
 Undo and redo now enter that owner through a second prepared transaction. GPU
 history can name the next undo/redo ID without removing it, allowing recovery
