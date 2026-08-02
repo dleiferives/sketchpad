@@ -317,7 +317,13 @@ before the checkpoint encoder reads it.
 ## Ordered Implementation
 
 1. Separate document metadata/history from the current CPU raster backend
-   without changing observable behavior.
+   without changing observable behavior. The first part is complete:
+   `DocumentMetadata` is now the backend-neutral immutable description of one
+   exact revision, and `GpuResidentDocument` is constructed from and owns that
+   complete geometry/layer snapshot. Recovery uses the same type instead of a
+   parallel GPU-prefixed copy. Mutable structural commands and their unified
+   chronological history still need to move behind the resident owner before
+   this item is fully complete.
 2. Define timestamped samples, versioned brush recipes, continuous primitives,
    opacity/flow algebra, and a deterministic CPU oracle.
 3. Add the page-batched full-float GPU atlas, layer store, and ordered layer

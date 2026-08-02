@@ -1,5 +1,6 @@
 use crate::{
     document::DocumentRevision,
+    document_metadata::DocumentMetadata,
     gpu_atlas::{AtlasLayout, SparseAtlasPlanner},
     gpu_document_history::{
         GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
@@ -63,6 +64,7 @@ impl Default for GpuResidentDocumentLimits {
 }
 
 pub struct GpuResidentDocument {
+    metadata: DocumentMetadata,
     target_id: GpuDocumentTargetId,
     atlas: SparseAtlasPlanner,
     history: GpuDocumentHistory,
@@ -74,30 +76,27 @@ pub struct GpuResidentDocument {
 
 impl GpuResidentDocument {
     pub fn new(
-        width: u32,
-        height: u32,
+        metadata: DocumentMetadata,
         target: &GpuDocumentTarget,
-        initial_revision: DocumentRevision,
         limits: GpuResidentDocumentLimits,
     ) -> Result<Self, GpuResidentDocumentError> {
-        Self::new_with_target_identity(
-            width,
-            height,
-            target.layout(),
-            target.id(),
-            initial_revision,
-            limits,
-        )
+        Self::new_with_target_identity(metadata, target.layout(), target.id(), limits)
     }
 
     fn new_with_target_identity(
-        width: u32,
-        height: u32,
+        metadata: DocumentMetadata,
         layout: AtlasLayout,
         target_id: GpuDocumentTargetId,
-        initial_revision: DocumentRevision,
         limits: GpuResidentDocumentLimits,
     ) -> Result<Self, GpuResidentDocumentError> {
+        if metadata.tile_size() != layout.tile_size() {
+            return Err(GpuResidentDocumentError::MetadataTileSizeMismatch {
+                metadata: metadata.tile_size(),
+                atlas: layout.tile_size(),
+            });
+        }
+        let [width, height] = metadata.dimensions();
+        let initial_revision = metadata.revision();
         let atlas = SparseAtlasPlanner::new(layout);
         let history = GpuDocumentHistory::new(limits.history_entries, limits.history_bytes)?;
         let mirror = GpuMirrorDispatcher::new(
@@ -116,6 +115,7 @@ impl GpuResidentDocument {
             limits.recovery_spill_bytes,
         )?;
         Ok(Self {
+            metadata,
             target_id,
             atlas,
             history,
@@ -268,6 +268,7 @@ impl GpuResidentDocument {
             .expect("mirror enqueue was checked immediately before submission");
         self.mirror_purposes
             .push_back(GpuMirrorRecoveryPurpose::History(history.id));
+        self.metadata.set_revision(prepared.revision);
         Ok(GpuResidentDocumentCommit {
             revision: prepared.revision,
             history_id: history.id,
@@ -411,6 +412,7 @@ impl GpuResidentDocument {
             .expect("mirror enqueue was checked before history swap submission");
         self.mirror_purposes
             .push_back(GpuMirrorRecoveryPurpose::ReconcileOnly);
+        self.metadata.set_revision(prepared.revision);
         assert_eq!(history_id, prepared.history_id);
         assert_eq!(recovery.id, prepared.history_id);
         assert_eq!(recovery.direction, prepared.direction);
@@ -651,6 +653,10 @@ impl GpuResidentDocument {
         &self.atlas
     }
 
+    pub const fn metadata(&self) -> &DocumentMetadata {
+        &self.metadata
+    }
+
     pub const fn target_id(&self) -> GpuDocumentTargetId {
         self.target_id
     }
@@ -668,7 +674,7 @@ impl GpuResidentDocument {
     }
 
     pub const fn revision(&self) -> DocumentRevision {
-        self.recovery.revision()
+        self.metadata.revision()
     }
 
     pub fn pending_mirror_purpose_count(&self) -> usize {
@@ -917,6 +923,10 @@ impl Error for GpuResidentDocumentSubmitFailure {
 #[derive(Debug)]
 pub enum GpuResidentDocumentError {
     RevisionExhausted,
+    MetadataTileSizeMismatch {
+        metadata: u32,
+        atlas: u32,
+    },
     TargetMismatch {
         expected: GpuDocumentTargetId,
         actual: GpuDocumentTargetId,
@@ -943,6 +953,10 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::RevisionExhausted => {
                 write!(formatter, "GPU document revision space is exhausted")
             }
+            Self::MetadataTileSizeMismatch { metadata, atlas } => write!(
+                formatter,
+                "document metadata tile size {metadata} does not match atlas tile size {atlas}"
+            ),
             Self::TargetMismatch { expected, actual } => write!(
                 formatter,
                 "GPU resident document is bound to target {}, not target {}",
@@ -1058,12 +1072,12 @@ mod tests {
         initial_revision: DocumentRevision,
         limits: GpuResidentDocumentLimits,
     ) -> Result<GpuResidentDocument, GpuResidentDocumentError> {
+        let metadata =
+            DocumentMetadata::new_blank(48, 40, layout.tile_size(), initial_revision).unwrap();
         GpuResidentDocument::new_with_target_identity(
-            48,
-            40,
+            metadata,
             layout,
             GpuDocumentTargetId::from_raw(73),
-            initial_revision,
             limits,
         )
     }
@@ -1111,11 +1125,9 @@ mod tests {
     fn invalid_history_limit_fails_before_constructing_an_owner() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
         let result = GpuResidentDocument::new_with_target_identity(
-            48,
-            40,
+            DocumentMetadata::new_blank(48, 40, 8, DocumentRevision::INITIAL).unwrap(),
             layout,
             GpuDocumentTargetId::from_raw(73),
-            DocumentRevision::INITIAL,
             GpuResidentDocumentLimits {
                 history_entries: 0,
                 ..limits()
@@ -1134,11 +1146,9 @@ mod tests {
     fn invalid_mirror_budget_is_reported_at_the_owner_boundary() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
         let result = GpuResidentDocument::new_with_target_identity(
-            48,
-            40,
+            DocumentMetadata::new_blank(48, 40, 8, DocumentRevision::INITIAL).unwrap(),
             layout,
             GpuDocumentTargetId::from_raw(73),
-            DocumentRevision::INITIAL,
             GpuResidentDocumentLimits {
                 mirror_staging_bytes: GPU_UNDO_BLOCK_BYTES - 1,
                 ..limits()
@@ -1150,6 +1160,24 @@ mod tests {
             Err(GpuResidentDocumentError::MirrorDispatch(
                 GpuMirrorDispatchError::InvalidStagingBudget { .. }
             ))
+        ));
+    }
+
+    #[test]
+    fn owner_rejects_metadata_for_a_different_tile_geometry() {
+        let result = GpuResidentDocument::new_with_target_identity(
+            DocumentMetadata::new_blank(48, 40, 16, DocumentRevision::INITIAL).unwrap(),
+            AtlasLayout::new(32, 8, 2).unwrap(),
+            GpuDocumentTargetId::from_raw(73),
+            limits(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(GpuResidentDocumentError::MetadataTileSizeMismatch {
+                metadata: 16,
+                atlas: 8
+            })
         ));
     }
 

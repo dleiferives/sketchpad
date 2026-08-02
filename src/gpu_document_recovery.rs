@@ -1,115 +1,17 @@
 use crate::{
     checkpoint::{self, CheckpointError, CheckpointSummary, DocumentSnapshot},
     document::{Document, DocumentError, DocumentLayerParts, DocumentRevision, LayerId},
+    document_metadata::{DocumentLayerMetadata, DocumentMetadata},
     gpu_recovery_replay::{
         replay_gpu_raster_recovery, GpuRasterRecoveryCommand, GpuRasterRecoveryReplayError,
     },
     gpu_recovery_timeline::GpuRecoveryTimelineSnapshot,
     gpu_revision_tasks::GpuRevisionedPayload,
 };
-use std::{error::Error, fmt, mem::size_of, path::Path, sync::Arc};
+use std::{error::Error, fmt, path::Path};
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct GpuDocumentLayerMetadata {
-    id: LayerId,
-    name: String,
-    visible: bool,
-    opacity: f32,
-}
-
-impl GpuDocumentLayerMetadata {
-    pub const fn id(&self) -> LayerId {
-        self.id
-    }
-
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub const fn visible(&self) -> bool {
-        self.visible
-    }
-
-    pub const fn opacity(&self) -> f32 {
-        self.opacity
-    }
-}
-
-#[derive(Clone)]
-pub struct GpuDocumentMetadataSnapshot {
-    revision: DocumentRevision,
-    width: u32,
-    height: u32,
-    tile_size: u32,
-    active_layer: LayerId,
-    layers: Arc<[GpuDocumentLayerMetadata]>,
-    retained_byte_len: u64,
-}
-
-impl GpuDocumentMetadataSnapshot {
-    pub fn from_document(document: &Document) -> Self {
-        let layers: Vec<_> = document
-            .layers()
-            .iter()
-            .map(|layer| GpuDocumentLayerMetadata {
-                id: layer.id(),
-                name: layer.name().to_owned(),
-                visible: layer.visible(),
-                opacity: layer.opacity(),
-            })
-            .collect();
-        let name_bytes = layers
-            .iter()
-            .try_fold(0_u64, |bytes, layer| {
-                bytes.checked_add(
-                    u64::try_from(layer.name.len())
-                        .expect("a live metadata name length fits in u64"),
-                )
-            })
-            .expect("live metadata name bytes fit in addressable memory");
-        let layer_bytes = u64::try_from(layers.len())
-            .expect("a live metadata layer count fits in u64")
-            .checked_mul(size_of::<GpuDocumentLayerMetadata>() as u64)
-            .expect("live metadata layer bytes fit in addressable memory");
-        let retained_byte_len = (size_of::<Self>() as u64)
-            .checked_add(layer_bytes)
-            .and_then(|bytes| bytes.checked_add(name_bytes))
-            .expect("a live document's validated metadata fits in addressable memory");
-        Self {
-            revision: document.revision(),
-            width: document.width(),
-            height: document.height(),
-            tile_size: document.tile_size(),
-            active_layer: document.active_layer_id(),
-            layers: layers.into(),
-            retained_byte_len,
-        }
-    }
-
-    pub const fn revision(&self) -> DocumentRevision {
-        self.revision
-    }
-
-    pub const fn dimensions(&self) -> [u32; 2] {
-        [self.width, self.height]
-    }
-
-    pub const fn tile_size(&self) -> u32 {
-        self.tile_size
-    }
-
-    pub const fn active_layer(&self) -> LayerId {
-        self.active_layer
-    }
-
-    pub fn layers(&self) -> &[GpuDocumentLayerMetadata] {
-        &self.layers
-    }
-
-    pub const fn retained_byte_len(&self) -> u64 {
-        self.retained_byte_len
-    }
-}
+pub type GpuDocumentLayerMetadata = DocumentLayerMetadata;
+pub type GpuDocumentMetadataSnapshot = DocumentMetadata;
 
 #[derive(Clone)]
 pub struct GpuDocumentRecoverySnapshot {
@@ -162,13 +64,13 @@ impl GpuDocumentRecoverySnapshot {
     }
 
     pub fn recover_document(&self) -> Result<GpuRecoveredDocument, GpuDocumentRecoveryError> {
-        let mut parts = Vec::with_capacity(self.metadata.layers.len());
+        let mut parts = Vec::with_capacity(self.metadata.layers().len());
         let mut stats = GpuDocumentRecoveryStats::default();
-        for layer in self.metadata.layers.iter() {
+        for layer in self.metadata.layers() {
             let recovered =
-                replay_gpu_raster_recovery(&self.rasters, layer.id).map_err(|error| {
+                replay_gpu_raster_recovery(&self.rasters, layer.id()).map_err(|error| {
                     GpuDocumentRecoveryError::Raster {
-                        layer: layer.id,
+                        layer: layer.id(),
                         error,
                     }
                 })?;
@@ -189,20 +91,20 @@ impl GpuDocumentRecoverySnapshot {
                 .layer_snapshots_applied
                 .saturating_add(recovered.stats().layer_snapshots_applied);
             parts.push(DocumentLayerParts {
-                id: layer.id,
-                name: layer.name.clone(),
-                visible: layer.visible,
-                opacity: layer.opacity,
+                id: layer.id(),
+                name: layer.name().to_owned(),
+                visible: layer.visible(),
+                opacity: layer.opacity(),
                 raster: recovered.into_raster(),
             });
         }
         let document = Document::from_layer_parts_at_revision(
-            self.metadata.width,
-            self.metadata.height,
-            self.metadata.tile_size,
-            self.metadata.active_layer,
+            self.metadata.width(),
+            self.metadata.height(),
+            self.metadata.tile_size(),
+            self.metadata.active_layer(),
             parts,
-            self.metadata.revision,
+            self.metadata.revision(),
         )?;
         Ok(GpuRecoveredDocument { document, stats })
     }

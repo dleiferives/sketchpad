@@ -229,6 +229,18 @@ rejection, and owner mismatch reporting. This closes the same-layout/same-
 serial resource aliasing hole while keeping the physical target-ownership
 refactor as a separate reviewable change.
 
+Resident document metadata now has one backend-neutral immutable contract.
+`DocumentMetadata` captures exact geometry, revision, active layer, ordered
+layer identities, names, visibility, and opacity without retaining raster
+pixels. Device-loss recovery and the resident owner both use this same type;
+the old GPU-specific metadata structs are compatibility aliases only. A
+resident owner can no longer be created from dimensions and revision alone,
+and rejects metadata whose logical tile size differs from its atlas. Raster
+commit and undo/redo submission advance the owned metadata revision at the
+same post-submit boundary as history, recovery, and mirror ownership. This is
+the first authority-consolidation slice; structural mutations and their
+chronological history remain on the legacy `Document` path for now.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default
