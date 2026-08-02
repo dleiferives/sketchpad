@@ -908,14 +908,8 @@ fn coords_for_raster(raster: &RasterLayer) -> Vec<TileCoord> {
 
 fn clone_raster(source: &RasterLayer) -> Result<RasterLayer, RasterError> {
     let mut cloned = RasterLayer::new(source.width(), source.height(), source.tile_size())?;
-    for coord in source.allocated_tile_coords() {
-        let pixels = source
-            .tile(coord)
-            .expect("allocated coordinates must resolve to tiles")
-            .pixels()
-            .to_vec()
-            .into_boxed_slice();
-        cloned.restore_tile(coord, pixels)?;
+    for tile in source.checkpoint_tiles() {
+        cloned.restore_shared_tile(tile.coord, tile.pixels)?;
     }
     Ok(cloned)
 }
@@ -1130,12 +1124,38 @@ mod tests {
         let original = document.active_layer_id();
         paint_pixel(&mut document, 1, 1, color(1.0, 0.0, 0.0, 0.5));
         let (duplicate, _) = document.duplicate_layer(original).unwrap();
+        let original_pixels = document
+            .layer_raster(original)
+            .unwrap()
+            .checkpoint_tiles()
+            .pop()
+            .unwrap()
+            .pixels;
+        let duplicate_pixels = document
+            .layer_raster(duplicate)
+            .unwrap()
+            .checkpoint_tiles()
+            .pop()
+            .unwrap()
+            .pixels;
+        assert!(std::sync::Arc::ptr_eq(&original_pixels, &duplicate_pixels));
         assert_eq!(
             document.composite().pixel(1, 1).unwrap(),
             LinearRgba::premultiplied(0.75, 0.0, 0.0, 0.75)
         );
 
         paint_pixel(&mut document, 2, 2, color(0.0, 0.0, 1.0, 1.0));
+        let changed_duplicate_pixels = document
+            .layer_raster(duplicate)
+            .unwrap()
+            .checkpoint_tiles()
+            .pop()
+            .unwrap()
+            .pixels;
+        assert!(!std::sync::Arc::ptr_eq(
+            &original_pixels,
+            &changed_duplicate_pixels
+        ));
         assert_eq!(
             document.layer_raster(original).unwrap().pixel(2, 2),
             Some(LinearRgba::TRANSPARENT)

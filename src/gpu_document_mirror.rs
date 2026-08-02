@@ -735,7 +735,7 @@ impl GpuCpuMirrorSnapshot {
     pub fn raster_layer(&self, layer: LayerId) -> Result<RasterLayer, RasterError> {
         let mut raster = RasterLayer::new(self.width, self.height, self.tile_size)?;
         for (key, pixels) in self.tiles.iter().filter(|(key, _)| key.layer == layer) {
-            raster.restore_tile(key.tile, pixels.as_ref().to_vec().into_boxed_slice())?;
+            raster.restore_shared_tile(key.tile, Arc::clone(pixels))?;
         }
         Ok(raster)
     }
@@ -1733,6 +1733,33 @@ mod tests {
             reconciler.mirror().tile_pixels(key).unwrap()[16 * 128 + 16],
             green
         );
+    }
+
+    #[test]
+    fn reconstructed_rasters_share_snapshot_tiles_until_mutation() {
+        let red = LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0);
+        let blue = LinearRgba::premultiplied(0.0, 0.0, 1.0, 1.0);
+        let (plan, key) = one_tile_plan(1, true);
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&plan).unwrap();
+        reconciler
+            .complete_batch(solid_patch(&plan.batches()[0], red))
+            .unwrap();
+        let snapshot = reconciler.snapshot();
+        let mut raster = snapshot.raster_layer(key.layer).unwrap();
+        let raster_pixels = raster.checkpoint_tiles().pop().unwrap().pixels;
+        let snapshot_pixels = snapshot.tiles.get(&key).unwrap();
+        assert!(Arc::ptr_eq(&raster_pixels, snapshot_pixels));
+
+        let gesture = raster.begin_gesture().unwrap();
+        raster.set_pixel(gesture, 16, 16, blue).unwrap();
+        raster.commit_gesture(gesture).unwrap();
+
+        assert_eq!(snapshot.tile_pixels(key).unwrap()[16 * 128 + 16], red);
+        assert_eq!(raster.pixel(16, 16), Some(blue));
+        let changed_pixels = raster.checkpoint_tiles().pop().unwrap().pixels;
+        assert!(!Arc::ptr_eq(&changed_pixels, snapshot_pixels));
     }
 
     #[test]

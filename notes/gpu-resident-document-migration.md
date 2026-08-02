@@ -178,7 +178,9 @@ The worker materializes the immutable metadata/raster pair into an editable
 CPU document, freezes its copy-on-write tiles as the existing layered
 `DocumentSnapshot`, and performs encoding plus atomic replacement there. The
 event/render thread does not replay strokes, composite the recovered document,
-encode, or touch the filesystem.
+encode, or touch the filesystem. Mirror materialization installs the immutable
+tile references directly into the worker raster; it does not copy every pixel
+before the checkpoint encoder reads it.
 
 ## Ordered Implementation
 

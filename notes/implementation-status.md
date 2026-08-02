@@ -298,6 +298,14 @@ layer metadata, active identity, and recovered pixels. The checkpoint object
 retains its source revision and replay stats so the revision-task completion
 can decide whether a successful write is still current.
 
+Mirror reconstruction and layer duplication now preserve that ownership all
+the way into `RasterLayer`: they install the existing immutable tile `Arc`
+instead of copying 128-by-128 full-float pixels. The first subsequent edit
+uses the raster's existing copy-on-write path, so duplicate layers remain
+independent while untouched tiles cost only metadata and reference counts.
+Tests assert pointer sharing before mutation, pointer separation afterward,
+and an unchanged mirror snapshot.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,

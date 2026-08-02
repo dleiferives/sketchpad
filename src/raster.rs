@@ -830,6 +830,14 @@ impl RasterLayer {
         coord: TileCoord,
         pixels: Box<[LinearRgba]>,
     ) -> Result<(), RasterError> {
+        self.restore_shared_tile(coord, pixels.into())
+    }
+
+    pub(crate) fn restore_shared_tile(
+        &mut self,
+        coord: TileCoord,
+        pixels: Arc<[LinearRgba]>,
+    ) -> Result<(), RasterError> {
         let bounds = self
             .tile_bounds(coord)
             .ok_or(RasterError::TileOutOfBounds(coord))?;
@@ -841,7 +849,7 @@ impl RasterLayer {
         }
 
         let mut state = TileState {
-            pixels: pixels.into(),
+            pixels,
             content_bounds: None,
             content_bounds_state: ContentBoundsState::Recompute,
         };
