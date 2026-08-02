@@ -130,6 +130,15 @@ before submitting GPU work rather than discovering a recoverability failure
 after pixels are visible. Pure tests cover combined redo clearing, oldest-undo
 eviction, stable ordering, pin mismatch, and absence of preflight mutation.
 
+The recovery-spill owner now previews and commits the corresponding ID
+replacement as one operation. It rejects repeated or untracked eviction IDs,
+duplicate new identity, nonconsecutive revisions, and post-eviction entry
+pressure before changing either index. A successful replacement removes the
+exact pending/ready entries in GPU-history order, reports the bytes freed by
+ready pairs, returns ownership of every removed spill, and installs the new ID
+as pending. Tests prove that preview is non-mutating, ready-byte accounting is
+released exactly once, and malformed eviction sets cannot partially branch.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

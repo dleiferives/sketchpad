@@ -3,7 +3,11 @@ use crate::{
     gpu_document_history::{GpuHistoryDirection, GpuHistoryId},
     gpu_raster_recovery::{GpuExactRasterRecoveryCommand, GpuExactRasterRecoveryTransition},
 };
-use std::{collections::BTreeMap, error::Error, fmt, mem};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    error::Error,
+    fmt, mem,
+};
 
 // A 64 MiB GPU history can contribute 128 MiB of before/after pixels. The
 // remaining allowance bounds canonical tile/region metadata at the 256-entry
@@ -44,6 +48,18 @@ impl GpuHistoryRecoverySpills {
         source_revision: DocumentRevision,
         revision: DocumentRevision,
     ) -> Result<(), GpuHistoryRecoveryError> {
+        self.check_replace(&[], id, source_revision, revision)?;
+        self.insert_pending(id, source_revision, revision);
+        Ok(())
+    }
+
+    pub fn check_replace(
+        &self,
+        evicted_ids: &[GpuHistoryId],
+        id: GpuHistoryId,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<GpuHistoryRecoveryReplacementPreview, GpuHistoryRecoveryError> {
         if source_revision.get().checked_add(1) != Some(revision.get()) {
             return Err(GpuHistoryRecoveryError::NonConsecutiveRevision {
                 source: source_revision,
@@ -62,13 +78,79 @@ impl GpuHistoryRecoverySpills {
                 registered_id,
             });
         }
-        if self.entries.len() == self.max_entries {
+
+        let mut seen = BTreeSet::new();
+        let mut freed_bytes = 0_u64;
+        for &evicted_id in evicted_ids {
+            if !seen.insert(evicted_id) {
+                return Err(GpuHistoryRecoveryError::DuplicateEvictedHistoryId(
+                    evicted_id,
+                ));
+            }
+            let entry = self.entries.get(&evicted_id).ok_or(
+                GpuHistoryRecoveryError::UntrackedEvictedHistoryId(evicted_id),
+            )?;
+            freed_bytes = freed_bytes
+                .checked_add(entry.retained_byte_len())
+                .ok_or(GpuHistoryRecoveryError::ByteCountOverflow)?;
+        }
+        let retained = self
+            .entries
+            .len()
+            .checked_sub(evicted_ids.len())
+            .expect("every unique evicted history ID was retained");
+        if retained >= self.max_entries {
             return Err(GpuHistoryRecoveryError::EntryLimitExhausted {
-                resident: self.entries.len(),
+                resident: retained,
                 maximum: self.max_entries,
             });
         }
 
+        Ok(GpuHistoryRecoveryReplacementPreview {
+            id,
+            evicted_ids: evicted_ids.into(),
+            freed_bytes,
+        })
+    }
+
+    pub fn replace(
+        &mut self,
+        evicted_ids: &[GpuHistoryId],
+        id: GpuHistoryId,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) -> Result<GpuHistoryRecoveryReplacement, GpuHistoryRecoveryError> {
+        let preview = self.check_replace(evicted_ids, id, source_revision, revision)?;
+        let mut evicted = Vec::with_capacity(evicted_ids.len());
+        for &evicted_id in evicted_ids {
+            evicted.push(
+                self.remove(evicted_id)
+                    .expect("the replacement preview validated every evicted history ID"),
+            );
+        }
+        self.insert_pending(id, source_revision, revision);
+        debug_assert_eq!(preview.id, id);
+        debug_assert_eq!(preview.evicted_ids.as_ref(), evicted_ids);
+        debug_assert_eq!(
+            preview.freed_bytes,
+            evicted
+                .iter()
+                .map(GpuHistoryRecoveryEntry::retained_byte_len)
+                .sum::<u64>()
+        );
+        Ok(GpuHistoryRecoveryReplacement {
+            id,
+            freed_bytes: preview.freed_bytes,
+            evicted,
+        })
+    }
+
+    fn insert_pending(
+        &mut self,
+        id: GpuHistoryId,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+    ) {
         self.entries.insert(
             id,
             GpuHistoryRecoveryEntry {
@@ -79,7 +161,6 @@ impl GpuHistoryRecoverySpills {
             },
         );
         self.revisions.insert(revision, id);
-        Ok(())
     }
 
     pub fn attach(
@@ -252,6 +333,33 @@ pub struct GpuHistoryRecoveryEntry {
     transition: Option<GpuExactRasterRecoveryTransition>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuHistoryRecoveryReplacementPreview {
+    id: GpuHistoryId,
+    evicted_ids: Box<[GpuHistoryId]>,
+    freed_bytes: u64,
+}
+
+impl GpuHistoryRecoveryReplacementPreview {
+    pub const fn id(&self) -> GpuHistoryId {
+        self.id
+    }
+
+    pub fn evicted_ids(&self) -> &[GpuHistoryId] {
+        &self.evicted_ids
+    }
+
+    pub const fn freed_bytes(&self) -> u64 {
+        self.freed_bytes
+    }
+}
+
+pub struct GpuHistoryRecoveryReplacement {
+    pub id: GpuHistoryId,
+    pub freed_bytes: u64,
+    pub evicted: Vec<GpuHistoryRecoveryEntry>,
+}
+
 impl GpuHistoryRecoveryEntry {
     pub const fn id(&self) -> GpuHistoryId {
         self.id
@@ -342,6 +450,8 @@ pub enum GpuHistoryRecoveryError {
         resident: usize,
         maximum: usize,
     },
+    DuplicateEvictedHistoryId(GpuHistoryId),
+    UntrackedEvictedHistoryId(GpuHistoryId),
     UntrackedHistoryId(GpuHistoryId),
     UntrackedRevision(DocumentRevision),
     SourceRevisionMismatch {
@@ -402,6 +512,16 @@ impl fmt::Display for GpuHistoryRecoveryError {
             Self::EntryLimitExhausted { resident, maximum } => write!(
                 formatter,
                 "GPU history recovery has {resident} entries and cannot exceed {maximum}"
+            ),
+            Self::DuplicateEvictedHistoryId(id) => write!(
+                formatter,
+                "GPU history recovery replacement repeats evicted ID {}",
+                id.get()
+            ),
+            Self::UntrackedEvictedHistoryId(id) => write!(
+                formatter,
+                "evicted GPU history ID {} has no recovery spill",
+                id.get()
             ),
             Self::UntrackedHistoryId(id) => {
                 write!(formatter, "GPU history ID {} has no recovery spill", id.get())
@@ -719,5 +839,101 @@ mod tests {
             spills.id_for_revision(DocumentRevision::from_raw(1)),
             Some(id)
         );
+    }
+
+    #[test]
+    fn replacement_previews_and_commits_matching_gpu_history_evictions() {
+        let first_id = GpuHistoryId::from_raw(1);
+        let second_id = GpuHistoryId::from_raw(2);
+        let third_id = GpuHistoryId::from_raw(3);
+        let mut spills = GpuHistoryRecoverySpills::new(2, 1_000_000).unwrap();
+        spills
+            .register(
+                first_id,
+                DocumentRevision::INITIAL,
+                DocumentRevision::from_raw(1),
+            )
+            .unwrap();
+        spills.attach(transition(0, 1)).unwrap();
+        let first_bytes = spills.resident_bytes();
+        spills
+            .register(
+                second_id,
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(2),
+            )
+            .unwrap();
+
+        let preview = spills
+            .check_replace(
+                &[first_id],
+                third_id,
+                DocumentRevision::from_raw(2),
+                DocumentRevision::from_raw(3),
+            )
+            .unwrap();
+        assert_eq!(preview.id(), third_id);
+        assert_eq!(preview.evicted_ids(), &[first_id]);
+        assert_eq!(preview.freed_bytes(), first_bytes);
+        assert_eq!(spills.len(), 2);
+        assert_eq!(spills.resident_bytes(), first_bytes);
+
+        let replacement = spills
+            .replace(
+                &[first_id],
+                third_id,
+                DocumentRevision::from_raw(2),
+                DocumentRevision::from_raw(3),
+            )
+            .unwrap();
+        assert_eq!(replacement.id, third_id);
+        assert_eq!(replacement.freed_bytes, first_bytes);
+        assert_eq!(replacement.evicted.len(), 1);
+        assert_eq!(replacement.evicted[0].id(), first_id);
+        assert!(replacement.evicted[0].transition().is_some());
+        assert!(spills.entry(first_id).is_none());
+        assert!(spills.entry(second_id).is_some());
+        assert!(spills.entry(third_id).is_some());
+        assert_eq!(spills.resident_bytes(), 0);
+        assert_eq!(spills.ready_len(), 0);
+        assert_eq!(spills.pending_len(), 2);
+    }
+
+    #[test]
+    fn invalid_replacement_sets_are_rejected_without_eviction() {
+        let first_id = GpuHistoryId::from_raw(1);
+        let second_id = GpuHistoryId::from_raw(2);
+        let mut spills = GpuHistoryRecoverySpills::new(1, 1_000_000).unwrap();
+        spills
+            .register(
+                first_id,
+                DocumentRevision::INITIAL,
+                DocumentRevision::from_raw(1),
+            )
+            .unwrap();
+
+        let replacement = |evicted: &[GpuHistoryId]| {
+            spills.check_replace(
+                evicted,
+                second_id,
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(2),
+            )
+        };
+        assert!(matches!(
+            replacement(&[]),
+            Err(GpuHistoryRecoveryError::EntryLimitExhausted { .. })
+        ));
+        assert_eq!(
+            replacement(&[first_id, first_id]).unwrap_err(),
+            GpuHistoryRecoveryError::DuplicateEvictedHistoryId(first_id)
+        );
+        assert_eq!(
+            replacement(&[GpuHistoryId::from_raw(99)]).unwrap_err(),
+            GpuHistoryRecoveryError::UntrackedEvictedHistoryId(GpuHistoryId::from_raw(99))
+        );
+        assert_eq!(spills.len(), 1);
+        assert!(spills.entry(first_id).is_some());
+        assert!(spills.entry(second_id).is_none());
     }
 }

@@ -125,6 +125,13 @@ owner can use that preview to check recovery-spill replacement, journal space,
 and mirror capacity while the encoded commit is still discardable; successful
 submission must produce the same ID and eviction sequence.
 
+The spill owner accepts that predicted eviction set as one replacement
+operation. It first proves that every evicted ID is unique and still tracked,
+that the proposed ID and consecutive revision pair are unused, and that the
+post-eviction entry count fits. Only then does it release ready or pending
+spills and insert the new pending association. Returned evicted entries retain
+ownership for auditing, and byte accounting falls only for ready exact pairs.
+
 Until the CPU mirror catches up, an in-memory journal retains complete
 semantic commands, including structural commands and undo/redo direction. On
 device loss, the application reconstructs from the exact mirror plus that
