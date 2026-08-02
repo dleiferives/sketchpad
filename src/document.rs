@@ -165,6 +165,24 @@ impl Document {
         active_layer: LayerId,
         parts: Vec<DocumentLayerParts>,
     ) -> Result<Self, DocumentError> {
+        Self::from_layer_parts_at_revision(
+            width,
+            height,
+            tile_size,
+            active_layer,
+            parts,
+            DocumentRevision::INITIAL,
+        )
+    }
+
+    pub(crate) fn from_layer_parts_at_revision(
+        width: u32,
+        height: u32,
+        tile_size: u32,
+        active_layer: LayerId,
+        parts: Vec<DocumentLayerParts>,
+        revision: DocumentRevision,
+    ) -> Result<Self, DocumentError> {
         if parts.is_empty() {
             return Err(DocumentError::NoLayers);
         }
@@ -212,7 +230,7 @@ impl Document {
             composite: RasterLayer::new(width, height, tile_size)?,
             composite_stats: CompositeStats::default(),
             history: DocumentHistory::default(),
-            revision: DocumentRevision::INITIAL,
+            revision,
         };
         document.recompose_all()?;
         document.reset_composite_stats();

@@ -225,10 +225,9 @@ untouched pixels, absent-tile removal, and a 250-pixel canvas edge.
 The payload set is intentionally not yet declared complete for drawing
 recovery. Until an undo/redo result has mapped, the system must retain an older
 exact replay base plus inverse-capable history; a pending GPU-only capture
-would disappear with the device. Structural payloads, inverse-history replay
-through that asynchronous interval, capture coalescing/backpressure, save race
-handling, and simulated device-loss replay remain the rest of migration step
-5.
+would disappear with the device. Inverse-history replay through that
+asynchronous interval, imported/deleted raster ownership, and capture
+coalescing remain the rest of migration step 5.
 
 The first anchor handoff owner now makes the exact CPU base and its post-base
 journal one state boundary. Recording delegates to the same transactional
@@ -252,11 +251,9 @@ revision. Pure loss simulations cover semantic paint followed by an exact
 full-float overwrite, commands interleaved across layers, and exact absence
 reclaiming a tile.
 
-This is not yet whole-document device-loss recovery: layer metadata and
-structural commands are not in the typed payload, and an undo/redo whose exact
-result is still mapping still needs the retained older anchor plus inverse
-history. Those unsupported cases remain explicit rather than falling back to
-a direction-only record.
+An undo/redo whose exact result is still mapping still needs the retained
+older anchor plus inverse history. That unsupported interval remains explicit
+rather than falling back to a direction-only record.
 
 Revisioned background work now has a bounded scheduling state machine for the
 save/autosave side of the migration. A payload reports its immutable target
@@ -270,6 +267,27 @@ return ownership without corrupting the queue. Successful completion reports
 interactive revision, so saving `R` after drawing reaches `R + n` cannot clear
 the modified marker. Pure tests exercise coalescing, stale success, worker
 failure, promotion, token mismatch, and exhaustion.
+
+Whole-document recovery now has an immutable CPU metadata half. It snapshots
+canvas geometry, stable layer IDs, order, names, visibility, opacity, and the
+active layer with a checked retained-byte count. Structural revisions enter
+the raster journal as explicit `MetadataOnly` boundaries; the target metadata
+snapshot carries their small canonical result, so they do not manufacture GPU
+pixel work. Pairing metadata with a raster timeline requires identical target
+revision and geometry and returns both snapshots unchanged on failure.
+
+The simulated loss path now rebuilds every target layer, then constructs an
+editable `Document` at the original revision with empty runtime undo history
+and a recomputed composite. A six-revision pure case covers semantic paint,
+layer creation, rename, opacity, visibility, reorder, active-layer identity,
+layer-local pixels, and final revision. This also gives the background task
+queue a complete revision-tagged payload for the currently supported raster
+commands.
+
+Imported-layer pixels, undoing deletion across an already-advanced base, and
+an undo/redo result that has not finished mapping still need exact owned raster
+content or the older inverse-capable anchor. The metadata snapshot does not
+hide those content-ownership requirements.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,

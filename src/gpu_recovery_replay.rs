@@ -16,13 +16,15 @@ use std::{error::Error, fmt, mem::size_of};
 pub enum GpuRasterRecoveryCommand {
     Round(GpuRoundRecoveryCommand),
     Exact(GpuExactRasterRecoveryCommand),
+    MetadataOnly,
 }
 
 impl GpuRasterRecoveryCommand {
-    pub const fn layer(&self) -> LayerId {
+    pub const fn layer(&self) -> Option<LayerId> {
         match self {
-            Self::Round(command) => command.layer(),
-            Self::Exact(command) => command.layer(),
+            Self::Round(command) => Some(command.layer()),
+            Self::Exact(command) => Some(command.layer()),
+            Self::MetadataOnly => None,
         }
     }
 
@@ -36,6 +38,7 @@ impl GpuRasterRecoveryCommand {
                 size_of::<GpuExactRasterRecoveryCommand>() as u64,
                 command.retained_byte_len(),
             ),
+            Self::MetadataOnly => (size_of::<Self>() as u64, size_of::<Self>() as u64),
         };
         variant_bytes
             .checked_sub(variant_size)
@@ -69,7 +72,7 @@ pub fn replay_gpu_raster_recovery(
 
     for record in snapshot.journal().records() {
         let command = record.command();
-        if command.layer() != layer {
+        if command.layer() != Some(layer) {
             stats.commands_skipped = stats.commands_skipped.saturating_add(1);
             continue;
         }
@@ -93,6 +96,9 @@ pub fn replay_gpu_raster_recovery(
                 if let Some(command_damage) = replay.damage {
                     merge_damage(&mut damage, &command_damage);
                 }
+            }
+            GpuRasterRecoveryCommand::MetadataOnly => {
+                unreachable!("metadata-only recovery commands were skipped before dispatch")
             }
         }
     }

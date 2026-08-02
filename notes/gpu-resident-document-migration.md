@@ -155,9 +155,12 @@ so background save/recovery work cannot race a later handoff.
 Device-loss reconstruction is per logical layer: materialize that layer's
 sparse mirror tiles, replay its round and exact-raster records while still
 walking the global revision sequence, then discard the temporary CPU history.
-This makes interleaved raster layers deterministic without pretending that
-unimplemented structural records can be skipped. Whole-document recovery is
-complete only when the metadata/structural payload joins the same sequence.
+This makes interleaved raster layers deterministic. CPU-canonical metadata is
+captured immutably at the same target revision; structural-only revisions use
+explicit no-raster boundaries, and recovery rebuilds layer order/properties
+before recompositing an editable document. Imported/deleted raster ownership
+and the pre-map undo interval remain explicit incomplete cases rather than
+being mistaken for metadata problems.
 
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
