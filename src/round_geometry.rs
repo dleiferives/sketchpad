@@ -202,6 +202,10 @@ impl RoundStrokeGeometry {
         self.complete.is_empty() && self.active.is_none()
     }
 
+    pub fn is_complete(&self) -> bool {
+        !self.complete.is_empty() && self.active.is_none()
+    }
+
     pub fn subpath_count(&self) -> usize {
         self.complete.len() + usize::from(self.active.is_some())
     }

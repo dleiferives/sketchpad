@@ -1,5 +1,5 @@
 use sketchpad::{
-    document::{Document, DocumentRevision},
+    document::{Document, DocumentRevision, LayerId},
     gpu_atlas::{AtlasLayout, AtlasPageId, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{GpuDocumentHistory, GpuHistoryDirection},
     gpu_document_mirror::{encode_gpu_mirror_revision_capture, GpuMirrorReadbackPlan},
@@ -7,14 +7,16 @@ use sketchpad::{
     gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
     gpu_document_undo::{GpuDocumentMemento, GPU_UNDO_BLOCK_BYTES},
     gpu_round::RoundMaskScheduler,
+    gpu_round_recovery::{replay_round_recovery_command, GpuRoundRecoveryCommand},
     gpu_round_target::RoundMaskTarget,
-    raster::TileCoord,
-    stroke::{RoundContact, RoundPathCommand, StrokeMaterial},
+    raster::{RasterLayer, TileCoord},
+    stroke::{RoundBrushRecipeV1, RoundContact, RoundPathCommand, StrokeMaterial},
 };
 use std::{error::Error, iter, mem::size_of, sync::mpsc};
 
 const PAGE_SIZE: u32 = 256;
 const TILE_SIZE: u32 = 128;
+const CPU_GPU_REPLAY_ABSOLUTE_TOLERANCE: f32 = 1.0e-6;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
@@ -48,20 +50,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let first = contact([64.0, 64.0], 8.0, 0);
     let last = contact([192.0, 64.0], 8.0, 1);
-    let paint_batch = scheduler.schedule(
-        &mut atlas,
-        &[
-            RoundPathCommand::Begin(first),
-            RoundPathCommand::Sweep {
-                from: first,
-                to: last,
-            },
-            RoundPathCommand::End {
-                at: last,
-                elapsed_micros: 2,
-            },
-        ],
+    let paint_commands = [
+        RoundPathCommand::Begin(first),
+        RoundPathCommand::Sweep {
+            from: first,
+            to: last,
+        },
+        RoundPathCommand::End {
+            at: last,
+            elapsed_micros: 2,
+        },
+    ];
+    let paint_material = StrokeMaterial::paint([0.2, 0.4, 0.8], 0.5, 1.0)?;
+    let paint_recovery = GpuRoundRecoveryCommand::new(
+        layer,
+        RoundBrushRecipeV1::with_minimum_pressure_fraction(paint_material, 16.0, 1.0)?,
+        paint_commands.to_vec(),
     )?;
+    let paint_batch = scheduler.schedule(&mut atlas, &paint_commands)?;
     mask.begin_stroke()?;
     let mut mask_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("GPU Document Commit Smoke Paint Mask"),
@@ -80,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &queue,
             &mut paint_encoder,
             &mask,
-            StrokeMaterial::paint([0.2, 0.4, 0.8], 0.5, 1.0)?,
+            paint_material,
         )?
         .ok_or("the painted stroke unexpectedly produced no commit")?;
     let paint_stats = encoded_paint.stats();
@@ -94,16 +100,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let eraser_contact = contact([64.0, 64.0], 4.0, 3);
-    let eraser_batch = scheduler.schedule(
-        &mut atlas,
-        &[
-            RoundPathCommand::Begin(eraser_contact),
-            RoundPathCommand::End {
-                at: eraser_contact,
-                elapsed_micros: 4,
-            },
-        ],
+    let eraser_commands = [
+        RoundPathCommand::Begin(eraser_contact),
+        RoundPathCommand::End {
+            at: eraser_contact,
+            elapsed_micros: 4,
+        },
+    ];
+    let eraser_material = StrokeMaterial::eraser(0.25, 1.0)?;
+    let eraser_recovery = GpuRoundRecoveryCommand::new(
+        layer,
+        RoundBrushRecipeV1::with_minimum_pressure_fraction(eraser_material, 8.0, 1.0)?,
+        eraser_commands.to_vec(),
     )?;
+    let eraser_batch = scheduler.schedule(&mut atlas, &eraser_commands)?;
     mask.begin_stroke()?;
     let mut eraser_mask_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("GPU Document Commit Smoke Eraser Mask"),
@@ -124,7 +134,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             &queue,
             &mut erase_encoder,
             &mask,
-            StrokeMaterial::eraser(0.25, 1.0)?,
+            eraser_material,
         )?
         .ok_or("the eraser stroke unexpectedly produced no commit")?;
     let erase_stats = encoded_erase.stats();
@@ -213,6 +223,25 @@ fn main() -> Result<(), Box<dyn Error>> {
     expect_color("retained left sweep", retained_left, [0.1, 0.2, 0.4, 0.5])?;
     expect_color("retained right sweep", retained_right, [0.1, 0.2, 0.4, 0.5])?;
     expect_color("cleared outside", transparent, [0.0; 4])?;
+
+    let mut recovered_raster = RasterLayer::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE)?;
+    let recovered_paint = replay_round_recovery_command(&mut recovered_raster, &paint_recovery)?;
+    let recovered_erase = replay_round_recovery_command(&mut recovered_raster, &eraser_recovery)?;
+    if recovered_paint.damage.is_none()
+        || recovered_erase.damage.is_none()
+        || recovered_paint.pixels_changed == 0
+        || recovered_erase.pixels_changed == 0
+    {
+        return Err("CPU recovery replay produced no paint or erase damage".into());
+    }
+    let recovery_comparison = compare_recovery_raster_to_gpu(
+        &recovered_raster,
+        &atlas,
+        layer,
+        page,
+        &color_bytes,
+        color_bytes_per_row,
+    )?;
 
     let swap_readback = SwapReadback {
         device: &device,
@@ -587,7 +616,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!(
         "gpu_document_commit_smoke adapter={:?} paint={paint_stats:?} erase={erase_stats:?} \
          source_over=exact destination_out=exact lazy_clear=exact undo_redo=exact \
-         mirror_capture_isolation=exact mirror_readback=bounded mirror_reconcile=exact",
+         mirror_capture_isolation=exact mirror_readback=bounded mirror_reconcile=exact \
+         cpu_recovery={recovery_comparison:?}",
         adapter.get_info().name,
     );
     Ok(())
@@ -763,6 +793,75 @@ fn expect_color(label: &str, actual: [f32; 4], expected: [f32; 4]) -> Result<(),
         return Err(format!("{label} is {actual:?}, expected {expected:?}").into());
     }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct RecoveryComparison {
+    compared_pixels: u64,
+    differing_pixels: u64,
+    differing_channels: u64,
+    maximum_absolute_error: f32,
+}
+
+fn compare_recovery_raster_to_gpu(
+    raster: &RasterLayer,
+    atlas: &SparseAtlasPlanner,
+    layer: LayerId,
+    page: AtlasPageId,
+    gpu_bytes: &[u8],
+    bytes_per_row: u32,
+) -> Result<RecoveryComparison, Box<dyn Error>> {
+    let mut comparison = RecoveryComparison::default();
+    for y in 0..raster.height() {
+        for x in 0..raster.width() {
+            comparison.compared_pixels += 1;
+            let key = LayerTileKey::new(layer, TileCoord::new(x / TILE_SIZE, y / TILE_SIZE));
+            let gpu = if let Some(slot) = atlas.slot(key) {
+                if slot.page() != page {
+                    return Err("CPU recovery comparison reached an unread GPU page".into());
+                }
+                read_color(
+                    gpu_bytes,
+                    bytes_per_row,
+                    slot.origin()[0] + x % TILE_SIZE,
+                    slot.origin()[1] + y % TILE_SIZE,
+                )?
+            } else {
+                [0.0; 4]
+            };
+            let cpu = raster
+                .pixel(x, y)
+                .expect("CPU recovery comparison stays inside the raster");
+            let cpu = [cpu.r, cpu.g, cpu.b, cpu.a];
+            let mut pixel_differs = false;
+            for (gpu_channel, cpu_channel) in gpu.into_iter().zip(cpu) {
+                if !gpu_channel.is_finite() || !cpu_channel.is_finite() {
+                    return Err(format!(
+                        "CPU/GPU recovery comparison found non-finite pixel ({x}, {y})"
+                    )
+                    .into());
+                }
+                if gpu_channel.to_bits() != cpu_channel.to_bits() {
+                    pixel_differs = true;
+                    comparison.differing_channels += 1;
+                }
+                let absolute_error = (gpu_channel - cpu_channel).abs();
+                comparison.maximum_absolute_error =
+                    comparison.maximum_absolute_error.max(absolute_error);
+                if absolute_error > CPU_GPU_REPLAY_ABSOLUTE_TOLERANCE {
+                    return Err(format!(
+                        "CPU recovery pixel ({x}, {y}) is {cpu:?}, GPU committed {gpu:?}; \
+                         channel error {absolute_error} exceeds {CPU_GPU_REPLAY_ABSOLUTE_TOLERANCE}"
+                    )
+                    .into());
+                }
+            }
+            if pixel_differs {
+                comparison.differing_pixels += 1;
+            }
+        }
+    }
+    Ok(comparison)
 }
 
 fn expect_swap_stats(

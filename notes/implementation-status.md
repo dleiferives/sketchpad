@@ -183,12 +183,31 @@ target, and command sequence while the live journal advances. Pure tests cover
 gap rejection, transactional byte exhaustion, partial retirement, snapshot
 isolation, and deterministic replay of a small state machine.
 
-The payload is intentionally not yet declared complete for drawing recovery.
-A direction-only undo record cannot reconstruct an undo whose target predates
-the mirror base; exact resulting blocks or a retained older replay base/inverse
-history are required. Typed round-stroke and structural payloads, that undo
-choice, capture coalescing/backpressure, save race handling, and simulated
-device-loss replay remain the rest of migration step 5.
+Full-flow round paint and erase now have the first typed journal payload. It
+retains the layer, versioned recipe, canonical continuous path commands, and a
+checked retained-byte charge. Construction returns command ownership on
+failure and rejects empty or incomplete paths, timestamp regression, no-op
+material, and optical-density flow that the current GPU commit path cannot yet
+execute. Its deterministic CPU oracle evaluates the same variable-radius
+capsule signed distance at pixel centers, applies the shared premultiplied
+material algebra, rolls back on error, and does not allocate a tile when an
+eraser crosses empty space. Two journaled strokes replay in revision order in
+the pure tests.
+
+The Atlas Intel UHD 630 smoke compared all 65,536 pixels after the same paint
+sweep and eraser dot ran through the GPU and CPU recovery paths. Storage and
+the GPU readback stayed exact `Rgba32Float`, but transcendental capsule math was
+not bit-identical: 8 pixels / 32 channels differed, with maximum absolute
+error `4.7683716e-7`; every channel passed the explicit `1e-6` oracle bound.
+The CPU replay is therefore a deterministic semantic fallback, not a bit-exact
+replacement for an asynchronously mirrored GPU revision.
+
+The payload set is intentionally not yet declared complete for drawing
+recovery. A direction-only undo record cannot reconstruct an undo whose target
+predates the mirror base; exact resulting blocks or a retained older replay
+base/inverse history are required. Structural payloads, that undo choice,
+capture coalescing/backpressure, save race handling, and simulated device-loss
+replay remain the rest of migration step 5.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
