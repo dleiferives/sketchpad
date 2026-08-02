@@ -283,12 +283,30 @@ That smoke exposed and now records an important cancel boundary: a newly
 allocated preview tile must be released from the sparse planner when the
 stroke is discarded. Leaving it allocated caused the next unrelated stroke
 to fail resident validation because the key was neither committed nor active.
-The isolated smoke explicitly reclaims it and verifies slot identity. The
-future live active-stroke owner must retain the batch's `newly_allocated`
-records and perform the same rollback atomically; the compositor deliberately
-does not mutate allocation ownership. The application is not switched to this
-path yet, and the final dirty-updated exact stable composite cache remains to
-be built.
+The reusable `GpuResidentRoundStrokeEngine` now owns that boundary. It creates
+the mask pipelines once, acquires a serial resident-document guard at begin,
+submits validated incremental command batches, retains only allocations that
+those batches created, and is the sole path to transient composition. Failed
+mask encoding restores the scheduler and releases that batch's allocations.
+Cancel ends the mask and returns every provisional slot without touching the
+color target, revision, or history. A mismatched token, layer, target, or
+layout fails before atlas mutation, and ordinary commit/undo preparation is
+blocked while the guard is held.
+
+The terminal commit path requires a complete semantic round path, constructs
+the versioned recovery command, ends the mask, captures exact first-write undo
+blocks, and passes the color work through the existing resident preflight and
+single-submit boundary. Success advances metadata, GPU history, live recovery,
+and asynchronous mirror capture together; every pre-submit failure discards
+target metadata and releases provisional allocations. There is no fallible
+acknowledgement after `Queue::submit`. The Atlas Intel UHD 630 smoke now uses
+this owner rather than a duplicate planner: it paints into a provisional tile,
+proves preview-only residency, cancels and observes reclamation, starts a
+second eraser stroke, previews the lower layer, commits it as history entry 1,
+and reads back the committed result exactly. The application is not switched
+to this path yet, and the final dirty-updated exact stable composite cache
+remains to be built. Command batches currently submit immediately; display-
+opportunity coalescing remains a later event-loop policy above this owner.
 
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized

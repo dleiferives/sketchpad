@@ -347,7 +347,14 @@ before the checkpoint encoder reads it.
    owner, application presentation cutover, and selected dirty-updated
    full-float stable composite cache remain.
 4. Add stable/tail round masks, live paint/erase presentation, GPU commit, and
-   exact block undo.
+   exact block undo. The first union-mask transaction is complete below the
+   application boundary: one reusable owner serializes begin/batches/cancel or
+   commit, owns provisional atlas rollback, presents through the ordered
+   active-layer compositor, and hands a completed stroke to the existing exact
+   undo/recovery/mirror transaction. Atlas hardware proves cancel, paint
+   preview, eraser preview, and committed eraser readback. Stable-prefix versus
+   replaceable-tail masks, optical-density flow, frame-opportunity batching,
+   and event-loop cutover remain.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss
    journal replay, and GPU color sampling.
 6. Make the GPU document path the default. Temporarily hide the unmigrated
