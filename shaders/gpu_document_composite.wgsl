@@ -7,7 +7,17 @@ struct Camera {
 }
 
 @group(0) @binding(0) var color_page: texture_2d<f32>;
-@group(0) @binding(1) var<uniform> camera: Camera;
+@group(0) @binding(1) var mask_page: texture_2d<f32>;
+@group(0) @binding(2) var<uniform> camera: Camera;
+
+struct Material {
+    color: vec4f,
+    opacity: f32,
+    operation: u32,
+    _padding: vec2u,
+}
+
+@group(0) @binding(3) var<uniform> material: Material;
 
 fn view_size() -> vec2f {
     let height = camera.canvas_size.y / camera.zoom;
@@ -20,6 +30,8 @@ struct CompositeVertexOutput {
     @location(1) @interpolate(flat) physical_origin: vec2u,
     @location(2) @interpolate(flat) pixel_extent: vec2u,
     @location(3) @interpolate(flat) opacity: f32,
+    @location(4) @interpolate(flat) transient: u32,
+    @location(5) @interpolate(flat) base_initialized: u32,
 }
 
 @vertex
@@ -29,6 +41,8 @@ fn composite_vs(
     @location(1) logical_extent: vec2f,
     @location(2) physical_origin: vec2u,
     @location(3) opacity: f32,
+    @location(4) transient: u32,
+    @location(5) base_initialized: u32,
 ) -> CompositeVertexOutput {
     let corners = array(
         vec2f(0.0, 1.0),
@@ -49,6 +63,8 @@ fn composite_vs(
     output.physical_origin = physical_origin;
     output.pixel_extent = vec2u(logical_extent);
     output.opacity = opacity;
+    output.transient = transient;
+    output.base_initialized = base_initialized;
     return output;
 }
 
@@ -56,5 +72,22 @@ fn composite_vs(
 fn composite_fs(input: CompositeVertexOutput) -> @location(0) vec4f {
     let size = vec2i(input.pixel_extent);
     let local_pixel = clamp(vec2i(input.local * vec2f(size)), vec2i(0), size - vec2i(1));
-    return textureLoad(color_page, vec2i(input.physical_origin) + local_pixel, 0) * input.opacity;
+    let atlas_pixel = vec2i(input.physical_origin) + local_pixel;
+    if input.transient == 0u {
+        return textureLoad(color_page, atlas_pixel, 0) * input.opacity;
+    }
+
+    var base = vec4f(0.0);
+    if input.base_initialized != 0u {
+        base = textureLoad(color_page, atlas_pixel, 0);
+    }
+    let alpha = material.opacity * clamp(textureLoad(mask_page, atlas_pixel, 0).r, 0.0, 1.0);
+    let keep_base = 1.0 - alpha;
+    var result: vec4f;
+    if material.operation == 0u {
+        result = vec4f(material.color.rgb * alpha + base.rgb * keep_base, alpha + base.a * keep_base);
+    } else {
+        result = base * keep_base;
+    }
+    return result * input.opacity;
 }
