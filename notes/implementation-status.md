@@ -49,6 +49,10 @@ encodes exactly one max-blended render pass per touched page. The target
 requires each encoded batch to be explicitly marked submitted or discarded
 before its shared instance buffers may be reused; this prevents two command
 buffers submitted together from silently seeing only the last queue write.
+It also retains the unioned conservative tile-local damage for every active
+slot across incremental batches. Submission keeps that damage and discard
+restores the exact prior union, providing the first-write block inventory
+needed by GPU undo without expanding a touched region to its whole tile.
 The first non-live color commit stage is connected as well. Lazy
 `Rgba32Float` pages consume the ended full-flow mask once per affected slot;
 fixed-function premultiplied source-over paints and destination-out erases in
@@ -69,6 +73,12 @@ traffic facts, not timing measurements. The first smoke attempt also caught
 that `from` is reserved in WGSL; the shader endpoints were renamed and the
 validation error is now necessarily exercised by the smoke path rather than
 being hidden by Rust-only compilation.
+
+That smoke now additionally checks the retained damage contract. The two-tile
+sweep reports exact clipped local bounds on both sides of the tile boundary,
+the replacement dot reports only its own local bounds, and dropping an encoded
+stroke before submission restores an empty active-damage set. This is a state
+and addressing proof; it does not add a timing claim.
 
 The matching full-float document smoke also passed on that Intel adapter. A
 half-opacity `[0.2, 0.4, 0.8]` straight-color sweep committed two logical tiles

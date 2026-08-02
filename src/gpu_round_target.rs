@@ -1,9 +1,10 @@
 use crate::{
     gpu_atlas::{AtlasLayout, AtlasPageId, AtlasSlot, LayerTileKey},
     gpu_round::{RoundMaskBatch, RoundMaskInstance},
+    raster::RectU32,
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     error::Error,
     fmt,
     mem::{size_of, size_of_val},
@@ -98,9 +99,16 @@ pub struct RoundMaskTarget {
     clear_buffer: wgpu::Buffer,
     clear_buffer_capacity: u64,
     active: bool,
-    active_slots: HashSet<(LayerTileKey, AtlasSlot)>,
+    active_tiles: HashMap<(LayerTileKey, AtlasSlot), RectU32>,
     encoded_batch_pending: bool,
-    pending_new_active_slots: Vec<(LayerTileKey, AtlasSlot)>,
+    pending_damage_changes: Vec<((LayerTileKey, AtlasSlot), Option<RectU32>)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveRoundMaskTile {
+    pub key: LayerTileKey,
+    pub slot: AtlasSlot,
+    pub local_damage: RectU32,
 }
 
 impl RoundMaskTarget {
@@ -239,9 +247,9 @@ impl RoundMaskTarget {
             clear_buffer,
             clear_buffer_capacity: INITIAL_INSTANCE_BUFFER_BYTES,
             active: false,
-            active_slots: HashSet::new(),
+            active_tiles: HashMap::new(),
             encoded_batch_pending: false,
-            pending_new_active_slots: Vec::new(),
+            pending_damage_changes: Vec::new(),
         })
     }
 
@@ -257,7 +265,7 @@ impl RoundMaskTarget {
             return Err(RoundMaskTargetError::StrokeAlreadyActive);
         }
         self.active = true;
-        self.active_slots.clear();
+        self.active_tiles.clear();
         Ok(())
     }
 
@@ -274,11 +282,11 @@ impl RoundMaskTarget {
     }
 
     pub fn active_slot_count(&self) -> usize {
-        self.active_slots.len()
+        self.active_tiles.len()
     }
 
     pub fn active_residents(&self) -> Vec<(LayerTileKey, AtlasSlot)> {
-        let mut residents: Vec<_> = self.active_slots.iter().copied().collect();
+        let mut residents: Vec<_> = self.active_tiles.keys().copied().collect();
         residents.sort_by_key(|(key, slot)| {
             (
                 slot.page().get(),
@@ -291,6 +299,28 @@ impl RoundMaskTarget {
         residents
     }
 
+    pub fn active_tiles(&self) -> Vec<ActiveRoundMaskTile> {
+        let mut tiles: Vec<_> = self
+            .active_tiles
+            .iter()
+            .map(|(&(key, slot), &local_damage)| ActiveRoundMaskTile {
+                key,
+                slot,
+                local_damage,
+            })
+            .collect();
+        tiles.sort_by_key(|tile| {
+            (
+                tile.slot.page().get(),
+                tile.slot.slot_in_page(),
+                tile.key.layer.get(),
+                tile.key.tile.y,
+                tile.key.tile.x,
+            )
+        });
+        tiles
+    }
+
     pub const fn encoded_batch_is_pending(&self) -> bool {
         self.encoded_batch_pending
     }
@@ -300,7 +330,7 @@ impl RoundMaskTarget {
             return Err(RoundMaskTargetError::NoEncodedBatch);
         }
         self.encoded_batch_pending = false;
-        self.pending_new_active_slots.clear();
+        self.pending_damage_changes.clear();
         Ok(())
     }
 
@@ -308,8 +338,15 @@ impl RoundMaskTarget {
         if !self.encoded_batch_pending {
             return Err(RoundMaskTargetError::NoEncodedBatch);
         }
-        for resident in self.pending_new_active_slots.drain(..) {
-            self.active_slots.remove(&resident);
+        for (resident, previous) in self.pending_damage_changes.drain(..).rev() {
+            match previous {
+                Some(damage) => {
+                    self.active_tiles.insert(resident, damage);
+                }
+                None => {
+                    self.active_tiles.remove(&resident);
+                }
+            }
         }
         self.encoded_batch_pending = false;
         Ok(())
@@ -365,7 +402,7 @@ impl RoundMaskTarget {
             for work in &page.work {
                 round_instances.push(work.payload);
                 let resident = (work.key, work.slot);
-                if !self.active_slots.contains(&resident) && pending_active.insert(resident) {
+                if !self.active_tiles.contains_key(&resident) && pending_active.insert(resident) {
                     clear_instances.push(ClearInstance::for_slot(work.slot, self.layout));
                 }
             }
@@ -428,9 +465,24 @@ impl RoundMaskTarget {
             pass.set_vertex_buffer(0, self.round_buffer.slice(..));
             pass.draw(0..6, encoding.round_instances.clone());
         }
-        self.pending_new_active_slots = pending_active.into_iter().collect();
-        self.active_slots
-            .extend(self.pending_new_active_slots.iter().copied());
+        let slots_by_key: HashMap<_, _> = batch
+            .allocations()
+            .iter()
+            .map(|allocation| (allocation.key, allocation.slot))
+            .collect();
+        self.pending_damage_changes = batch
+            .touched_tiles()
+            .iter()
+            .map(|damage| {
+                let resident = (damage.key, slots_by_key[&damage.key]);
+                let previous = self.active_tiles.get(&resident).copied();
+                let combined = previous
+                    .map(|existing| existing.union(damage.local_damage))
+                    .unwrap_or(damage.local_damage);
+                self.active_tiles.insert(resident, combined);
+                (resident, previous)
+            })
+            .collect();
         self.encoded_batch_pending = true;
 
         Ok(RoundMaskTargetStats {

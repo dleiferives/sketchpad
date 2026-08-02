@@ -3,6 +3,7 @@ use sketchpad::{
     gpu_atlas::{AtlasLayout, SparseAtlasPlanner},
     gpu_round::RoundMaskScheduler,
     gpu_round_target::RoundMaskTarget,
+    raster::{RectU32, TileCoord},
     stroke::{RoundContact, RoundPathCommand},
 };
 use std::{error::Error, iter, mem::size_of, sync::mpsc};
@@ -74,6 +75,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     target.end_stroke()?;
     queue.submit(iter::once(first_encoder.finish()));
     target.encoded_batch_submitted()?;
+    expect_active_damage(
+        &target,
+        TileCoord::new(0, 0),
+        RectU32::from_min_max(55, 55, 128, 73).unwrap(),
+    )?;
+    expect_active_damage(
+        &target,
+        TileCoord::new(1, 0),
+        RectU32::from_min_max(0, 55, 73, 73).unwrap(),
+    )?;
 
     let second = contact([20.0, 20.0], 4.0, 3);
     let second_batch = scheduler.schedule(
@@ -126,6 +137,38 @@ fn main() -> Result<(), Box<dyn Error>> {
     );
     queue.submit(iter::once(second_encoder.finish()));
     target.encoded_batch_submitted()?;
+    expect_active_damage(
+        &target,
+        TileCoord::new(0, 0),
+        RectU32::from_min_max(15, 15, 25, 25).unwrap(),
+    )?;
+
+    let discarded = contact([220.0, 220.0], 2.0, 5);
+    let discarded_batch = scheduler.schedule(
+        &mut atlas,
+        &[
+            RoundPathCommand::Begin(discarded),
+            RoundPathCommand::End {
+                at: discarded,
+                elapsed_micros: 6,
+            },
+        ],
+    )?;
+    target.begin_stroke()?;
+    let mut discarded_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("Continuous Round Mask Smoke Discarded Stroke"),
+    });
+    target.encode_batch(&device, &queue, &mut discarded_encoder, &discarded_batch)?;
+    target.end_stroke()?;
+    if target.active_slot_count() != 1 {
+        return Err("discard control did not stage one active tile".into());
+    }
+    drop(discarded_encoder);
+    target.encoded_batch_discarded()?;
+    if target.active_slot_count() != 0 {
+        return Err("discarded mask damage remained active".into());
+    }
+
     let slice = readback.slice(..);
     let (sender, receiver) = mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |result| {
@@ -197,6 +240,24 @@ fn read_mask(bytes: &[u8], bytes_per_row: u32, x: u32, y: u32) -> Result<f32, Bo
 fn expect_mask_value(x: u32, y: u32, value: f32, expected: f32) -> Result<(), Box<dyn Error>> {
     if (value - expected).abs() > 1.0e-6 {
         return Err(format!("mask pixel ({x}, {y}) is {value}, expected {expected}").into());
+    }
+    Ok(())
+}
+
+fn expect_active_damage(
+    target: &RoundMaskTarget,
+    tile: TileCoord,
+    expected: RectU32,
+) -> Result<(), Box<dyn Error>> {
+    let active = target.active_tiles();
+    let actual = active
+        .iter()
+        .find_map(|active| (active.key.tile == tile).then_some(active.local_damage));
+    if actual != Some(expected) {
+        return Err(format!(
+            "active mask tile {tile:?} has damage {actual:?}, expected {expected:?}"
+        )
+        .into());
     }
     Ok(())
 }
