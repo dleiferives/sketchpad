@@ -408,6 +408,11 @@ pub enum StrokeError {
     InvalidDiameter,
     InvalidMinimumPressure,
     InvalidSample,
+    InvalidPoint,
+    InvalidContact,
+    PathAlreadyActive,
+    PathNotActive,
+    DiscontinuousPath,
     TimestampMovedBackward,
     StrokeFinalized,
 }
@@ -429,6 +434,11 @@ impl fmt::Display for StrokeError {
                 write!(formatter, "round brush minimum pressure is invalid")
             }
             Self::InvalidSample => write!(formatter, "timed brush sample is invalid"),
+            Self::InvalidPoint => write!(formatter, "stroke evaluation point is invalid"),
+            Self::InvalidContact => write!(formatter, "round contact is invalid"),
+            Self::PathAlreadyActive => write!(formatter, "a round subpath is already active"),
+            Self::PathNotActive => write!(formatter, "no round subpath is active"),
+            Self::DiscontinuousPath => write!(formatter, "round path command is discontinuous"),
             Self::TimestampMovedBackward => write!(formatter, "stroke timestamp moved backward"),
             Self::StrokeFinalized => write!(formatter, "stroke is already finalized"),
         }

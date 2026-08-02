@@ -13,6 +13,7 @@ pub mod persistence;
 pub mod pipeline;
 pub mod raster;
 pub mod replay;
+pub mod round_geometry;
 pub mod sdf;
 pub mod stroke;
 

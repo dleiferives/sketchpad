@@ -9,11 +9,15 @@ Selected next architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
 page-batched GPU-resident layer and continuous-mask design in
 [GPU-resident document and continuous brush migration](gpu-resident-document-migration.md).
-The first non-live groundwork now exists in `stroke`: validated full-precision
-paint/erase material state, separate opacity/flow accumulation, timestamped
-round contacts, and a packet-batching-invariant command stream. Its release
-tests pass on Atlas. The inventory below continues to describe the executable
-at commit `373b0e7`; the new contract is not wired into live drawing yet.
+The first non-live groundwork now exists in `stroke` and `round_geometry`:
+validated full-precision paint/erase material state, separate opacity/flow
+accumulation, timestamped round contacts, a packet-batching-invariant command
+stream, and a CPU reference oracle for continuous variable-radius round
+sweeps. The oracle treats consecutive segment overlap as one traversal while
+allowing nonconsecutive self-crossings and pressure-separated subpaths to add
+flow. Its release tests pass on Atlas. The inventory below continues to
+describe the executable at commit `373b0e7`; the new contract is not wired
+into live drawing yet.
 
 ## Current Executable
 
@@ -259,6 +263,11 @@ The current test suite covers:
 - one undo entry across many input updates;
 - independence from collinear event batching;
 - exact shared round-dab coverage and distance-resampling behavior;
+- continuous variable-radius round-sweep distance and antialias coverage;
+- stable flow at connected sweep joins, additive flow at nonconsecutive
+  self-crossings, and distinct pressure-separated traversals;
+- validated round-command continuity, bounds, and packet-batching-invariant
+  command generation;
 - globally ordered raster/layer undo, redo invalidation, imported-layer
   restoration, and matched bounded raster-memento eviction;
 - redo cleanup for both present layers and rasters temporarily retained by
