@@ -43,7 +43,24 @@ and translates each dot or variable-radius sweep into its physical page slot.
 Its tests cover a nine-tile sweep in one page batch, the exact 64-slot page
 boundary, edge-tile clipping, incremental begin/sweep/end, layout mismatch,
 and failure without partial scheduler/atlas mutation. GPU textures and passes
-are not connected to these batches yet.
+are now connected for the full-flow mask stage: a real `R32Float` target packs
+all instances into one upload, lazily clears newly used physical slots, and
+encodes exactly one max-blended render pass per touched page. The target
+requires each encoded batch to be explicitly marked submitted or discarded
+before its shared instance buffers may be reused; this prevents two command
+buffers submitted together from silently seeing only the last queue write.
+Color-page commit and live presentation are not connected yet.
+
+The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
+two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
+and one page pass. A second stroke reused one tile, cleared only that slot,
+encoded one round instance plus one clear in 56 bytes, and kept the other
+slot's prior mask intact. Exact readback checks saw new coverage `1`, cleared
+coverage `0`, and retained-other-slot coverage `1`. These are correctness and
+traffic facts, not timing measurements. The first smoke attempt also caught
+that `from` is reserved in WGSL; the shader endpoints were renamed and the
+validation error is now necessarily exercised by the smoke path rather than
+being hidden by Rust-only compilation.
 
 ## Current Executable
 

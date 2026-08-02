@@ -75,6 +75,7 @@ pub struct RoundMaskTileDamage {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RoundMaskBatch {
+    layout: AtlasLayout,
     pages: Vec<AtlasPageBatch<RoundMaskInstance>>,
     touched_tiles: Vec<RoundMaskTileDamage>,
     allocations: Vec<AtlasAllocation>,
@@ -83,6 +84,10 @@ pub struct RoundMaskBatch {
 }
 
 impl RoundMaskBatch {
+    pub const fn layout(&self) -> AtlasLayout {
+        self.layout
+    }
+
     pub fn pages(&self) -> &[AtlasPageBatch<RoundMaskInstance>] {
         &self.pages
     }
@@ -239,6 +244,7 @@ impl RoundMaskScheduler {
 
         self.active_contact = next_active;
         Ok(RoundMaskBatch {
+            layout: self.layout,
             pages,
             touched_tiles,
             allocations,
