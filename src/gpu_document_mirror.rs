@@ -385,6 +385,24 @@ impl GpuMirrorRevisionCapture {
         self.queued.is_empty() && self.active.is_none()
     }
 
+    pub(crate) const fn capture_submission_acknowledged(&self) -> bool {
+        self.capture_submitted
+    }
+
+    pub(crate) fn matches_plan(&self, plan: &GpuMirrorReadbackPlan) -> bool {
+        self.revision == plan.revision()
+            && self.byte_len == plan.byte_len()
+            && self.block_count == plan.block_count()
+            && self.remaining_byte_len == self.byte_len
+            && self.active.is_none()
+            && self.queued.len() == plan.batches().len()
+            && self
+                .queued
+                .iter()
+                .map(|batch| &batch.plan)
+                .eq(plan.batches())
+    }
+
     pub fn capture_submitted(&mut self) -> Result<(), GpuMirrorReadbackError> {
         if self.capture_submitted {
             return Err(GpuMirrorReadbackError::CaptureAlreadySubmitted);
@@ -756,6 +774,23 @@ impl GpuCpuMirror {
         }
     }
 
+    fn validate_plan(&self, plan: &GpuMirrorReadbackPlan) -> Result<(), GpuMirrorReconcileError> {
+        let mut resident_states = HashMap::<LayerTileKey, bool>::new();
+        for batch in plan.batches() {
+            for region in batch.regions() {
+                self.validate_region_bounds(region.key, region.local_bounds)?;
+                if let Some(previous) = resident_states.insert(region.key, region.initialized) {
+                    if previous != region.initialized {
+                        return Err(GpuMirrorReconcileError::ConflictingResidentState(
+                            region.key,
+                        ));
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_revision(
         &self,
         revision: DocumentRevision,
@@ -770,32 +805,7 @@ impl GpuCpuMirror {
                 });
             }
             for region in batch.regions() {
-                let tile_origin_x = region
-                    .key
-                    .tile
-                    .x
-                    .checked_mul(self.tile_size)
-                    .ok_or(GpuMirrorReconcileError::TileCoordinateOverflow(region.key))?;
-                let tile_origin_y = region
-                    .key
-                    .tile
-                    .y
-                    .checked_mul(self.tile_size)
-                    .ok_or(GpuMirrorReconcileError::TileCoordinateOverflow(region.key))?;
-                if tile_origin_x >= self.width || tile_origin_y >= self.height {
-                    return Err(GpuMirrorReconcileError::TileOutOfBounds(region.key));
-                }
-                let valid_width = self.tile_size.min(self.width - tile_origin_x);
-                let valid_height = self.tile_size.min(self.height - tile_origin_y);
-                if region.local_bounds.max_x() > valid_width
-                    || region.local_bounds.max_y() > valid_height
-                {
-                    return Err(GpuMirrorReconcileError::RegionOutsideTile {
-                        key: region.key,
-                        bounds: region.local_bounds,
-                        valid_extent: [valid_width, valid_height],
-                    });
-                }
+                self.validate_region_bounds(region.key, region.local_bounds)?;
                 if let Some(previous) = resident_states.insert(region.key, region.initialized) {
                     if previous != region.initialized {
                         return Err(GpuMirrorReconcileError::ConflictingResidentState(
@@ -817,6 +827,36 @@ impl GpuCpuMirror {
                     });
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_region_bounds(
+        &self,
+        key: LayerTileKey,
+        bounds: RectU32,
+    ) -> Result<(), GpuMirrorReconcileError> {
+        let tile_origin_x = key
+            .tile
+            .x
+            .checked_mul(self.tile_size)
+            .ok_or(GpuMirrorReconcileError::TileCoordinateOverflow(key))?;
+        let tile_origin_y = key
+            .tile
+            .y
+            .checked_mul(self.tile_size)
+            .ok_or(GpuMirrorReconcileError::TileCoordinateOverflow(key))?;
+        if tile_origin_x >= self.width || tile_origin_y >= self.height {
+            return Err(GpuMirrorReconcileError::TileOutOfBounds(key));
+        }
+        let valid_width = self.tile_size.min(self.width - tile_origin_x);
+        let valid_height = self.tile_size.min(self.height - tile_origin_y);
+        if bounds.max_x() > valid_width || bounds.max_y() > valid_height {
+            return Err(GpuMirrorReconcileError::RegionOutsideTile {
+                key,
+                bounds,
+                valid_extent: [valid_width, valid_height],
+            });
         }
         Ok(())
     }
@@ -902,6 +942,7 @@ impl GpuMirrorReconciler {
                 return Err(GpuMirrorReconcileError::MalformedRevisionPlan);
             }
         }
+        self.mirror.validate_plan(plan)?;
         self.pending.push_back(PendingMirrorRevision {
             revision: plan.revision(),
             expected_batches: plan.batches().to_vec(),
@@ -1690,5 +1731,34 @@ mod tests {
                 .unwrap(),
             vec![DocumentRevision::from_raw(1)]
         );
+    }
+
+    #[test]
+    fn plan_geometry_is_rejected_before_a_revision_is_registered() {
+        let layout = AtlasLayout::document_default();
+        let (capture, states) = capture_and_states(
+            layout,
+            &[(
+                TileCoord::new(1, 0),
+                RectU32::from_xywh(0, 0, 16, 16).unwrap(),
+                true,
+            )],
+        );
+        let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::from_raw(1),
+            &capture,
+            &states,
+            DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        )
+        .unwrap();
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+
+        assert!(matches!(
+            reconciler.register_plan(&plan),
+            Err(GpuMirrorReconcileError::TileOutOfBounds(_))
+        ));
+        assert_eq!(reconciler.pending_revision_count(), 0);
+        assert_eq!(reconciler.mirror().revision(), DocumentRevision::INITIAL);
     }
 }

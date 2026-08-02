@@ -6,6 +6,7 @@ mod document_history;
 pub mod gpu_atlas;
 pub mod gpu_document_history;
 pub mod gpu_document_mirror;
+pub mod gpu_document_mirror_dispatcher;
 pub mod gpu_document_target;
 pub mod gpu_document_undo;
 pub mod gpu_round;

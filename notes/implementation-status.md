@@ -156,12 +156,25 @@ staged for the CPU. Sequential bounded mapping still reconstructed the exact
 tile. This proves snapshot isolation across a later GPU mutation. It is a
 correctness result, not a timing measurement.
 
-The live application still does not dispatch these batches or bind mirror
-revisions to save/export. The dispatcher must enforce the staging cap globally
-across multiple pending revision captures, account immutable snapshot bytes,
-and define backpressure/coalescing when reconciliation falls behind. That
-dispatcher, the semantic journal, save race handling, and device-loss replay
-remain the rest of migration step 5.
+A global reconciliation dispatcher now owns ordered captures and their CPU
+reconciler. Its defaults are a 64 MiB immutable-snapshot budget and one 16 MiB
+staging buffer. Capacity can be checked before allocating a revision capture;
+enqueue repeats the check transactionally and returns ownership of a rejected
+capture. Only the oldest revision may prepare a staging copy, so multiple
+pending captures cannot multiply mapped-transfer memory. Completed batches
+release their exact snapshot-byte charge, the final batch retires its capture,
+and the dispatcher reports which revision became atomically visible. Plan
+geometry is now rejected during registration, before mapped bytes can be
+consumed, including edge-tile bounds and document extent.
+
+The Atlas isolation smoke runs this dispatcher at exact 16,384-byte snapshot
+and 8,192-byte staging limits. It rejects capacity for another capture while
+the first is resident, never exposes more than one 8,192-byte staging batch,
+and returns both counters to zero after reconciliation. The live application
+still does not enqueue captures or bind mirror revisions to save/export. A
+semantic journal must define the nonblocking response when snapshot capacity
+is exhausted; capture coalescing/backpressure, save race handling, and
+device-loss replay remain the rest of migration step 5.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
