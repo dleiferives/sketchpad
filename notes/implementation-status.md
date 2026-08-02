@@ -118,6 +118,18 @@ the exact command back on its original side. Recording during a pending swap
 is rejected. Pure tests cover branch clearing order, both budgets, oversize
 rejection, and finish/cancel behavior.
 
+GPU history now also exposes a non-mutating commit preview for the live-owner
+cutover. It reports the next stable history ID and the exact IDs that a new
+branch, entry limit, or byte limit would evict, without clearing redo or
+changing accounting. The atlas separately validates every prospective
+history pin without incrementing it. Actual recording reuses the same core
+preview, asserts that its committed ID/eviction sequence agrees, and still
+returns the memento unchanged on any rejected preflight. This lets the future
+owner check history, spill replacement, recovery journal, and mirror capacity
+before submitting GPU work rather than discovering a recoverability failure
+after pixels are visible. Pure tests cover combined redo clearing, oldest-undo
+eviction, stable ordering, pin mismatch, and absence of preflight mutation.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

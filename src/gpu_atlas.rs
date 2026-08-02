@@ -283,6 +283,16 @@ impl SparseAtlasPlanner {
     }
 
     pub fn pin(&mut self, key: LayerTileKey, expected_slot: AtlasSlot) -> Result<(), AtlasError> {
+        self.check_pin(key, expected_slot)?;
+        let next = self
+            .pin_count(key)
+            .checked_add(1)
+            .expect("the pin count was checked before mutation");
+        self.pin_counts.insert(key, next);
+        Ok(())
+    }
+
+    pub fn check_pin(&self, key: LayerTileKey, expected_slot: AtlasSlot) -> Result<(), AtlasError> {
         let actual = self.slot(key);
         if actual != Some(expected_slot) {
             return Err(AtlasError::ResidentSlotMismatch {
@@ -291,11 +301,9 @@ impl SparseAtlasPlanner {
                 actual,
             });
         }
-        let next = self
-            .pin_count(key)
+        self.pin_count(key)
             .checked_add(1)
             .ok_or(AtlasError::PinCountOverflow(key))?;
-        self.pin_counts.insert(key, next);
         Ok(())
     }
 
@@ -652,6 +660,18 @@ mod tests {
         let layout = AtlasLayout::new(32, 16, 1).unwrap();
         let mut atlas = SparseAtlasPlanner::new(layout);
         let allocation = atlas.allocate(key(9, 0, 0)).unwrap();
+        atlas.check_pin(allocation.key, allocation.slot).unwrap();
+        assert_eq!(atlas.pin_count(allocation.key), 0);
+        let missing = key(9, 1, 0);
+        assert_eq!(
+            atlas.check_pin(missing, allocation.slot),
+            Err(AtlasError::ResidentSlotMismatch {
+                key: missing,
+                expected: allocation.slot,
+                actual: None,
+            })
+        );
+        assert_eq!(atlas.pinned_tile_count(), 0);
         atlas.pin(allocation.key, allocation.slot).unwrap();
         atlas.pin(allocation.key, allocation.slot).unwrap();
         assert_eq!(atlas.pin_count(allocation.key), 2);

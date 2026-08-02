@@ -58,6 +58,22 @@ pub struct GpuHistoryRecord {
     pub evicted: Vec<GpuHistoryEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GpuHistoryRecordPreview {
+    id: GpuHistoryId,
+    evicted_ids: Box<[GpuHistoryId]>,
+}
+
+impl GpuHistoryRecordPreview {
+    pub const fn id(&self) -> GpuHistoryId {
+        self.id
+    }
+
+    pub fn evicted_ids(&self) -> &[GpuHistoryId] {
+        &self.evicted_ids
+    }
+}
+
 pub struct GpuHistoryRecordFailure {
     pub error: GpuHistoryRecordError,
     pub memento: GpuDocumentMemento,
@@ -79,6 +95,12 @@ impl GpuDocumentHistory {
         atlas: &mut SparseAtlasPlanner,
         memento: GpuDocumentMemento,
     ) -> Result<GpuHistoryRecord, Box<GpuHistoryRecordFailure>> {
+        let preview = match self.check_record(atlas, &memento) {
+            Ok(preview) => preview,
+            Err(error) => {
+                return Err(Box::new(GpuHistoryRecordFailure { error, memento }));
+            }
+        };
         let byte_len = memento.byte_len();
         let residents = memento_residents(&memento);
         let mut pinned = Vec::with_capacity(residents.len());
@@ -98,6 +120,15 @@ impl GpuDocumentHistory {
         }
         match self.core.record(memento, byte_len) {
             Ok(record) => {
+                debug_assert_eq!(record.id, preview.id);
+                debug_assert_eq!(
+                    record
+                        .evicted
+                        .iter()
+                        .map(|entry| entry.id)
+                        .collect::<Vec<_>>(),
+                    preview.evicted_ids.as_ref()
+                );
                 for entry in &record.evicted {
                     unpin_memento(atlas, &entry.value);
                 }
@@ -122,6 +153,26 @@ impl GpuDocumentHistory {
                 }))
             }
         }
+    }
+
+    pub fn check_record(
+        &self,
+        atlas: &SparseAtlasPlanner,
+        memento: &GpuDocumentMemento,
+    ) -> Result<GpuHistoryRecordPreview, GpuHistoryRecordError> {
+        let preview = self
+            .core
+            .check_record(memento.byte_len())
+            .map_err(GpuHistoryRecordError::History)?;
+        for (key, slot) in memento_residents(memento) {
+            atlas
+                .check_pin(key, slot)
+                .map_err(GpuHistoryRecordError::Atlas)?;
+        }
+        Ok(GpuHistoryRecordPreview {
+            id: preview.id,
+            evicted_ids: preview.evicted_ids.into_boxed_slice(),
+        })
     }
 
     pub fn clear(
@@ -253,6 +304,14 @@ struct CoreRecord<T> {
     evicted: Vec<WeightedEntry<T>>,
 }
 
+struct CoreRecordPreview {
+    id: GpuHistoryId,
+    evicted_ids: Vec<GpuHistoryId>,
+    redo_count: usize,
+    undo_evict_count: usize,
+    resident_bytes: u64,
+}
+
 #[derive(Debug)]
 struct CoreRecordFailure<T> {
     error: GpuDocumentHistoryError,
@@ -279,56 +338,100 @@ impl<T> BoundedHistory<T> {
     }
 
     fn record(&mut self, value: T, byte_len: u64) -> Result<CoreRecord<T>, CoreRecordFailure<T>> {
-        let redo_bytes = self
-            .redo
-            .iter()
-            .try_fold(0_u64, |total, entry| total.checked_add(entry.byte_len));
-        let next_resident_bytes = redo_bytes.and_then(|redo_bytes| {
-            self.resident_bytes
-                .checked_sub(redo_bytes)
-                .and_then(|retained| retained.checked_add(byte_len))
-        });
-        let error = if self.pending.is_some() {
-            Some(GpuDocumentHistoryError::PendingOperation)
-        } else if byte_len == 0 {
-            Some(GpuDocumentHistoryError::EmptyMemento)
-        } else if byte_len > self.max_bytes {
-            Some(GpuDocumentHistoryError::MementoExceedsBudget {
-                requested: byte_len,
-                maximum: self.max_bytes,
-            })
-        } else if self.next_id == u64::MAX {
-            Some(GpuDocumentHistoryError::HistoryIdOverflow)
-        } else if next_resident_bytes.is_none() {
-            Some(GpuDocumentHistoryError::ByteCountOverflow)
-        } else {
-            None
+        let preview = match self.check_record(byte_len) {
+            Ok(preview) => preview,
+            Err(error) => return Err(CoreRecordFailure { error, value }),
         };
-        if let Some(error) = error {
-            return Err(CoreRecordFailure { error, value });
-        }
-
-        let id = GpuHistoryId(self.next_id);
+        let id = preview.id;
         self.next_id += 1;
-        let mut evicted = Vec::with_capacity(self.redo.len() + 1);
-        while let Some(entry) = self.redo.pop_front() {
-            evicted.push(entry);
+        let mut evicted = Vec::with_capacity(preview.redo_count + preview.undo_evict_count);
+        for _ in 0..preview.redo_count {
+            evicted.push(
+                self.redo
+                    .pop_front()
+                    .expect("the record preview counted every redo entry"),
+            );
         }
-        self.resident_bytes = next_resident_bytes.expect("overflow was rejected before mutation");
         self.undo.push_back(WeightedEntry {
             id,
             byte_len,
             value,
         });
-        while self.undo.len() > self.max_entries || self.resident_bytes > self.max_bytes {
+        for _ in 0..preview.undo_evict_count {
+            evicted.push(
+                self.undo
+                    .pop_front()
+                    .expect("the record preview counted every undo eviction"),
+            );
+        }
+        self.resident_bytes = preview.resident_bytes;
+        debug_assert_eq!(
+            evicted.iter().map(|entry| entry.id).collect::<Vec<_>>(),
+            preview.evicted_ids
+        );
+        Ok(CoreRecord { id, evicted })
+    }
+
+    fn check_record(&self, byte_len: u64) -> Result<CoreRecordPreview, GpuDocumentHistoryError> {
+        if self.pending.is_some() {
+            return Err(GpuDocumentHistoryError::PendingOperation);
+        }
+        if byte_len == 0 {
+            return Err(GpuDocumentHistoryError::EmptyMemento);
+        }
+        if byte_len > self.max_bytes {
+            return Err(GpuDocumentHistoryError::MementoExceedsBudget {
+                requested: byte_len,
+                maximum: self.max_bytes,
+            });
+        }
+        if self.next_id == u64::MAX {
+            return Err(GpuDocumentHistoryError::HistoryIdOverflow);
+        }
+
+        let redo_bytes = self
+            .redo
+            .iter()
+            .try_fold(0_u64, |total, entry| total.checked_add(entry.byte_len))
+            .ok_or(GpuDocumentHistoryError::ByteCountOverflow)?;
+        let mut resident_bytes = self
+            .resident_bytes
+            .checked_sub(redo_bytes)
+            .and_then(|retained| retained.checked_add(byte_len))
+            .ok_or(GpuDocumentHistoryError::ByteCountOverflow)?;
+        let mut undo_len = self
+            .undo
+            .len()
+            .checked_add(1)
+            .ok_or(GpuDocumentHistoryError::ByteCountOverflow)?;
+        let mut undo_evict_count = 0;
+        while undo_len > self.max_entries || resident_bytes > self.max_bytes {
             let entry = self
                 .undo
-                .pop_front()
-                .expect("a retained entry causes every history budget excess");
-            self.resident_bytes -= entry.byte_len;
-            evicted.push(entry);
+                .get(undo_evict_count)
+                .expect("a valid new entry cannot evict itself");
+            resident_bytes = resident_bytes
+                .checked_sub(entry.byte_len)
+                .expect("a retained undo entry owns its accounted bytes");
+            undo_evict_count += 1;
+            undo_len -= 1;
         }
-        Ok(CoreRecord { id, evicted })
+
+        let mut evicted_ids = Vec::with_capacity(self.redo.len() + undo_evict_count);
+        evicted_ids.extend(self.redo.iter().map(|entry| entry.id));
+        evicted_ids.extend(
+            self.undo
+                .iter()
+                .take(undo_evict_count)
+                .map(|entry| entry.id),
+        );
+        Ok(CoreRecordPreview {
+            id: GpuHistoryId(self.next_id),
+            evicted_ids,
+            redo_count: self.redo.len(),
+            undo_evict_count,
+            resident_bytes,
+        })
     }
 
     fn begin(&mut self, direction: GpuHistoryDirection) -> Result<bool, GpuDocumentHistoryError> {
@@ -448,8 +551,13 @@ mod tests {
     #[test]
     fn byte_and_entry_budgets_evict_oldest_undo_entries() {
         let mut history = BoundedHistory::new(3, 10).unwrap();
-        assert!(history.record(1, 4).unwrap().evicted.is_empty());
+        let first = history.record(1, 4).unwrap().id;
         assert!(history.record(2, 4).unwrap().evicted.is_empty());
+        let preview = history.check_record(4).unwrap();
+        assert_eq!(preview.id.get(), 3);
+        assert_eq!(preview.evicted_ids, vec![first]);
+        assert_eq!(history.undo.len(), 2);
+        assert_eq!(history.resident_bytes, 8);
         let record = history.record(3, 4).unwrap();
         assert_eq!(values(&record.evicted), vec![1]);
         assert_eq!(values(history.undo.make_contiguous()), vec![2, 3]);
@@ -474,6 +582,18 @@ mod tests {
         history.finish_pending().unwrap();
         assert_eq!(values(history.redo.make_contiguous()), vec![2, 1]);
 
+        let preview = history.check_record(5).unwrap();
+        assert_eq!(preview.id.get(), 3);
+        assert_eq!(
+            preview
+                .evicted_ids
+                .iter()
+                .map(|id| id.get())
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(history.undo.is_empty());
+        assert_eq!(values(history.redo.make_contiguous()), vec![2, 1]);
         let record = history.record(3, 5).unwrap();
         assert_eq!(values(&record.evicted), vec![2, 1]);
         assert_eq!(values(history.undo.make_contiguous()), vec![3]);

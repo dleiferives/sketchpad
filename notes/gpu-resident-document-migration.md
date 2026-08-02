@@ -117,6 +117,14 @@ GPU raster history stores exact before-blocks plus tile allocation/occupancy
 metadata. Undo and redo exchange exact GPU blocks and then schedule ordinary
 asynchronous mirror reconciliation.
 
+A live submission must preflight every fallible owner before it reaches
+`Queue::submit`. GPU history therefore previews the stable ID of the proposed
+entry and the exact redo/oldest-undo IDs that branch and capacity policy would
+evict. Atlas history pins have a matching read-only validation path. The live
+owner can use that preview to check recovery-spill replacement, journal space,
+and mirror capacity while the encoded commit is still discardable; successful
+submission must produce the same ID and eviction sequence.
+
 Until the CPU mirror catches up, an in-memory journal retains complete
 semantic commands, including structural commands and undo/redo direction. On
 device loss, the application reconstructs from the exact mirror plus that
