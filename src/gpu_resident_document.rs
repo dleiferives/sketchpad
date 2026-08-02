@@ -1290,6 +1290,19 @@ impl GpuResidentDocument {
         self.apply_metadata_edit(edit).map(Some)
     }
 
+    pub fn rename_layer(
+        &mut self,
+        layer: LayerId,
+        name: impl Into<String>,
+    ) -> Result<Option<GpuResidentMetadataCommit>, Box<GpuResidentMetadataEditFailure>> {
+        let edit = match self.metadata.prepare_layer_name(layer, name) {
+            Ok(Some(edit)) => edit,
+            Ok(None) => return Ok(None),
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        self.apply_metadata_edit(edit).map(Some)
+    }
+
     pub fn move_layer(
         &mut self,
         layer: crate::document::LayerId,
@@ -2245,6 +2258,33 @@ mod tests {
             document.recovery_snapshot().revision(),
             redo_visibility.revision
         );
+    }
+
+    #[test]
+    fn resident_layer_name_is_one_reversible_metadata_revision() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let layer = document.metadata().active_layer();
+
+        let commit = document
+            .rename_layer(layer, "Ink")
+            .unwrap()
+            .expect("name changed");
+        assert_eq!(document.metadata().layers()[0].name(), "Ink");
+        assert_eq!(document.recovery().revision(), commit.revision);
+        assert_eq!(document.mirror().snapshot().revision(), commit.revision);
+        assert!(document.rename_layer(layer, "Ink").unwrap().is_none());
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("rename is undoable");
+        assert_eq!(document.metadata().layers()[0].name(), "Layer 1");
+        document
+            .swap_metadata_history(GpuHistoryDirection::Redo)
+            .unwrap()
+            .expect("rename is redoable");
+        assert_eq!(document.metadata().layers()[0].name(), "Ink");
     }
 
     #[test]

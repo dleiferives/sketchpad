@@ -97,8 +97,18 @@ publication steps. The hardware smoke forces the import to grow a second atlas
 page, verifies the exact GPU pixel, reconstructs it after simulated device
 loss, and exercises presence undo/redo.
 
-During this transition, natural brushes, layer rename, and color picking are
-intentionally unavailable in
+Resident metadata also has a reversible layer-name edit. It validates
+nonempty names, rejects no-ops, participates in the same chronological
+history/recovery boundary, and recomputes the metadata snapshot's retained
+byte accounting when name length changes. `DocumentMetadata::apply_edit` now
+keeps active identity and next-layer ID in locals and replaces the complete
+validated snapshot only after every check succeeds, so a malformed presence
+or name command cannot partly mutate allocation state. The application does
+not yet expose an inline rename control; this slice establishes the tested
+resident command that control must call.
+
+During this transition, natural brushes, the layer-rename UI interaction, and
+color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.
 
