@@ -174,6 +174,12 @@ retention while preserving a newer request that arrives during I/O. Duplicate
 or older requests add no work; a successful stale write remains a valid file
 but cannot mark the live document clean.
 
+The worker materializes the immutable metadata/raster pair into an editable
+CPU document, freezes its copy-on-write tiles as the existing layered
+`DocumentSnapshot`, and performs encoding plus atomic replacement there. The
+event/render thread does not replay strokes, composite the recovered document,
+encode, or touch the filesystem.
+
 ## Ordered Implementation
 
 1. Separate document metadata/history from the current CPU raster backend

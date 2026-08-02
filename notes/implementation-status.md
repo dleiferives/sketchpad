@@ -289,6 +289,15 @@ an undo/redo result that has not finished mapping still need exact owned raster
 content or the older inverse-capable anchor. The metadata snapshot does not
 hide those content-ownership requirements.
 
+The same immutable document payload can now build the existing layered
+checkpoint entirely off the live path. Worker-side reconstruction produces a
+`DocumentSnapshot` whose raster tiles retain shared pixel ownership; encoding
+and atomic replacement then reuse the established `.sketchpad` format. The
+six-revision loss case now also encodes and decodes that checkpoint and checks
+layer metadata, active identity, and recovered pixels. The checkpoint object
+retains its source revision and replay stats so the revision-task completion
+can decide whether a successful write is still current.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,

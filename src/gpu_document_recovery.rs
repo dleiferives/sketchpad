@@ -1,4 +1,5 @@
 use crate::{
+    checkpoint::{self, CheckpointError, CheckpointSummary, DocumentSnapshot},
     document::{Document, DocumentError, DocumentLayerParts, DocumentRevision, LayerId},
     gpu_recovery_replay::{
         replay_gpu_raster_recovery, GpuRasterRecoveryCommand, GpuRasterRecoveryReplayError,
@@ -6,7 +7,7 @@ use crate::{
     gpu_recovery_timeline::GpuRecoveryTimelineSnapshot,
     gpu_revision_tasks::GpuRevisionedPayload,
 };
-use std::{error::Error, fmt, mem::size_of, sync::Arc};
+use std::{error::Error, fmt, mem::size_of, path::Path, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuDocumentLayerMetadata {
@@ -202,6 +203,20 @@ impl GpuDocumentRecoverySnapshot {
         )?;
         Ok(GpuRecoveredDocument { document, stats })
     }
+
+    pub fn build_checkpoint(
+        &self,
+    ) -> Result<GpuDocumentCheckpoint, GpuDocumentCheckpointBuildError> {
+        let recovered = self.recover_document()?;
+        let revision = recovered.document.revision();
+        let stats = recovered.stats;
+        let snapshot = checkpoint::snapshot_document(&recovered.document)?;
+        Ok(GpuDocumentCheckpoint {
+            revision,
+            snapshot,
+            recovery_stats: stats,
+        })
+    }
 }
 
 impl GpuRevisionedPayload for GpuDocumentRecoverySnapshot {
@@ -213,6 +228,30 @@ impl GpuRevisionedPayload for GpuDocumentRecoverySnapshot {
 pub struct GpuRecoveredDocument {
     document: Document,
     stats: GpuDocumentRecoveryStats,
+}
+
+pub struct GpuDocumentCheckpoint {
+    revision: DocumentRevision,
+    snapshot: DocumentSnapshot,
+    recovery_stats: GpuDocumentRecoveryStats,
+}
+
+impl GpuDocumentCheckpoint {
+    pub const fn revision(&self) -> DocumentRevision {
+        self.revision
+    }
+
+    pub const fn recovery_stats(&self) -> GpuDocumentRecoveryStats {
+        self.recovery_stats
+    }
+
+    pub fn encode(&self) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+        checkpoint::encode_document_snapshot(&self.snapshot)
+    }
+
+    pub fn save_atomic(&self, path: &Path) -> Result<CheckpointSummary, CheckpointError> {
+        checkpoint::save_document_snapshot_atomic(path, &self.snapshot)
+    }
 }
 
 impl GpuRecoveredDocument {
@@ -350,6 +389,42 @@ impl From<DocumentError> for GpuDocumentRecoveryError {
     }
 }
 
+#[derive(Debug)]
+pub enum GpuDocumentCheckpointBuildError {
+    Recovery(GpuDocumentRecoveryError),
+    Checkpoint(CheckpointError),
+}
+
+impl fmt::Display for GpuDocumentCheckpointBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Recovery(error) => error.fmt(formatter),
+            Self::Checkpoint(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl Error for GpuDocumentCheckpointBuildError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Recovery(error) => Some(error),
+            Self::Checkpoint(error) => Some(error),
+        }
+    }
+}
+
+impl From<GpuDocumentRecoveryError> for GpuDocumentCheckpointBuildError {
+    fn from(error: GpuDocumentRecoveryError) -> Self {
+        Self::Recovery(error)
+    }
+}
+
+impl From<CheckpointError> for GpuDocumentCheckpointBuildError {
+    fn from(error: CheckpointError) -> Self {
+        Self::Checkpoint(error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -480,6 +555,19 @@ mod tests {
         assert_eq!(recovered_document.undo_depth(), 0);
         assert_eq!(recovered.stats().layers_recovered, 2);
         assert_eq!(recovered.stats().commands_applied, 1);
+
+        let checkpoint = snapshot.build_checkpoint().unwrap();
+        assert_eq!(checkpoint.revision(), document.revision());
+        assert_eq!(checkpoint.recovery_stats(), recovered.stats());
+        let (encoded, summary) = checkpoint.encode().unwrap();
+        assert_eq!(summary.layer_count, 2);
+        let reopened = checkpoint::decode_document(&encoded).unwrap();
+        assert_eq!(reopened.active_layer_id(), second);
+        assert_eq!(reopened.layers()[0].name(), "Highlights");
+        assert_eq!(
+            reopened.layer_raster(painted_layer).unwrap().pixel(8, 8),
+            Some(LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0))
+        );
     }
 
     #[test]
