@@ -202,10 +202,30 @@ error `4.7683716e-7`; every channel passed the explicit `1e-6` oracle bound.
 The CPU replay is therefore a deterministic semantic fallback, not a bit-exact
 replacement for an asynchronously mirrored GPU revision.
 
+Undo/redo now has its selected CPU payload representation below the
+application boundary. A completed mapped mirror revision can be consumed as a
+single-layer exact raster command only when every planned batch is present
+exactly once and revision, byte count, logical region shape, resident state,
+pixel count, finiteness, 16-pixel block alignment, and non-overlap all pass.
+The command canonicalizes physical readback order into logical tile order,
+owns the full-float pixels, has a checked journal charge, and returns expensive
+input ownership on validation failure. Replay prepares every affected tile
+before mutation, copies exact channel bits while preserving untouched pixels,
+handles a resulting absent tile explicitly, reports actual changed-pixel
+damage, and creates no accidental CPU undo history.
+
+That work also exposed and fixed a partial-edge invariant: a logical canvas
+whose dimensions are not multiples of 128 may legitimately produce a padded
+16-pixel GPU undo block. Reconciliation now accepts padding inside the
+physical tile, copies only its logical canvas intersection, and leaves padded
+CPU pixels transparent. Pure tests cover out-of-order mapped batches,
+duplicate rejection with retained ownership, exact partial replacement,
+untouched pixels, absent-tile removal, and a 250-pixel canvas edge.
+
 The payload set is intentionally not yet declared complete for drawing
-recovery. A direction-only undo record cannot reconstruct an undo whose target
-predates the mirror base; exact resulting blocks or a retained older replay
-base/inverse history are required. Structural payloads, that undo choice,
+recovery. Until an undo/redo result has mapped, the system must retain an older
+exact replay base plus inverse-capable history; a pending GPU-only capture
+would disappear with the device. Structural payloads, that anchor handoff,
 capture coalescing/backpressure, save race handling, and simulated device-loss
 replay remain the rest of migration step 5.
 

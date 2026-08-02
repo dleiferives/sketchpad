@@ -136,6 +136,16 @@ content have the same ownership requirement. The implementation must choose
 and budget one of those representations before claiming device-loss recovery;
 a direction-only journal is explicitly insufficient.
 
+The selected raster representation is an exact forward patch for the state
+*after* an undo or redo. It owns the mapped `Rgba32Float` block pixels and the
+logical present/absent tile result, is canonicalized by layer and tile, and can
+apply to the immediately preceding CPU recovery state without consulting the
+GPU history stack. A complete multi-batch mirror plan is required before the
+payload is accepted. The asynchronous interval still matters: until those
+bytes have mapped and the recovery base has advanced atomically, recovery must
+retain the older replay base and inverse-capable history. A GPU-only capture is
+not device-loss protection.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the

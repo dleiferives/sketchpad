@@ -230,6 +230,21 @@ pub struct GpuMirrorPatchBatch {
 }
 
 impl GpuMirrorPatchBatch {
+    #[cfg(test)]
+    pub(crate) fn from_test_parts(
+        revision: DocumentRevision,
+        index: u32,
+        regions: Vec<GpuMirrorPatchRegion>,
+        byte_len: u64,
+    ) -> Self {
+        Self {
+            revision,
+            index,
+            regions,
+            byte_len,
+        }
+    }
+
     pub const fn revision(&self) -> DocumentRevision {
         self.revision
     }
@@ -240,6 +255,10 @@ impl GpuMirrorPatchBatch {
 
     pub fn regions(&self) -> &[GpuMirrorPatchRegion] {
         &self.regions
+    }
+
+    pub fn into_regions(self) -> Vec<GpuMirrorPatchRegion> {
+        self.regions
     }
 
     pub const fn byte_len(&self) -> u64 {
@@ -849,13 +868,11 @@ impl GpuCpuMirror {
         if tile_origin_x >= self.width || tile_origin_y >= self.height {
             return Err(GpuMirrorReconcileError::TileOutOfBounds(key));
         }
-        let valid_width = self.tile_size.min(self.width - tile_origin_x);
-        let valid_height = self.tile_size.min(self.height - tile_origin_y);
-        if bounds.max_x() > valid_width || bounds.max_y() > valid_height {
+        if bounds.max_x() > self.tile_size || bounds.max_y() > self.tile_size {
             return Err(GpuMirrorReconcileError::RegionOutsideTile {
                 key,
                 bounds,
-                valid_extent: [valid_width, valid_height],
+                valid_extent: [self.tile_size; 2],
             });
         }
         Ok(())
@@ -877,14 +894,35 @@ impl GpuCpuMirror {
                     .entry(region.key)
                     .or_insert_with(|| vec![LinearRgba::TRANSPARENT; self.tile_pixel_count].into());
                 let destination = Arc::make_mut(pixels);
-                let width = region.local_bounds.width() as usize;
-                for row in 0..region.local_bounds.height() as usize {
-                    let destination_start = (region.local_bounds.min_y() as usize + row)
-                        * self.tile_size as usize
-                        + region.local_bounds.min_x() as usize;
-                    let source_start = row * width;
-                    destination[destination_start..destination_start + width]
-                        .copy_from_slice(&region.pixels[source_start..source_start + width]);
+                let tile_origin_x = region
+                    .key
+                    .tile
+                    .x
+                    .checked_mul(self.tile_size)
+                    .expect("validated mirror tile x is representable");
+                let tile_origin_y = region
+                    .key
+                    .tile
+                    .y
+                    .checked_mul(self.tile_size)
+                    .expect("validated mirror tile y is representable");
+                let valid_width = self.tile_size.min(self.width - tile_origin_x);
+                let valid_height = self.tile_size.min(self.height - tile_origin_y);
+                let copy_max_x = region.local_bounds.max_x().min(valid_width);
+                let copy_max_y = region.local_bounds.max_y().min(valid_height);
+                if region.local_bounds.min_x() >= copy_max_x
+                    || region.local_bounds.min_y() >= copy_max_y
+                {
+                    continue;
+                }
+                let source_stride = region.local_bounds.width() as usize;
+                let copy_width = (copy_max_x - region.local_bounds.min_x()) as usize;
+                for y in region.local_bounds.min_y()..copy_max_y {
+                    let destination_start =
+                        y as usize * self.tile_size as usize + region.local_bounds.min_x() as usize;
+                    let source_start = (y - region.local_bounds.min_y()) as usize * source_stride;
+                    destination[destination_start..destination_start + copy_width]
+                        .copy_from_slice(&region.pixels[source_start..source_start + copy_width]);
                 }
             }
         }
@@ -1760,5 +1798,38 @@ mod tests {
         ));
         assert_eq!(reconciler.pending_revision_count(), 0);
         assert_eq!(reconciler.mirror().revision(), DocumentRevision::INITIAL);
+    }
+
+    #[test]
+    fn block_padding_at_a_partial_canvas_edge_is_accepted_but_not_materialized() {
+        let layout = AtlasLayout::document_default();
+        let tile = TileCoord::new(1, 1);
+        let (capture, states) = capture_and_states(
+            layout,
+            &[(tile, RectU32::from_xywh(120, 120, 2, 2).unwrap(), true)],
+        );
+        let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::from_raw(1),
+            &capture,
+            &states,
+            DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        )
+        .unwrap();
+        assert_eq!(
+            plan.batches()[0].regions()[0].local_bounds,
+            RectU32::from_xywh(112, 112, 16, 16).unwrap()
+        );
+        let blue = LinearRgba::premultiplied(0.0, 0.0, 1.0, 1.0);
+        let mut reconciler =
+            GpuMirrorReconciler::new(250, 250, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&plan).unwrap();
+        reconciler
+            .complete_batch(solid_patch(&plan.batches()[0], blue))
+            .unwrap();
+
+        let key = LayerTileKey::new(states[0].key.layer, tile);
+        let pixels = reconciler.mirror().tile_pixels(key).unwrap();
+        assert_eq!(pixels[121 * 128 + 121], blue);
+        assert_eq!(pixels[127 * 128 + 127], LinearRgba::TRANSPARENT);
     }
 }
