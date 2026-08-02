@@ -327,7 +327,12 @@ before the checkpoint encoder reads it.
 2. Define timestamped samples, versioned brush recipes, continuous primitives,
    opacity/flow algebra, and a deterministic CPU oracle.
 3. Add the page-batched full-float GPU atlas, layer store, and ordered layer
-   compositor.
+   compositor. Exact bootstrap is complete: an existing sparse layered CPU
+   document now seeds both the revision-matched CPU mirror and deterministic
+   atlas residents without copying its shared CPU tile storage first. Atlas
+   upload is full `Rgba32Float`, validates every key/slot/pixel count before
+   issuing writes, and records target resident identity only after validation.
+   Ordered GPU composition and live presentation remain.
 4. Add stable/tail round masks, live paint/erase presentation, GPU commit, and
    exact block undo.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss

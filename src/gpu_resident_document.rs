@@ -1,14 +1,14 @@
 use crate::{
-    document::DocumentRevision,
+    document::{Document, DocumentRevision},
     document_metadata::DocumentMetadata,
-    gpu_atlas::{AtlasLayout, SparseAtlasPlanner},
+    gpu_atlas::{AtlasError, AtlasLayout, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{
         GpuDocumentHistory, GpuDocumentHistoryError, GpuHistoryDirection, GpuHistoryEntry,
         GpuHistoryId, GpuHistoryRecordError, GpuHistoryRecordPreview, DEFAULT_GPU_HISTORY_BYTES,
         DEFAULT_GPU_HISTORY_ENTRIES,
     },
     gpu_document_mirror::{
-        encode_gpu_mirror_revision_capture, GpuCpuMirrorSnapshot, GpuMirrorPlanError,
+        encode_gpu_mirror_revision_capture, GpuCpuMirror, GpuCpuMirrorSnapshot, GpuMirrorPlanError,
         GpuMirrorReadbackError, GpuMirrorReadbackPlan, GpuMirrorRevisionCapture,
         DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
     },
@@ -17,8 +17,9 @@ use crate::{
         DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES,
     },
     gpu_document_target::{
-        ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentTarget,
-        GpuDocumentTargetError, GpuDocumentTargetId, GpuUndoSwapStats,
+        ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentBootstrapStats,
+        GpuDocumentResidentUpload, GpuDocumentTarget, GpuDocumentTargetError, GpuDocumentTargetId,
+        GpuUndoSwapStats,
     },
     gpu_history_recovery::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
@@ -95,15 +96,39 @@ impl GpuResidentDocument {
                 atlas: layout.tile_size(),
             });
         }
-        let [width, height] = metadata.dimensions();
-        let initial_revision = metadata.revision();
+        let mirror = GpuCpuMirror::new(
+            metadata.width(),
+            metadata.height(),
+            metadata.tile_size(),
+            metadata.revision(),
+        )
+        .map_err(GpuMirrorDispatchError::from)?;
+        Self::new_with_mirror(metadata, layout, target_id, mirror, limits)
+    }
+
+    fn new_with_mirror(
+        metadata: DocumentMetadata,
+        layout: AtlasLayout,
+        target_id: GpuDocumentTargetId,
+        mirror: GpuCpuMirror,
+        limits: GpuResidentDocumentLimits,
+    ) -> Result<Self, GpuResidentDocumentError> {
+        if metadata.tile_size() != layout.tile_size() {
+            return Err(GpuResidentDocumentError::MetadataTileSizeMismatch {
+                metadata: metadata.tile_size(),
+                atlas: layout.tile_size(),
+            });
+        }
+        if mirror.revision() != metadata.revision() {
+            return Err(GpuResidentDocumentError::MirrorRevisionMismatch {
+                metadata: metadata.revision(),
+                mirror: mirror.revision(),
+            });
+        }
         let atlas = SparseAtlasPlanner::new(layout);
         let history = GpuDocumentHistory::new(limits.history_entries, limits.history_bytes)?;
-        let mirror = GpuMirrorDispatcher::new(
-            width,
-            height,
-            layout.tile_size(),
-            initial_revision,
+        let mirror = GpuMirrorDispatcher::from_mirror(
+            mirror,
             limits.mirror_snapshot_bytes,
             limits.mirror_staging_bytes,
         )?;
@@ -123,6 +148,41 @@ impl GpuResidentDocument {
             recovery,
             mirror_purposes: VecDeque::new(),
             pending_mirror_handoff: None,
+        })
+    }
+
+    pub fn from_cpu_document(
+        document: &Document,
+        target: &mut GpuDocumentTarget,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        limits: GpuResidentDocumentLimits,
+    ) -> Result<GpuResidentDocumentBootstrap, GpuResidentDocumentError> {
+        let metadata = DocumentMetadata::from_document(document);
+        let mirror = GpuCpuMirror::from_document(document).map_err(GpuMirrorDispatchError::from)?;
+        let mut resident =
+            Self::new_with_mirror(metadata, target.layout(), target.id(), mirror, limits)?;
+        let mut uploads = Vec::new();
+        for layer in document.layers() {
+            let raster = document
+                .layer_raster(layer.id())
+                .expect("every document layer must retain its raster payload");
+            let mut tiles = raster.checkpoint_tiles();
+            tiles.sort_unstable_by_key(|tile| (tile.coord.y, tile.coord.x));
+            for tile in tiles {
+                let key = LayerTileKey::new(layer.id(), tile.coord);
+                let slot = resident.atlas.allocate(key)?.slot;
+                uploads.push(GpuDocumentResidentUpload {
+                    key,
+                    slot,
+                    pixels: tile.pixels,
+                });
+            }
+        }
+        let stats = target.upload_initial_residents(device, queue, &uploads)?;
+        Ok(GpuResidentDocumentBootstrap {
+            document: resident,
+            stats,
         })
     }
 
@@ -728,6 +788,25 @@ pub struct GpuResidentDocumentCommit {
     pub freed_spill_bytes: u64,
 }
 
+pub struct GpuResidentDocumentBootstrap {
+    document: GpuResidentDocument,
+    stats: GpuDocumentBootstrapStats,
+}
+
+impl GpuResidentDocumentBootstrap {
+    pub const fn document(&self) -> &GpuResidentDocument {
+        &self.document
+    }
+
+    pub const fn stats(&self) -> GpuDocumentBootstrapStats {
+        self.stats
+    }
+
+    pub fn into_document(self) -> GpuResidentDocument {
+        self.document
+    }
+}
+
 pub struct PreparedGpuResidentHistorySwap {
     revision: DocumentRevision,
     history_id: GpuHistoryId,
@@ -923,6 +1002,10 @@ impl Error for GpuResidentDocumentSubmitFailure {
 #[derive(Debug)]
 pub enum GpuResidentDocumentError {
     RevisionExhausted,
+    MirrorRevisionMismatch {
+        metadata: DocumentRevision,
+        mirror: DocumentRevision,
+    },
     MetadataTileSizeMismatch {
         metadata: u32,
         atlas: u32,
@@ -938,6 +1021,7 @@ pub enum GpuResidentDocumentError {
     HistoryPreviewChanged,
     HistorySwapChanged,
     MirrorHandoffPending(DocumentRevision),
+    Atlas(AtlasError),
     History(GpuDocumentHistoryError),
     HistoryRecord(GpuHistoryRecordError),
     Target(GpuDocumentTargetError),
@@ -953,6 +1037,12 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::RevisionExhausted => {
                 write!(formatter, "GPU document revision space is exhausted")
             }
+            Self::MirrorRevisionMismatch { metadata, mirror } => write!(
+                formatter,
+                "document metadata revision {} does not match CPU mirror revision {}",
+                metadata.get(),
+                mirror.get()
+            ),
             Self::MetadataTileSizeMismatch { metadata, atlas } => write!(
                 formatter,
                 "document metadata tile size {metadata} does not match atlas tile size {atlas}"
@@ -981,6 +1071,7 @@ impl fmt::Display for GpuResidentDocumentError {
                 "GPU mirror revision {} is waiting for recovery handoff",
                 revision.get()
             ),
+            Self::Atlas(error) => error.fmt(formatter),
             Self::History(error) => error.fmt(formatter),
             Self::HistoryRecord(error) => error.fmt(formatter),
             Self::Target(error) => error.fmt(formatter),
@@ -995,6 +1086,7 @@ impl fmt::Display for GpuResidentDocumentError {
 impl Error for GpuResidentDocumentError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Atlas(error) => Some(error),
             Self::History(error) => Some(error),
             Self::HistoryRecord(error) => Some(error),
             Self::Target(error) => Some(error),
@@ -1010,6 +1102,12 @@ impl Error for GpuResidentDocumentError {
 impl From<GpuDocumentHistoryError> for GpuResidentDocumentError {
     fn from(error: GpuDocumentHistoryError) -> Self {
         Self::History(error)
+    }
+}
+
+impl From<AtlasError> for GpuResidentDocumentError {
+    fn from(error: AtlasError) -> Self {
+        Self::Atlas(error)
     }
 }
 

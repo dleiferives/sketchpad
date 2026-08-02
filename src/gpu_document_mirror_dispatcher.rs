@@ -34,6 +34,15 @@ impl GpuMirrorDispatcher {
         max_snapshot_bytes: u64,
         max_staging_bytes: u64,
     ) -> Result<Self, GpuMirrorDispatchError> {
+        let mirror = GpuCpuMirror::new(width, height, tile_size, initial_revision)?;
+        Self::from_mirror(mirror, max_snapshot_bytes, max_staging_bytes)
+    }
+
+    pub fn from_mirror(
+        mirror: GpuCpuMirror,
+        max_snapshot_bytes: u64,
+        max_staging_bytes: u64,
+    ) -> Result<Self, GpuMirrorDispatchError> {
         if max_snapshot_bytes < GPU_UNDO_BLOCK_BYTES {
             return Err(GpuMirrorDispatchError::InvalidSnapshotBudget {
                 requested: max_snapshot_bytes,
@@ -47,7 +56,7 @@ impl GpuMirrorDispatcher {
             });
         }
         Ok(Self {
-            reconciler: GpuMirrorReconciler::new(width, height, tile_size, initial_revision)?,
+            reconciler: GpuMirrorReconciler::from_mirror(mirror),
             captures: VecDeque::new(),
             plans: VecDeque::new(),
             mapped_batches: Vec::new(),

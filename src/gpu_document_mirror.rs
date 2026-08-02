@@ -1,5 +1,5 @@
 use crate::{
-    document::{DocumentRevision, LayerId},
+    document::{Document, DocumentRevision, LayerId},
     gpu_atlas::{AtlasLayout, AtlasSlot, LayerTileKey},
     gpu_document_target::GpuDocumentTarget,
     gpu_document_undo::{
@@ -808,6 +808,37 @@ impl GpuCpuMirror {
         })
     }
 
+    pub fn from_document(document: &Document) -> Result<Self, GpuMirrorReconcileError> {
+        let mut mirror = Self::new(
+            document.width(),
+            document.height(),
+            document.tile_size(),
+            document.revision(),
+        )?;
+        for layer in document.layers() {
+            let raster = document
+                .layer_raster(layer.id())
+                .expect("every document layer must retain its raster payload");
+            if raster.active_gesture_id().is_some() {
+                return Err(GpuMirrorReconcileError::ActiveRasterGesture(layer.id()));
+            }
+            for tile in raster.checkpoint_tiles() {
+                let key = LayerTileKey::new(layer.id(), tile.coord);
+                if let Some((index, _)) = tile.pixels.iter().enumerate().find(|(_, pixel)| {
+                    !pixel.r.is_finite()
+                        || !pixel.g.is_finite()
+                        || !pixel.b.is_finite()
+                        || !pixel.a.is_finite()
+                }) {
+                    return Err(GpuMirrorReconcileError::NonFinitePixel { key, index });
+                }
+                let previous = mirror.tiles.insert(key, tile.pixels);
+                debug_assert!(previous.is_none(), "document layer tiles are unique");
+            }
+        }
+        Ok(mirror)
+    }
+
     pub const fn revision(&self) -> DocumentRevision {
         self.revision
     }
@@ -1002,6 +1033,15 @@ impl GpuMirrorReconciler {
             latest_registered: initial_revision,
             pending: VecDeque::new(),
         })
+    }
+
+    pub fn from_mirror(mirror: GpuCpuMirror) -> Self {
+        let latest_registered = mirror.revision();
+        Self {
+            mirror,
+            latest_registered,
+            pending: VecDeque::new(),
+        }
     }
 
     pub fn register_plan(
@@ -1403,6 +1443,7 @@ pub enum GpuMirrorReconcileError {
     EmptyCanvas,
     InvalidTileSize,
     TileStorageOverflow,
+    ActiveRasterGesture(LayerId),
     TileSizeMismatch {
         expected: u32,
         actual: u32,
@@ -1467,6 +1508,11 @@ impl fmt::Display for GpuMirrorReconcileError {
             Self::EmptyCanvas => write!(formatter, "GPU CPU mirror canvas is empty"),
             Self::InvalidTileSize => write!(formatter, "GPU CPU mirror tile size is zero"),
             Self::TileStorageOverflow => write!(formatter, "GPU CPU mirror tile size overflows"),
+            Self::ActiveRasterGesture(layer) => write!(
+                formatter,
+                "GPU CPU mirror cannot capture active gesture on layer {}",
+                layer.get()
+            ),
             Self::TileSizeMismatch { expected, actual } => write!(
                 formatter,
                 "GPU CPU mirror expected {expected}-pixel tiles, got {actual}"
@@ -1574,11 +1620,67 @@ impl Error for GpuMirrorReconcileError {}
 mod tests {
     use super::*;
     use crate::{
-        document::LayerId,
+        document::{Document, LayerId},
         gpu_atlas::{LayerTileKey, SparseAtlasPlanner},
         gpu_round_target::ActiveRoundMaskTile,
         raster::TileCoord,
     };
+
+    #[test]
+    fn document_bootstrap_mirror_shares_exact_sparse_layer_tiles() {
+        let mut document = Document::new(32, 32, 16).unwrap();
+        let bottom = document.active_layer_id();
+        {
+            let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+            gesture
+                .set_pixel(3, 4, LinearRgba::from_straight(0.8, 0.4, 0.2, 0.5))
+                .unwrap();
+            gesture.commit().unwrap();
+        }
+        document.record_active_raster_edit().unwrap();
+        let top = document.create_layer("Top").unwrap();
+        {
+            let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+            gesture
+                .set_pixel(20, 7, LinearRgba::from_straight(0.1, 0.3, 0.9, 1.0))
+                .unwrap();
+            gesture.commit().unwrap();
+        }
+        document.record_active_raster_edit().unwrap();
+
+        let mirror = GpuCpuMirror::from_document(&document).unwrap();
+        assert_eq!(mirror.revision(), document.revision());
+        assert_eq!(mirror.tile_count(), 2);
+        assert_eq!(
+            mirror.tile_pixels(LayerTileKey::new(bottom, TileCoord::new(0, 0))),
+            document
+                .layer_raster(bottom)
+                .unwrap()
+                .tile(TileCoord::new(0, 0))
+                .map(|tile| tile.pixels())
+        );
+        assert_eq!(
+            mirror.tile_pixels(LayerTileKey::new(top, TileCoord::new(1, 0))),
+            document
+                .layer_raster(top)
+                .unwrap()
+                .tile(TileCoord::new(1, 0))
+                .map(|tile| tile.pixels())
+        );
+    }
+
+    #[test]
+    fn document_bootstrap_rejects_an_uncommitted_raster_gesture() {
+        let mut document = Document::new(32, 32, 16).unwrap();
+        let layer = document.active_layer_id();
+        let gesture = document.active_layer_mut().begin_gesture().unwrap();
+
+        assert!(matches!(
+            GpuCpuMirror::from_document(&document),
+            Err(GpuMirrorReconcileError::ActiveRasterGesture(actual)) if actual == layer
+        ));
+        document.active_layer_mut().cancel_gesture(gesture).unwrap();
+    }
 
     fn capture_and_states(
         layout: AtlasLayout,

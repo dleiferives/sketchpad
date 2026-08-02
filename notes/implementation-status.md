@@ -241,6 +241,19 @@ same post-submit boundary as history, recovery, and mirror ownership. This is
 the first authority-consolidation slice; structural mutations and their
 chronological history remain on the legacy `Document` path for now.
 
+The resident owner can now bootstrap an existing exact layered document. It
+captures one immutable CPU mirror at the document revision, deterministically
+allocates every sparse `(LayerId, TileCoord)` in layer/row order, and uploads
+the shared tile pixels into lazy `Rgba32Float` atlas pages. The target validates
+empty ownership, unique keys and slots, layout bounds, and full tile payloads
+before issuing any queue write; its logical resident map is installed only
+after that preflight. Atlas-capacity failure discards the not-yet-published
+owner and leaves the target uninitialized. The Atlas Intel UHD 630 hardware
+smoke bootstrapped two layers/two tiles, copied the page back, and found both
+premultiplied full-float pixels plus untouched transparency bit-exact. This is
+a correctness result, not a timing measurement. Presentation still reads the
+legacy flattened CPU cache; the next slice is the ordered resident compositor.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

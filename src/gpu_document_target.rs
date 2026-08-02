@@ -4,15 +4,19 @@ use crate::{
         GpuDocumentMemento, GpuUndoCapturePlan, GpuUndoPlanError, GpuUndoResourceError,
     },
     gpu_round_target::RoundMaskTarget,
+    raster::LinearRgba,
     stroke::{PaintOperation, StrokeAccumulation, StrokeMaterial},
 };
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fmt,
     mem::{size_of, size_of_val},
     num::NonZeroU64,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 const INITIAL_INSTANCE_BUFFER_BYTES: u64 = 4_096;
@@ -119,6 +123,19 @@ pub struct GpuDocumentTarget {
     pending_undo_swap_serial: Option<u64>,
     next_undo_swap_serial: u64,
     pending_undo_resident_changes: Vec<(AtlasSlot, Option<LayerTileKey>)>,
+}
+
+pub(crate) struct GpuDocumentResidentUpload {
+    pub key: LayerTileKey,
+    pub slot: AtlasSlot,
+    pub pixels: Arc<[LinearRgba]>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDocumentBootstrapStats {
+    pub retained_pages: u32,
+    pub uploaded_tiles: u32,
+    pub uploaded_bytes: u64,
 }
 
 pub struct EncodedGpuDocumentCommit {
@@ -327,6 +344,96 @@ impl GpuDocumentTarget {
 
     pub fn initialized_resident(&self, slot: AtlasSlot) -> Option<LayerTileKey> {
         self.initialized_residents.get(&slot).copied()
+    }
+
+    pub(crate) fn upload_initial_residents(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        uploads: &[GpuDocumentResidentUpload],
+    ) -> Result<GpuDocumentBootstrapStats, GpuDocumentTargetError> {
+        if self.commit_pending {
+            return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if !self.initialized_residents.is_empty() {
+            return Err(GpuDocumentTargetError::BootstrapTargetNotEmpty);
+        }
+        let pixel_count = usize::try_from(
+            self.layout
+                .tile_size()
+                .checked_mul(self.layout.tile_size())
+                .ok_or(GpuDocumentTargetError::BootstrapPixelCountOverflow)?,
+        )
+        .map_err(|_| GpuDocumentTargetError::BootstrapPixelCountOverflow)?;
+        let mut keys = HashSet::with_capacity(uploads.len());
+        let mut slots = HashSet::with_capacity(uploads.len());
+        for upload in uploads {
+            if !keys.insert(upload.key) {
+                return Err(GpuDocumentTargetError::DuplicateBootstrapResident(
+                    upload.key,
+                ));
+            }
+            if !slots.insert(upload.slot) {
+                return Err(GpuDocumentTargetError::DuplicateBootstrapSlot(upload.slot));
+            }
+            let origin = upload.slot.origin();
+            let valid_x = origin[0]
+                .checked_add(self.layout.tile_size())
+                .is_some_and(|end| end <= self.layout.page_size());
+            let valid_y = origin[1]
+                .checked_add(self.layout.tile_size())
+                .is_some_and(|end| end <= self.layout.page_size());
+            if upload.slot.page().get() >= self.layout.max_pages() || !valid_x || !valid_y {
+                return Err(GpuDocumentTargetError::InvalidBootstrapSlot(upload.slot));
+            }
+            if upload.pixels.len() != pixel_count {
+                return Err(GpuDocumentTargetError::InvalidBootstrapPixelCount {
+                    key: upload.key,
+                    expected: pixel_count,
+                    actual: upload.pixels.len(),
+                });
+            }
+        }
+        if let Some(highest_page) = uploads.iter().map(|upload| upload.slot.page().get()).max() {
+            self.ensure_pages(device, highest_page)?;
+        }
+
+        let bytes_per_row = self
+            .layout
+            .tile_size()
+            .checked_mul(size_of::<LinearRgba>() as u32)
+            .ok_or(GpuDocumentTargetError::BootstrapByteCountOverflow)?;
+        let uploaded_bytes = u64::try_from(uploads.len())
+            .ok()
+            .and_then(|count| {
+                count
+                    .checked_mul(pixel_count as u64)
+                    .and_then(|pixels| pixels.checked_mul(size_of::<LinearRgba>() as u64))
+            })
+            .ok_or(GpuDocumentTargetError::BootstrapByteCountOverflow)?;
+        for upload in uploads {
+            let page = &self.pages[upload.slot.page().get() as usize];
+            queue.write_texture(
+                texture_copy(&page.texture, upload.slot.origin()),
+                bytemuck::cast_slice(upload.pixels.as_ref()),
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(self.layout.tile_size()),
+                },
+                copy_extent([self.layout.tile_size(); 2]),
+            );
+        }
+        self.initialized_residents
+            .extend(uploads.iter().map(|upload| (upload.slot, upload.key)));
+        Ok(GpuDocumentBootstrapStats {
+            retained_pages: self.pages.len() as u32,
+            uploaded_tiles: uploads.len() as u32,
+            uploaded_bytes,
+        })
     }
 
     pub const fn commit_is_pending(&self) -> bool {
@@ -1082,6 +1189,17 @@ pub enum GpuDocumentTargetError {
     },
     Float32BlendingUnavailable,
     TargetIdentityOverflow,
+    BootstrapTargetNotEmpty,
+    BootstrapPixelCountOverflow,
+    BootstrapByteCountOverflow,
+    DuplicateBootstrapResident(LayerTileKey),
+    DuplicateBootstrapSlot(AtlasSlot),
+    InvalidBootstrapSlot(AtlasSlot),
+    InvalidBootstrapPixelCount {
+        key: LayerTileKey,
+        expected: usize,
+        actual: usize,
+    },
     TargetTokenMismatch {
         expected: GpuDocumentTargetId,
         actual: GpuDocumentTargetId,
@@ -1139,6 +1257,35 @@ impl fmt::Display for GpuDocumentTargetError {
                 write!(formatter, "Rgba32Float document blending is unavailable")
             }
             Self::TargetIdentityOverflow => write!(formatter, "GPU target identity overflows"),
+            Self::BootstrapTargetNotEmpty => {
+                write!(formatter, "GPU bootstrap target already contains residents")
+            }
+            Self::BootstrapPixelCountOverflow => {
+                write!(formatter, "GPU bootstrap tile pixel count overflows")
+            }
+            Self::BootstrapByteCountOverflow => {
+                write!(formatter, "GPU bootstrap byte count overflows")
+            }
+            Self::DuplicateBootstrapResident(key) => {
+                write!(formatter, "GPU bootstrap repeats resident {key:?}")
+            }
+            Self::DuplicateBootstrapSlot(slot) => {
+                write!(formatter, "GPU bootstrap repeats slot {slot:?}")
+            }
+            Self::InvalidBootstrapSlot(slot) => {
+                write!(
+                    formatter,
+                    "GPU bootstrap slot {slot:?} is outside its layout"
+                )
+            }
+            Self::InvalidBootstrapPixelCount {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GPU bootstrap resident {key:?} has {actual} pixels, expected {expected}"
+            ),
             Self::TargetTokenMismatch { expected, actual } => write!(
                 formatter,
                 "GPU token belongs to target {}, not target {}",
