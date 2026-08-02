@@ -73,8 +73,21 @@ impl GpuLiveRecovery {
         evicted_raster_ids: &[GpuHistoryId],
         revision: DocumentRevision,
     ) -> Result<PreparedGpuMetadataHistoryRecoveryRecord, GpuLiveRecoveryError> {
+        self.prepare_structural_history_record(
+            evicted_raster_ids,
+            revision,
+            GpuRasterRecoveryCommand::MetadataOnly,
+        )
+    }
+
+    pub fn prepare_structural_history_record(
+        &self,
+        evicted_raster_ids: &[GpuHistoryId],
+        revision: DocumentRevision,
+        command: GpuRasterRecoveryCommand,
+    ) -> Result<PreparedGpuMetadataHistoryRecoveryRecord, GpuLiveRecoveryError> {
         let source_revision = self.timeline.target_revision();
-        let byte_len = GpuRasterRecoveryCommand::MetadataOnly.retained_byte_len();
+        let byte_len = command.retained_byte_len();
         self.timeline.check_record(revision, byte_len)?;
         let freed_spill_bytes = self.spills.check_remove_all(evicted_raster_ids)?;
         Ok(PreparedGpuMetadataHistoryRecoveryRecord {
@@ -83,6 +96,7 @@ impl GpuLiveRecovery {
             revision,
             byte_len,
             freed_spill_bytes,
+            command,
         })
     }
 
@@ -90,15 +104,18 @@ impl GpuLiveRecovery {
         &mut self,
         prepared: PreparedGpuMetadataHistoryRecoveryRecord,
     ) -> Result<GpuMetadataHistoryRecoveryRecordCommit, GpuLiveRecoveryError> {
-        self.check_prepared_metadata_history_record(&prepared)?;
+        self.commit_structural_history_record(prepared)
+    }
+
+    pub fn commit_structural_history_record(
+        &mut self,
+        prepared: PreparedGpuMetadataHistoryRecoveryRecord,
+    ) -> Result<GpuMetadataHistoryRecoveryRecordCommit, GpuLiveRecoveryError> {
+        self.check_prepared_structural_history_record(&prepared)?;
         let removal = self.spills.remove_all(&prepared.evicted_raster_ids)?;
         if self
             .timeline
-            .record(
-                prepared.revision,
-                prepared.byte_len,
-                GpuRasterRecoveryCommand::MetadataOnly,
-            )
+            .record(prepared.revision, prepared.byte_len, prepared.command)
             .is_err()
         {
             unreachable!("the metadata recovery record was rechecked before journal insertion")
@@ -112,6 +129,13 @@ impl GpuLiveRecovery {
     }
 
     pub fn check_prepared_metadata_history_record(
+        &self,
+        prepared: &PreparedGpuMetadataHistoryRecoveryRecord,
+    ) -> Result<(), GpuLiveRecoveryError> {
+        self.check_prepared_structural_history_record(prepared)
+    }
+
+    pub fn check_prepared_structural_history_record(
         &self,
         prepared: &PreparedGpuMetadataHistoryRecoveryRecord,
     ) -> Result<(), GpuLiveRecoveryError> {
@@ -391,13 +415,14 @@ pub struct PreparedGpuHistoryRecoveryRecord {
     command: GpuRasterRecoveryCommand,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PreparedGpuMetadataHistoryRecoveryRecord {
     evicted_raster_ids: Box<[GpuHistoryId]>,
     source_revision: DocumentRevision,
     revision: DocumentRevision,
     byte_len: u64,
     freed_spill_bytes: u64,
+    command: GpuRasterRecoveryCommand,
 }
 
 impl PreparedGpuMetadataHistoryRecoveryRecord {
@@ -824,9 +849,10 @@ mod tests {
             GpuMirrorReconciler,
         },
         gpu_document_undo::{GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES},
+        gpu_layer_recovery::GpuExactLayerRecoveryCommand,
         gpu_raster_recovery::GpuExactRasterRecoveryTransition,
         gpu_round_target::ActiveRoundMaskTile,
-        raster::{LinearRgba, RectU32, TileCoord},
+        raster::{LinearRgba, RasterLayer, RectU32, TileCoord},
     };
 
     fn revision(value: u64) -> DocumentRevision {
@@ -933,6 +959,32 @@ mod tests {
                 .command(),
             &GpuRasterRecoveryCommand::MetadataOnly
         );
+    }
+
+    #[test]
+    fn structural_metadata_record_retains_its_forward_raster_command() {
+        let mut state = empty_state(2);
+        let layer = LayerId::from_raw(9);
+        let raster = RasterLayer::new(32, 32, 32).unwrap();
+        let command = GpuRasterRecoveryCommand::from(
+            GpuExactLayerRecoveryCommand::from_raster(layer, &raster).unwrap(),
+        );
+        let prepared = state
+            .prepare_structural_history_record(&[], revision(1), command.clone())
+            .unwrap();
+
+        state.commit_structural_history_record(prepared).unwrap();
+        assert_eq!(
+            state
+                .timeline()
+                .journal()
+                .records()
+                .last()
+                .unwrap()
+                .command(),
+            &command
+        );
+        assert!(state.spills().is_empty());
     }
 
     fn ready_state() -> (GpuLiveRecovery, GpuHistoryId) {

@@ -278,6 +278,35 @@ impl DocumentMetadata {
         })
     }
 
+    pub fn prepare_duplicate_layer(
+        &self,
+        source: LayerId,
+    ) -> Result<DocumentMetadataEdit, DocumentMetadataError> {
+        let source_index = self.require_layer_index(source)?;
+        let source = &self.layers[source_index];
+        let next_layer_id = self
+            .next_layer_id
+            .checked_add(1)
+            .ok_or(DocumentMetadataError::LayerIdExhausted)?;
+        let id = LayerId::from_raw(self.next_layer_id);
+        if id.get() == 0 || self.layers.iter().any(|layer| layer.id == id) {
+            return Err(DocumentMetadataError::LayerIdExhausted);
+        }
+        debug_assert_ne!(next_layer_id, 0);
+        Ok(DocumentMetadataEdit::Presence {
+            layer: DocumentLayerMetadata {
+                id,
+                name: format!("{} copy", source.name),
+                visible: source.visible,
+                opacity: source.opacity,
+            },
+            index: source_index + 1,
+            before_active: self.active_layer,
+            after_active: id,
+            present_after: true,
+        })
+    }
+
     pub fn prepare_delete_layer(
         &self,
         layer: LayerId,
@@ -718,5 +747,31 @@ mod tests {
             metadata.prepare_create_layer("   "),
             Err(DocumentMetadataError::EmptyLayerName)
         ));
+    }
+
+    #[test]
+    fn duplicate_presence_inherits_properties_and_follows_its_source() {
+        let mut document = Document::new(32, 32, 8).unwrap();
+        let source = document.active_layer_id();
+        document.rename_layer(source, "Ink").unwrap();
+        document.set_layer_visibility(source, false).unwrap();
+        document.set_layer_opacity(source, 0.375).unwrap();
+        let upper = document.create_layer("Upper").unwrap();
+        let mut metadata = DocumentMetadata::from_document(&document);
+
+        let edit = metadata.prepare_duplicate_layer(source).unwrap();
+        let duplicate = edit.layer();
+        let revision = metadata.revision().checked_next().unwrap();
+        metadata
+            .apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision)
+            .unwrap();
+
+        assert_eq!(metadata.layers()[0].id(), source);
+        assert_eq!(metadata.layers()[1].id(), duplicate);
+        assert_eq!(metadata.layers()[2].id(), upper);
+        assert_eq!(metadata.layers()[1].name(), "Ink copy");
+        assert!(!metadata.layers()[1].visible());
+        assert_eq!(metadata.layers()[1].opacity(), 0.375);
+        assert_eq!(metadata.active_layer(), duplicate);
     }
 }

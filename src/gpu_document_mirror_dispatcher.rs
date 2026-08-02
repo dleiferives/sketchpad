@@ -131,6 +131,37 @@ impl GpuMirrorDispatcher {
             .register_metadata_revision(source_revision, revision)?)
     }
 
+    pub fn check_layer_clone_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        source: crate::document::LayerId,
+        destination: crate::document::LayerId,
+    ) -> Result<(), GpuMirrorDispatchError> {
+        self.reconciler.check_layer_clone_revision(
+            source_revision,
+            revision,
+            source,
+            destination,
+        )?;
+        Ok(())
+    }
+
+    pub fn register_layer_clone_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        source: crate::document::LayerId,
+        destination: crate::document::LayerId,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorDispatchError> {
+        Ok(self.reconciler.register_layer_clone_revision(
+            source_revision,
+            revision,
+            source,
+            destination,
+        )?)
+    }
+
     pub fn retire_layer_when_idle(&mut self, layer: crate::document::LayerId) -> usize {
         self.reconciler.retire_layer_when_idle(layer)
     }

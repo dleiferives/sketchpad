@@ -1,5 +1,5 @@
 use crate::{
-    document::{Document, DocumentRevision},
+    document::{Document, DocumentRevision, LayerId},
     document_metadata::{
         DocumentMetadata, DocumentMetadataEdit, DocumentMetadataEditDirection,
         DocumentMetadataError,
@@ -22,8 +22,8 @@ use crate::{
     gpu_document_recovery::GpuDocumentRecoverySnapshot,
     gpu_document_target::{
         ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentBootstrapStats,
-        GpuDocumentResidentUpload, GpuDocumentTarget, GpuDocumentTargetError, GpuDocumentTargetId,
-        GpuUndoSwapStats,
+        GpuDocumentResidentClone, GpuDocumentResidentCloneStats, GpuDocumentResidentUpload,
+        GpuDocumentTarget, GpuDocumentTargetError, GpuDocumentTargetId, GpuUndoSwapStats,
     },
     gpu_history_recovery::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
@@ -33,11 +33,14 @@ use crate::{
         GpuLiveRecovery, GpuLiveRecoveryError, GpuMirrorRecoveryCommit, GpuMirrorRecoveryPurpose,
         PreparedGpuHistoryRecoveryRecord, PreparedGpuHistoryRecoverySwap,
     },
+    gpu_layer_recovery::{GpuExactLayerRecoveryBuildError, GpuExactLayerRecoveryCommand},
     gpu_raster_recovery::GpuExactRasterRecoveryTransition,
     gpu_recovery_journal::{
         DEFAULT_GPU_RECOVERY_JOURNAL_BYTES, DEFAULT_GPU_RECOVERY_JOURNAL_ENTRIES,
     },
-    gpu_recovery_replay::GpuRasterRecoveryCommand,
+    gpu_recovery_replay::{
+        replay_gpu_raster_recovery, GpuRasterRecoveryCommand, GpuRasterRecoveryReplayError,
+    },
     gpu_round::{RoundMaskBatch, RoundMaskError, RoundMaskScheduler},
     stroke::RoundPathCommand,
 };
@@ -962,6 +965,173 @@ impl GpuResidentDocument {
         self.apply_metadata_edit(edit).map(|commit| (layer, commit))
     }
 
+    pub fn duplicate_layer(
+        &mut self,
+        target: &mut GpuDocumentTarget,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        source: LayerId,
+    ) -> Result<(LayerId, GpuResidentLayerCloneCommit), Box<GpuResidentMetadataEditFailure>> {
+        if let Err(error) = self.check_active_round_stroke(None) {
+            return Err(metadata_edit_failure(error, None));
+        }
+        if let Err(error) = self.check_target(target) {
+            return Err(metadata_edit_failure(error, None));
+        }
+        let edit = match self.metadata.prepare_duplicate_layer(source) {
+            Ok(edit) => edit,
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        let destination = edit.layer();
+        let Some(revision) = self.revision().checked_next() else {
+            return Err(metadata_edit_failure(
+                GpuResidentDocumentError::RevisionExhausted,
+                Some(edit),
+            ));
+        };
+        let mut metadata = self.metadata.clone();
+        if let Err(error) =
+            metadata.apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision)
+        {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+        let history_preview = match self.history.check_metadata_record(&edit) {
+            Ok(preview) => preview,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        let recovered = match replay_gpu_raster_recovery(
+            &self.recovery.timeline().snapshot(),
+            source,
+        ) {
+            Ok(recovered) => recovered,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        let recovery_command = match GpuExactLayerRecoveryCommand::from_raster(
+            destination,
+            recovered.raster(),
+        ) {
+            Ok(command) => GpuRasterRecoveryCommand::from(command),
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        if let Err(error) = self.mirror.check_layer_clone_revision(
+            self.revision(),
+            revision,
+            source,
+            destination,
+        ) {
+            return Err(metadata_edit_failure(error.into(), Some(edit)));
+        }
+        let recovery = match self.recovery.prepare_structural_history_record(
+            history_preview.evicted_raster_ids(),
+            revision,
+            recovery_command,
+        ) {
+            Ok(recovery) => recovery,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+
+        let mut source_residents: Vec<_> = self
+            .atlas
+            .allocations()
+            .filter(|(key, _)| key.layer == source)
+            .collect();
+        source_residents.sort_unstable_by_key(|(key, _)| (key.tile.y, key.tile.x));
+        if let Some((key, slot, actual)) = source_residents.iter().find_map(|(key, slot)| {
+            target
+                .initialized_resident(*slot)
+                .filter(|actual| actual != key)
+                .map(|actual| (*key, *slot, actual))
+        }) {
+            return Err(metadata_edit_failure(
+                GpuDocumentTargetError::ResidentCloneSourceMismatch {
+                    slot,
+                    expected: key,
+                    actual: Some(actual),
+                }
+                .into(),
+                Some(edit),
+            ));
+        }
+        source_residents.retain(|(key, slot)| match target.initialized_resident(*slot) {
+            Some(actual) => actual == *key,
+            None => false,
+        });
+        let destination_keys: Vec<_> = source_residents
+            .iter()
+            .map(|(key, _)| LayerTileKey::new(destination, key.tile))
+            .collect();
+        let allocations = match self.atlas.allocate_batch(destination_keys) {
+            Ok(allocations) => allocations,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
+        debug_assert!(allocations.iter().all(|allocation| allocation.newly_allocated));
+        let clones: Vec<_> = source_residents
+            .iter()
+            .zip(&allocations)
+            .map(|((source_key, source_slot), destination)| GpuDocumentResidentClone {
+                source_key: *source_key,
+                source_slot: *source_slot,
+                destination_key: destination.key,
+                destination_slot: destination.slot,
+            })
+            .collect();
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("GPU Resident Layer Clone"),
+        });
+        let encoded = match target.encode_resident_clone(device, &mut encoder, &clones) {
+            Ok(encoded) => encoded,
+            Err(error) => {
+                for allocation in allocations.iter().rev() {
+                    self.atlas
+                        .release(allocation.key)
+                        .expect("failed resident clone owns every destination allocation");
+                }
+                return Err(metadata_edit_failure(error.into(), Some(edit)));
+            }
+        };
+
+        queue.submit(iter::once(encoder.finish()));
+        let stats = encoded.stats();
+        target
+            .resident_clone_submitted(encoded)
+            .expect("the newly encoded resident clone still owns its target token");
+        let history = self
+            .history
+            .record_metadata(&mut self.atlas, edit)
+            .expect("structural history was checked immediately before submission");
+        assert!(history_preview.matches_record(&history));
+        let recovery = self
+            .recovery
+            .commit_structural_history_record(recovery)
+            .expect("structural recovery was checked immediately before submission");
+        self.mirror
+            .register_layer_clone_revision(self.revision(), revision, source, destination)
+            .expect("mirror layer clone was checked immediately before submission");
+        self.metadata = metadata;
+        assert!(history
+            .evicted
+            .iter()
+            .filter(|entry| entry.kind() == GpuHistoryEntryKind::Raster)
+            .map(GpuHistoryEntry::id)
+            .eq(recovery
+                .evicted_spills
+                .iter()
+                .map(GpuHistoryRecoveryEntry::id)));
+        let reclamation = self.reclaim_unreachable_layers(&history.evicted);
+        Ok((
+            destination,
+            GpuResidentLayerCloneCommit {
+                revision,
+                history_id: history.id,
+                stats,
+                evicted_history: history.evicted,
+                evicted_spills: recovery.evicted_spills,
+                freed_spill_bytes: recovery.freed_spill_bytes,
+                reclamation,
+            },
+        ))
+    }
+
     pub fn delete_layer(
         &mut self,
         layer: crate::document::LayerId,
@@ -1225,6 +1395,16 @@ pub struct GpuResidentDocumentCommit {
 pub struct GpuResidentMetadataCommit {
     pub revision: DocumentRevision,
     pub history_id: GpuHistoryId,
+    pub evicted_history: Vec<GpuHistoryEntry>,
+    pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
+    pub freed_spill_bytes: u64,
+    pub reclamation: GpuResidentLayerReclamation,
+}
+
+pub struct GpuResidentLayerCloneCommit {
+    pub revision: DocumentRevision,
+    pub history_id: GpuHistoryId,
+    pub stats: GpuDocumentResidentCloneStats,
     pub evicted_history: Vec<GpuHistoryEntry>,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
     pub freed_spill_bytes: u64,
@@ -1537,6 +1717,8 @@ pub enum GpuResidentDocumentError {
     MirrorReadback(GpuMirrorReadbackError),
     MirrorDispatch(GpuMirrorDispatchError),
     Recovery(GpuLiveRecoveryError),
+    RecoveryReplay(GpuRasterRecoveryReplayError),
+    LayerRecoveryBuild(GpuExactLayerRecoveryBuildError),
     Metadata(DocumentMetadataError),
 }
 
@@ -1611,6 +1793,8 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::MirrorReadback(error) => error.fmt(formatter),
             Self::MirrorDispatch(error) => error.fmt(formatter),
             Self::Recovery(error) => error.fmt(formatter),
+            Self::RecoveryReplay(error) => error.fmt(formatter),
+            Self::LayerRecoveryBuild(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
         }
     }
@@ -1627,6 +1811,8 @@ impl Error for GpuResidentDocumentError {
             Self::MirrorReadback(error) => Some(error),
             Self::MirrorDispatch(error) => Some(error),
             Self::Recovery(error) => Some(error),
+            Self::RecoveryReplay(error) => Some(error),
+            Self::LayerRecoveryBuild(error) => Some(error),
             Self::RoundMask(error) => Some(error),
             Self::Metadata(error) => Some(error),
             _ => None,
@@ -1685,6 +1871,18 @@ impl From<GpuMirrorDispatchError> for GpuResidentDocumentError {
 impl From<GpuLiveRecoveryError> for GpuResidentDocumentError {
     fn from(error: GpuLiveRecoveryError) -> Self {
         Self::Recovery(error)
+    }
+}
+
+impl From<GpuRasterRecoveryReplayError> for GpuResidentDocumentError {
+    fn from(error: GpuRasterRecoveryReplayError) -> Self {
+        Self::RecoveryReplay(error)
+    }
+}
+
+impl From<GpuExactLayerRecoveryBuildError> for GpuResidentDocumentError {
+    fn from(error: GpuExactLayerRecoveryBuildError) -> Self {
+        Self::LayerRecoveryBuild(error)
     }
 }
 

@@ -853,6 +853,23 @@ impl GpuCpuMirror {
         before - self.tiles.len()
     }
 
+    fn clone_layer(&mut self, source: LayerId, destination: LayerId) {
+        debug_assert_ne!(source, destination);
+        debug_assert!(self.tiles.keys().all(|key| key.layer != destination));
+        let copies: Vec<_> = self
+            .tiles
+            .iter()
+            .filter(|(key, _)| key.layer == source)
+            .map(|(key, pixels)| {
+                (
+                    LayerTileKey::new(destination, key.tile),
+                    Arc::clone(pixels),
+                )
+            })
+            .collect();
+        self.tiles.extend(copies);
+    }
+
     pub fn tile_pixels(&self, key: LayerTileKey) -> Option<&[LinearRgba]> {
         self.tiles.get(&key).map(AsRef::as_ref)
     }
@@ -1019,6 +1036,17 @@ struct PendingMirrorRevision {
     revision: DocumentRevision,
     expected_batches: Vec<GpuMirrorBatchPlan>,
     batches: Vec<Option<GpuMirrorPatchBatch>>,
+    effect: PendingMirrorEffect,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PendingMirrorEffect {
+    #[default]
+    None,
+    CloneLayer {
+        source: LayerId,
+        destination: LayerId,
+    },
 }
 
 pub struct GpuMirrorReconciler {
@@ -1064,6 +1092,7 @@ impl GpuMirrorReconciler {
             batches: std::iter::repeat_with(|| None)
                 .take(plan.batches().len())
                 .collect(),
+            effect: PendingMirrorEffect::None,
         });
         self.latest_registered = plan.revision();
         Ok(())
@@ -1079,9 +1108,64 @@ impl GpuMirrorReconciler {
             revision,
             expected_batches: Vec::new(),
             batches: Vec::new(),
+            effect: PendingMirrorEffect::None,
         });
         self.latest_registered = revision;
         Ok(self.apply_ready(None)?.0)
+    }
+
+    pub fn register_layer_clone_revision(
+        &mut self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        source: LayerId,
+        destination: LayerId,
+    ) -> Result<Vec<DocumentRevision>, GpuMirrorReconcileError> {
+        self.check_layer_clone_revision(source_revision, revision, source, destination)?;
+        self.pending.push_back(PendingMirrorRevision {
+            revision,
+            expected_batches: Vec::new(),
+            batches: Vec::new(),
+            effect: PendingMirrorEffect::CloneLayer {
+                source,
+                destination,
+            },
+        });
+        self.latest_registered = revision;
+        Ok(self.apply_ready(None)?.0)
+    }
+
+    pub fn check_layer_clone_revision(
+        &self,
+        source_revision: DocumentRevision,
+        revision: DocumentRevision,
+        source: LayerId,
+        destination: LayerId,
+    ) -> Result<(), GpuMirrorReconcileError> {
+        self.check_metadata_revision(source_revision, revision)?;
+        if source == destination {
+            return Err(GpuMirrorReconcileError::LayerCloneIdentity(source));
+        }
+        let destination_exists = self
+            .mirror
+            .tiles
+            .keys()
+            .any(|key| key.layer == destination)
+            || self.pending.iter().any(|pending| {
+                matches!(
+                    pending.effect,
+                    PendingMirrorEffect::CloneLayer {
+                        destination: pending_destination,
+                        ..
+                    } if pending_destination == destination
+                )
+            });
+        if destination_exists {
+            return Err(GpuMirrorReconcileError::LayerCloneDestinationExists(
+                destination,
+            ));
+        }
+        Ok(())
     }
 
     pub fn check_metadata_revision(
@@ -1259,6 +1343,13 @@ impl GpuMirrorReconciler {
                 .collect();
             self.mirror
                 .apply_validated_revision(pending.revision, owned_batches);
+            if let PendingMirrorEffect::CloneLayer {
+                source,
+                destination,
+            } = pending.effect
+            {
+                self.mirror.clone_layer(source, destination);
+            }
             applied.push(pending.revision);
             if capture_revision == Some(pending.revision) {
                 captured = Some(self.mirror.snapshot());
@@ -1546,6 +1637,8 @@ pub enum GpuMirrorReconcileError {
         latest: DocumentRevision,
         requested: DocumentRevision,
     },
+    LayerCloneIdentity(LayerId),
+    LayerCloneDestinationExists(LayerId),
     EmptyRevisionPlan,
     MalformedRevisionPlan,
     UnknownRevision(DocumentRevision),
@@ -1618,6 +1711,16 @@ impl fmt::Display for GpuMirrorReconcileError {
                 "GPU mirror revision {} is not newer than {}",
                 requested.get(),
                 latest.get()
+            ),
+            Self::LayerCloneIdentity(layer) => write!(
+                formatter,
+                "GPU mirror cannot clone layer {} onto itself",
+                layer.get()
+            ),
+            Self::LayerCloneDestinationExists(layer) => write!(
+                formatter,
+                "GPU mirror clone destination layer {} already has pixels",
+                layer.get()
             ),
             Self::EmptyRevisionPlan => write!(formatter, "GPU mirror revision plan is empty"),
             Self::MalformedRevisionPlan => {
@@ -2036,6 +2139,62 @@ mod tests {
 
         let (next_raster, _) = one_tile_plan(3, true);
         reconciler.check_register_plan(&next_raster).unwrap();
+    }
+
+    #[test]
+    fn layer_clone_waits_for_source_pixels_and_shares_immutable_tiles() {
+        let red = LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0);
+        let (raster, source_key) = one_tile_plan(1, true);
+        let destination = LayerId::from_raw(source_key.layer.get() + 10);
+        let destination_key = LayerTileKey::new(destination, source_key.tile);
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler.register_plan(&raster).unwrap();
+
+        assert!(reconciler
+            .register_layer_clone_revision(
+                DocumentRevision::from_raw(1),
+                DocumentRevision::from_raw(2),
+                source_key.layer,
+                destination,
+            )
+            .unwrap()
+            .is_empty());
+        assert!(reconciler.mirror().tile_pixels(destination_key).is_none());
+
+        assert_eq!(
+            reconciler
+                .complete_batch(solid_patch(&raster.batches()[0], red))
+                .unwrap(),
+            vec![DocumentRevision::from_raw(1), DocumentRevision::from_raw(2)]
+        );
+        assert_eq!(
+            reconciler.mirror().tile_pixels(destination_key).unwrap(),
+            reconciler.mirror().tile_pixels(source_key).unwrap()
+        );
+        assert!(Arc::ptr_eq(
+            reconciler.mirror().tiles.get(&source_key).unwrap(),
+            reconciler.mirror().tiles.get(&destination_key).unwrap(),
+        ));
+
+        let green = LinearRgba::premultiplied(0.0, 1.0, 0.0, 1.0);
+        let (source_change, _) = one_tile_plan(3, true);
+        reconciler.register_plan(&source_change).unwrap();
+        reconciler
+            .complete_batch(solid_patch(&source_change.batches()[0], green))
+            .unwrap();
+        assert_eq!(
+            reconciler.mirror().tile_pixels(source_key).unwrap()[16 * 128 + 16],
+            green
+        );
+        assert_eq!(
+            reconciler.mirror().tile_pixels(destination_key).unwrap()[16 * 128 + 16],
+            red
+        );
+        assert!(!Arc::ptr_eq(
+            reconciler.mirror().tiles.get(&source_key).unwrap(),
+            reconciler.mirror().tiles.get(&destination_key).unwrap(),
+        ));
     }
 
     #[test]

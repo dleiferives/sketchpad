@@ -123,12 +123,44 @@ pub struct GpuDocumentTarget {
     pending_undo_swap_serial: Option<u64>,
     next_undo_swap_serial: u64,
     pending_undo_resident_changes: Vec<(AtlasSlot, Option<LayerTileKey>)>,
+    resident_clone_pending: bool,
+    pending_resident_clone_serial: Option<u64>,
+    next_resident_clone_serial: u64,
+    pending_clone_resident_changes: Vec<(AtlasSlot, Option<LayerTileKey>)>,
 }
 
 pub(crate) struct GpuDocumentResidentUpload {
     pub key: LayerTileKey,
     pub slot: AtlasSlot,
     pub pixels: Arc<[LinearRgba]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GpuDocumentResidentClone {
+    pub source_key: LayerTileKey,
+    pub source_slot: AtlasSlot,
+    pub destination_key: LayerTileKey,
+    pub destination_slot: AtlasSlot,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDocumentResidentCloneStats {
+    pub copied_tiles: u32,
+    pub copied_bytes: u64,
+    pub retained_pages: u32,
+}
+
+pub struct EncodedGpuDocumentResidentClone {
+    target_id: GpuDocumentTargetId,
+    serial: u64,
+    stats: GpuDocumentResidentCloneStats,
+    _scratch: Option<wgpu::Texture>,
+}
+
+impl EncodedGpuDocumentResidentClone {
+    pub const fn stats(&self) -> GpuDocumentResidentCloneStats {
+        self.stats
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -317,6 +349,10 @@ impl GpuDocumentTarget {
             pending_undo_swap_serial: None,
             next_undo_swap_serial: 1,
             pending_undo_resident_changes: Vec::new(),
+            resident_clone_pending: false,
+            pending_resident_clone_serial: None,
+            next_resident_clone_serial: 1,
+            pending_clone_resident_changes: Vec::new(),
         })
     }
 
@@ -357,6 +393,9 @@ impl GpuDocumentTarget {
         }
         if self.undo_swap_pending {
             return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
         }
         if !self.initialized_residents.is_empty() {
             return Err(GpuDocumentTargetError::BootstrapTargetNotEmpty);
@@ -434,6 +473,174 @@ impl GpuDocumentTarget {
             uploaded_tiles: uploads.len() as u32,
             uploaded_bytes,
         })
+    }
+
+    pub(crate) fn encode_resident_clone(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        clones: &[GpuDocumentResidentClone],
+    ) -> Result<EncodedGpuDocumentResidentClone, GpuDocumentTargetError> {
+        if self.commit_pending {
+            return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
+        }
+        let mut destinations = HashSet::with_capacity(clones.len());
+        for clone in clones {
+            if clone.source_key == clone.destination_key
+                || clone.source_slot == clone.destination_slot
+            {
+                return Err(GpuDocumentTargetError::InvalidResidentClone);
+            }
+            if !destinations.insert(clone.destination_slot) {
+                return Err(GpuDocumentTargetError::DuplicateResidentCloneDestination(
+                    clone.destination_slot,
+                ));
+            }
+            let actual = self.initialized_residents.get(&clone.source_slot).copied();
+            if actual != Some(clone.source_key) {
+                return Err(GpuDocumentTargetError::ResidentCloneSourceMismatch {
+                    slot: clone.source_slot,
+                    expected: clone.source_key,
+                    actual,
+                });
+            }
+            if self
+                .pages
+                .get(clone.source_slot.page().get() as usize)
+                .is_none()
+            {
+                return Err(GpuDocumentTargetError::MissingColorPage(
+                    clone.source_slot.page(),
+                ));
+            }
+        }
+        if let Some(highest_page) = clones
+            .iter()
+            .map(|clone| clone.destination_slot.page().get())
+            .max()
+        {
+            self.ensure_pages(device, highest_page)?;
+        }
+        let serial = self.next_resident_clone_serial;
+        let next_serial = serial
+            .checked_add(1)
+            .ok_or(GpuDocumentTargetError::ResidentCloneSerialOverflow)?;
+        let copied_tiles = checked_u32(clones.len())?;
+        let copied_bytes = u64::from(self.layout.tile_size())
+            .checked_mul(u64::from(self.layout.tile_size()))
+            .and_then(|pixels| pixels.checked_mul(size_of::<LinearRgba>() as u64))
+            .and_then(|tile_bytes| tile_bytes.checked_mul(u64::from(copied_tiles)))
+            .and_then(|logical_bytes| logical_bytes.checked_mul(2))
+            .ok_or(GpuDocumentTargetError::ResidentCloneByteCountOverflow)?;
+        let scratch = (!clones.is_empty()).then(|| {
+            device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("GPU Resident Layer Clone Scratch"),
+                size: copy_extent([self.layout.tile_size(); 2]),
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba32Float,
+                usage: wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            })
+        });
+        for clone in clones {
+            let source = &self.pages[clone.source_slot.page().get() as usize].texture;
+            let destination =
+                &self.pages[clone.destination_slot.page().get() as usize].texture;
+            encoder.copy_texture_to_texture(
+                texture_copy(source, clone.source_slot.origin()),
+                texture_copy(
+                    scratch
+                        .as_ref()
+                        .expect("a nonempty clone batch owns its scratch texture"),
+                    [0, 0],
+                ),
+                copy_extent([self.layout.tile_size(); 2]),
+            );
+            encoder.copy_texture_to_texture(
+                texture_copy(
+                    scratch
+                        .as_ref()
+                        .expect("a nonempty clone batch owns its scratch texture"),
+                    [0, 0],
+                ),
+                texture_copy(destination, clone.destination_slot.origin()),
+                copy_extent([self.layout.tile_size(); 2]),
+            );
+        }
+        debug_assert!(self.pending_clone_resident_changes.is_empty());
+        for clone in clones {
+            let previous = self
+                .initialized_residents
+                .insert(clone.destination_slot, clone.destination_key);
+            self.pending_clone_resident_changes
+                .push((clone.destination_slot, previous));
+        }
+        self.resident_clone_pending = true;
+        self.pending_resident_clone_serial = Some(serial);
+        self.next_resident_clone_serial = next_serial;
+        Ok(EncodedGpuDocumentResidentClone {
+            target_id: self.id,
+            serial,
+            stats: GpuDocumentResidentCloneStats {
+                copied_tiles,
+                copied_bytes,
+                retained_pages: self.pages.len() as u32,
+            },
+            _scratch: scratch,
+        })
+    }
+
+    pub fn check_encoded_resident_clone(
+        &self,
+        encoded: &EncodedGpuDocumentResidentClone,
+    ) -> Result<(), GpuDocumentTargetError> {
+        check_token_target(self.id, encoded.target_id)?;
+        if !self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::NoEncodedResidentClone);
+        }
+        if self.pending_resident_clone_serial != Some(encoded.serial) {
+            return Err(GpuDocumentTargetError::ResidentCloneTokenMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn resident_clone_submitted(
+        &mut self,
+        encoded: EncodedGpuDocumentResidentClone,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.check_encoded_resident_clone(&encoded)?;
+        self.resident_clone_pending = false;
+        self.pending_resident_clone_serial = None;
+        self.pending_clone_resident_changes.clear();
+        Ok(())
+    }
+
+    pub fn resident_clone_discarded(
+        &mut self,
+        encoded: EncodedGpuDocumentResidentClone,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.check_encoded_resident_clone(&encoded)?;
+        for (slot, previous) in self.pending_clone_resident_changes.drain(..).rev() {
+            match previous {
+                Some(key) => {
+                    self.initialized_residents.insert(slot, key);
+                }
+                None => {
+                    self.initialized_residents.remove(&slot);
+                }
+            }
+        }
+        self.resident_clone_pending = false;
+        self.pending_resident_clone_serial = None;
+        Ok(())
     }
 
     pub const fn commit_is_pending(&self) -> bool {
@@ -576,6 +783,9 @@ impl GpuDocumentTarget {
         }
         if self.undo_swap_pending {
             return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
         }
         if mask.stroke_is_active() {
             return Err(GpuDocumentTargetError::MaskStrokeStillActive);
@@ -833,6 +1043,9 @@ impl GpuDocumentTarget {
         }
         if self.undo_swap_pending {
             return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
         }
         if memento.plan().layout() != self.layout {
             return Err(GpuDocumentTargetError::LayoutMismatch {
@@ -1216,6 +1429,18 @@ pub enum GpuDocumentTargetError {
     MementoCommitTokenRequired,
     CommitSerialOverflow,
     NoEncodedCommit,
+    ResidentCloneAwaitingSubmission,
+    NoEncodedResidentClone,
+    ResidentCloneTokenMismatch,
+    ResidentCloneSerialOverflow,
+    ResidentCloneByteCountOverflow,
+    InvalidResidentClone,
+    DuplicateResidentCloneDestination(AtlasSlot),
+    ResidentCloneSourceMismatch {
+        slot: AtlasSlot,
+        expected: LayerTileKey,
+        actual: Option<LayerTileKey>,
+    },
     UndoPlan(GpuUndoPlanError),
     UndoResource(GpuUndoResourceError),
     UndoSwapAwaitingSubmission,
@@ -1319,6 +1544,36 @@ impl fmt::Display for GpuDocumentTargetError {
             }
             Self::CommitSerialOverflow => write!(formatter, "GPU commit serial overflows"),
             Self::NoEncodedCommit => write!(formatter, "no GPU document commit is pending"),
+            Self::ResidentCloneAwaitingSubmission => {
+                write!(formatter, "a GPU resident clone is awaiting submission")
+            }
+            Self::NoEncodedResidentClone => {
+                write!(formatter, "no GPU resident clone is pending")
+            }
+            Self::ResidentCloneTokenMismatch => {
+                write!(formatter, "GPU resident clone token does not match")
+            }
+            Self::ResidentCloneSerialOverflow => {
+                write!(formatter, "GPU resident clone serial overflows")
+            }
+            Self::ResidentCloneByteCountOverflow => {
+                write!(formatter, "GPU resident clone byte count overflows")
+            }
+            Self::InvalidResidentClone => {
+                write!(formatter, "GPU resident clone source and destination overlap")
+            }
+            Self::DuplicateResidentCloneDestination(slot) => write!(
+                formatter,
+                "GPU resident clone repeats destination slot {slot:?}"
+            ),
+            Self::ResidentCloneSourceMismatch {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GPU resident clone slot {slot:?} expected source {expected:?}, found {actual:?}"
+            ),
             Self::UndoPlan(error) => error.fmt(formatter),
             Self::UndoResource(error) => error.fmt(formatter),
             Self::UndoSwapAwaitingSubmission => {

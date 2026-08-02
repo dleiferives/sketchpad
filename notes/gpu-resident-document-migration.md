@@ -269,9 +269,9 @@ encoded color token and semantic recovery command; a rejected final preflight
 also returns the command encoder and prepared bundle, whose tokens can be
 split for explicit target rollback. The historical paragraph above describes
 the pre-cutover owner. Raster submission, mapped-readback driving,
-presentation, save/export, active-layer selection, and the first revisioned
-metadata controls are now live; remaining structural work is layer
-deletion/duplication/rename and import. Empty layer creation is also live as a
+presentation, save/export, active-layer selection, and revisioned metadata
+controls are now live; remaining structural work is layer rename and import.
+Empty layer creation is also live as a
 metadata-only presence edit: it allocates a stable monotonic ID but no atlas
 resident, and the same edit removes/reinserts that identity during undo/redo.
 Deletion uses the inverse presence state: metadata/composition stop naming the
@@ -282,6 +282,23 @@ Only then are atlas allocations released. CPU-mirror tile removal is deferred
 until the reconciler has applied every previously registered revision, which
 keeps in-flight exact transitions valid while bounding permanently orphaned
 payload.
+
+Duplication is the first live payload-bearing structural command. The owner
+prepares one presence edit plus an exact destination-layer recovery snapshot,
+allocates only initialized source tiles, and copies those tiles GPU-to-GPU.
+The mirror records a distinct ordered clone effect rather than scheduling a
+redundant readback: once all earlier raster revisions apply, it shares the
+source's immutable CPU tiles under the new identity. Recovery does not rely on
+that delayed mirror effect; its canonical whole-layer command can rebuild the
+duplicate from the current recovery base and journal after device loss.
+
+Atlas slots on the same page cannot be copied directly because WebGPU rejects
+all same-texture copies, including disjoint regions. One tile-sized transient
+full-float texture is therefore reused as `source -> scratch -> destination`.
+The cost is two GPU tile transfers per initialized tile and one bounded scratch
+allocation per duplication, with no CPU pixel transfer. The encoded target
+token owns that scratch through queue submission and makes resident-identity
+publication explicitly submit/discard transactional.
 
 Undo and redo now enter that owner through a second prepared transaction. GPU
 history can name the next undo/redo ID without removing it, allowing recovery
@@ -388,11 +405,13 @@ document edit: it advances no revision, creates no undo entry, and records no
 recovery command. The UI layer list, active highlight, title, relative-layer
 navigation, and next stroke all read that same resident metadata.
 
-The remaining layer operations cannot reuse this exception. Visibility,
-opacity, ordering, rename, creation, duplication, deletion, and import are
-chronological revisioned edits. The current GPU history entry owns only a
-raster memento and every such ID expects a two-sided raster spill, while a
-metadata-only edit may have no pixel transition at all.
+All other layer operations remain chronological revisioned edits. Visibility,
+opacity, ordering, rename, creation, duplication, deletion, and import cannot
+reuse the selection-only exception. The history is now typed: raster mementos
+own atlas pins and two-sided spill associations, while reversible metadata and
+presence entries share the same order without pretending to own raster undo
+blocks. Payload-bearing structural records may still append a forward recovery
+command, as duplication does, without becoming raster-memento history.
 
 Visibility, opacity, and ordering now have a shared reversible metadata-edit
 value below the owner. Preparation validates layer identity, opacity/index
@@ -402,11 +421,12 @@ the corresponding after-state and advances revision again. Order changes move
 the stable identity without changing active selection. Malformed or stale
 values fail without publishing a partially changed layer array.
 
-The next structural slice must make the resident history value typed (`raster`
-versus metadata or layer presence), keep one global undo/redo order, and teach
-live recovery which history IDs require raster spill. Mutating live metadata
-now and clearing or splitting history would make recovery superficially
-correct but user undo incorrect, so those actions remain gated.
+The typed-history and presence-edit slices are complete. The next structural
+work should reuse duplication's preflight/publication boundary for imported
+raster payloads, then add rename as a small reversible metadata edit. Import
+must additionally validate and stage externally decoded pixels without
+publishing a layer identity until its atlas, recovery, history, and mirror
+owners can all accept the revision.
 
 ## Ordered Implementation
 

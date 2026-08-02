@@ -1901,7 +1901,34 @@ impl App {
     }
 
     fn duplicate_active_layer(&mut self) {
-        if self.active_stroke.is_some() || self.reject_legacy_document_action("duplicate layer") {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(gpu) = self.gpu.as_mut() {
+            if let Some(resident) = gpu.resident.as_mut() {
+                let source = resident.document.metadata().active_layer();
+                match resident.document.duplicate_layer(
+                    &mut resident.target,
+                    &gpu.device,
+                    &gpu.queue,
+                    source,
+                ) {
+                    Ok((duplicate, commit)) => {
+                        log::info!(
+                            "duplicated resident layer {} as {} ({} sparse tiles, {} bytes)",
+                            source.get(),
+                            duplicate.get(),
+                            commit.stats.copied_tiles,
+                            commit.stats.copied_bytes,
+                        );
+                        self.mark_document_dirty();
+                    }
+                    Err(failure) => log::error!("could not duplicate resident layer: {failure}"),
+                }
+                return;
+            }
+        }
+        if self.reject_legacy_document_action("duplicate layer") {
             return;
         }
         let source = self.document.active_layer_id();

@@ -61,8 +61,31 @@ registered raster revisions reconcile, so cleanup cannot invalidate an
 in-flight exact transition. Deleting the last layer fails without revision,
 history, or storage mutation.
 
-During this transition, natural brushes, layer duplication/rename,
-PNG import, and color picking are intentionally unavailable in
+Layer duplication is live as the first payload-bearing structural resident
+transaction. It prepares the inherited metadata, bounded history eviction,
+exact whole-layer recovery command, ordered CPU-mirror clone, and sparse atlas
+capacity before publishing the new identity. Initialized source tiles are
+copied entirely on the GPU; empty/uninitialized atlas allocations are not
+materialized in the duplicate. The CPU mirror applies the clone only after all
+older raster revisions are exact, then shares immutable tile allocations with
+the source until either layer changes. Recovery independently retains a
+canonical full-float snapshot for the new identity, so device loss does not
+depend on the GPU copy surviving.
+
+WebGPU does not permit a texture-to-texture copy when source and destination
+name the same texture, even for disjoint atlas slots. The first hardware smoke
+caught this on Intel UHD Graphics 630. The live path therefore reuses one
+tile-sized transient `Rgba32Float` scratch texture and encodes
+`source slot -> scratch -> destination slot` for each initialized tile. This
+doubles copy traffic but keeps it GPU-local, bounds temporary storage to one
+tile, works within and across atlas pages, and avoids a CPU upload/readback.
+The encoded token retains the scratch texture until submission and rolls back
+logical resident identities if discarded. The hardware smoke compares every
+row of the source and destination tiles, reconstructs the duplicate after
+simulated device loss, and exercises metadata undo/redo.
+
+During this transition, natural brushes, layer rename, PNG import, and color
+picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.
 
@@ -629,10 +652,12 @@ deletion, then restores the missing layer from this command at the next
 revision. Another keeps imported pixels immutable while the live layer
 continues changing.
 
-Application integration must retain that payload in structural history and
-reuse it when an absent layer is restored. An undo/redo result that exists only
-on the GPU and has not finished mapping still needs the older inverse-capable
-anchor; the whole-layer payload does not hide that ownership requirement.
+Application integration now retains that payload for resident duplication and
+reuses the ordinary presence edit for undo/redo while the copied atlas payload
+remains dormant. Import still needs the corresponding external-payload
+transaction. An undo/redo result that exists only on the GPU and has not
+finished mapping still needs the older inverse-capable anchor; the whole-layer
+payload does not hide that ownership requirement.
 
 The same immutable document payload can now build the existing layered
 checkpoint entirely off the live path. Worker-side reconstruction produces a

@@ -2,6 +2,7 @@ use sketchpad::{
     document::Document,
     gpu_atlas::{AtlasLayout, LayerTileKey},
     gpu_document_compositor::GpuDocumentCompositor,
+    gpu_document_history::GpuHistoryDirection,
     gpu_document_target::GpuDocumentTarget,
     gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
     gpu_resident_round_stroke::GpuResidentRoundStrokeEngine,
@@ -425,13 +426,129 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("current resident snapshot did not recover the committed eraser".into());
     }
 
+    let clone_source = resident.metadata().active_layer();
+    let (clone, clone_commit) =
+        resident.duplicate_layer(&mut target, &device, &queue, clone_source)?;
+    if clone_commit.stats.copied_tiles != 1
+        || resident.metadata().active_layer() != clone
+        || resident.metadata().layers().len() != 3
+    {
+        return Err("resident layer clone did not publish its sparse payload and metadata".into());
+    }
+    let source_slot = resident
+        .atlas()
+        .slot(LayerTileKey::new(clone_source, TileCoord::new(0, 0)))
+        .ok_or("clone source tile is no longer resident")?;
+    let clone_slot = resident
+        .atlas()
+        .slot(LayerTileKey::new(clone, TileCoord::new(0, 0)))
+        .ok_or("clone destination tile is not resident")?;
+    let clone_readback = read_page(&device, &queue, &target, source_slot.page(), bytes_per_row)?;
+    expect_tile_equal(
+        &clone_readback,
+        bytes_per_row,
+        source_slot.origin(),
+        clone_slot.origin(),
+    )?;
+    let recovered_clone = resident.recovery_snapshot().recover_document()?;
+    let source_raster = recovered_clone
+        .document()
+        .layer_raster(clone_source)
+        .ok_or("recovered clone source is missing")?;
+    let clone_raster = recovered_clone
+        .document()
+        .layer_raster(clone)
+        .ok_or("recovered clone destination is missing")?;
+    if source_raster.allocated_tile_coords().collect::<Vec<_>>()
+        != clone_raster.allocated_tile_coords().collect::<Vec<_>>()
+        || (0..TILE_SIZE).any(|y| {
+            (0..PAGE_SIZE).any(|x| source_raster.pixel(x, y) != clone_raster.pixel(x, y))
+        })
+    {
+        return Err("resident layer clone recovery differs from its source".into());
+    }
+    resident
+        .swap_metadata_history(GpuHistoryDirection::Undo)?
+        .ok_or("resident clone undo was unavailable")?;
+    if resident.metadata().layers().iter().any(|layer| layer.id() == clone) {
+        return Err("resident clone undo retained duplicate metadata".into());
+    }
+    resident
+        .swap_metadata_history(GpuHistoryDirection::Redo)?
+        .ok_or("resident clone redo was unavailable")?;
+    if !resident.metadata().layers().iter().any(|layer| layer.id() == clone) {
+        return Err("resident clone redo did not restore duplicate metadata".into());
+    }
+
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=3 tiles=4 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact clone=gpu_exact recovery=exact undo_redo=exact",
         adapter.get_info().name
     );
+    Ok(())
+}
+
+fn read_page(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    target: &GpuDocumentTarget,
+    page: sketchpad::gpu_atlas::AtlasPageId,
+    bytes_per_row: u32,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("GPU Resident Clone Page Readback"),
+        size: u64::from(bytes_per_row) * u64::from(PAGE_SIZE),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Resident Clone Page Copy"),
+    });
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: target.page_texture(page).ok_or("clone page is missing")?,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(PAGE_SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: PAGE_SIZE,
+            height: PAGE_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([encoder.finish()]);
+    map_readback(device, &readback)
+}
+
+fn expect_tile_equal(
+    bytes: &[u8],
+    bytes_per_row: u32,
+    source: [u32; 2],
+    destination: [u32; 2],
+) -> Result<(), Box<dyn Error>> {
+    let row_bytes = TILE_SIZE as usize * size_of::<LinearRgba>();
+    for y in 0..TILE_SIZE {
+        let source_start = (source[1] + y) as usize * bytes_per_row as usize
+            + source[0] as usize * size_of::<LinearRgba>();
+        let destination_start = (destination[1] + y) as usize * bytes_per_row as usize
+            + destination[0] as usize * size_of::<LinearRgba>();
+        if bytes[source_start..source_start + row_bytes]
+            != bytes[destination_start..destination_start + row_bytes]
+        {
+            return Err(format!("resident clone tile differs from source on row {y}").into());
+        }
+    }
     Ok(())
 }
 
