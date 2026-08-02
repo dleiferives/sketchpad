@@ -71,6 +71,36 @@ impl GpuDocumentHistoryValue {
             Self::Metadata(edit) => Some(edit),
         }
     }
+
+    pub fn references_layer(&self, layer: crate::document::LayerId) -> bool {
+        match self {
+            Self::Raster(memento) => memento
+                .plan()
+                .regions()
+                .iter()
+                .any(|region| region.key.layer == layer),
+            Self::Metadata(edit) => edit.layer() == layer,
+        }
+    }
+
+    pub fn referenced_layers(&self) -> Vec<crate::document::LayerId> {
+        let mut layers = HashSet::new();
+        match self {
+            Self::Raster(memento) => {
+                layers.extend(
+                    memento
+                        .plan()
+                        .regions()
+                        .iter()
+                        .map(|region| region.key.layer),
+                );
+            }
+            Self::Metadata(edit) => {
+                layers.insert(edit.layer());
+            }
+        }
+        layers.into_iter().collect()
+    }
 }
 
 pub struct GpuHistoryEntry {
@@ -100,6 +130,10 @@ impl GpuHistoryEntry {
 
     pub fn into_value(self) -> GpuDocumentHistoryValue {
         self.inner.value
+    }
+
+    pub fn referenced_layers(&self) -> Vec<crate::document::LayerId> {
+        self.inner.value.referenced_layers()
     }
 }
 
@@ -444,6 +478,12 @@ impl GpuDocumentHistory {
         self.core.max_entries
     }
 
+    pub fn references_layer(&self, layer: crate::document::LayerId) -> bool {
+        self.core
+            .values()
+            .any(|value| value.references_layer(layer))
+    }
+
     fn evicted_raster_ids(&self, ids: &[GpuHistoryId]) -> Box<[GpuHistoryId]> {
         ids.iter()
             .copied()
@@ -691,6 +731,14 @@ impl<T> BoundedHistory<T> {
             .chain(&self.redo)
             .find(|entry| entry.id == id)
             .map(|entry| &entry.value)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &T> {
+        self.undo
+            .iter()
+            .chain(&self.redo)
+            .map(|entry| &entry.value)
+            .chain(self.pending.iter().map(|pending| &pending.entry.value))
     }
 
     fn finish_pending(&mut self) -> Result<GpuHistoryId, GpuDocumentHistoryError> {

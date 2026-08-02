@@ -50,7 +50,18 @@ Undo removes that metadata and redo restores the same ID; selection-only
 changes between creation and undo do not invalidate the command. Branching
 after the undo allocates a newer ID rather than reusing the unreachable one.
 
-During this transition, natural brushes, layer deletion/duplication/rename,
+Layer deletion is live and uses the opposite side of that presence edit. The
+layer disappears from composition immediately while its sparse atlas and CPU
+mirror payload remain dormant for exact undo. History entries now expose the
+layer identities they retain. When branching or bounded-history eviction
+leaves an absent layer with no reachable raster or metadata command, the owner
+releases its atlas allocations and schedules CPU-mirror tile retirement. The
+mirror performs that retirement immediately when idle or after all previously
+registered raster revisions reconcile, so cleanup cannot invalidate an
+in-flight exact transition. Deleting the last layer fails without revision,
+history, or storage mutation.
+
+During this transition, natural brushes, layer duplication/rename,
 PNG import, and color picking are intentionally unavailable in
 resident mode. The legacy `Document` remains immutable fallback data; the
 application never treats it as a second writable pixel authority.

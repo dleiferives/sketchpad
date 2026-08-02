@@ -41,7 +41,11 @@ use crate::{
     gpu_round::{RoundMaskBatch, RoundMaskError, RoundMaskScheduler},
     stroke::RoundPathCommand,
 };
-use std::{collections::VecDeque, error::Error, fmt, iter};
+use std::{
+    collections::{HashSet, VecDeque},
+    error::Error,
+    fmt, iter,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GpuResidentDocumentLimits {
@@ -387,6 +391,7 @@ impl GpuResidentDocument {
         self.mirror_purposes
             .push_back(GpuMirrorRecoveryPurpose::History(history.id));
         self.metadata.set_revision(prepared.revision);
+        let reclamation = self.reclaim_unreachable_layers(&history.evicted);
         Ok(GpuResidentDocumentCommit {
             revision: prepared.revision,
             history_id: history.id,
@@ -394,6 +399,7 @@ impl GpuResidentDocument {
             evicted_history: history.evicted,
             evicted_spills: recovery.evicted_spills,
             freed_spill_bytes: recovery.freed_spill_bytes,
+            reclamation,
         })
     }
 
@@ -956,6 +962,17 @@ impl GpuResidentDocument {
         self.apply_metadata_edit(edit).map(|commit| (layer, commit))
     }
 
+    pub fn delete_layer(
+        &mut self,
+        layer: crate::document::LayerId,
+    ) -> Result<GpuResidentMetadataCommit, Box<GpuResidentMetadataEditFailure>> {
+        let edit = match self.metadata.prepare_delete_layer(layer) {
+            Ok(edit) => edit,
+            Err(error) => return Err(metadata_edit_failure(error.into(), None)),
+        };
+        self.apply_metadata_edit(edit)
+    }
+
     pub fn set_layer_opacity(
         &mut self,
         layer: crate::document::LayerId,
@@ -1041,13 +1058,47 @@ impl GpuResidentDocument {
                 .evicted_spills
                 .iter()
                 .map(GpuHistoryRecoveryEntry::id)));
+        let reclamation = self.reclaim_unreachable_layers(&history.evicted);
         Ok(GpuResidentMetadataCommit {
             revision,
             history_id: history.id,
             evicted_history: history.evicted,
             evicted_spills: recovery.evicted_spills,
             freed_spill_bytes: recovery.freed_spill_bytes,
+            reclamation,
         })
+    }
+
+    fn reclaim_unreachable_layers(
+        &mut self,
+        evicted: &[GpuHistoryEntry],
+    ) -> GpuResidentLayerReclamation {
+        let candidates: HashSet<_> = evicted
+            .iter()
+            .flat_map(GpuHistoryEntry::referenced_layers)
+            .collect();
+        let mut candidates: Vec<_> = candidates.into_iter().collect();
+        candidates.sort_by_key(|layer| layer.get());
+        let mut reclamation = GpuResidentLayerReclamation::default();
+        for layer in candidates {
+            let present = self
+                .metadata
+                .layers()
+                .iter()
+                .any(|candidate| candidate.id() == layer);
+            if present || self.history.references_layer(layer) {
+                continue;
+            }
+            let released = self
+                .atlas
+                .release_layer(layer)
+                .expect("an unreachable layer has no remaining history pins");
+            reclamation.layers += 1;
+            reclamation.atlas_tiles += released.len();
+            reclamation.mirror_tiles_retired_immediately +=
+                self.mirror.retire_layer_when_idle(layer);
+        }
+        reclamation
     }
 
     pub fn next_history_kind(
@@ -1168,6 +1219,7 @@ pub struct GpuResidentDocumentCommit {
     pub evicted_history: Vec<GpuHistoryEntry>,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
     pub freed_spill_bytes: u64,
+    pub reclamation: GpuResidentLayerReclamation,
 }
 
 pub struct GpuResidentMetadataCommit {
@@ -1176,6 +1228,14 @@ pub struct GpuResidentMetadataCommit {
     pub evicted_history: Vec<GpuHistoryEntry>,
     pub evicted_spills: Vec<GpuHistoryRecoveryEntry>,
     pub freed_spill_bytes: u64,
+    pub reclamation: GpuResidentLayerReclamation,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuResidentLayerReclamation {
+    pub layers: usize,
+    pub atlas_tiles: usize,
+    pub mirror_tiles_retired_immediately: usize,
 }
 
 pub struct GpuResidentMetadataHistorySwapCommit {
@@ -1907,6 +1967,61 @@ mod tests {
             "undone layer IDs are not reused"
         );
         assert_eq!(document.history().redo_depth(), 0);
+    }
+
+    #[test]
+    fn deleted_layer_payload_stays_reachable_then_reclaims_on_branch() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let original = document.metadata().active_layer();
+        let (created, _) = document.create_layer("Ink").unwrap();
+        let key = LayerTileKey::new(created, crate::raster::TileCoord::new(0, 0));
+        document.atlas.allocate(key).unwrap();
+
+        let deletion = document.delete_layer(created).unwrap();
+        assert_eq!(document.metadata().layers().len(), 1);
+        assert_eq!(document.metadata().active_layer(), original);
+        assert_eq!(document.atlas().resident_tile_count(), 1);
+        assert_eq!(deletion.reclamation, GpuResidentLayerReclamation::default());
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("deletion is undoable");
+        assert_eq!(document.metadata().layers().len(), 2);
+        assert_eq!(document.metadata().active_layer(), created);
+        assert!(document.atlas().slot(key).is_some());
+
+        document
+            .swap_metadata_history(GpuHistoryDirection::Undo)
+            .unwrap()
+            .expect("creation is undoable");
+        assert_eq!(document.metadata().layers().len(), 1);
+        assert_eq!(document.atlas().resident_tile_count(), 1);
+
+        let (_, branch) = document.create_layer("Paint").unwrap();
+        assert_eq!(branch.reclamation.layers, 1);
+        assert_eq!(branch.reclamation.atlas_tiles, 1);
+        assert!(document.atlas().slot(key).is_none());
+        assert_eq!(document.history().redo_depth(), 0);
+    }
+
+    #[test]
+    fn deleting_the_last_resident_layer_is_transactional() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let layer = document.metadata().active_layer();
+        let failure = document
+            .delete_layer(layer)
+            .err()
+            .expect("the last layer cannot be deleted");
+        assert!(failure.edit.is_none());
+        assert!(matches!(
+            failure.error,
+            GpuResidentDocumentError::Metadata(DocumentMetadataError::CannotDeleteLastLayer)
+        ));
+        assert_eq!(document.metadata().layers().len(), 1);
+        assert_eq!(document.history().undo_depth(), 0);
     }
 
     #[test]

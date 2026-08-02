@@ -278,6 +278,32 @@ impl DocumentMetadata {
         })
     }
 
+    pub fn prepare_delete_layer(
+        &self,
+        layer: LayerId,
+    ) -> Result<DocumentMetadataEdit, DocumentMetadataError> {
+        if self.layers.len() == 1 {
+            return Err(DocumentMetadataError::CannotDeleteLastLayer);
+        }
+        let index = self.require_layer_index(layer)?;
+        let after_active = if self.active_layer == layer {
+            if index + 1 < self.layers.len() {
+                self.layers[index + 1].id
+            } else {
+                self.layers[index - 1].id
+            }
+        } else {
+            self.active_layer
+        };
+        Ok(DocumentMetadataEdit::Presence {
+            layer: self.layers[index].clone(),
+            index,
+            before_active: self.active_layer,
+            after_active,
+            present_after: false,
+        })
+    }
+
     pub fn prepare_layer_opacity(
         &self,
         layer: LayerId,

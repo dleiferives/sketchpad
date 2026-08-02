@@ -274,6 +274,14 @@ metadata controls are now live; remaining structural work is layer
 deletion/duplication/rename and import. Empty layer creation is also live as a
 metadata-only presence edit: it allocates a stable monotonic ID but no atlas
 resident, and the same edit removes/reinserts that identity during undo/redo.
+Deletion uses the inverse presence state: metadata/composition stop naming the
+layer, but sparse GPU and mirror pixels stay dormant while any reachable
+history entry can restore it. History exposes retained layer identities so a
+branch clear or capacity eviction can prove an absent layer unreachable.
+Only then are atlas allocations released. CPU-mirror tile removal is deferred
+until the reconciler has applied every previously registered revision, which
+keeps in-flight exact transitions valid while bounding permanently orphaned
+payload.
 
 Undo and redo now enter that owner through a second prepared transaction. GPU
 history can name the next undo/redo ID without removing it, allowing recovery

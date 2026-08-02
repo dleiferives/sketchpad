@@ -1916,7 +1916,21 @@ impl App {
     }
 
     fn delete_active_layer(&mut self) {
-        if self.active_stroke.is_some() || self.reject_legacy_document_action("delete layer") {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            let layer = resident.document.metadata().active_layer();
+            match resident.document.delete_layer(layer) {
+                Ok(_) => {
+                    log::info!("deleted resident layer {}", layer.get());
+                    self.mark_document_dirty();
+                }
+                Err(failure) => log::warn!("could not delete resident layer: {failure}"),
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("delete layer") {
             return;
         }
         let layer = self.document.active_layer_id();

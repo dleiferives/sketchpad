@@ -131,6 +131,10 @@ impl GpuMirrorDispatcher {
             .register_metadata_revision(source_revision, revision)?)
     }
 
+    pub fn retire_layer_when_idle(&mut self, layer: crate::document::LayerId) -> usize {
+        self.reconciler.retire_layer_when_idle(layer)
+    }
+
     pub fn check_prepared_capture(
         &self,
         plan: &GpuMirrorReadbackPlan,

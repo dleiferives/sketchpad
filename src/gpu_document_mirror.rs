@@ -9,7 +9,7 @@ use crate::{
     raster::{LinearRgba, RasterError, RasterLayer, RectU32, TileCoord},
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error,
     fmt,
     sync::mpsc::{self, Receiver, TryRecvError},
@@ -847,6 +847,12 @@ impl GpuCpuMirror {
         self.tiles.len()
     }
 
+    fn retire_layer(&mut self, layer: LayerId) -> usize {
+        let before = self.tiles.len();
+        self.tiles.retain(|key, _| key.layer != layer);
+        before - self.tiles.len()
+    }
+
     pub fn tile_pixels(&self, key: LayerTileKey) -> Option<&[LinearRgba]> {
         self.tiles.get(&key).map(AsRef::as_ref)
     }
@@ -1019,6 +1025,7 @@ pub struct GpuMirrorReconciler {
     mirror: GpuCpuMirror,
     latest_registered: DocumentRevision,
     pending: VecDeque<PendingMirrorRevision>,
+    deferred_retired_layers: HashSet<LayerId>,
 }
 
 impl GpuMirrorReconciler {
@@ -1032,6 +1039,7 @@ impl GpuMirrorReconciler {
             mirror: GpuCpuMirror::new(width, height, tile_size, initial_revision)?,
             latest_registered: initial_revision,
             pending: VecDeque::new(),
+            deferred_retired_layers: HashSet::new(),
         })
     }
 
@@ -1041,6 +1049,7 @@ impl GpuMirrorReconciler {
             mirror,
             latest_registered,
             pending: VecDeque::new(),
+            deferred_retired_layers: HashSet::new(),
         }
     }
 
@@ -1093,6 +1102,11 @@ impl GpuMirrorReconciler {
             });
         }
         Ok(())
+    }
+
+    pub fn retire_layer_when_idle(&mut self, layer: LayerId) -> usize {
+        self.deferred_retired_layers.insert(layer);
+        self.apply_retired_layers_if_idle()
     }
 
     pub fn check_register_plan(
@@ -1250,7 +1264,19 @@ impl GpuMirrorReconciler {
                 captured = Some(self.mirror.snapshot());
             }
         }
+        self.apply_retired_layers_if_idle();
         Ok((applied, captured))
+    }
+
+    fn apply_retired_layers_if_idle(&mut self) -> usize {
+        if !self.pending.is_empty() {
+            return 0;
+        }
+        let layers = std::mem::take(&mut self.deferred_retired_layers);
+        layers
+            .into_iter()
+            .map(|layer| self.mirror.retire_layer(layer))
+            .sum()
     }
 }
 
@@ -2010,6 +2036,34 @@ mod tests {
 
         let (next_raster, _) = one_tile_plan(3, true);
         reconciler.check_register_plan(&next_raster).unwrap();
+    }
+
+    #[test]
+    fn unreachable_layer_retirement_waits_for_pending_reconciliation() {
+        let red = LinearRgba::premultiplied(1.0, 0.0, 0.0, 1.0);
+        let (plan, key) = one_tile_plan(1, true);
+        let mut reconciler =
+            GpuMirrorReconciler::new(128, 128, 128, DocumentRevision::INITIAL).unwrap();
+        reconciler
+            .mirror
+            .tiles
+            .insert(key, vec![LinearRgba::TRANSPARENT; 128 * 128].into());
+        reconciler.register_plan(&plan).unwrap();
+
+        assert_eq!(reconciler.retire_layer_when_idle(key.layer), 0);
+        assert_eq!(reconciler.mirror().tile_count(), 1);
+        reconciler
+            .complete_batch(solid_patch(&plan.batches()[0], red))
+            .unwrap();
+        assert_eq!(reconciler.mirror().tile_count(), 0);
+
+        let other = LayerTileKey::new(LayerId::from_raw(99), TileCoord::new(0, 0));
+        reconciler
+            .mirror
+            .tiles
+            .insert(other, vec![LinearRgba::TRANSPARENT; 128 * 128].into());
+        assert_eq!(reconciler.retire_layer_when_idle(other.layer), 1);
+        assert_eq!(reconciler.mirror().tile_count(), 0);
     }
 
     #[test]
