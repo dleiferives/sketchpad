@@ -37,7 +37,13 @@ partial allocation, and groups resident work by physical page. The selected
 16 MiB per full-float RGBA page, 4 MiB per scalar full-float mask page, and a
 1,024-tile initial capacity. A regression test explicitly proves that 48
 touched logical tiles on one page produce one page batch, not 48 tile batches.
-GPU textures and passes are not connected to this planner yet.
+A stateful round-mask scheduler now validates incremental command continuity,
+computes conservative clipped damage, allocates the affected layer/tile keys,
+and translates each dot or variable-radius sweep into its physical page slot.
+Its tests cover a nine-tile sweep in one page batch, the exact 64-slot page
+boundary, edge-tile clipping, incremental begin/sweep/end, layout mismatch,
+and failure without partial scheduler/atlas mutation. GPU textures and passes
+are not connected to these batches yet.
 
 ## Current Executable
 

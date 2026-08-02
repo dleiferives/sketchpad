@@ -4,6 +4,7 @@ pub mod contact;
 pub mod document;
 mod document_history;
 pub mod gpu_atlas;
+pub mod gpu_round;
 pub mod gpu_stroke;
 pub mod gpu_stroke_target;
 pub mod image_io;
