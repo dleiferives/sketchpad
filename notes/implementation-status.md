@@ -63,6 +63,17 @@ optical-density flow, and reuse of its own queue-written buffers before the
 encoded commit is submitted or discarded. Live presentation, optical-density
 accumulation, exact GPU undo, and application cutover are not connected yet.
 
+Exact GPU undo now has a deterministic copy planner, but not yet its backing
+buffer or live history command. Each conservative tile-local damage rectangle
+rounds outward to `16 x 16` full-float blocks. One block is exactly 4 KiB, and
+its 16-pixel `Rgba32Float` row is exactly WebGPU's 256-byte copy-row alignment.
+Adjacent selected blocks for one tile coalesce into one rectangular copy
+region: a full 128-pixel tile remains 64 accounting blocks / 256 KiB but needs
+one texture-buffer copy command rather than 64. Plans are ordered by physical
+page/slot, carry stable logical occupants, use checked size arithmetic, and
+reject non-block-aligned tile layouts, out-of-tile damage, or conflicting
+occupants before any GPU mutation.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,
