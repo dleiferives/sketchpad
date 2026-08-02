@@ -277,6 +277,20 @@ impl RoundMaskTarget {
         self.active_slots.len()
     }
 
+    pub fn active_residents(&self) -> Vec<(LayerTileKey, AtlasSlot)> {
+        let mut residents: Vec<_> = self.active_slots.iter().copied().collect();
+        residents.sort_by_key(|(key, slot)| {
+            (
+                slot.page().get(),
+                slot.slot_in_page(),
+                key.layer.get(),
+                key.tile.y,
+                key.tile.x,
+            )
+        });
+        residents
+    }
+
     pub const fn encoded_batch_is_pending(&self) -> bool {
         self.encoded_batch_pending
     }

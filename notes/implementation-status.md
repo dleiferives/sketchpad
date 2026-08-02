@@ -49,7 +49,15 @@ encodes exactly one max-blended render pass per touched page. The target
 requires each encoded batch to be explicitly marked submitted or discarded
 before its shared instance buffers may be reused; this prevents two command
 buffers submitted together from silently seeing only the last queue write.
-Color-page commit and live presentation are not connected yet.
+The first non-live color commit stage is connected as well. Lazy
+`Rgba32Float` pages consume the ended full-flow mask once per affected slot;
+fixed-function premultiplied source-over paints and destination-out erases in
+one pass per touched page. A physical slot is cleared only on its first color
+write or after its logical `(LayerId, TileCoord)` occupant changes. The target
+rejects active masks, mask batches not yet acknowledged as submitted,
+optical-density flow, and reuse of its own queue-written buffers before the
+encoded commit is submitted or discarded. Live presentation, optical-density
+accumulation, exact GPU undo, and application cutover are not connected yet.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
@@ -61,6 +69,18 @@ traffic facts, not timing measurements. The first smoke attempt also caught
 that `from` is reserved in WGSL; the shader endpoints were renamed and the
 validation error is now necessarily exercised by the smoke path rather than
 being hidden by Rust-only compilation.
+
+The matching full-float document smoke also passed on that Intel adapter. A
+half-opacity `[0.2, 0.4, 0.8]` straight-color sweep committed two logical tiles
+in one color-page pass, cleared two previously uninitialized slots, and wrote
+96 bytes of uniform/instance data. A quarter-opacity eraser then committed one
+resident tile in one pass, performed no redundant color clear, and wrote 48
+bytes. Exact `Rgba32Float` readback produced premultiplied paint
+`[0.1, 0.2, 0.4, 0.5]`, destination-out erase
+`[0.075, 0.15, 0.3, 0.375]`, unchanged paint elsewhere on both tiles, and
+transparent pixels outside the sweep. This proves blend, addressing,
+retention, and lazy-clear semantics on the first hardware adapter; it is not a
+timing result and does not yet exercise the live executable.
 
 ## Current Executable
 
