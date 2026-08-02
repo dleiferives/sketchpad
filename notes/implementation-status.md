@@ -150,7 +150,20 @@ exact forward patch before any GPU swap needs to be submitted. A pending spill
 therefore produces an explicit queueable error with no revision change. Pure
 tests cover successful commit, branch/budget replacement, stale tokens,
 returned command ownership, pending inverse rejection, and exact undo-side
-selection. Mirror completion is the next half to join this coordinator.
+selection.
+
+Mapped mirror completion has now joined the same coordinator. Its prepared
+handoff owns both the immutable CPU snapshot and exact two-sided transition,
+requires matching targets and the current base as source, and previews journal
+retirement before mutation. Original history mapping must attach to the exact
+registered ID. Undo/redo or evicted-history mapping may be marked
+reconcile-only, but that path refuses to discard any transition whose history
+ID is still tracked. Commit rechecks the complete boundary, then attaches the
+required spill and advances the base/journal together; a reconcile-only pair
+is returned to the caller as unused ownership. Tests cover atomic history
+attachment plus retirement, safe reconcile-only disposal, wrong-purpose
+rejection, and preservation of the snapshot, transition, journal, base, and
+pending spill on failure.
 
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized

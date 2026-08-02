@@ -221,6 +221,15 @@ redo clones the after patch into the next forward recovery record. The UI may
 queue that discrete action, but it must not submit a GPU swap first and hope
 the inverse becomes recoverable later.
 
+Mapped completion uses the same two-phase rule. Preparation requires the
+transition target to equal the snapshot revision and its source to equal the
+current recovery base. A history completion must name the registered pending
+ID; a reconcile-only undo/redo completion is rejected if it would discard a
+still-owned history spill. Only after the spill-attachment and base-retirement
+previews both succeed does commit attach the pair and advance the mirror base.
+A genuinely reconcile-only transition is returned unused rather than retained
+as duplicate CPU history.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the
