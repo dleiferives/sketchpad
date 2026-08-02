@@ -105,6 +105,25 @@ impl<C> GpuRecoveryJournal<C> {
         &mut self,
         revision: DocumentRevision,
     ) -> Result<GpuRecoveryRetirement<C>, GpuRecoveryJournalError> {
+        let preview = self.check_acknowledge_mirrored(revision)?;
+        let records: Vec<_> = self.entries.drain(..preview.record_count).collect();
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_sub(preview.retired_bytes)
+            .expect("the retirement preview counted only retained journal bytes");
+        self.mirrored_revision = revision;
+        Ok(GpuRecoveryRetirement {
+            previous_revision: preview.previous_revision,
+            mirrored_revision: preview.mirrored_revision,
+            retired_bytes: preview.retired_bytes,
+            records,
+        })
+    }
+
+    pub fn check_acknowledge_mirrored(
+        &self,
+        revision: DocumentRevision,
+    ) -> Result<GpuRecoveryRetirementPreview, GpuRecoveryJournalError> {
         if revision < self.mirrored_revision {
             return Err(GpuRecoveryJournalError::MirrorRevisionRegressed {
                 mirrored: self.mirrored_revision,
@@ -118,11 +137,11 @@ impl<C> GpuRecoveryJournal<C> {
             });
         }
         if revision == self.mirrored_revision {
-            return Ok(GpuRecoveryRetirement {
+            return Ok(GpuRecoveryRetirementPreview {
                 previous_revision: revision,
                 mirrored_revision: revision,
                 retired_bytes: 0,
-                records: Vec::new(),
+                record_count: 0,
             });
         }
         if !self.entries.iter().any(|entry| entry.revision == revision) {
@@ -135,18 +154,17 @@ impl<C> GpuRecoveryJournal<C> {
             .iter()
             .take_while(|entry| entry.revision <= revision)
             .count();
-        let records: Vec<_> = self.entries.drain(..retire_count).collect();
-        let retired_bytes = records.iter().map(GpuRecoveryRecord::byte_len).sum();
-        self.resident_bytes = self
-            .resident_bytes
-            .checked_sub(retired_bytes)
-            .expect("retired journal records own their accounted bytes");
-        self.mirrored_revision = revision;
-        Ok(GpuRecoveryRetirement {
+        let retired_bytes = self
+            .entries
+            .iter()
+            .take(retire_count)
+            .try_fold(0_u64, |total, record| total.checked_add(record.byte_len()))
+            .ok_or(GpuRecoveryJournalError::ByteCountOverflow)?;
+        Ok(GpuRecoveryRetirementPreview {
             previous_revision,
             mirrored_revision: revision,
             retired_bytes,
-            records,
+            record_count: retire_count,
         })
     }
 
@@ -288,6 +306,14 @@ pub struct GpuRecoveryRetirement<C> {
     pub records: Vec<GpuRecoveryRecord<C>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuRecoveryRetirementPreview {
+    pub previous_revision: DocumentRevision,
+    pub mirrored_revision: DocumentRevision,
+    pub retired_bytes: u64,
+    pub record_count: usize,
+}
+
 pub struct GpuRecoveryRecordFailure<C> {
     pub error: GpuRecoveryJournalError,
     pub command: C,
@@ -420,6 +446,14 @@ mod tests {
         journal.record(revision(2), 12, -1_i32).unwrap();
         let snapshot = journal.snapshot();
 
+        let preview = journal.check_acknowledge_mirrored(revision(1)).unwrap();
+        assert_eq!(preview.previous_revision, DocumentRevision::INITIAL);
+        assert_eq!(preview.mirrored_revision, revision(1));
+        assert_eq!(preview.retired_bytes, 8);
+        assert_eq!(preview.record_count, 1);
+        assert_eq!(journal.mirrored_revision(), DocumentRevision::INITIAL);
+        assert_eq!(journal.len(), 2);
+        assert_eq!(journal.resident_bytes(), 20);
         let retired = journal.acknowledge_mirrored(revision(1)).unwrap();
         assert_eq!(retired.previous_revision, DocumentRevision::INITIAL);
         assert_eq!(retired.mirrored_revision, revision(1));

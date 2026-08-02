@@ -167,67 +167,62 @@ impl GpuHistoryRecoverySpills {
         &mut self,
         transition: GpuExactRasterRecoveryTransition,
     ) -> Result<GpuHistoryRecoveryAttachment, Box<GpuHistoryRecoveryAttachFailure>> {
+        let attachment = match self.check_attach(&transition) {
+            Ok(attachment) => attachment,
+            Err(error) => return Err(attach_failure(error, transition)),
+        };
+        self.entries
+            .get_mut(&attachment.id)
+            .expect("the recovery attachment preflight retained its history ID")
+            .transition = Some(transition);
+        self.ready_entries += 1;
+        self.resident_bytes = self
+            .resident_bytes
+            .checked_add(attachment.byte_len)
+            .expect("the recovery attachment preflight validated byte accounting");
+        Ok(attachment)
+    }
+
+    pub fn check_attach(
+        &self,
+        transition: &GpuExactRasterRecoveryTransition,
+    ) -> Result<GpuHistoryRecoveryAttachment, GpuHistoryRecoveryError> {
         let revision = transition.revision();
         let Some(&id) = self.revisions.get(&revision) else {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::UntrackedRevision(revision),
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::UntrackedRevision(revision));
         };
         let entry = self
             .entries
             .get(&id)
             .expect("the revision index names one retained recovery spill entry");
         if entry.transition.is_some() {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::TransitionAlreadyAttached { id, revision },
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::TransitionAlreadyAttached { id, revision });
         }
         if transition.source_revision() != entry.source_revision {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::SourceRevisionMismatch {
-                    id,
-                    expected: entry.source_revision,
-                    actual: transition.source_revision(),
-                },
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::SourceRevisionMismatch {
+                id,
+                expected: entry.source_revision,
+                actual: transition.source_revision(),
+            });
         }
 
         let byte_len = transition.retained_byte_len();
         if byte_len > self.max_bytes {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::TransitionExceedsByteLimit {
-                    requested: byte_len,
-                    maximum: self.max_bytes,
-                },
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::TransitionExceedsByteLimit {
+                requested: byte_len,
+                maximum: self.max_bytes,
+            });
         }
         let Some(next_resident_bytes) = self.resident_bytes.checked_add(byte_len) else {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::ByteCountOverflow,
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::ByteCountOverflow);
         };
         if next_resident_bytes > self.max_bytes {
-            return Err(attach_failure(
-                GpuHistoryRecoveryError::ByteLimitExhausted {
-                    resident: self.resident_bytes,
-                    requested: byte_len,
-                    maximum: self.max_bytes,
-                },
-                transition,
-            ));
+            return Err(GpuHistoryRecoveryError::ByteLimitExhausted {
+                resident: self.resident_bytes,
+                requested: byte_len,
+                maximum: self.max_bytes,
+            });
         }
-
-        self.entries
-            .get_mut(&id)
-            .expect("the validated recovery spill entry remains retained")
-            .transition = Some(transition);
-        self.ready_entries += 1;
-        self.resident_bytes = next_resident_bytes;
         Ok(GpuHistoryRecoveryAttachment {
             id,
             revision,
@@ -709,7 +704,18 @@ mod tests {
             )
             .unwrap();
 
-        let mismatch = spills.attach(transition(0, 2)).unwrap_err();
+        let mismatched_transition = transition(0, 2);
+        assert_eq!(
+            spills.check_attach(&mismatched_transition).unwrap_err(),
+            GpuHistoryRecoveryError::SourceRevisionMismatch {
+                id,
+                expected: DocumentRevision::from_raw(1),
+                actual: DocumentRevision::INITIAL,
+            }
+        );
+        assert_eq!(spills.pending_len(), 1);
+        assert_eq!(spills.resident_bytes(), 0);
+        let mismatch = spills.attach(mismatched_transition).unwrap_err();
         assert_eq!(
             mismatch.transition.revision(),
             DocumentRevision::from_raw(2)

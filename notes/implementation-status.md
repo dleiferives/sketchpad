@@ -300,6 +300,16 @@ save or device-loss worker sees one stable base/target pair while the live
 timeline advances. Pure tests cover partial retirement, geometry/ahead-of-log
 failure, returned ownership, and snapshot survival after full retirement.
 
+Mirror-anchor retirement and exact-spill attachment now have matching
+read-only previews for the live coordinator. A journal acknowledgement reports
+the precise record count and bytes it would retire; the timeline layers canvas,
+tile, monotonic-base, and journal-order checks over that preview. Separately,
+spill attachment validates the registered history ID, source/target revision,
+pending state, and complete byte budget while only borrowing the transition.
+The mutating methods reuse those checks, so a coordinator can validate both
+owners before committing either. Tests verify that previews leave the mirror
+base, journal records, pending spill, and byte accounting unchanged.
+
 The first simulated device-loss replay now consumes that immutable pair. A
 mirror base can materialize one sparse `RasterLayer` by stable `LayerId`.
 The typed raster journal unifies full-flow round semantics with exact mapped

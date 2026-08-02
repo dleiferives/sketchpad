@@ -167,6 +167,14 @@ mirror ahead of the journal before replacing its immutable base or retiring
 any record. Snapshots retain both sides of the boundary with shared ownership,
 so background save/recovery work cannot race a later handoff.
 
+Both halves of a mapped-history handoff are now separately preflightable. The
+spill store can validate a borrowed two-sided transition, including identity
+and its final retained-byte charge, without taking it. The timeline can preview
+the exact record count and bytes a borrowed mirror snapshot would retire
+without replacing the base. The live coordinator must pass both checks before
+attaching the spill and advancing the base; after that point neither operation
+has a remaining data-dependent failure.
+
 Device-loss reconstruction is per logical layer: materialize that layer's
 sparse mirror tiles, replay its round and exact-raster records while still
 walking the global revision sequence, then discard the temporary CPU history.

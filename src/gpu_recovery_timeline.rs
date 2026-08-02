@@ -3,7 +3,7 @@ use crate::{
     gpu_document_mirror::GpuCpuMirrorSnapshot,
     gpu_recovery_journal::{
         GpuRecoveryJournal, GpuRecoveryJournalError, GpuRecoveryJournalSnapshot,
-        GpuRecoveryRecordFailure, GpuRecoveryRetirement,
+        GpuRecoveryRecordFailure, GpuRecoveryRetirement, GpuRecoveryRetirementPreview,
     },
 };
 use std::{error::Error, fmt, mem};
@@ -44,36 +44,16 @@ impl<C> GpuRecoveryTimeline<C> {
         &mut self,
         next: GpuCpuMirrorSnapshot,
     ) -> Result<GpuRecoveryBaseAdvance<C>, Box<GpuRecoveryBaseAdvanceFailure>> {
-        if next.dimensions() != self.base.dimensions() || next.tile_size() != self.base.tile_size()
-        {
+        if let Err(error) = self.check_advance_base(&next) {
             return Err(Box::new(GpuRecoveryBaseAdvanceFailure {
-                error: GpuRecoveryTimelineError::GeometryMismatch {
-                    expected_dimensions: self.base.dimensions(),
-                    actual_dimensions: next.dimensions(),
-                    expected_tile_size: self.base.tile_size(),
-                    actual_tile_size: next.tile_size(),
-                },
+                error,
                 base: next,
             }));
         }
-        if next.revision() <= self.base.revision() {
-            return Err(Box::new(GpuRecoveryBaseAdvanceFailure {
-                error: GpuRecoveryTimelineError::BaseNotNewer {
-                    current: self.base.revision(),
-                    requested: next.revision(),
-                },
-                base: next,
-            }));
-        }
-        let retirement = match self.journal.acknowledge_mirrored(next.revision()) {
-            Ok(retirement) => retirement,
-            Err(error) => {
-                return Err(Box::new(GpuRecoveryBaseAdvanceFailure {
-                    error: error.into(),
-                    base: next,
-                }));
-            }
-        };
+        let retirement = self
+            .journal
+            .acknowledge_mirrored(next.revision())
+            .expect("the recovery-base preflight validated journal retirement");
         let previous_base = mem::replace(&mut self.base, next);
         debug_assert_eq!(
             self.base.revision(),
@@ -84,6 +64,30 @@ impl<C> GpuRecoveryTimeline<C> {
             previous_base,
             retirement,
         })
+    }
+
+    pub fn check_advance_base(
+        &self,
+        next: &GpuCpuMirrorSnapshot,
+    ) -> Result<GpuRecoveryRetirementPreview, GpuRecoveryTimelineError> {
+        if next.dimensions() != self.base.dimensions() || next.tile_size() != self.base.tile_size()
+        {
+            return Err(GpuRecoveryTimelineError::GeometryMismatch {
+                expected_dimensions: self.base.dimensions(),
+                actual_dimensions: next.dimensions(),
+                expected_tile_size: self.base.tile_size(),
+                actual_tile_size: next.tile_size(),
+            });
+        }
+        if next.revision() <= self.base.revision() {
+            return Err(GpuRecoveryTimelineError::BaseNotNewer {
+                current: self.base.revision(),
+                requested: next.revision(),
+            });
+        }
+        self.journal
+            .check_acknowledge_mirrored(next.revision())
+            .map_err(Into::into)
     }
 
     pub fn snapshot(&self) -> GpuRecoveryTimelineSnapshot<C> {
@@ -269,7 +273,13 @@ mod tests {
             .unwrap();
         let before = timeline.snapshot();
 
-        let advance = timeline.advance_base(mirror(1, 64, 64, 16)).unwrap();
+        let next = mirror(1, 64, 64, 16);
+        let preview = timeline.check_advance_base(&next).unwrap();
+        assert_eq!(preview.retired_bytes, 10);
+        assert_eq!(preview.record_count, 1);
+        assert_eq!(timeline.base_revision().get(), 0);
+        assert_eq!(timeline.journal().len(), 2);
+        let advance = timeline.advance_base(next).unwrap();
         assert_eq!(advance.previous_base.revision().get(), 0);
         assert_eq!(advance.retirement.retired_bytes, 10);
         assert_eq!(advance.retirement.records.len(), 1);
