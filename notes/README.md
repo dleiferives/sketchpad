@@ -70,9 +70,13 @@ The notes are organized by purpose:
   split, and the GPU/CPU measurement plan for faster, better knife and bristle
   marks.
 - [GPU active-stroke architecture](gpu-active-stroke-architecture.md) — the
-  selected sparse scratch-tile transaction, CPU/GPU authority state machine,
-  layer-order constraint, asynchronous readback/undo contract, and staged
-  route from the measured offscreen sweep to a correct live brush.
+  implemented sparse scratch-tile transaction and its CPU-canonical
+  gesture-boundary contract. It is now a control and historical stepping
+  stone rather than the destination architecture.
+- [GPU-resident document and continuous brush migration](gpu-resident-document-migration.md)
+  — the selected replacement: page-batched GPU layer tiles, scalar continuous
+  stroke masks, opacity/flow semantics, exact GPU undo, asynchronous CPU
+  reconciliation, revisioned persistence, and the ordered brush cutover.
 - [Document semantics and storage](document-semantics-and-storage.md) — brush
   graphs, eraser lineage, color contracts, SQLite versus container formats,
   undo, autosave, recovery, and coordinate serialization.

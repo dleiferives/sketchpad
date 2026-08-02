@@ -2,6 +2,12 @@
 
 Status: active delivery queue, 2026-07-27.
 
+Renderer migration decision, 2026-08-01: hard round and eraser will be the
+first GPU-resident document slice, followed by the natural brushes one at a
+time. The complete ownership, opacity/flow, undo, persistence, and cutover
+contract is in
+[GPU-resident document and continuous brush migration](gpu-resident-document-migration.md).
+
 This roadmap governs the product-feature phase. Performance work supports each
 feature but does not replace shipping it. Features land as small vertical
 slices with deterministic correctness tests, explicit document semantics, and

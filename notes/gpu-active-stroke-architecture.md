@@ -1,9 +1,11 @@
 # GPU Active-Stroke Architecture
 
-Status: selected architecture and incremental implementation contract,
-2026-07-28. Offscreen geometry, sparse full-float GPU tiles, asynchronous
-readback, and the CPU commit boundary exist; live presentation/input wiring
-and layer-aware composition remain to be integrated.
+Status: implemented stepping stone, superseded as the destination architecture
+on 2026-08-01. Offscreen geometry, sparse full-float GPU tiles, live
+presentation, asynchronous readback, and the CPU commit boundary exist. The
+transaction remains a correctness/performance control, but the selected
+replacement is the GPU-resident document path in
+[gpu-resident-document-migration.md](gpu-resident-document-migration.md).
 
 ## Decision
 

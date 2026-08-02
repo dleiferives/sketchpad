@@ -5,6 +5,13 @@ current executable actually does. Product intent remains in
 [first-usable-product.md](first-usable-product.md); research claims and future
 possibilities belong in the subject notes.
 
+Selected next architecture, 2026-08-01: replace the CPU
+stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
+page-batched GPU-resident layer and continuous-mask design in
+[GPU-resident document and continuous brush migration](gpu-resident-document-migration.md).
+This paragraph records the next implementation direction; the inventory below
+continues to describe the executable at commit `373b0e7` until slices land.
+
 ## Current Executable
 
 Run on Atlas:
