@@ -184,6 +184,7 @@ pub struct AtlasPageBatch<T> {
 pub struct SparseAtlasPlanner {
     layout: AtlasLayout,
     allocations: HashMap<LayerTileKey, AtlasSlot>,
+    pin_counts: HashMap<LayerTileKey, u32>,
     occupants: Vec<Option<LayerTileKey>>,
     free_slots: Vec<u32>,
 }
@@ -193,6 +194,7 @@ impl SparseAtlasPlanner {
         Self {
             layout,
             allocations: HashMap::new(),
+            pin_counts: HashMap::new(),
             occupants: Vec::new(),
             free_slots: Vec::new(),
         }
@@ -212,6 +214,14 @@ impl SparseAtlasPlanner {
 
     pub fn free_slot_count(&self) -> usize {
         self.free_slots.len()
+    }
+
+    pub fn pinned_tile_count(&self) -> usize {
+        self.pin_counts.len()
+    }
+
+    pub fn pin_count(&self, key: LayerTileKey) -> u32 {
+        self.pin_counts.get(&key).copied().unwrap_or(0)
     }
 
     pub fn slot(&self, key: LayerTileKey) -> Option<AtlasSlot> {
@@ -272,16 +282,54 @@ impl SparseAtlasPlanner {
         keys.into_iter().map(|key| self.allocate(key)).collect()
     }
 
-    pub fn release(&mut self, key: LayerTileKey) -> Option<AtlasSlot> {
-        let slot = self.allocations.remove(&key)?;
+    pub fn pin(&mut self, key: LayerTileKey, expected_slot: AtlasSlot) -> Result<(), AtlasError> {
+        let actual = self.slot(key);
+        if actual != Some(expected_slot) {
+            return Err(AtlasError::ResidentSlotMismatch {
+                key,
+                expected: expected_slot,
+                actual,
+            });
+        }
+        let next = self
+            .pin_count(key)
+            .checked_add(1)
+            .ok_or(AtlasError::PinCountOverflow(key))?;
+        self.pin_counts.insert(key, next);
+        Ok(())
+    }
+
+    pub fn unpin(&mut self, key: LayerTileKey) -> Result<(), AtlasError> {
+        let count = self
+            .pin_counts
+            .get_mut(&key)
+            .ok_or(AtlasError::KeyNotPinned(key))?;
+        *count -= 1;
+        if *count == 0 {
+            self.pin_counts.remove(&key);
+        }
+        Ok(())
+    }
+
+    pub fn release(&mut self, key: LayerTileKey) -> Result<Option<AtlasSlot>, AtlasError> {
+        let pin_count = self.pin_count(key);
+        if pin_count != 0 {
+            return Err(AtlasError::KeyPinned { key, pin_count });
+        }
+        let Some(slot) = self.allocations.remove(&key) else {
+            return Ok(None);
+        };
         let global_slot = self.global_from_slot(slot);
         let occupant = self.occupants[global_slot as usize].take();
         assert_eq!(occupant, Some(key));
         self.free_slots.push(global_slot);
-        Some(slot)
+        Ok(Some(slot))
     }
 
-    pub fn release_layer(&mut self, layer: LayerId) -> Vec<(LayerTileKey, AtlasSlot)> {
+    pub fn release_layer(
+        &mut self,
+        layer: LayerId,
+    ) -> Result<Vec<(LayerTileKey, AtlasSlot)>, AtlasError> {
         let mut keys: Vec<_> = self
             .allocations
             .keys()
@@ -289,14 +337,22 @@ impl SparseAtlasPlanner {
             .filter(|key| key.layer == layer)
             .collect();
         keys.sort_by_key(|key| (key.tile.y, key.tile.x));
-        keys.into_iter()
+        if let Some(key) = keys.iter().find(|key| self.pin_count(**key) != 0) {
+            return Err(AtlasError::KeyPinned {
+                key: *key,
+                pin_count: self.pin_count(*key),
+            });
+        }
+        Ok(keys
+            .into_iter()
             .map(|key| {
                 let slot = self
                     .release(key)
+                    .expect("all pinned layer keys were rejected before release")
                     .expect("a key collected from the planner must remain allocated");
                 (key, slot)
             })
-            .collect()
+            .collect())
     }
 
     pub fn batch_resident_work<T>(
@@ -370,6 +426,17 @@ pub enum AtlasError {
     },
     DuplicateKey(LayerTileKey),
     KeyNotResident(LayerTileKey),
+    ResidentSlotMismatch {
+        key: LayerTileKey,
+        expected: AtlasSlot,
+        actual: Option<AtlasSlot>,
+    },
+    PinCountOverflow(LayerTileKey),
+    KeyNotPinned(LayerTileKey),
+    KeyPinned {
+        key: LayerTileKey,
+        pin_count: u32,
+    },
 }
 
 impl fmt::Display for AtlasError {
@@ -404,6 +471,38 @@ impl fmt::Display for AtlasError {
             Self::KeyNotResident(key) => write!(
                 formatter,
                 "layer {} tile ({}, {}) is not resident",
+                key.layer.get(),
+                key.tile.x,
+                key.tile.y
+            ),
+            Self::ResidentSlotMismatch {
+                key,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "layer {} tile ({}, {}) expected atlas slot {expected:?}, found {actual:?}",
+                key.layer.get(),
+                key.tile.x,
+                key.tile.y
+            ),
+            Self::PinCountOverflow(key) => write!(
+                formatter,
+                "atlas pin count overflows for layer {} tile ({}, {})",
+                key.layer.get(),
+                key.tile.x,
+                key.tile.y
+            ),
+            Self::KeyNotPinned(key) => write!(
+                formatter,
+                "layer {} tile ({}, {}) is not pinned",
+                key.layer.get(),
+                key.tile.x,
+                key.tile.y
+            ),
+            Self::KeyPinned { key, pin_count } => write!(
+                formatter,
+                "layer {} tile ({}, {}) has {pin_count} history pins",
                 key.layer.get(),
                 key.tile.x,
                 key.tile.y
@@ -492,7 +591,7 @@ mod tests {
         let layout = AtlasLayout::new(32, 16, 1).unwrap();
         let mut atlas = SparseAtlasPlanner::new(layout);
         let first = atlas.allocate(key(1, 0, 0)).unwrap();
-        assert_eq!(atlas.release(first.key), Some(first.slot));
+        assert_eq!(atlas.release(first.key).unwrap(), Some(first.slot));
         let replacement = atlas.allocate(key(2, 0, 0)).unwrap();
         assert_eq!(replacement.slot, first.slot);
         assert!(replacement.newly_allocated);
@@ -535,7 +634,7 @@ mod tests {
         atlas
             .allocate_batch([key(7, 2, 1), key(8, 0, 0), key(7, 1, 1), key(7, 0, 2)])
             .unwrap();
-        let released = atlas.release_layer(LayerId::from_raw(7));
+        let released = atlas.release_layer(LayerId::from_raw(7)).unwrap();
         assert_eq!(
             released.iter().map(|(key, _)| key.tile).collect::<Vec<_>>(),
             vec![
@@ -546,5 +645,49 @@ mod tests {
         );
         assert_eq!(atlas.resident_tile_count(), 1);
         assert_eq!(atlas.retained_page_count(), 1);
+    }
+
+    #[test]
+    fn history_pins_prevent_slot_reuse_until_the_last_unpin() {
+        let layout = AtlasLayout::new(32, 16, 1).unwrap();
+        let mut atlas = SparseAtlasPlanner::new(layout);
+        let allocation = atlas.allocate(key(9, 0, 0)).unwrap();
+        atlas.pin(allocation.key, allocation.slot).unwrap();
+        atlas.pin(allocation.key, allocation.slot).unwrap();
+        assert_eq!(atlas.pin_count(allocation.key), 2);
+        assert_eq!(
+            atlas.release(allocation.key),
+            Err(AtlasError::KeyPinned {
+                key: allocation.key,
+                pin_count: 2,
+            })
+        );
+        atlas.unpin(allocation.key).unwrap();
+        assert_eq!(atlas.pin_count(allocation.key), 1);
+        atlas.unpin(allocation.key).unwrap();
+        assert_eq!(atlas.pinned_tile_count(), 0);
+        assert_eq!(
+            atlas.release(allocation.key).unwrap(),
+            Some(allocation.slot)
+        );
+    }
+
+    #[test]
+    fn a_pinned_layer_release_fails_without_releasing_siblings() {
+        let layout = AtlasLayout::new(32, 16, 1).unwrap();
+        let mut atlas = SparseAtlasPlanner::new(layout);
+        let first = atlas.allocate(key(10, 0, 0)).unwrap();
+        let second = atlas.allocate(key(10, 1, 0)).unwrap();
+        atlas.pin(second.key, second.slot).unwrap();
+        assert_eq!(
+            atlas.release_layer(LayerId::from_raw(10)),
+            Err(AtlasError::KeyPinned {
+                key: second.key,
+                pin_count: 1,
+            })
+        );
+        assert_eq!(atlas.slot(first.key), Some(first.slot));
+        assert_eq!(atlas.slot(second.key), Some(second.slot));
+        assert_eq!(atlas.resident_tile_count(), 2);
     }
 }

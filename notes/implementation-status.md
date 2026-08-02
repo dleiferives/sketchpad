@@ -88,6 +88,14 @@ no longer names the recorded logical resident. GPU history budgeting, slot
 pinning, absent-tile occupancy exchange, revision commands, and CPU spill are
 the remaining history layer above this pixel-exchange primitive.
 
+The sparse atlas now has checked reference-counted history pins as the first
+part of that layer. A memento can pin its exact logical resident/physical-slot
+pair; neither single-tile nor whole-layer release can recycle a pinned slot.
+Whole-layer release validates every key before mutation, so encountering one
+pin cannot partially release its siblings. The last unpin restores ordinary
+slot reclamation. No live path creates these pins yet; the history owner is
+the next connection.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,
