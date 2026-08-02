@@ -103,14 +103,17 @@ history/recovery boundary, and recomputes the metadata snapshot's retained
 byte accounting when name length changes. `DocumentMetadata::apply_edit` now
 keeps active identity and next-layer ID in locals and replaces the complete
 validated snapshot only after every check succeeds, so a malformed presence
-or name command cannot partly mutate allocation state. The application does
-not yet expose an inline rename control; this slice establishes the tested
-resident command that control must call.
+or name command cannot partly mutate allocation state. The layer panel now
+exposes that command through a focused inline editor: `NAME` begins a draft,
+Enter or `SAVE` commits, and Escape, `CANCEL`, closing the panel, or hiding the
+UI discards it. Blank drafts cannot be submitted. Editing the draft is session
+state only, so it creates no document revision or undo entry until the final
+name is accepted.
 
-During this transition, natural brushes, the layer-rename UI interaction, and
-color picking are intentionally unavailable in
-resident mode. The legacy `Document` remains immutable fallback data; the
-application never treats it as a second writable pixel authority.
+During this transition, natural brushes and color picking are intentionally
+unavailable in resident mode. The legacy `Document` remains immutable
+fallback data; the application never treats it as a second writable pixel
+authority.
 
 The reversible metadata edits are prepared without mutation, require the exact
 expected side plus exact next revision when applied, reverse through the same
@@ -1342,9 +1345,9 @@ This is an architectural integration checkpoint, not yet the usable painter:
 - arbitrary general edits still use full-tile content-bound rescans;
 - hard round and eraser are GPU-resident on selected live hardware, and the
   active layer, revisioned layer properties/presence/order, duplication, and
-  PNG import are resident there. Flat, pencil, bristle, palette knife, layer
-  rename, and color picking are temporarily disabled rather than mutating
-  stale CPU fallback data;
+  PNG import and layer rename are resident there. Flat, pencil, bristle,
+  palette knife, and color picking are temporarily disabled rather than
+  mutating stale CPU fallback data;
 - repeated dab/tile intersections are not yet coalesced in the retained CPU
   brush paths;
 - live physical-input diagnostics now separate hover and contact for relative

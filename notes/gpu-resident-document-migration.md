@@ -270,8 +270,8 @@ also returns the command encoder and prepared bundle, whose tokens can be
 split for explicit target rollback. The historical paragraph above describes
 the pre-cutover owner. Raster submission, mapped-readback driving,
 presentation, save/export, active-layer selection, and revisioned metadata
-controls are now live; the remaining structural UI work is exposing rename.
-Empty layer creation is also live as a
+controls, including the inline layer-name editor, are now live. Empty layer
+creation is also live as a
 metadata-only presence edit: it allocates a stable monotonic ID but no atlas
 resident, and the same edit removes/reinserts that identity during undo/redo.
 Deletion uses the inverse presence state: metadata/composition stop naming the
@@ -402,9 +402,9 @@ Document replacement is now an explicit snapshot-and-rebootstrap boundary. A
 candidate file is decoded and a complete replacement resident owner is
 bootstrapped before either the legacy metadata view or active GPU owner is
 published; any failure leaves the current canvas untouched. Other unmigrated
-actions fail closed. Natural brushes, the layer-rename UI, and composite color
-picking are not allowed to touch the legacy CPU pixels while the resident
-owner is active. They must return through resident
+actions fail closed. Natural brushes and composite color picking are not
+allowed to touch the legacy CPU pixels while the resident owner is active.
+They must return through resident
 metadata/history transactions or GPU sampling. This temporary restriction is
 a correctness boundary, not the intended product surface.
 
@@ -431,11 +431,12 @@ the corresponding after-state and advances revision again. Order changes move
 the stable identity without changing active selection. Malformed or stale
 values fail without publishing a partially changed layer array.
 
-The typed-history, presence-edit, duplication, imported-payload, and reversible
-rename-command slices are complete. Rename now recomputes retained metadata
-bytes and publishes transactionally, but still needs an application UI
-interaction. The larger remaining cutover is natural-brush execution; that
-should not be mixed into the structural layer transaction code.
+The typed-history, presence-edit, duplication, imported-payload, reversible
+rename-command, and inline rename UI slices are complete. Rename recomputes
+retained metadata bytes and publishes only the accepted final value; the
+in-progress text draft remains ephemeral UI state. The larger remaining
+cutover is natural-brush execution; that should not be mixed into the
+structural layer transaction code.
 
 ## Ordered Implementation
 

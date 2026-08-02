@@ -772,6 +772,7 @@ impl App {
             UiAction::CreateLayer => self.create_layer(),
             UiAction::DuplicateActiveLayer => self.duplicate_active_layer(),
             UiAction::DeleteActiveLayer => self.delete_active_layer(),
+            UiAction::RenameLayer { layer, name } => self.rename_layer(layer, name),
             UiAction::MoveActiveLayer(offset) => self.move_active_layer(offset),
             UiAction::OpenDocument => self.choose_document_open(),
             UiAction::SaveDocument => {
@@ -1968,6 +1969,33 @@ impl App {
                 self.mark_document_dirty();
             }
             Err(error) => log::warn!("could not delete layer: {error}"),
+        }
+    }
+
+    fn rename_layer(&mut self, layer: LayerId, name: String) {
+        if self.active_stroke.is_some() {
+            return;
+        }
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            match resident.document.rename_layer(layer, name) {
+                Ok(Some(_)) => {
+                    log::info!("renamed resident layer {}", layer.get());
+                    self.mark_document_dirty();
+                }
+                Ok(None) => {}
+                Err(failure) => log::warn!("could not rename resident layer: {failure}"),
+            }
+            return;
+        }
+        if self.reject_legacy_document_action("rename layer") {
+            return;
+        }
+        match self.document.rename_layer(layer, name) {
+            Ok(()) => {
+                log::info!("renamed layer {}", layer.get());
+                self.mark_document_dirty();
+            }
+            Err(error) => log::warn!("could not rename layer: {error}"),
         }
     }
 

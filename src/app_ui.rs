@@ -121,7 +121,7 @@ pub enum UiExportRegion {
     ContentBounds,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
     SetVisible(bool),
     SelectTool(UiTool),
@@ -138,6 +138,10 @@ pub enum UiAction {
     CreateLayer,
     DuplicateActiveLayer,
     DeleteActiveLayer,
+    RenameLayer {
+        layer: LayerId,
+        name: String,
+    },
     MoveActiveLayer(isize),
     OpenDocument,
     SaveDocument,
@@ -338,7 +342,7 @@ impl Default for ColorPickerState {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 struct UiSessionState {
     file_panel_open: bool,
     brush_panel_open: bool,
@@ -349,6 +353,14 @@ struct UiSessionState {
     key_capture: Option<KeyBindingTarget>,
     pending_key_capture: Option<PendingKeyCapture>,
     reset_keybindings_armed: bool,
+    layer_rename: Option<LayerRenameState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LayerRenameState {
+    layer: LayerId,
+    name: String,
+    focus_requested: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -584,11 +596,12 @@ impl UiOverlay {
         let context = self.context.clone();
         let mut actions = Vec::new();
         let mut hit_regions = UiHitRegions::default();
-        let mut session = self.session;
+        let mut session = self.session.clone();
         session.color_picker.sync(snapshot.color);
         if !snapshot.visible {
             session.key_capture = None;
             session.reset_keybindings_armed = false;
+            session.layer_rename = None;
         }
         if let Some(pending) = session.pending_key_capture.take() {
             actions.push(UiAction::SetKeyBinding {
@@ -954,6 +967,7 @@ fn show_toolbar(
             layers,
             actions,
             &mut session.layers_panel_open,
+            &mut session.layer_rename,
         )
     } else {
         Rect::NOTHING
@@ -1395,7 +1409,14 @@ fn show_layers_panel(
     layers: &[UiLayerSnapshot<'_>],
     actions: &mut Vec<UiAction>,
     layers_panel_open: &mut bool,
+    layer_rename: &mut Option<LayerRenameState>,
 ) -> Rect {
+    if layer_rename
+        .as_ref()
+        .is_some_and(|rename| !layers.iter().any(|layer| layer.id == rename.layer))
+    {
+        *layer_rename = None;
+    }
     let area = egui::Area::new(Id::new("sketchpad-layers-panel"))
         .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, 16.0))
         .order(Order::Foreground)
@@ -1415,6 +1436,7 @@ fn show_layers_panel(
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if icon_button(ui, "×", "Close layers", false).clicked() {
                                 *layers_panel_open = false;
+                                *layer_rename = None;
                             }
                             ui.add_enabled_ui(layers.len() > 1, |ui| {
                                 if compact_text_button(ui, "DEL", "Delete active layer").clicked() {
@@ -1436,7 +1458,62 @@ fn show_layers_panel(
                         if compact_text_button(ui, "DOWN", "Move active layer down").clicked() {
                             actions.push(UiAction::MoveActiveLayer(-1));
                         }
+                        if compact_text_button(ui, "NAME", "Rename active layer").clicked() {
+                            if let Some(active) = layers
+                                .iter()
+                                .find(|layer| layer.id == snapshot.active_layer)
+                            {
+                                *layer_rename = Some(LayerRenameState {
+                                    layer: active.id,
+                                    name: active.name.to_owned(),
+                                    focus_requested: false,
+                                });
+                            }
+                        }
                     });
+                    let mut rename_finished = None;
+                    if let Some(rename) = layer_rename.as_mut() {
+                        let response = ui.add(
+                            egui::TextEdit::singleline(&mut rename.name)
+                                .id(Id::new(("sketchpad-layer-name", rename.layer.get())))
+                                .desired_width(LAYER_PANEL_WIDTH)
+                                .char_limit(128)
+                                .font(FontId::proportional(13.0))
+                                .text_color(TEXT),
+                        );
+                        if !rename.focus_requested {
+                            response.request_focus();
+                            rename.focus_requested = true;
+                        }
+                        let cancel = response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                        let enter = response.has_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                        let valid = !rename.name.trim().is_empty();
+                        let mut commit = enter && valid;
+                        let mut cancel_clicked = false;
+                        ui.horizontal(|ui| {
+                            ui.add_enabled_ui(valid, |ui| {
+                                if compact_text_button(ui, "SAVE", "Commit layer name").clicked() {
+                                    commit = true;
+                                }
+                            });
+                            if compact_text_button(ui, "CANCEL", "Cancel layer rename").clicked() {
+                                cancel_clicked = true;
+                            }
+                        });
+                        if cancel || cancel_clicked {
+                            rename_finished = Some(None);
+                        } else if commit {
+                            rename_finished = Some(Some((rename.layer, rename.name.clone())));
+                        }
+                    }
+                    if let Some(result) = rename_finished {
+                        *layer_rename = None;
+                        if let Some((layer, name)) = result {
+                            actions.push(UiAction::RenameLayer { layer, name });
+                        }
+                    }
                     separator_horizontal(ui);
                     egui::ScrollArea::vertical()
                         .id_salt("sketchpad-layer-list")
