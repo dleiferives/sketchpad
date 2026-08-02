@@ -11,10 +11,15 @@ use std::{
 pub const DEFAULT_GPU_HISTORY_BYTES: u64 = 64 * 1024 * 1024;
 pub const DEFAULT_GPU_HISTORY_ENTRIES: usize = 256;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct GpuHistoryId(u64);
 
 impl GpuHistoryId {
+    #[cfg(test)]
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -146,6 +151,10 @@ impl GpuDocumentHistory {
 
     pub fn pending_direction(&self) -> Option<GpuHistoryDirection> {
         self.core.pending.as_ref().map(|pending| pending.direction)
+    }
+
+    pub fn pending_id(&self) -> Option<GpuHistoryId> {
+        self.core.pending_id()
     }
 
     pub fn pending_memento_mut(
@@ -337,6 +346,10 @@ impl<T> BoundedHistory<T> {
         Ok(true)
     }
 
+    fn pending_id(&self) -> Option<GpuHistoryId> {
+        self.pending.as_ref().map(|pending| pending.entry.id)
+    }
+
     fn finish_pending(&mut self) -> Result<GpuHistoryId, GpuDocumentHistoryError> {
         let pending = self
             .pending
@@ -473,6 +486,7 @@ mod tests {
         let mut history = BoundedHistory::new(8, 100).unwrap();
         let first = history.record(7, 12).unwrap().id;
         assert!(history.begin(GpuHistoryDirection::Undo).unwrap());
+        assert_eq!(history.pending_id(), Some(first));
         assert_eq!(history.pending.as_ref().unwrap().entry.id, first);
         assert_eq!(history.resident_bytes, 12);
         assert_eq!(history.cancel_pending().unwrap(), first);

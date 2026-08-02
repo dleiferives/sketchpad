@@ -110,6 +110,7 @@ impl GpuExactRasterRecoveryCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuExactRasterRecoveryTransition {
+    source_revision: DocumentRevision,
     revision: DocumentRevision,
     before: GpuExactRasterRecoveryCommand,
     after: GpuExactRasterRecoveryCommand,
@@ -177,6 +178,7 @@ impl GpuExactRasterRecoveryTransition {
         let retained_byte_len = transition_retained_byte_len(&before_command, &after)
             .expect("validated addressable recovery commands have representable combined bytes");
         Ok(Self {
+            source_revision: plan.source_revision(),
             revision: plan.revision(),
             before: before_command,
             after,
@@ -190,6 +192,10 @@ impl GpuExactRasterRecoveryTransition {
     ) -> Result<GpuExactRasterRecoveryCommand, GpuExactRasterRecoveryTransitionError> {
         GpuExactRasterRecoveryCommand::from_regions(tile_size, regions)
             .map_err(|failure| GpuExactRasterRecoveryTransitionError::Before(failure.error))
+    }
+
+    pub const fn source_revision(&self) -> DocumentRevision {
+        self.source_revision
     }
 
     pub const fn revision(&self) -> DocumentRevision {
@@ -1310,6 +1316,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(transition.revision(), DocumentRevision::from_raw(2));
+        assert_eq!(transition.source_revision(), DocumentRevision::from_raw(1));
         assert_eq!(transition.layer(), key.layer);
         assert!(transition.retained_byte_len() >= 2 * 32 * 32 * 16);
         let cloned = transition.clone();

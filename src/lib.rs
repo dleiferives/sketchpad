@@ -10,6 +10,7 @@ pub mod gpu_document_mirror_dispatcher;
 pub mod gpu_document_recovery;
 pub mod gpu_document_target;
 pub mod gpu_document_undo;
+pub mod gpu_history_recovery;
 pub mod gpu_layer_recovery;
 pub mod gpu_raster_recovery;
 pub mod gpu_recovery_journal;

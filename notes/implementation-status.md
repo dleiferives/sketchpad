@@ -235,8 +235,22 @@ dispatcher retains each accepted plan plus shared mapped batches, constructs
 the two-sided spill before advancing the mirror, and returns it only with the
 completed revision. The GPU correctness smoke now contains an after/before
 oracle for that returned spill, though this slice was compile-checked rather
-than run against hardware. Bounded history still needs to bind the spill to
-the matching GPU history ID before this closes the live pre-map interval.
+than run against hardware.
+
+The non-live recovery-spill owner now binds those transitions to the matching
+stable GPU history IDs without duplicating undo/redo stack state. Registration
+requires one exact consecutive source/target revision and rejects duplicate
+IDs, duplicate revisions, and capacity pressure before mutation. Mapping can
+complete out of registration order; attachment resolves by target revision,
+rechecks the source, and returns the full-float transition unchanged on stale,
+duplicate, mismatched, or over-budget input. A ready ID exposes its exact
+before-side for undo and after-side for redo. GPU-history branch clearing and
+eviction can remove that same ID, including while mapping is pending; a late
+result then remains explicitly untracked. The default 256-entry / 160 MiB CPU
+budget covers twice the default 64 MiB GPU pixel budget plus bounded
+tile/region metadata, and accounting drops only when GPU history relinquishes
+the ID. Pure tests cover out-of-order attachment, direction selection,
+transactional failures, explicit eviction, and both limits.
 
 That work also exposed and fixed a partial-edge invariant: a logical canvas
 whose dimensions are not multiples of 128 may legitimately produce a padded
@@ -246,12 +260,13 @@ CPU pixels transparent. Pure tests cover out-of-order mapped batches,
 duplicate rejection with retained ownership, exact partial replacement,
 untouched pixels, absent-tile removal, and a 250-pixel canvas edge.
 
-The payload set is intentionally not yet declared complete for drawing
-recovery. Until an undo/redo result has mapped, the system must retain an older
-exact replay base plus inverse-capable history; a pending GPU-only capture
-would disappear with the device. Inverse-history replay through that
-asynchronous interval, imported/deleted raster ownership, and capture
-coalescing remain the rest of migration step 5.
+The payload set is intentionally not yet declared complete for live drawing
+recovery. The app-level owner must register GPU history, journal command,
+readback, spill attachment, anchor advancement, undo/redo, branch clearing,
+and eviction as one checked state transition. Until the original history
+spill has mapped, an undo cannot use it as an inverse; the system must retain
+the older exact replay anchor and complete inverse-capable history, or queue
+that undo. A pending GPU-only capture would disappear with the device.
 
 The first anchor handoff owner now makes the exact CPU base and its post-base
 journal one state boundary. Recording delegates to the same transactional

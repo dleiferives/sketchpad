@@ -176,8 +176,16 @@ representation is an exact two-sided transition: copy the before-blocks from
 the preceding immutable mirror and retain the mapped after-blocks under shared
 ownership. Every readback plan names that precise source revision, and the
 dispatcher constructs the pair before it lets reconciliation advance the
-mirror. Live integration must associate the returned pair with the GPU history
-ID before allowing the newer mirror base to retire the semantic command.
+mirror. A separate bounded spill owner registers the stable GPU history ID and
+its consecutive source/target revision before readback, then attaches the
+returned pair by that exact identity. It deliberately does not maintain a
+second undo stack: the GPU history remains authoritative for order, branching,
+and eviction. Undo selects the pair's before-side, redo selects its after-side,
+and a branch clear or budget eviction removes the same ID from both owners.
+Pending, duplicate, stale, mismatched, and over-budget attachments leave both
+the association and expensive transition ownership explicit. The live owner
+must perform these calls atomically and must not advance the recovery anchor
+past an ID whose transition is still pending.
 
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
