@@ -17,7 +17,7 @@ use crate::{
     },
     gpu_document_target::{
         ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentTarget,
-        GpuDocumentTargetError, GpuUndoSwapStats,
+        GpuDocumentTargetError, GpuDocumentTargetId, GpuUndoSwapStats,
     },
     gpu_history_recovery::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
@@ -63,6 +63,7 @@ impl Default for GpuResidentDocumentLimits {
 }
 
 pub struct GpuResidentDocument {
+    target_id: GpuDocumentTargetId,
     atlas: SparseAtlasPlanner,
     history: GpuDocumentHistory,
     mirror: GpuMirrorDispatcher,
@@ -75,7 +76,25 @@ impl GpuResidentDocument {
     pub fn new(
         width: u32,
         height: u32,
+        target: &GpuDocumentTarget,
+        initial_revision: DocumentRevision,
+        limits: GpuResidentDocumentLimits,
+    ) -> Result<Self, GpuResidentDocumentError> {
+        Self::new_with_target_identity(
+            width,
+            height,
+            target.layout(),
+            target.id(),
+            initial_revision,
+            limits,
+        )
+    }
+
+    fn new_with_target_identity(
+        width: u32,
+        height: u32,
         layout: AtlasLayout,
+        target_id: GpuDocumentTargetId,
         initial_revision: DocumentRevision,
         limits: GpuResidentDocumentLimits,
     ) -> Result<Self, GpuResidentDocumentError> {
@@ -97,6 +116,7 @@ impl GpuResidentDocument {
             limits.recovery_spill_bytes,
         )?;
         Ok(Self {
+            target_id,
             atlas,
             history,
             mirror,
@@ -114,6 +134,9 @@ impl GpuResidentDocument {
         encoded: EncodedGpuDocumentCommit,
         recovery_command: GpuRasterRecoveryCommand,
     ) -> Result<PreparedGpuResidentDocumentCommit, Box<GpuResidentDocumentPrepareFailure>> {
+        if let Err(error) = self.check_target(target) {
+            return Err(prepare_failure(error, encoded, recovery_command));
+        }
         if target.layout() != self.atlas.layout() {
             return Err(prepare_failure(
                 GpuResidentDocumentError::TargetLayoutMismatch {
@@ -263,6 +286,9 @@ impl GpuResidentDocument {
         direction: GpuHistoryDirection,
     ) -> Result<Option<PreparedGpuResidentHistorySwap>, Box<GpuResidentHistorySwapPrepareFailure>>
     {
+        if let Err(error) = self.check_target(target) {
+            return Err(history_swap_prepare_failure(error));
+        }
         let Some(revision) = self.revision().checked_next() else {
             return Err(history_swap_prepare_failure(
                 GpuResidentDocumentError::RevisionExhausted,
@@ -401,6 +427,7 @@ impl GpuResidentDocument {
         target: &mut GpuDocumentTarget,
         prepared: PreparedGpuResidentHistorySwap,
     ) -> Result<GpuHistoryId, GpuResidentDocumentError> {
+        self.check_target(target)?;
         let PreparedGpuResidentHistorySwap { encoded, .. } = prepared;
         let memento = self.history.pending_memento_mut()?;
         target.undo_swap_discarded(encoded, memento)?;
@@ -439,6 +466,23 @@ impl GpuResidentDocument {
             .check_prepared_history_swap(&prepared.recovery)?;
         self.mirror
             .check_prepared_capture(&prepared.plan, &prepared.capture)?;
+        Ok(())
+    }
+
+    fn check_target(&self, target: &GpuDocumentTarget) -> Result<(), GpuResidentDocumentError> {
+        self.check_target_identity(target.id())
+    }
+
+    fn check_target_identity(
+        &self,
+        actual: GpuDocumentTargetId,
+    ) -> Result<(), GpuResidentDocumentError> {
+        if actual != self.target_id {
+            return Err(GpuResidentDocumentError::TargetMismatch {
+                expected: self.target_id,
+                actual,
+            });
+        }
         Ok(())
     }
 
@@ -588,6 +632,7 @@ impl GpuResidentDocument {
         target: &GpuDocumentTarget,
         prepared: &PreparedGpuResidentDocumentCommit,
     ) -> Result<(), GpuResidentDocumentError> {
+        self.check_target(target)?;
         target.check_encoded_commit(&prepared.encoded)?;
         let history = self
             .history
@@ -604,6 +649,10 @@ impl GpuResidentDocument {
 
     pub const fn atlas(&self) -> &SparseAtlasPlanner {
         &self.atlas
+    }
+
+    pub const fn target_id(&self) -> GpuDocumentTargetId {
+        self.target_id
     }
 
     pub const fn history(&self) -> &GpuDocumentHistory {
@@ -868,6 +917,10 @@ impl Error for GpuResidentDocumentSubmitFailure {
 #[derive(Debug)]
 pub enum GpuResidentDocumentError {
     RevisionExhausted,
+    TargetMismatch {
+        expected: GpuDocumentTargetId,
+        actual: GpuDocumentTargetId,
+    },
     TargetLayoutMismatch {
         expected: AtlasLayout,
         actual: AtlasLayout,
@@ -890,6 +943,12 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::RevisionExhausted => {
                 write!(formatter, "GPU document revision space is exhausted")
             }
+            Self::TargetMismatch { expected, actual } => write!(
+                formatter,
+                "GPU resident document is bound to target {}, not target {}",
+                expected.get(),
+                actual.get()
+            ),
             Self::TargetLayoutMismatch { expected, actual } => write!(
                 formatter,
                 "GPU document target layout {actual:?} does not match owner {expected:?}"
@@ -994,13 +1053,29 @@ mod tests {
         }
     }
 
+    fn test_document(
+        layout: AtlasLayout,
+        initial_revision: DocumentRevision,
+        limits: GpuResidentDocumentLimits,
+    ) -> Result<GpuResidentDocument, GpuResidentDocumentError> {
+        GpuResidentDocument::new_with_target_identity(
+            48,
+            40,
+            layout,
+            GpuDocumentTargetId::from_raw(73),
+            initial_revision,
+            limits,
+        )
+    }
+
     #[test]
     fn owner_starts_all_subsystems_at_one_revision_and_budget() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
         let initial_revision = DocumentRevision::from_raw(19);
         let limits = limits();
-        let document = GpuResidentDocument::new(48, 40, layout, initial_revision, limits).unwrap();
+        let document = test_document(layout, initial_revision, limits).unwrap();
 
+        assert_eq!(document.target_id(), GpuDocumentTargetId::from_raw(73));
         assert_eq!(document.atlas().layout(), layout);
         assert_eq!(document.history().max_entries(), limits.history_entries);
         assert_eq!(document.history().max_bytes(), limits.history_bytes);
@@ -1022,15 +1097,24 @@ mod tests {
         assert_eq!(document.mirror().pending_revision_count(), 0);
         assert_eq!(document.pending_mirror_purpose_count(), 0);
         assert_eq!(document.pending_mirror_handoff_error(), None);
+        let wrong_target = GpuDocumentTargetId::from_raw(74);
+        assert!(matches!(
+            document.check_target_identity(wrong_target),
+            Err(GpuResidentDocumentError::TargetMismatch {
+                expected,
+                actual
+            }) if expected == document.target_id() && actual == wrong_target
+        ));
     }
 
     #[test]
     fn invalid_history_limit_fails_before_constructing_an_owner() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
-        let result = GpuResidentDocument::new(
+        let result = GpuResidentDocument::new_with_target_identity(
             48,
             40,
             layout,
+            GpuDocumentTargetId::from_raw(73),
             DocumentRevision::INITIAL,
             GpuResidentDocumentLimits {
                 history_entries: 0,
@@ -1049,10 +1133,11 @@ mod tests {
     #[test]
     fn invalid_mirror_budget_is_reported_at_the_owner_boundary() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
-        let result = GpuResidentDocument::new(
+        let result = GpuResidentDocument::new_with_target_identity(
             48,
             40,
             layout,
+            GpuDocumentTargetId::from_raw(73),
             DocumentRevision::INITIAL,
             GpuResidentDocumentLimits {
                 mirror_staging_bytes: GPU_UNDO_BLOCK_BYTES - 1,
@@ -1071,8 +1156,7 @@ mod tests {
     #[test]
     fn delayed_history_mapping_becomes_reconcile_only_after_eviction() {
         let layout = AtlasLayout::new(32, 8, 2).unwrap();
-        let mut document =
-            GpuResidentDocument::new(48, 40, layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let mut document = test_document(layout, DocumentRevision::INITIAL, limits()).unwrap();
         let first_id = GpuHistoryId::from_raw(1);
         let first_revision = DocumentRevision::from_raw(1);
         let first = document

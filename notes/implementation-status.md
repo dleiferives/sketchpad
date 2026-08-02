@@ -219,6 +219,16 @@ its two-sided spill, while an already-evicted ID becomes reconcile-only. A pure
 regression test covers both sides of that lifetime change. The application
 event loop has not yet been cut over to call this driver or poll the device.
 
+The remaining external color target is now identity-bound before it is moved
+behind the owner API. Each `GpuDocumentTarget` receives a process-unique ID;
+opaque color-commit and undo-swap tokens carry that ID and fail before serial
+validation on another target. A `GpuResidentDocument` is constructed from one
+specific target and checks the same identity on preparation, final submission,
+and explicit discard. Pure tests cover unique allocation, cross-target token
+rejection, and owner mismatch reporting. This closes the same-layout/same-
+serial resource aliasing hole while keeping the physical target-ownership
+refactor as a separate reviewable change.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

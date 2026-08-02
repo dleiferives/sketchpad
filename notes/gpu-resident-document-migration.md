@@ -283,6 +283,17 @@ ID is still tracked it attaches the exact spill, while an ID evicted before
 mapping downgrades to reconcile-only and advances the recovery base without
 resurrecting dead undo ownership.
 
+GPU target identity is now explicit rather than implied by a per-target serial
+number. Every color target receives one process-unique checked ID, and both
+commit and undo-swap tokens carry it. Token validation rejects a different
+target before considering its pending serial. `GpuResidentDocument`
+construction binds the owner permanently to one target ID and layout; prepare,
+submit, and discard paths all enforce that binding. Two freshly constructed
+targets can therefore no longer accept each other's first token merely because
+both local serial counters begin at one. The next API consolidation can move
+target encoding behind the owner without carrying this ambiguity through the
+cutover.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the

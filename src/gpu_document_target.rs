@@ -12,10 +12,26 @@ use std::{
     fmt,
     mem::{size_of, size_of_val},
     num::NonZeroU64,
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 const INITIAL_INSTANCE_BUFFER_BYTES: u64 = 4_096;
 const INITIAL_UNDO_SCRATCH_BYTES: u64 = 4_096;
+static NEXT_GPU_DOCUMENT_TARGET_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GpuDocumentTargetId(u64);
+
+impl GpuDocumentTargetId {
+    #[cfg(test)]
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -81,6 +97,7 @@ pub struct ColorCommitStats {
 }
 
 pub struct GpuDocumentTarget {
+    id: GpuDocumentTargetId,
     layout: AtlasLayout,
     pages: Vec<ColorPage>,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -105,6 +122,7 @@ pub struct GpuDocumentTarget {
 }
 
 pub struct EncodedGpuDocumentCommit {
+    target_id: GpuDocumentTargetId,
     stats: ColorCommitStats,
     serial: u64,
     memento: GpuDocumentMemento,
@@ -136,6 +154,7 @@ pub struct GpuUndoSwapStats {
 }
 
 pub struct EncodedGpuUndoSwap {
+    target_id: GpuDocumentTargetId,
     stats: GpuUndoSwapStats,
     serial: u64,
 }
@@ -160,6 +179,7 @@ impl GpuDocumentTarget {
         {
             return Err(GpuDocumentTargetError::Float32BlendingUnavailable);
         }
+        let id = allocate_target_id()?;
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU Document Commit Uniform"),
@@ -258,6 +278,7 @@ impl GpuDocumentTarget {
         let undo_scratch_buffer = create_undo_scratch_buffer(device, INITIAL_UNDO_SCRATCH_BYTES);
 
         Ok(Self {
+            id,
             layout,
             pages: Vec::new(),
             bind_group_layout,
@@ -286,6 +307,10 @@ impl GpuDocumentTarget {
         self.layout
     }
 
+    pub const fn id(&self) -> GpuDocumentTargetId {
+        self.id
+    }
+
     pub fn retained_page_count(&self) -> usize {
         self.pages.len()
     }
@@ -312,7 +337,7 @@ impl GpuDocumentTarget {
         &self,
         encoded: &EncodedGpuDocumentCommit,
     ) -> Result<(), GpuDocumentTargetError> {
-        self.validate_commit_token(encoded.serial)
+        self.validate_commit_token(encoded.target_id, encoded.serial)
     }
 
     pub fn commit_submitted(&mut self) -> Result<(), GpuDocumentTargetError> {
@@ -337,7 +362,7 @@ impl GpuDocumentTarget {
         &mut self,
         encoded: EncodedGpuDocumentCommit,
     ) -> Result<GpuDocumentMemento, GpuDocumentTargetError> {
-        self.validate_commit_token(encoded.serial)?;
+        self.validate_commit_token(encoded.target_id, encoded.serial)?;
         self.finish_commit_submission();
         Ok(encoded.memento)
     }
@@ -373,12 +398,17 @@ impl GpuDocumentTarget {
         &mut self,
         encoded: EncodedGpuDocumentCommit,
     ) -> Result<(), GpuDocumentTargetError> {
-        self.validate_commit_token(encoded.serial)?;
+        self.validate_commit_token(encoded.target_id, encoded.serial)?;
         self.finish_commit_discard();
         Ok(())
     }
 
-    fn validate_commit_token(&self, serial: u64) -> Result<(), GpuDocumentTargetError> {
+    fn validate_commit_token(
+        &self,
+        target_id: GpuDocumentTargetId,
+        serial: u64,
+    ) -> Result<(), GpuDocumentTargetError> {
+        check_token_target(self.id, target_id)?;
         if !self.commit_pending {
             return Err(GpuDocumentTargetError::NoEncodedCommit);
         }
@@ -414,6 +444,7 @@ impl GpuDocumentTarget {
             self.encode_full_flow_commit_internal(device, queue, encoder, mask, material, true)?;
         Ok(match (memento, serial) {
             (Some(memento), Some(serial)) => Some(EncodedGpuDocumentCommit {
+                target_id: self.id,
                 stats,
                 serial,
                 memento,
@@ -681,7 +712,7 @@ impl GpuDocumentTarget {
         &self,
         encoded: &EncodedGpuUndoSwap,
     ) -> Result<(), GpuDocumentTargetError> {
-        self.validate_undo_swap_token(encoded.serial)
+        self.validate_undo_swap_token(encoded.target_id, encoded.serial)
     }
 
     pub fn encode_undo_swap(
@@ -785,6 +816,7 @@ impl GpuDocumentTarget {
         self.pending_undo_swap_serial = Some(swap_serial);
         self.next_undo_swap_serial = next_swap_serial;
         Ok(EncodedGpuUndoSwap {
+            target_id: self.id,
             serial: swap_serial,
             stats: GpuUndoSwapStats {
                 copy_regions,
@@ -798,7 +830,7 @@ impl GpuDocumentTarget {
         &mut self,
         encoded: EncodedGpuUndoSwap,
     ) -> Result<(), GpuDocumentTargetError> {
-        self.validate_undo_swap_token(encoded.serial)?;
+        self.validate_undo_swap_token(encoded.target_id, encoded.serial)?;
         self.undo_swap_pending = false;
         self.pending_undo_swap_serial = None;
         self.pending_undo_resident_changes.clear();
@@ -810,7 +842,7 @@ impl GpuDocumentTarget {
         encoded: EncodedGpuUndoSwap,
         memento: &mut GpuDocumentMemento,
     ) -> Result<(), GpuDocumentTargetError> {
-        self.validate_undo_swap_token(encoded.serial)?;
+        self.validate_undo_swap_token(encoded.target_id, encoded.serial)?;
         for (slot, previous) in self.pending_undo_resident_changes.drain(..).rev() {
             match previous {
                 Some(key) => {
@@ -827,7 +859,12 @@ impl GpuDocumentTarget {
         Ok(())
     }
 
-    fn validate_undo_swap_token(&self, serial: u64) -> Result<(), GpuDocumentTargetError> {
+    fn validate_undo_swap_token(
+        &self,
+        target_id: GpuDocumentTargetId,
+        serial: u64,
+    ) -> Result<(), GpuDocumentTargetError> {
+        check_token_target(self.id, target_id)?;
         if !self.undo_swap_pending {
             return Err(GpuDocumentTargetError::NoEncodedUndoSwap);
         }
@@ -1014,6 +1051,25 @@ const fn copy_extent(extent: [u32; 2]) -> wgpu::Extent3d {
     }
 }
 
+fn allocate_target_id() -> Result<GpuDocumentTargetId, GpuDocumentTargetError> {
+    NEXT_GPU_DOCUMENT_TARGET_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+            value.checked_add(1)
+        })
+        .map(GpuDocumentTargetId)
+        .map_err(|_| GpuDocumentTargetError::TargetIdentityOverflow)
+}
+
+fn check_token_target(
+    expected: GpuDocumentTargetId,
+    actual: GpuDocumentTargetId,
+) -> Result<(), GpuDocumentTargetError> {
+    if actual != expected {
+        return Err(GpuDocumentTargetError::TargetTokenMismatch { expected, actual });
+    }
+    Ok(())
+}
+
 fn checked_u32(value: usize) -> Result<u32, GpuDocumentTargetError> {
     u32::try_from(value).map_err(|_| GpuDocumentTargetError::InstanceCountOverflow)
 }
@@ -1025,6 +1081,11 @@ pub enum GpuDocumentTargetError {
         maximum: u32,
     },
     Float32BlendingUnavailable,
+    TargetIdentityOverflow,
+    TargetTokenMismatch {
+        expected: GpuDocumentTargetId,
+        actual: GpuDocumentTargetId,
+    },
     LayoutMismatch {
         expected: AtlasLayout,
         actual: AtlasLayout,
@@ -1077,6 +1138,13 @@ impl fmt::Display for GpuDocumentTargetError {
             Self::Float32BlendingUnavailable => {
                 write!(formatter, "Rgba32Float document blending is unavailable")
             }
+            Self::TargetIdentityOverflow => write!(formatter, "GPU target identity overflows"),
+            Self::TargetTokenMismatch { expected, actual } => write!(
+                formatter,
+                "GPU token belongs to target {}, not target {}",
+                actual.get(),
+                expected.get()
+            ),
             Self::LayoutMismatch { expected, actual } => write!(
                 formatter,
                 "GPU document layout mismatch: expected {expected:?}, got {actual:?}"
@@ -1153,6 +1221,26 @@ impl Error for GpuDocumentTargetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn target_identities_are_process_unique() {
+        let first = allocate_target_id().unwrap();
+        let second = allocate_target_id().unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first.get(), 0);
+        assert_ne!(second.get(), 0);
+    }
+
+    #[test]
+    fn opaque_tokens_reject_a_different_target_identity() {
+        let expected = GpuDocumentTargetId::from_raw(11);
+        let actual = GpuDocumentTargetId::from_raw(12);
+        assert_eq!(check_token_target(expected, expected), Ok(()));
+        assert_eq!(
+            check_token_target(expected, actual),
+            Err(GpuDocumentTargetError::TargetTokenMismatch { expected, actual })
+        );
+    }
 
     #[test]
     fn commit_data_is_tightly_packed_and_full_precision() {
