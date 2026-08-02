@@ -204,9 +204,20 @@ commands. Final submission rechecks target token, pending history identity and
 direction, recovery revision, and mirror capacity before one queue submission;
 it then finishes history/recovery and enqueues reconciliation as one boundary.
 Ordinary commits and swaps also retain an ordered mirror purpose (`History(id)`
-or `ReconcileOnly`) beside each capture. The application still needs a driver
-that stages/map-polls the oldest capture and atomically hands its completed
-snapshot/transition back to live recovery.
+or `ReconcileOnly`) beside each capture.
+
+That bounded mirror driver now exists inside `GpuResidentDocument`. It owns the
+encoder for one oldest-revision staging copy, acknowledges submission, starts
+callback mapping without waiting, and exposes polling separately. Incomplete
+batches report their exact bytes and applied revisions. A last batch creates
+the exact transition/snapshot handoff and commits it to recovery before the
+next readback can start. Any rejected handoff remains fully owned inside the
+document, including mapped pixels and completion metadata, and can be retried;
+the stored error is observable for policy/UI reporting. Purpose resolution
+also handles history eviction during long mapping: a still-tracked ID receives
+its two-sided spill, while an already-evicted ID becomes reconcile-only. A pure
+regression test covers both sides of that lifetime change. The application
+event loop has not yet been cut over to call this driver or poll the device.
 
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized

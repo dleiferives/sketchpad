@@ -267,7 +267,21 @@ different command buffer into the atomic bundle. Successful submission finishes
 the history move, records the exact forward recovery patch, and marks the
 resulting mirror revision as reconcile-only; it does not create a second
 history spill for the same command. Mirror-purpose ordering is now retained
-beside the dispatcher queue, ready for the mapped-completion driver.
+beside the dispatcher queue.
+
+The owner now drives that queue one bounded batch at a time. A prepared
+readback owns its command encoder, submission immediately starts asynchronous
+mapping, and polling never waits. On the last batch, the dispatcher first
+constructs the exact two-sided transition and exact new CPU snapshot; the
+owner then hands both to live recovery before permitting another readback.
+Failed handoff retains the snapshot, transition, requested purpose, completion
+accounting, and exact error inside the owner for retry, so mapped pixels cannot
+fall through an error return. New drawing may continue until the immutable
+snapshot budget backpressures it, but reconciliation cannot pass the failed
+revision. A delayed `History(id)` completion is resolved dynamically: if that
+ID is still tracked it attaches the exact spill, while an ID evicted before
+mapping downgrades to reconcile-only and advances the recovery base without
+resurrecting dead undo ownership.
 
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered

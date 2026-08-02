@@ -7,11 +7,13 @@ use crate::{
         DEFAULT_GPU_HISTORY_ENTRIES,
     },
     gpu_document_mirror::{
-        encode_gpu_mirror_revision_capture, GpuMirrorPlanError, GpuMirrorReadbackError,
-        GpuMirrorReadbackPlan, GpuMirrorRevisionCapture, DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        encode_gpu_mirror_revision_capture, GpuCpuMirrorSnapshot, GpuMirrorPlanError,
+        GpuMirrorReadbackError, GpuMirrorReadbackPlan, GpuMirrorRevisionCapture,
+        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
     },
     gpu_document_mirror_dispatcher::{
-        GpuMirrorDispatchError, GpuMirrorDispatcher, DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES,
+        GpuMirrorDispatchCompletion, GpuMirrorDispatchError, GpuMirrorDispatcher,
+        DEFAULT_GPU_MIRROR_SNAPSHOT_BYTES,
     },
     gpu_document_target::{
         ColorCommitStats, EncodedGpuDocumentCommit, EncodedGpuUndoSwap, GpuDocumentTarget,
@@ -22,9 +24,10 @@ use crate::{
         DEFAULT_GPU_HISTORY_RECOVERY_ENTRIES,
     },
     gpu_live_recovery::{
-        GpuLiveRecovery, GpuLiveRecoveryError, GpuMirrorRecoveryPurpose,
+        GpuLiveRecovery, GpuLiveRecoveryError, GpuMirrorRecoveryCommit, GpuMirrorRecoveryPurpose,
         PreparedGpuHistoryRecoveryRecord, PreparedGpuHistoryRecoverySwap,
     },
+    gpu_raster_recovery::GpuExactRasterRecoveryTransition,
     gpu_recovery_journal::{
         DEFAULT_GPU_RECOVERY_JOURNAL_BYTES, DEFAULT_GPU_RECOVERY_JOURNAL_ENTRIES,
     },
@@ -65,6 +68,7 @@ pub struct GpuResidentDocument {
     mirror: GpuMirrorDispatcher,
     recovery: GpuLiveRecovery,
     mirror_purposes: VecDeque<GpuMirrorRecoveryPurpose>,
+    pending_mirror_handoff: Option<PendingGpuResidentMirrorHandoff>,
 }
 
 impl GpuResidentDocument {
@@ -98,6 +102,7 @@ impl GpuResidentDocument {
             mirror,
             recovery,
             mirror_purposes: VecDeque::new(),
+            pending_mirror_handoff: None,
         })
     }
 
@@ -437,6 +442,147 @@ impl GpuResidentDocument {
         Ok(())
     }
 
+    pub fn prepare_next_mirror_readback(
+        &mut self,
+        device: &wgpu::Device,
+        mut encoder: wgpu::CommandEncoder,
+    ) -> Result<Option<PreparedGpuResidentMirrorReadback>, GpuResidentDocumentError> {
+        if let Some(pending) = &self.pending_mirror_handoff {
+            return Err(GpuResidentDocumentError::MirrorHandoffPending(
+                pending.revision,
+            ));
+        }
+        if !self.mirror.encode_next_readback(device, &mut encoder)? {
+            return Ok(None);
+        }
+        Ok(Some(PreparedGpuResidentMirrorReadback { encoder }))
+    }
+
+    pub fn submit_mirror_readback(
+        &mut self,
+        queue: &wgpu::Queue,
+        prepared: PreparedGpuResidentMirrorReadback,
+    ) -> Result<GpuResidentMirrorReadbackSubmission, GpuResidentDocumentError> {
+        let staging_bytes = self.mirror.staging_byte_len();
+        queue.submit(iter::once(prepared.encoder.finish()));
+        self.mirror.readback_submitted()?;
+        self.mirror.begin_map()?;
+        Ok(GpuResidentMirrorReadbackSubmission { staging_bytes })
+    }
+
+    pub fn discard_mirror_readback(
+        &mut self,
+        _prepared: PreparedGpuResidentMirrorReadback,
+    ) -> Result<(), GpuResidentDocumentError> {
+        self.mirror.readback_discarded()?;
+        Ok(())
+    }
+
+    pub fn try_finish_mirror(
+        &mut self,
+    ) -> Result<Option<GpuResidentMirrorCompletion>, GpuResidentDocumentError> {
+        if self.pending_mirror_handoff.is_some() {
+            return self.retry_pending_mirror_handoff().map(Some);
+        }
+        let Some(completion) = self.mirror.try_finish()? else {
+            return Ok(None);
+        };
+        let GpuMirrorDispatchCompletion {
+            revision,
+            batch_index,
+            byte_len,
+            applied_revisions,
+            recovery_transition,
+        } = completion;
+        let Some(transition) = recovery_transition else {
+            return Ok(Some(GpuResidentMirrorCompletion {
+                revision,
+                batch_index,
+                byte_len,
+                applied_revisions,
+                handoff: None,
+            }));
+        };
+        let requested_purpose = *self
+            .mirror_purposes
+            .front()
+            .expect("every completed resident mirror revision retains its recovery purpose");
+        self.pending_mirror_handoff = Some(PendingGpuResidentMirrorHandoff {
+            revision,
+            batch_index,
+            byte_len,
+            applied_revisions,
+            requested_purpose,
+            snapshot: self.mirror.snapshot(),
+            transition,
+            last_error: None,
+        });
+        self.retry_pending_mirror_handoff().map(Some)
+    }
+
+    fn retry_pending_mirror_handoff(
+        &mut self,
+    ) -> Result<GpuResidentMirrorCompletion, GpuResidentDocumentError> {
+        let pending = self
+            .pending_mirror_handoff
+            .take()
+            .expect("mirror handoff retry requires retained ownership");
+        let purpose =
+            self.resolve_mirror_purpose(pending.requested_purpose, pending.transition.revision());
+        let prepared = match self.recovery.prepare_mirror_handoff(
+            purpose,
+            pending.snapshot,
+            pending.transition,
+        ) {
+            Ok(prepared) => prepared,
+            Err(failure) => {
+                let error = failure.error;
+                self.pending_mirror_handoff = Some(PendingGpuResidentMirrorHandoff {
+                    revision: pending.revision,
+                    batch_index: pending.batch_index,
+                    byte_len: pending.byte_len,
+                    applied_revisions: pending.applied_revisions,
+                    requested_purpose: pending.requested_purpose,
+                    snapshot: failure.snapshot,
+                    transition: failure.transition,
+                    last_error: Some(error),
+                });
+                return Err(error.into());
+            }
+        };
+        let handoff = self
+            .recovery
+            .commit_mirror_handoff(prepared)
+            .expect("a resident mirror handoff is committed immediately after preparation");
+        let queued_purpose = self
+            .mirror_purposes
+            .pop_front()
+            .expect("a completed resident mirror handoff retains its queued purpose");
+        assert_eq!(queued_purpose, pending.requested_purpose);
+        Ok(GpuResidentMirrorCompletion {
+            revision: pending.revision,
+            batch_index: pending.batch_index,
+            byte_len: pending.byte_len,
+            applied_revisions: pending.applied_revisions,
+            handoff: Some(handoff),
+        })
+    }
+
+    fn resolve_mirror_purpose(
+        &self,
+        requested: GpuMirrorRecoveryPurpose,
+        revision: DocumentRevision,
+    ) -> GpuMirrorRecoveryPurpose {
+        match requested {
+            GpuMirrorRecoveryPurpose::History(id)
+                if self.recovery.spills().id_for_revision(revision) != Some(id) =>
+            {
+                GpuMirrorRecoveryPurpose::ReconcileOnly
+            }
+            purpose => purpose,
+        }
+    }
+
     fn check_prepared_commit(
         &self,
         target: &GpuDocumentTarget,
@@ -478,6 +624,12 @@ impl GpuResidentDocument {
 
     pub fn pending_mirror_purpose_count(&self) -> usize {
         self.mirror_purposes.len()
+    }
+
+    pub fn pending_mirror_handoff_error(&self) -> Option<GpuLiveRecoveryError> {
+        self.pending_mirror_handoff
+            .as_ref()
+            .and_then(|pending| pending.last_error)
     }
 }
 
@@ -555,6 +707,34 @@ pub struct GpuResidentHistorySwapCommit {
     pub history_id: GpuHistoryId,
     pub direction: GpuHistoryDirection,
     pub stats: GpuUndoSwapStats,
+}
+
+pub struct PreparedGpuResidentMirrorReadback {
+    encoder: wgpu::CommandEncoder,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GpuResidentMirrorReadbackSubmission {
+    pub staging_bytes: u64,
+}
+
+pub struct GpuResidentMirrorCompletion {
+    pub revision: DocumentRevision,
+    pub batch_index: u32,
+    pub byte_len: u64,
+    pub applied_revisions: Vec<DocumentRevision>,
+    pub handoff: Option<GpuMirrorRecoveryCommit>,
+}
+
+struct PendingGpuResidentMirrorHandoff {
+    revision: DocumentRevision,
+    batch_index: u32,
+    byte_len: u64,
+    applied_revisions: Vec<DocumentRevision>,
+    requested_purpose: GpuMirrorRecoveryPurpose,
+    snapshot: GpuCpuMirrorSnapshot,
+    transition: GpuExactRasterRecoveryTransition,
+    last_error: Option<GpuLiveRecoveryError>,
 }
 
 pub struct GpuResidentHistorySwapPrepareFailure {
@@ -694,6 +874,7 @@ pub enum GpuResidentDocumentError {
     },
     HistoryPreviewChanged,
     HistorySwapChanged,
+    MirrorHandoffPending(DocumentRevision),
     History(GpuDocumentHistoryError),
     HistoryRecord(GpuHistoryRecordError),
     Target(GpuDocumentTargetError),
@@ -722,6 +903,11 @@ impl fmt::Display for GpuResidentDocumentError {
             Self::HistorySwapChanged => {
                 write!(formatter, "GPU history changed after swap preparation")
             }
+            Self::MirrorHandoffPending(revision) => write!(
+                formatter,
+                "GPU mirror revision {} is waiting for recovery handoff",
+                revision.get()
+            ),
             Self::History(error) => error.fmt(formatter),
             Self::HistoryRecord(error) => error.fmt(formatter),
             Self::Target(error) => error.fmt(formatter),
@@ -835,6 +1021,7 @@ mod tests {
         assert_eq!(document.history().undo_depth(), 0);
         assert_eq!(document.mirror().pending_revision_count(), 0);
         assert_eq!(document.pending_mirror_purpose_count(), 0);
+        assert_eq!(document.pending_mirror_handoff_error(), None);
     }
 
     #[test]
@@ -879,5 +1066,50 @@ mod tests {
                 GpuMirrorDispatchError::InvalidStagingBudget { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn delayed_history_mapping_becomes_reconcile_only_after_eviction() {
+        let layout = AtlasLayout::new(32, 8, 2).unwrap();
+        let mut document =
+            GpuResidentDocument::new(48, 40, layout, DocumentRevision::INITIAL, limits()).unwrap();
+        let first_id = GpuHistoryId::from_raw(1);
+        let first_revision = DocumentRevision::from_raw(1);
+        let first = document
+            .recovery
+            .prepare_history_record(
+                first_id,
+                &[],
+                first_revision,
+                GpuRasterRecoveryCommand::MetadataOnly,
+            )
+            .unwrap();
+        document.recovery.commit_history_record(first).unwrap();
+        assert_eq!(
+            document.resolve_mirror_purpose(
+                GpuMirrorRecoveryPurpose::History(first_id),
+                first_revision,
+            ),
+            GpuMirrorRecoveryPurpose::History(first_id)
+        );
+
+        let second_id = GpuHistoryId::from_raw(2);
+        let second = document
+            .recovery
+            .prepare_history_record(
+                second_id,
+                &[first_id],
+                DocumentRevision::from_raw(2),
+                GpuRasterRecoveryCommand::MetadataOnly,
+            )
+            .unwrap();
+        document.recovery.commit_history_record(second).unwrap();
+        assert_eq!(
+            document.resolve_mirror_purpose(
+                GpuMirrorRecoveryPurpose::History(first_id),
+                first_revision,
+            ),
+            GpuMirrorRecoveryPurpose::ReconcileOnly
+        );
     }
 }
