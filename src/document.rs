@@ -1,5 +1,8 @@
-use crate::raster::{
-    Damage, DerivedContentChange, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord,
+use crate::{
+    document_history::{DocumentEdit, DocumentHistory},
+    raster::{
+        Damage, DerivedContentChange, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord,
+    },
 };
 use std::{
     collections::{HashMap, HashSet},
@@ -7,7 +10,7 @@ use std::{
     fmt, mem,
 };
 
-pub const MAX_DOCUMENT_HISTORY_ENTRIES: usize = 256;
+pub use crate::document_history::MAX_DOCUMENT_HISTORY_ENTRIES;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct DocumentRevision(u64);
@@ -84,55 +87,8 @@ pub struct Document {
     next_layer_id: u64,
     composite: RasterLayer,
     composite_stats: CompositeStats,
-    history_undo: Vec<DocumentEdit>,
-    history_redo: Vec<DocumentEdit>,
+    history: DocumentHistory,
     revision: DocumentRevision,
-}
-
-enum DocumentEdit {
-    Raster {
-        layer: LayerId,
-    },
-    LayerPresence {
-        layer: DocumentLayer,
-        index: usize,
-        before_active: LayerId,
-        after_active: LayerId,
-        present_after: bool,
-    },
-    Rename {
-        layer: LayerId,
-        before: String,
-        after: String,
-    },
-    Visibility {
-        layer: LayerId,
-        before: bool,
-        after: bool,
-    },
-    Opacity {
-        layer: LayerId,
-        before: f32,
-        after: f32,
-    },
-    Move {
-        layer: LayerId,
-        before: usize,
-        after: usize,
-    },
-}
-
-impl DocumentEdit {
-    const fn layer_id(&self) -> LayerId {
-        match self {
-            Self::Raster { layer }
-            | Self::Rename { layer, .. }
-            | Self::Visibility { layer, .. }
-            | Self::Opacity { layer, .. }
-            | Self::Move { layer, .. } => *layer,
-            Self::LayerPresence { layer, .. } => layer.id,
-        }
-    }
 }
 
 pub(crate) struct DocumentLayerParts {
@@ -162,8 +118,7 @@ impl Document {
             next_layer_id: 2,
             composite: RasterLayer::new(width, height, tile_size)?,
             composite_stats: CompositeStats::default(),
-            history_undo: Vec::new(),
-            history_redo: Vec::new(),
+            history: DocumentHistory::default(),
             revision: DocumentRevision::INITIAL,
         })
     }
@@ -193,8 +148,7 @@ impl Document {
             next_layer_id: 2,
             composite,
             composite_stats: CompositeStats::default(),
-            history_undo: Vec::new(),
-            history_redo: Vec::new(),
+            history: DocumentHistory::default(),
             revision: DocumentRevision::INITIAL,
         })
     }
@@ -252,8 +206,7 @@ impl Document {
             next_layer_id,
             composite: RasterLayer::new(width, height, tile_size)?,
             composite_stats: CompositeStats::default(),
-            history_undo: Vec::new(),
-            history_redo: Vec::new(),
+            history: DocumentHistory::default(),
             revision: DocumentRevision::INITIAL,
         };
         document.recompose_all()?;
@@ -320,11 +273,11 @@ impl Document {
     }
 
     pub fn undo_depth(&self) -> usize {
-        self.history_undo.len()
+        self.history.undo_depth()
     }
 
     pub fn redo_depth(&self) -> usize {
-        self.history_redo.len()
+        self.history.redo_depth()
     }
 
     pub const fn revision(&self) -> DocumentRevision {
@@ -574,8 +527,8 @@ impl Document {
             return Err(DocumentError::RasterEditStillActive(layer));
         }
         let tracked = self
-            .history_undo
-            .iter()
+            .history
+            .undo_edits()
             .filter(|edit| matches!(edit, DocumentEdit::Raster { layer: edit_layer } if *edit_layer == layer))
             .count();
         let actual = raster.undo_depth();
@@ -591,34 +544,34 @@ impl Document {
     }
 
     pub fn undo(&mut self) -> Result<Option<Damage>, DocumentError> {
-        let Some(mut edit) = self.history_undo.pop() else {
+        let Some(mut edit) = self.history.pop_undo() else {
             return Ok(None);
         };
         match self.apply_edit(&mut edit, false) {
             Ok(damage) => {
-                self.history_redo.push(edit);
+                self.history.finish_undo(edit);
                 self.revision.advance();
                 Ok(Some(damage))
             }
             Err(error) => {
-                self.history_undo.push(edit);
+                self.history.restore_undo(edit);
                 Err(error)
             }
         }
     }
 
     pub fn redo(&mut self) -> Result<Option<Damage>, DocumentError> {
-        let Some(mut edit) = self.history_redo.pop() else {
+        let Some(mut edit) = self.history.pop_redo() else {
             return Ok(None);
         };
         match self.apply_edit(&mut edit, true) {
             Ok(damage) => {
-                self.history_undo.push(edit);
+                self.history.finish_redo(edit);
                 self.revision.advance();
                 Ok(Some(damage))
             }
             Err(error) => {
-                self.history_redo.push(edit);
+                self.history.restore_redo(edit);
                 Err(error)
             }
         }
@@ -717,30 +670,25 @@ impl Document {
     }
 
     fn record_edit(&mut self, edit: DocumentEdit) {
-        self.clear_document_redo();
-        self.history_undo.push(edit);
-        while self.history_undo.len() > MAX_DOCUMENT_HISTORY_ENTRIES {
-            let evicted = self.history_undo.remove(0);
-            if let DocumentEdit::Raster { layer } = evicted {
-                let raster = self
-                    .rasters
-                    .get_mut(&layer)
-                    .expect("a retained raster edit must retain its stable layer");
-                assert!(
-                    raster.discard_oldest_undo(),
-                    "a retained raster edit must own one local memento"
-                );
-            }
+        self.clear_raster_redo_history();
+        if let Some(DocumentEdit::Raster { layer }) = self.history.record(edit) {
+            let raster = self
+                .rasters
+                .get_mut(&layer)
+                .expect("a retained raster edit must retain its stable layer");
+            assert!(
+                raster.discard_oldest_undo(),
+                "a retained raster edit must own one local memento"
+            );
         }
         self.prune_detached_rasters();
         self.revision.advance();
     }
 
-    fn clear_document_redo(&mut self) {
+    fn clear_raster_redo_history(&mut self) {
         for raster in self.rasters.values_mut() {
             raster.clear_redo_history();
         }
-        self.history_redo.clear();
     }
 
     fn apply_edit(
@@ -908,8 +856,7 @@ impl Document {
 
     fn prune_detached_rasters(&mut self) {
         let mut retained: HashSet<_> = self.layers.iter().map(|layer| layer.id).collect();
-        retained.extend(self.history_undo.iter().map(DocumentEdit::layer_id));
-        retained.extend(self.history_redo.iter().map(DocumentEdit::layer_id));
+        retained.extend(self.history.referenced_layer_ids());
         self.rasters.retain(|id, _| retained.contains(id));
     }
 
