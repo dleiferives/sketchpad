@@ -146,6 +146,12 @@ bytes have mapped and the recovery base has advanced atomically, recovery must
 retain the older replay base and inverse-capable history. A GPU-only capture is
 not device-loss protection.
 
+The base/journal owner performs that advancement as one checked ownership
+handoff. It rejects mismatched geometry, regression, unknown revisions, and a
+mirror ahead of the journal before replacing its immutable base or retiring
+any record. Snapshots retain both sides of the boundary with shared ownership,
+so background save/recovery work cannot race a later handoff.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the

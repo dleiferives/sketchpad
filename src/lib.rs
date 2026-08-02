@@ -11,6 +11,7 @@ pub mod gpu_document_target;
 pub mod gpu_document_undo;
 pub mod gpu_raster_recovery;
 pub mod gpu_recovery_journal;
+pub mod gpu_recovery_timeline;
 pub mod gpu_round;
 pub mod gpu_round_recovery;
 pub mod gpu_round_target;

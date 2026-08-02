@@ -225,9 +225,21 @@ untouched pixels, absent-tile removal, and a 250-pixel canvas edge.
 The payload set is intentionally not yet declared complete for drawing
 recovery. Until an undo/redo result has mapped, the system must retain an older
 exact replay base plus inverse-capable history; a pending GPU-only capture
-would disappear with the device. Structural payloads, that anchor handoff,
-capture coalescing/backpressure, save race handling, and simulated device-loss
-replay remain the rest of migration step 5.
+would disappear with the device. Structural payloads, inverse-history replay
+through that asynchronous interval, capture coalescing/backpressure, save race
+handling, and simulated device-loss replay remain the rest of migration step
+5.
+
+The first anchor handoff owner now makes the exact CPU base and its post-base
+journal one state boundary. Recording delegates to the same transactional
+entry/byte preflight. Advancing to a newer mirror snapshot first verifies
+canvas and tile geometry and asks the journal to retire through that exact
+revision; only then does it replace the base. Failure returns the candidate
+snapshot unchanged and cannot retire a command. Its immutable snapshot clones
+the base's copy-on-write tile references and the journal's command `Arc`s, so a
+save or device-loss worker sees one stable base/target pair while the live
+timeline advances. Pure tests cover partial retirement, geometry/ahead-of-log
+failure, returned ownership, and snapshot survival after full retirement.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
