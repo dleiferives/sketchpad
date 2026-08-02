@@ -252,7 +252,21 @@ owner and leaves the target uninitialized. The Atlas Intel UHD 630 hardware
 smoke bootstrapped two layers/two tiles, copied the page back, and found both
 premultiplied full-float pixels plus untouched transparency bit-exact. This is
 a correctness result, not a timing measurement. Presentation still reads the
-legacy flattened CPU cache; the next slice is the ordered resident compositor.
+legacy flattened CPU cache.
+
+An isolated ordered resident compositor now draws the atlas without flattening
+the document. Its instance plan is layer-major and page-minor: page grouping
+reduces state changes only within one layer, so a later layer can never be
+moved below an earlier one. Hidden and zero-opacity layers emit no work;
+partial document-edge tiles retain full physical slots but clip their logical
+quad; each premultiplied sample is scaled by layer opacity and source-overed.
+Preparation validates the bound target identity, atlas layout, and every
+logical-key/physical-slot association before writing instance data. The Atlas
+Intel UHD 630 hardware smoke composited overlapping pixels from two layers into
+an `Rgba32Float` target and matched the CPU oracle exactly. The smoke now also
+checks exact initial atlas upload and mirror ownership for three sparse tiles.
+This proves direct composition only. The application is not switched to it,
+and the final dirty-updated exact stable composite cache remains to be built.
 
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized

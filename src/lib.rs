@@ -5,6 +5,7 @@ pub mod document;
 mod document_history;
 pub mod document_metadata;
 pub mod gpu_atlas;
+pub mod gpu_document_compositor;
 pub mod gpu_document_history;
 pub mod gpu_document_mirror;
 pub mod gpu_document_mirror_dispatcher;

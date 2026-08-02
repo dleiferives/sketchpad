@@ -113,6 +113,10 @@ impl Default for AtlasLayout {
 pub struct AtlasPageId(u32);
 
 impl AtlasPageId {
+    pub(crate) const fn from_raw(value: u32) -> Self {
+        Self(value)
+    }
+
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -226,6 +230,10 @@ impl SparseAtlasPlanner {
 
     pub fn slot(&self, key: LayerTileKey) -> Option<AtlasSlot> {
         self.allocations.get(&key).copied()
+    }
+
+    pub fn allocations(&self) -> impl Iterator<Item = (LayerTileKey, AtlasSlot)> + '_ {
+        self.allocations.iter().map(|(&key, &slot)| (key, slot))
     }
 
     pub fn allocate(&mut self, key: LayerTileKey) -> Result<AtlasAllocation, AtlasError> {

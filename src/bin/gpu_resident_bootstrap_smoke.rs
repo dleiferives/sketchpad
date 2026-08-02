@@ -1,8 +1,10 @@
 use sketchpad::{
     document::Document,
     gpu_atlas::{AtlasLayout, LayerTileKey},
+    gpu_document_compositor::GpuDocumentCompositor,
     gpu_document_target::GpuDocumentTarget,
     gpu_resident_document::{GpuResidentDocument, GpuResidentDocumentLimits},
+    pipeline::CanvasUniform,
     raster::{LinearRgba, TileCoord},
 };
 use std::{error::Error, mem::size_of, sync::mpsc};
@@ -37,6 +39,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     paint_pixel(&mut cpu, 9, 11, bottom_color)?;
     let top = cpu.create_layer("Top")?;
     let top_color = LinearRgba::from_straight(0.1, 0.4, 0.9, 0.75);
+    paint_pixel(&mut cpu, 9, 11, top_color)?;
     paint_pixel(&mut cpu, 143, 17, top_color)?;
 
     let layout = AtlasLayout::new(PAGE_SIZE, TILE_SIZE, 1)?;
@@ -51,19 +54,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let resident = bootstrap.document();
     if resident.metadata().revision() != cpu.revision()
         || resident.metadata().layers().len() != 2
-        || resident.atlas().resident_tile_count() != 2
-        || resident.mirror().snapshot().tile_count() != 2
+        || resident.atlas().resident_tile_count() != 3
+        || resident.mirror().snapshot().tile_count() != 3
     {
         return Err("resident bootstrap ownership does not match the CPU document".into());
     }
-    if bootstrap.stats().uploaded_tiles != 2
+    if bootstrap.stats().uploaded_tiles != 3
         || bootstrap.stats().retained_pages != 1
-        || bootstrap.stats().uploaded_bytes != 2 * u64::from(TILE_SIZE * TILE_SIZE) * 16
+        || bootstrap.stats().uploaded_bytes != 3 * u64::from(TILE_SIZE * TILE_SIZE) * 16
     {
         return Err(format!("unexpected bootstrap stats: {:?}", bootstrap.stats()).into());
     }
 
     let bottom_key = LayerTileKey::new(bottom, TileCoord::new(0, 0));
+    let top_left_key = LayerTileKey::new(top, TileCoord::new(0, 0));
     let top_key = LayerTileKey::new(top, TileCoord::new(1, 0));
     let bottom_slot = resident
         .atlas()
@@ -73,7 +77,12 @@ fn main() -> Result<(), Box<dyn Error>> {
         .atlas()
         .slot(top_key)
         .ok_or("top tile was not allocated")?;
+    let top_left_slot = resident
+        .atlas()
+        .slot(top_left_key)
+        .ok_or("top-left tile was not allocated")?;
     if target.initialized_resident(bottom_slot) != Some(bottom_key)
+        || target.initialized_resident(top_left_slot) != Some(top_left_key)
         || target.initialized_resident(top_slot) != Some(top_key)
     {
         return Err("target resident identity does not match the atlas".into());
@@ -131,16 +140,123 @@ fn main() -> Result<(), Box<dyn Error>> {
     expect_pixel(
         &bytes,
         bytes_per_row,
+        top_left_slot.origin()[0] + 9,
+        top_left_slot.origin()[1] + 11,
+        top_color,
+    )?;
+    expect_pixel(
+        &bytes,
+        bytes_per_row,
         bottom_slot.origin()[0] + 10,
         bottom_slot.origin()[1] + 11,
         LinearRgba::TRANSPARENT,
     )?;
 
+    let composite_texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("GPU Resident Bootstrap Composite"),
+        size: wgpu::Extent3d {
+            width: PAGE_SIZE,
+            height: TILE_SIZE,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let composite_view = composite_texture.create_view(&Default::default());
+    let mut compositor =
+        GpuDocumentCompositor::new(&device, wgpu::TextureFormat::Rgba32Float, &target);
+    let composite_stats = compositor.prepare(
+        &device,
+        &queue,
+        resident.metadata(),
+        resident.atlas(),
+        &target,
+        CanvasUniform {
+            center: [PAGE_SIZE as f32 * 0.5, TILE_SIZE as f32 * 0.5],
+            zoom: 1.0,
+            _padding: 0.0,
+            viewport_size: [PAGE_SIZE as f32, TILE_SIZE as f32],
+            canvas_size: [PAGE_SIZE as f32, TILE_SIZE as f32],
+        },
+    )?;
+    let composite_readback = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("GPU Resident Bootstrap Composite Readback"),
+        size: u64::from(bytes_per_row) * u64::from(TILE_SIZE),
+        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    let mut composite_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Resident Bootstrap Composite Encoder"),
+    });
+    {
+        let mut pass = composite_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("GPU Resident Bootstrap Composite Pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &composite_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        compositor.draw(&mut pass);
+    }
+    composite_encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: &composite_texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &composite_readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(TILE_SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: PAGE_SIZE,
+            height: TILE_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit([composite_encoder.finish()]);
+    let composite_bytes = map_readback(&device, &composite_readback)?;
+    let expected_composite = cpu
+        .composite()
+        .pixel(9, 11)
+        .ok_or("CPU composite pixel is missing")?;
+    expect_pixel(
+        &composite_bytes,
+        bytes_per_row,
+        9,
+        TILE_SIZE - 1 - 11,
+        expected_composite,
+    )?;
+    if composite_stats.visible_layers != 2
+        || composite_stats.visible_tiles != 3
+        || composite_stats.draw_batches != 2
+    {
+        return Err(format!("unexpected composite stats: {composite_stats:?}").into());
+    }
+
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=2 upload=exact mirror=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=2 tiles=3 upload=exact mirror=exact composite=exact",
         adapter.get_info().name
     );
     Ok(())
@@ -154,8 +270,11 @@ fn paint_pixel(
 ) -> Result<(), Box<dyn Error>> {
     let mut gesture = document.active_layer_mut().scoped_gesture()?;
     gesture.set_pixel(x, y, color)?;
-    gesture.commit()?;
+    let damage = gesture.commit()?;
     document.record_active_raster_edit()?;
+    if let Some(damage) = damage {
+        document.recompose_damage(&damage)?;
+    }
     Ok(())
 }
 

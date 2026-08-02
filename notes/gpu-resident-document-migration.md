@@ -332,7 +332,11 @@ before the checkpoint encoder reads it.
    atlas residents without copying its shared CPU tile storage first. Atlas
    upload is full `Rgba32Float`, validates every key/slot/pixel count before
    issuing writes, and records target resident identity only after validation.
-   Ordered GPU composition and live presentation remain.
+   Ordered direct GPU composition is also complete as an isolated path: it
+   emits layer-major/page-minor batches, applies visibility and opacity, clips
+   partial edge tiles, validates target resident identity, and source-overs
+   premultiplied pixels without flattening layers. Live presentation and the
+   selected dirty-updated full-float stable composite cache remain.
 4. Add stable/tail round masks, live paint/erase presentation, GPU commit, and
    exact block undo.
 5. Add asynchronous CPU reconciliation, revisioned snapshots, device-loss
