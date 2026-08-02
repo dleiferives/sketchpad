@@ -118,18 +118,42 @@ the exact command back on its original side. Recording during a pending swap
 is rejected. Pure tests cover branch clearing order, both budgets, oversize
 rejection, and finish/cancel behavior.
 
-Asynchronous CPU reconciliation now has its first non-GPU planning layer.
+Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default
-cap is 16 MiB in flight. Regions larger than that cap split only at 16-pixel
-block-row boundaries, so every buffer row remains naturally 256-byte aligned;
-a synthetic 2,048-pixel full-tile region splits into four exact 16 MiB
-batches. Ordinary 128-pixel tiles coalesce until the cap. Logically absent
-residents become zero-byte metadata records instead of needless transparent
-pixel copies. Checked tests cover packing, splitting, byte/block totals,
-absent residents, and a budget smaller than one block. GPU copy encoding,
-asynchronous mapping, ordered revision application, and the CPU mirror itself
-are the next connections.
+staging-buffer cap is 16 MiB. Regions larger than that cap split only at
+16-pixel block-row boundaries, so every buffer row remains naturally
+256-byte aligned; a synthetic 2,048-pixel full-tile region splits into four
+exact 16 MiB batches. Ordinary 128-pixel tiles coalesce until the cap.
+Logically absent residents become zero-byte metadata records instead of
+needless transparent pixel copies.
+
+The GPU boundary validates atlas layout, logical resident identity, physical
+slot, color-page existence, and device buffer limits before encoding copies.
+Mapping is callback-driven and polled without imposing a wait in the API;
+mapped full-float bytes become owned patch regions and the buffer is unmapped
+on either successful decoding or a terminal decode error. A revision-ordered
+reconciler accepts completed batches in any order but applies only a complete
+oldest revision. Its CPU store remains sparse, removes logically absent tiles,
+and uses `Arc` copy-on-write tiles so save/export can hold an immutable exact
+revision while later reconciliation proceeds.
+
+Pure checks cover packing, splitting, byte/block totals, absent residents, a
+budget smaller than one block, out-of-order completion, malformed-patch retry,
+sparse removal, and snapshot isolation. The Atlas Intel UHD 630 correctness
+smoke additionally copied and asynchronously mapped the eraser transaction's
+exact 16,384-byte `Rgba32Float` region, reconciled it atomically, and found the
+expected premultiplied `[0.075, 0.15, 0.3, 0.375]` center in both the mapped
+patch and the revisioned CPU tile. This is a correctness result, not a timing
+measurement.
+
+The live application still does not dispatch these batches or bind mirror
+revisions to save/export. Multi-batch revision capture must be made immutable
+at the commit boundary before later GPU writes are allowed; otherwise batches
+copied at different times could describe different interactive revisions.
+The bounded dispatcher, immutable GPU reconciliation source, semantic journal,
+save race handling, and device-loss replay remain the rest of migration step
+5.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,

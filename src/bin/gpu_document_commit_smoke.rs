@@ -1,7 +1,11 @@
 use sketchpad::{
-    document::Document,
+    document::{Document, DocumentRevision},
     gpu_atlas::{AtlasLayout, AtlasPageId, LayerTileKey, SparseAtlasPlanner},
     gpu_document_history::{GpuDocumentHistory, GpuHistoryDirection},
+    gpu_document_mirror::{
+        encode_gpu_mirror_batch, GpuMirrorPatchRegion, GpuMirrorReadbackPlan, GpuMirrorReconciler,
+        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+    },
     gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
     gpu_document_undo::GpuDocumentMemento,
     gpu_round::RoundMaskScheduler,
@@ -36,7 +40,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
 
     let layout = AtlasLayout::new(PAGE_SIZE, TILE_SIZE, 1)?;
-    let document = Document::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE)?;
+    let mut document = Document::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE)?;
     let layer = document.active_layer_id();
     let mut atlas = SparseAtlasPlanner::new(layout);
     let mut scheduler = RoundMaskScheduler::new([PAGE_SIZE; 2], layer, layout)?;
@@ -339,6 +343,82 @@ fn main() -> Result<(), Box<dyn Error>> {
         )?,
         [0.075, 0.15, 0.3, 0.375],
     )?;
+
+    if !history.begin_undo()? {
+        return Err("mirror control could not inspect the eraser memento".into());
+    }
+    document.create_layer("Mirror Revision")?;
+    let mirror_revision = document.revision();
+    let mirror_plan = GpuMirrorReadbackPlan::from_memento(
+        mirror_revision,
+        history.pending_memento_mut()?,
+        DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+    )?;
+    history.cancel_pending()?;
+    if mirror_plan.batches().len() != 1 || mirror_plan.byte_len() != 16_384 {
+        return Err(format!("unexpected mirror plan: {mirror_plan:?}").into());
+    }
+    let mut mirror_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("GPU Document Commit Smoke Mirror Readback"),
+    });
+    let mut pending_mirror = encode_gpu_mirror_batch(
+        &color,
+        &device,
+        &mut mirror_encoder,
+        mirror_plan.batches()[0].clone(),
+    )?;
+    queue.submit(iter::once(mirror_encoder.finish()));
+    pending_mirror.begin_map()?;
+    device.poll(wgpu::PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    })?;
+    let mirror_patch = pending_mirror
+        .try_finish()?
+        .ok_or("GPU mirror map did not finish after a blocking poll")?;
+    if mirror_patch.byte_len() != 16_384 || mirror_patch.regions().len() != 1 {
+        return Err(format!("unexpected mirror patch: {mirror_patch:?}").into());
+    }
+    expect_color(
+        "mirrored erased center",
+        read_patch_color(&mirror_patch.regions()[0], 64, 64)?,
+        [0.075, 0.15, 0.3, 0.375],
+    )?;
+    let mirror_key = mirror_patch.regions()[0].key;
+    let mut reconciler =
+        GpuMirrorReconciler::new(PAGE_SIZE, PAGE_SIZE, TILE_SIZE, DocumentRevision::INITIAL)?;
+    reconciler.register_plan(&mirror_plan)?;
+    let applied_revisions = reconciler.complete_batch(mirror_patch)?;
+    if applied_revisions != [mirror_revision]
+        || reconciler.mirror().revision() != mirror_revision
+        || reconciler.pending_revision_count() != 0
+    {
+        return Err("GPU mirror revision did not reconcile atomically".into());
+    }
+    let mirrored_tile = reconciler
+        .mirror()
+        .tile_pixels(mirror_key)
+        .ok_or("GPU mirror did not materialize its sparse CPU tile")?;
+    let mirrored_center = mirrored_tile
+        .get(64 * TILE_SIZE as usize + 64)
+        .ok_or("GPU mirror CPU tile is truncated")?;
+    expect_color(
+        "reconciled erased center",
+        [
+            mirrored_center.r,
+            mirrored_center.g,
+            mirrored_center.b,
+            mirrored_center.a,
+        ],
+        [0.075, 0.15, 0.3, 0.375],
+    )?;
+    let mirror_snapshot = reconciler.snapshot();
+    if mirror_snapshot.revision() != mirror_revision
+        || mirror_snapshot.tile_pixels(mirror_key) != Some(mirrored_tile)
+    {
+        return Err("GPU mirror snapshot did not preserve the reconciled revision".into());
+    }
+
     if history.undo_depth() != 2 || history.redo_depth() != 0 {
         return Err("GPU undo/redo history depths did not round-trip".into());
     }
@@ -386,7 +466,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     println!(
         "gpu_document_commit_smoke adapter={:?} paint={paint_stats:?} erase={erase_stats:?} \
-         source_over=exact destination_out=exact lazy_clear=exact undo_redo=exact",
+         source_over=exact destination_out=exact lazy_clear=exact undo_redo=exact \
+         mirror_readback=exact mirror_reconcile=exact",
         adapter.get_info().name,
     );
     Ok(())
@@ -551,6 +632,28 @@ fn read_color(
         *value = f32::from_ne_bytes(bytes[start..start + 4].try_into()?);
     }
     Ok(color)
+}
+
+fn read_patch_color(
+    patch: &GpuMirrorPatchRegion,
+    local_x: u32,
+    local_y: u32,
+) -> Result<[f32; 4], Box<dyn Error>> {
+    if !patch.initialized || !patch.local_bounds.contains(local_x, local_y) {
+        return Err(format!(
+            "mirror patch {:?} does not contain initialized pixel ({local_x}, {local_y})",
+            patch.local_bounds
+        )
+        .into());
+    }
+    let x = local_x - patch.local_bounds.min_x();
+    let y = local_y - patch.local_bounds.min_y();
+    let index = y as usize * patch.local_bounds.width() as usize + x as usize;
+    let pixel = patch
+        .pixels
+        .get(index)
+        .ok_or("mirror patch pixel storage is truncated")?;
+    Ok([pixel.r, pixel.g, pixel.b, pixel.a])
 }
 
 fn expect_color(label: &str, actual: [f32; 4], expected: [f32; 4]) -> Result<(), Box<dyn Error>> {
