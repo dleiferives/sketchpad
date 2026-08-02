@@ -36,6 +36,51 @@ pub struct GpuUndoCapturePlan {
     byte_len: u64,
 }
 
+pub struct GpuDocumentMemento {
+    plan: GpuUndoCapturePlan,
+    buffer: wgpu::Buffer,
+}
+
+impl GpuDocumentMemento {
+    pub(crate) fn new(
+        device: &wgpu::Device,
+        plan: GpuUndoCapturePlan,
+    ) -> Result<Self, GpuUndoResourceError> {
+        if plan.is_empty() {
+            return Err(GpuUndoResourceError::EmptyCapture);
+        }
+        if plan.byte_len() > device.limits().max_buffer_size {
+            return Err(GpuUndoResourceError::BufferTooLarge {
+                requested: plan.byte_len(),
+                maximum: device.limits().max_buffer_size,
+            });
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU Document Exact Undo Memento"),
+            size: plan.byte_len(),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Ok(Self { plan, buffer })
+    }
+
+    pub fn plan(&self) -> &GpuUndoCapturePlan {
+        &self.plan
+    }
+
+    pub const fn block_count(&self) -> u32 {
+        self.plan.block_count()
+    }
+
+    pub const fn byte_len(&self) -> u64 {
+        self.plan.byte_len()
+    }
+
+    pub(crate) const fn buffer(&self) -> &wgpu::Buffer {
+        &self.buffer
+    }
+}
+
 impl GpuUndoCapturePlan {
     pub fn from_mask(mask: &RoundMaskTarget) -> Result<Self, GpuUndoPlanError> {
         Self::from_active_tiles(mask.layout(), &mask.active_tiles())
@@ -240,6 +285,26 @@ impl fmt::Display for GpuUndoPlanError {
 }
 
 impl Error for GpuUndoPlanError {}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GpuUndoResourceError {
+    EmptyCapture,
+    BufferTooLarge { requested: u64, maximum: u64 },
+}
+
+impl fmt::Display for GpuUndoResourceError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EmptyCapture => write!(formatter, "GPU undo capture is empty"),
+            Self::BufferTooLarge { requested, maximum } => write!(
+                formatter,
+                "GPU undo buffer {requested} exceeds device limit {maximum}"
+            ),
+        }
+    }
+}
+
+impl Error for GpuUndoResourceError {}
 
 #[cfg(test)]
 mod tests {

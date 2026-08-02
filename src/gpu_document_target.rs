@@ -1,5 +1,8 @@
 use crate::{
     gpu_atlas::{AtlasLayout, AtlasPageId, AtlasSlot, LayerTileKey},
+    gpu_document_undo::{
+        GpuDocumentMemento, GpuUndoCapturePlan, GpuUndoPlanError, GpuUndoResourceError,
+    },
     gpu_round_target::RoundMaskTarget,
     stroke::{PaintOperation, StrokeAccumulation, StrokeMaterial},
 };
@@ -12,6 +15,7 @@ use std::{
 };
 
 const INITIAL_INSTANCE_BUFFER_BYTES: u64 = 4_096;
+const INITIAL_UNDO_SCRATCH_BYTES: u64 = 4_096;
 
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
@@ -71,6 +75,9 @@ pub struct ColorCommitStats {
     pub committed_slots: u32,
     pub cleared_slots: u32,
     pub bytes_written: u64,
+    pub undo_copy_regions: u32,
+    pub undo_blocks: u32,
+    pub undo_bytes: u64,
 }
 
 pub struct GpuDocumentTarget {
@@ -85,7 +92,40 @@ pub struct GpuDocumentTarget {
     instance_buffer_capacity: u64,
     initialized_residents: HashMap<AtlasSlot, LayerTileKey>,
     commit_pending: bool,
+    pending_commit_serial: Option<u64>,
+    pending_commit_requires_memento: bool,
+    next_commit_serial: u64,
     pending_resident_changes: Vec<(AtlasSlot, Option<LayerTileKey>)>,
+    undo_scratch_buffer: wgpu::Buffer,
+    undo_scratch_capacity: u64,
+    undo_swap_pending: bool,
+}
+
+pub struct EncodedGpuDocumentCommit {
+    stats: ColorCommitStats,
+    serial: u64,
+    memento: GpuDocumentMemento,
+}
+
+impl EncodedGpuDocumentCommit {
+    pub const fn stats(&self) -> ColorCommitStats {
+        self.stats
+    }
+
+    pub const fn undo_block_count(&self) -> u32 {
+        self.memento.block_count()
+    }
+
+    pub const fn undo_byte_len(&self) -> u64 {
+        self.memento.byte_len()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuUndoSwapStats {
+    pub copy_regions: u32,
+    pub blocks: u32,
+    pub bytes_copied: u64,
 }
 
 impl GpuDocumentTarget {
@@ -197,6 +237,7 @@ impl GpuDocumentTarget {
             cache: None,
         });
         let instance_buffer = create_instance_buffer(device, INITIAL_INSTANCE_BUFFER_BYTES);
+        let undo_scratch_buffer = create_undo_scratch_buffer(device, INITIAL_UNDO_SCRATCH_BYTES);
 
         Ok(Self {
             layout,
@@ -210,7 +251,13 @@ impl GpuDocumentTarget {
             instance_buffer_capacity: INITIAL_INSTANCE_BUFFER_BYTES,
             initialized_residents: HashMap::new(),
             commit_pending: false,
+            pending_commit_serial: None,
+            pending_commit_requires_memento: false,
+            next_commit_serial: 1,
             pending_resident_changes: Vec::new(),
+            undo_scratch_buffer,
+            undo_scratch_capacity: INITIAL_UNDO_SCRATCH_BYTES,
+            undo_swap_pending: false,
         })
     }
 
@@ -240,15 +287,41 @@ impl GpuDocumentTarget {
         if !self.commit_pending {
             return Err(GpuDocumentTargetError::NoEncodedCommit);
         }
-        self.commit_pending = false;
-        self.pending_resident_changes.clear();
+        if self.pending_commit_requires_memento {
+            return Err(GpuDocumentTargetError::MementoCommitTokenRequired);
+        }
+        self.finish_commit_submission();
         Ok(())
+    }
+
+    fn finish_commit_submission(&mut self) {
+        self.commit_pending = false;
+        self.pending_commit_serial = None;
+        self.pending_commit_requires_memento = false;
+        self.pending_resident_changes.clear();
+    }
+
+    pub fn commit_submitted_with_memento(
+        &mut self,
+        encoded: EncodedGpuDocumentCommit,
+    ) -> Result<GpuDocumentMemento, GpuDocumentTargetError> {
+        self.validate_commit_token(encoded.serial)?;
+        self.finish_commit_submission();
+        Ok(encoded.memento)
     }
 
     pub fn commit_discarded(&mut self) -> Result<(), GpuDocumentTargetError> {
         if !self.commit_pending {
             return Err(GpuDocumentTargetError::NoEncodedCommit);
         }
+        if self.pending_commit_requires_memento {
+            return Err(GpuDocumentTargetError::MementoCommitTokenRequired);
+        }
+        self.finish_commit_discard();
+        Ok(())
+    }
+
+    fn finish_commit_discard(&mut self) {
         for (slot, previous) in self.pending_resident_changes.drain(..).rev() {
             match previous {
                 Some(key) => {
@@ -260,6 +333,26 @@ impl GpuDocumentTarget {
             }
         }
         self.commit_pending = false;
+        self.pending_commit_serial = None;
+        self.pending_commit_requires_memento = false;
+    }
+
+    pub fn commit_discarded_with_memento(
+        &mut self,
+        encoded: EncodedGpuDocumentCommit,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.validate_commit_token(encoded.serial)?;
+        self.finish_commit_discard();
+        Ok(())
+    }
+
+    fn validate_commit_token(&self, serial: u64) -> Result<(), GpuDocumentTargetError> {
+        if !self.commit_pending {
+            return Err(GpuDocumentTargetError::NoEncodedCommit);
+        }
+        if self.pending_commit_serial != Some(serial) {
+            return Err(GpuDocumentTargetError::CommitTokenMismatch);
+        }
         Ok(())
     }
 
@@ -271,8 +364,48 @@ impl GpuDocumentTarget {
         mask: &RoundMaskTarget,
         material: StrokeMaterial,
     ) -> Result<ColorCommitStats, GpuDocumentTargetError> {
+        let (stats, memento, _) =
+            self.encode_full_flow_commit_internal(device, queue, encoder, mask, material, false)?;
+        debug_assert!(memento.is_none());
+        Ok(stats)
+    }
+
+    pub fn encode_full_flow_commit_with_undo(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        mask: &RoundMaskTarget,
+        material: StrokeMaterial,
+    ) -> Result<Option<EncodedGpuDocumentCommit>, GpuDocumentTargetError> {
+        let (stats, memento, serial) =
+            self.encode_full_flow_commit_internal(device, queue, encoder, mask, material, true)?;
+        Ok(match (memento, serial) {
+            (Some(memento), Some(serial)) => Some(EncodedGpuDocumentCommit {
+                stats,
+                serial,
+                memento,
+            }),
+            (None, None) => None,
+            _ => unreachable!("an encoded undo capture and commit serial are created together"),
+        })
+    }
+
+    fn encode_full_flow_commit_internal(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        mask: &RoundMaskTarget,
+        material: StrokeMaterial,
+        capture_undo: bool,
+    ) -> Result<(ColorCommitStats, Option<GpuDocumentMemento>, Option<u64>), GpuDocumentTargetError>
+    {
         if self.commit_pending {
             return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
         }
         if mask.stroke_is_active() {
             return Err(GpuDocumentTargetError::MaskStrokeStillActive);
@@ -288,27 +421,38 @@ impl GpuDocumentTarget {
         }
         match material.accumulation() {
             StrokeAccumulation::None => {
-                return Ok(ColorCommitStats {
-                    retained_pages: self.pages.len() as u32,
-                    ..Default::default()
-                });
+                return Ok((
+                    ColorCommitStats {
+                        retained_pages: self.pages.len() as u32,
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                ));
             }
             StrokeAccumulation::CoverageUnion => {}
             StrokeAccumulation::OpticalDensity { .. } => {
                 return Err(GpuDocumentTargetError::UnsupportedAccumulation);
             }
         }
-        let residents = mask.active_residents();
-        if residents.is_empty() {
-            return Ok(ColorCommitStats {
-                retained_pages: self.pages.len() as u32,
-                ..Default::default()
-            });
+        let active_tiles = mask.active_tiles();
+        if active_tiles.is_empty() {
+            return Ok((
+                ColorCommitStats {
+                    retained_pages: self.pages.len() as u32,
+                    ..Default::default()
+                },
+                None,
+                None,
+            ));
         }
 
         let mut grouped = BTreeMap::<AtlasPageId, Vec<(LayerTileKey, AtlasSlot)>>::new();
-        for resident in residents {
-            grouped.entry(resident.1.page()).or_default().push(resident);
+        for active in &active_tiles {
+            grouped
+                .entry(active.slot.page())
+                .or_default()
+                .push((active.key, active.slot));
         }
         let highest_page = grouped
             .last_key_value()
@@ -348,6 +492,20 @@ impl GpuDocumentTarget {
 
         let instance_bytes = size_of_val(instances.as_slice()) as u64;
         self.ensure_instance_capacity(device, instance_bytes)?;
+        let memento = if capture_undo {
+            let plan = GpuUndoCapturePlan::from_active_tiles(self.layout, &active_tiles)
+                .map_err(GpuDocumentTargetError::UndoPlan)?;
+            Some(
+                GpuDocumentMemento::new(device, plan)
+                    .map_err(GpuDocumentTargetError::UndoResource)?,
+            )
+        } else {
+            None
+        };
+        let commit_serial = self.next_commit_serial;
+        let next_commit_serial = commit_serial
+            .checked_add(1)
+            .ok_or(GpuDocumentTargetError::CommitSerialOverflow)?;
         let uniform = CommitUniform {
             page_size: [self.layout.page_size() as f32; 2],
             opacity: material.opacity(),
@@ -381,6 +539,30 @@ impl GpuDocumentTarget {
                     },
                 ],
             }));
+        }
+
+        if let Some(memento) = &memento {
+            for region in memento.plan().regions() {
+                if self.initialized_residents.get(&region.slot) == Some(&region.key) {
+                    let page = &self.pages[region.slot.page().get() as usize];
+                    encoder.copy_texture_to_buffer(
+                        texture_copy(&page.texture, region.physical_origin),
+                        buffer_copy(
+                            memento.buffer(),
+                            region.buffer_offset,
+                            region.bytes_per_row,
+                            region.extent[1],
+                        ),
+                        copy_extent(region.extent),
+                    );
+                } else {
+                    encoder.clear_buffer(
+                        memento.buffer(),
+                        region.buffer_offset,
+                        Some(region.byte_len()),
+                    );
+                }
+            }
         }
 
         for (encoding, bind_group) in encodings.iter().zip(&bind_groups) {
@@ -422,8 +604,11 @@ impl GpuDocumentTarget {
             .map(|(slot, previous, _)| (slot, previous))
             .collect();
         self.commit_pending = true;
+        self.pending_commit_serial = Some(commit_serial);
+        self.pending_commit_requires_memento = capture_undo;
+        self.next_commit_serial = next_commit_serial;
 
-        Ok(ColorCommitStats {
+        let stats = ColorCommitStats {
             retained_pages: self.pages.len() as u32,
             render_passes: encodings.len() as u32,
             committed_slots: encodings
@@ -435,7 +620,118 @@ impl GpuDocumentTarget {
                 .map(|encoding| encoding.clear_instances.len() as u32)
                 .sum(),
             bytes_written: size_of::<CommitUniform>() as u64 + instance_bytes,
+            undo_copy_regions: memento
+                .as_ref()
+                .map(|memento| memento.plan().regions().len() as u32)
+                .unwrap_or(0),
+            undo_blocks: memento
+                .as_ref()
+                .map(GpuDocumentMemento::block_count)
+                .unwrap_or(0),
+            undo_bytes: memento
+                .as_ref()
+                .map(GpuDocumentMemento::byte_len)
+                .unwrap_or(0),
+        };
+        Ok((stats, memento, Some(commit_serial)))
+    }
+
+    pub const fn undo_swap_is_pending(&self) -> bool {
+        self.undo_swap_pending
+    }
+
+    pub fn encode_undo_swap(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        memento: &mut GpuDocumentMemento,
+    ) -> Result<GpuUndoSwapStats, GpuDocumentTargetError> {
+        if self.commit_pending {
+            return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if memento.plan().layout() != self.layout {
+            return Err(GpuDocumentTargetError::LayoutMismatch {
+                expected: self.layout,
+                actual: memento.plan().layout(),
+            });
+        }
+        for region in memento.plan().regions() {
+            let actual = self.initialized_residents.get(&region.slot).copied();
+            if actual != Some(region.key) {
+                return Err(GpuDocumentTargetError::UndoResidentMismatch {
+                    slot: region.slot,
+                    expected: region.key,
+                    actual,
+                });
+            }
+            if self.pages.get(region.slot.page().get() as usize).is_none() {
+                return Err(GpuDocumentTargetError::MissingColorPage(region.slot.page()));
+            }
+        }
+        self.ensure_undo_scratch_capacity(device, memento.byte_len())?;
+        let copy_regions = checked_u32(memento.plan().regions().len())?;
+        let bytes_copied = memento
+            .byte_len()
+            .checked_mul(3)
+            .ok_or(GpuDocumentTargetError::UndoCopySizeOverflow)?;
+
+        for region in memento.plan().regions() {
+            let page = &self.pages[region.slot.page().get() as usize];
+            encoder.copy_texture_to_buffer(
+                texture_copy(&page.texture, region.physical_origin),
+                buffer_copy(
+                    &self.undo_scratch_buffer,
+                    region.buffer_offset,
+                    region.bytes_per_row,
+                    region.extent[1],
+                ),
+                copy_extent(region.extent),
+            );
+        }
+        for region in memento.plan().regions() {
+            let page = &self.pages[region.slot.page().get() as usize];
+            encoder.copy_buffer_to_texture(
+                buffer_copy(
+                    memento.buffer(),
+                    region.buffer_offset,
+                    region.bytes_per_row,
+                    region.extent[1],
+                ),
+                texture_copy(&page.texture, region.physical_origin),
+                copy_extent(region.extent),
+            );
+        }
+        for region in memento.plan().regions() {
+            encoder.copy_buffer_to_buffer(
+                &self.undo_scratch_buffer,
+                region.buffer_offset,
+                memento.buffer(),
+                region.buffer_offset,
+                region.byte_len(),
+            );
+        }
+
+        self.undo_swap_pending = true;
+        Ok(GpuUndoSwapStats {
+            copy_regions,
+            blocks: memento.block_count(),
+            bytes_copied,
         })
+    }
+
+    pub fn undo_swap_submitted(&mut self) -> Result<(), GpuDocumentTargetError> {
+        if !self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::NoEncodedUndoSwap);
+        }
+        self.undo_swap_pending = false;
+        Ok(())
+    }
+
+    pub fn undo_swap_discarded(&mut self) -> Result<(), GpuDocumentTargetError> {
+        self.undo_swap_submitted()
     }
 
     fn ensure_pages(
@@ -474,6 +770,28 @@ impl GpuDocumentTarget {
         }
         self.instance_buffer = create_instance_buffer(device, capacity);
         self.instance_buffer_capacity = capacity;
+        Ok(())
+    }
+
+    fn ensure_undo_scratch_capacity(
+        &mut self,
+        device: &wgpu::Device,
+        required: u64,
+    ) -> Result<(), GpuDocumentTargetError> {
+        if required <= self.undo_scratch_capacity {
+            return Ok(());
+        }
+        let capacity = required
+            .checked_next_power_of_two()
+            .ok_or(GpuDocumentTargetError::UndoCopySizeOverflow)?;
+        if capacity > device.limits().max_buffer_size {
+            return Err(GpuDocumentTargetError::UndoScratchTooLarge {
+                requested: capacity,
+                maximum: device.limits().max_buffer_size,
+            });
+        }
+        self.undo_scratch_buffer = create_undo_scratch_buffer(device, capacity);
+        self.undo_scratch_capacity = capacity;
         Ok(())
     }
 }
@@ -547,6 +865,52 @@ fn create_instance_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
     })
 }
 
+fn create_undo_scratch_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("GPU Document Undo Swap Scratch"),
+        size,
+        usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn texture_copy(texture: &wgpu::Texture, origin: [u32; 2]) -> wgpu::TexelCopyTextureInfo<'_> {
+    wgpu::TexelCopyTextureInfo {
+        texture,
+        mip_level: 0,
+        origin: wgpu::Origin3d {
+            x: origin[0],
+            y: origin[1],
+            z: 0,
+        },
+        aspect: wgpu::TextureAspect::All,
+    }
+}
+
+fn buffer_copy(
+    buffer: &wgpu::Buffer,
+    offset: u64,
+    bytes_per_row: u32,
+    rows_per_image: u32,
+) -> wgpu::TexelCopyBufferInfo<'_> {
+    wgpu::TexelCopyBufferInfo {
+        buffer,
+        layout: wgpu::TexelCopyBufferLayout {
+            offset,
+            bytes_per_row: Some(bytes_per_row),
+            rows_per_image: Some(rows_per_image),
+        },
+    }
+}
+
+const fn copy_extent(extent: [u32; 2]) -> wgpu::Extent3d {
+    wgpu::Extent3d {
+        width: extent[0],
+        height: extent[1],
+        depth_or_array_layers: 1,
+    }
+}
+
 fn checked_u32(value: usize) -> Result<u32, GpuDocumentTargetError> {
     u32::try_from(value).map_err(|_| GpuDocumentTargetError::InstanceCountOverflow)
 }
@@ -566,8 +930,21 @@ pub enum GpuDocumentTargetError {
     MaskStrokeStillActive,
     MaskBatchAwaitingSubmission,
     CommitAwaitingSubmission,
+    CommitTokenMismatch,
+    MementoCommitTokenRequired,
+    CommitSerialOverflow,
     NoEncodedCommit,
+    UndoPlan(GpuUndoPlanError),
+    UndoResource(GpuUndoResourceError),
+    UndoSwapAwaitingSubmission,
+    NoEncodedUndoSwap,
+    UndoResidentMismatch {
+        slot: AtlasSlot,
+        expected: LayerTileKey,
+        actual: Option<LayerTileKey>,
+    },
     MissingMaskPage(AtlasPageId),
+    MissingColorPage(AtlasPageId),
     PageOutOfRange {
         page: u32,
         maximum_pages: u32,
@@ -575,6 +952,11 @@ pub enum GpuDocumentTargetError {
     InstanceCountOverflow,
     InstanceBufferOverflow,
     InstanceBufferTooLarge {
+        requested: u64,
+        maximum: u64,
+    },
+    UndoCopySizeOverflow,
+    UndoScratchTooLarge {
         requested: u64,
         maximum: u64,
     },
@@ -609,9 +991,33 @@ impl fmt::Display for GpuDocumentTargetError {
             Self::CommitAwaitingSubmission => {
                 write!(formatter, "a GPU document commit is awaiting submission")
             }
+            Self::CommitTokenMismatch => {
+                write!(formatter, "GPU document commit token does not match")
+            }
+            Self::MementoCommitTokenRequired => {
+                write!(formatter, "GPU document commit requires its memento token")
+            }
+            Self::CommitSerialOverflow => write!(formatter, "GPU commit serial overflows"),
             Self::NoEncodedCommit => write!(formatter, "no GPU document commit is pending"),
+            Self::UndoPlan(error) => error.fmt(formatter),
+            Self::UndoResource(error) => error.fmt(formatter),
+            Self::UndoSwapAwaitingSubmission => {
+                write!(formatter, "a GPU undo swap is awaiting submission")
+            }
+            Self::NoEncodedUndoSwap => write!(formatter, "no GPU undo swap is pending"),
+            Self::UndoResidentMismatch {
+                slot,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "GPU undo slot {slot:?} expected {expected:?}, found {actual:?}"
+            ),
             Self::MissingMaskPage(page) => {
                 write!(formatter, "round mask page {} does not exist", page.get())
+            }
+            Self::MissingColorPage(page) => {
+                write!(formatter, "GPU color page {} does not exist", page.get())
             }
             Self::PageOutOfRange {
                 page,
@@ -625,6 +1031,11 @@ impl fmt::Display for GpuDocumentTargetError {
             Self::InstanceBufferTooLarge { requested, maximum } => write!(
                 formatter,
                 "GPU commit instance buffer {requested} exceeds device limit {maximum}"
+            ),
+            Self::UndoCopySizeOverflow => write!(formatter, "GPU undo copy size overflows"),
+            Self::UndoScratchTooLarge { requested, maximum } => write!(
+                formatter,
+                "GPU undo scratch buffer {requested} exceeds device limit {maximum}"
             ),
         }
     }

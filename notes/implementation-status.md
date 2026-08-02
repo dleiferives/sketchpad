@@ -61,10 +61,11 @@ write or after its logical `(LayerId, TileCoord)` occupant changes. The target
 rejects active masks, mask batches not yet acknowledged as submitted,
 optical-density flow, and reuse of its own queue-written buffers before the
 encoded commit is submitted or discarded. Live presentation, optical-density
-accumulation, exact GPU undo, and application cutover are not connected yet.
+accumulation, document-history sequencing, allocation/occupancy restoration,
+and application cutover are not connected yet.
 
-Exact GPU undo now has a deterministic copy planner, but not yet its backing
-buffer or live history command. Each conservative tile-local damage rectangle
+Exact GPU pixel undo now has a deterministic copy planner and backing buffers,
+but not yet its live history command. Each conservative tile-local damage rectangle
 rounds outward to `16 x 16` full-float blocks. One block is exactly 4 KiB, and
 its 16-pixel `Rgba32Float` row is exactly WebGPU's 256-byte copy-row alignment.
 Adjacent selected blocks for one tile coalesce into one rectangular copy
@@ -73,6 +74,19 @@ one texture-buffer copy command rather than 64. Plans are ordered by physical
 page/slot, carry stable logical occupants, use checked size arithmetic, and
 reject non-block-aligned tile layouts, out-of-tile damage, or conflicting
 occupants before any GPU mutation.
+
+An undo-enabled color commit captures those regions before the paint pass.
+Existing residents copy exact `Rgba32Float` pixels into a private memento;
+new residents record zero directly in that buffer rather than reading
+undefined texture memory. The memento becomes usable only when its matching
+encoded-commit token is acknowledged after submission. Undo copies current
+pixels to one reusable scratch buffer, copies the memento into the document,
+then replaces the memento with the prior current pixels. The same operation is
+therefore exact redo on its next invocation. A pending commit or swap blocks
+shared-resource reuse, and a swap fails before encoding if any physical slot
+no longer names the recorded logical resident. GPU history budgeting, slot
+pinning, absent-tile occupancy exchange, revision commands, and CPU spill are
+the remaining history layer above this pixel-exchange primitive.
 
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
@@ -102,6 +116,15 @@ bytes. Exact `Rgba32Float` readback produced premultiplied paint
 transparent pixels outside the sweep. This proves blend, addressing,
 retention, and lazy-clear semantics on the first hardware adapter; it is not a
 timing result and does not yet exercise the live executable.
+
+The document smoke now captures and exchanges both mementos as well. The paint
+capture selected two coalesced regions / 20 blocks / 81,920 bytes; the smaller
+eraser selected one region / 4 blocks / 16,384 bytes. The exact hardware
+sequence was paint, erase, undo erase, undo paint to transparent, redo paint,
+and redo erase. Every checked pixel matched its original full-float value at
+every state. Each swap transfers three times its stored bytes because it
+captures current pixels, restores target pixels, and replaces the memento;
+that traffic is a correctness counter, not a benchmark result.
 
 ## Current Executable
 

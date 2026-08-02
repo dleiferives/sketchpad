@@ -1,7 +1,8 @@
 use sketchpad::{
     document::Document,
-    gpu_atlas::{AtlasLayout, LayerTileKey, SparseAtlasPlanner},
-    gpu_document_target::GpuDocumentTarget,
+    gpu_atlas::{AtlasLayout, AtlasPageId, LayerTileKey, SparseAtlasPlanner},
+    gpu_document_target::{GpuDocumentTarget, GpuUndoSwapStats},
+    gpu_document_undo::GpuDocumentMemento,
     gpu_round::RoundMaskScheduler,
     gpu_round_target::RoundMaskTarget,
     raster::TileCoord,
@@ -69,15 +70,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut paint_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("GPU Document Commit Smoke Paint"),
     });
-    let paint_stats = color.encode_full_flow_commit(
-        &device,
-        &queue,
-        &mut paint_encoder,
-        &mask,
-        StrokeMaterial::paint([0.2, 0.4, 0.8], 0.5, 1.0)?,
-    )?;
+    let encoded_paint = color
+        .encode_full_flow_commit_with_undo(
+            &device,
+            &queue,
+            &mut paint_encoder,
+            &mask,
+            StrokeMaterial::paint([0.2, 0.4, 0.8], 0.5, 1.0)?,
+        )?
+        .ok_or("the painted stroke unexpectedly produced no commit")?;
+    let paint_stats = encoded_paint.stats();
     queue.submit(iter::once(paint_encoder.finish()));
-    color.commit_submitted()?;
+    let mut paint_memento = color.commit_submitted_with_memento(encoded_paint)?;
 
     let eraser_contact = contact([64.0, 64.0], 4.0, 3);
     let eraser_batch = scheduler.schedule(
@@ -104,13 +108,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut erase_encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("GPU Document Commit Smoke Erase"),
     });
-    let erase_stats = color.encode_full_flow_commit(
-        &device,
-        &queue,
-        &mut erase_encoder,
-        &mask,
-        StrokeMaterial::eraser(0.25, 1.0)?,
-    )?;
+    let encoded_erase = color
+        .encode_full_flow_commit_with_undo(
+            &device,
+            &queue,
+            &mut erase_encoder,
+            &mask,
+            StrokeMaterial::eraser(0.25, 1.0)?,
+        )?
+        .ok_or("the eraser stroke unexpectedly produced no commit")?;
+    let erase_stats = encoded_erase.stats();
     let color_bytes_per_row = PAGE_SIZE * size_of::<[f32; 4]>() as u32;
     let color_readback = readback_buffer(
         &device,
@@ -141,12 +148,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         },
     );
     queue.submit(iter::once(erase_encoder.finish()));
-    color.commit_submitted()?;
+    let mut erase_memento = color.commit_submitted_with_memento(encoded_erase)?;
 
     let color_bytes = map_readback(&device, &color_readback)?;
-    if let Some(error) = pollster::block_on(error_scope.pop()) {
-        return Err(error.into());
-    }
 
     let left_slot = atlas
         .slot(LayerTileKey::new(layer, TileCoord::new(0, 0)))
@@ -184,6 +188,103 @@ fn main() -> Result<(), Box<dyn Error>> {
     expect_color("retained right sweep", retained_right, [0.1, 0.2, 0.4, 0.5])?;
     expect_color("cleared outside", transparent, [0.0; 4])?;
 
+    let (undo_erase_stats, after_undo_erase) = swap_and_read(
+        &device,
+        &queue,
+        &mut color,
+        &mut erase_memento,
+        page,
+        color_bytes_per_row,
+        "GPU Document Commit Smoke Undo Erase",
+    )?;
+    expect_color(
+        "undo erase center",
+        read_color(
+            &after_undo_erase,
+            color_bytes_per_row,
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        )?,
+        [0.1, 0.2, 0.4, 0.5],
+    )?;
+
+    let (undo_paint_stats, after_undo_paint) = swap_and_read(
+        &device,
+        &queue,
+        &mut color,
+        &mut paint_memento,
+        page,
+        color_bytes_per_row,
+        "GPU Document Commit Smoke Undo Paint",
+    )?;
+    for (label, x, y) in [
+        (
+            "undo paint center",
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        ),
+        (
+            "undo paint left",
+            left_slot.origin()[0] + 100,
+            left_slot.origin()[1] + 64,
+        ),
+        (
+            "undo paint right",
+            right_slot.origin()[0] + 52,
+            right_slot.origin()[1] + 64,
+        ),
+    ] {
+        expect_color(
+            label,
+            read_color(&after_undo_paint, color_bytes_per_row, x, y)?,
+            [0.0; 4],
+        )?;
+    }
+
+    let (redo_paint_stats, after_redo_paint) = swap_and_read(
+        &device,
+        &queue,
+        &mut color,
+        &mut paint_memento,
+        page,
+        color_bytes_per_row,
+        "GPU Document Commit Smoke Redo Paint",
+    )?;
+    expect_color(
+        "redo paint center",
+        read_color(
+            &after_redo_paint,
+            color_bytes_per_row,
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        )?,
+        [0.1, 0.2, 0.4, 0.5],
+    )?;
+
+    let (redo_erase_stats, after_redo_erase) = swap_and_read(
+        &device,
+        &queue,
+        &mut color,
+        &mut erase_memento,
+        page,
+        color_bytes_per_row,
+        "GPU Document Commit Smoke Redo Erase",
+    )?;
+    expect_color(
+        "redo erase center",
+        read_color(
+            &after_redo_erase,
+            color_bytes_per_row,
+            left_slot.origin()[0] + 64,
+            left_slot.origin()[1] + 64,
+        )?,
+        [0.075, 0.15, 0.3, 0.375],
+    )?;
+
+    if let Some(error) = pollster::block_on(error_scope.pop()) {
+        return Err(error.into());
+    }
+
     if paint_mask_stats.render_passes != 1 || paint_mask_stats.cleared_slots != 2 {
         return Err(format!("unexpected paint-mask stats: {paint_mask_stats:?}").into());
     }
@@ -193,19 +294,29 @@ fn main() -> Result<(), Box<dyn Error>> {
     if paint_stats.render_passes != 1
         || paint_stats.committed_slots != 2
         || paint_stats.cleared_slots != 2
+        || paint_stats.undo_copy_regions != 2
+        || paint_stats.undo_blocks != 20
+        || paint_stats.undo_bytes != 81_920
     {
         return Err(format!("unexpected paint stats: {paint_stats:?}").into());
     }
     if erase_stats.render_passes != 1
         || erase_stats.committed_slots != 1
         || erase_stats.cleared_slots != 0
+        || erase_stats.undo_copy_regions != 1
+        || erase_stats.undo_blocks != 4
+        || erase_stats.undo_bytes != 16_384
     {
         return Err(format!("unexpected erase stats: {erase_stats:?}").into());
     }
+    expect_swap_stats("undo erase", undo_erase_stats, 1, 4, 49_152)?;
+    expect_swap_stats("undo paint", undo_paint_stats, 2, 20, 245_760)?;
+    expect_swap_stats("redo paint", redo_paint_stats, 2, 20, 245_760)?;
+    expect_swap_stats("redo erase", redo_erase_stats, 1, 4, 49_152)?;
 
     println!(
         "gpu_document_commit_smoke adapter={:?} paint={paint_stats:?} erase={erase_stats:?} \
-         source_over=exact destination_out=exact lazy_clear=exact",
+         source_over=exact destination_out=exact lazy_clear=exact undo_redo=exact",
         adapter.get_info().name,
     );
     Ok(())
@@ -235,6 +346,47 @@ fn require_format_support(adapter: &wgpu::Adapter) -> Result<(), Box<dyn Error>>
         }
     }
     Ok(())
+}
+
+fn swap_and_read(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    color: &mut GpuDocumentTarget,
+    memento: &mut GpuDocumentMemento,
+    page: AtlasPageId,
+    bytes_per_row: u32,
+    label: &str,
+) -> Result<(GpuUndoSwapStats, Vec<u8>), Box<dyn Error>> {
+    let readback = readback_buffer(device, label, bytes_per_row);
+    let mut encoder =
+        device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+    let stats = color.encode_undo_swap(device, &mut encoder, memento)?;
+    encoder.copy_texture_to_buffer(
+        wgpu::TexelCopyTextureInfo {
+            texture: color
+                .page_texture(page)
+                .expect("the swapped color page must exist"),
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        wgpu::TexelCopyBufferInfo {
+            buffer: &readback,
+            layout: wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(PAGE_SIZE),
+            },
+        },
+        wgpu::Extent3d {
+            width: PAGE_SIZE,
+            height: PAGE_SIZE,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(iter::once(encoder.finish()));
+    color.undo_swap_submitted()?;
+    Ok((stats, map_readback(device, &readback)?))
 }
 
 fn contact(center: [f32; 2], radius: f32, elapsed_micros: u64) -> RoundContact {
@@ -292,6 +444,24 @@ fn expect_color(label: &str, actual: [f32; 4], expected: [f32; 4]) -> Result<(),
         .any(|(actual, expected)| (actual - expected).abs() > 1.0e-6)
     {
         return Err(format!("{label} is {actual:?}, expected {expected:?}").into());
+    }
+    Ok(())
+}
+
+fn expect_swap_stats(
+    label: &str,
+    actual: GpuUndoSwapStats,
+    regions: u32,
+    blocks: u32,
+    bytes: u64,
+) -> Result<(), Box<dyn Error>> {
+    let expected = GpuUndoSwapStats {
+        copy_regions: regions,
+        blocks,
+        bytes_copied: bytes,
+    };
+    if actual != expected {
+        return Err(format!("{label} stats are {actual:?}, expected {expected:?}").into());
     }
     Ok(())
 }
