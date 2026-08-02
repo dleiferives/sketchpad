@@ -29,6 +29,16 @@ undo/composition behavior are unchanged, and release tests pass on Atlas. The
 inventory below continues to describe the executable at commit `373b0e7`; the
 new stroke contract is not wired into live drawing yet.
 
+The first GPU-atlas foundation is also non-live: a deterministic sparse
+planner maps `(LayerId, TileCoord)` into stable row-major slots on lazy 2D
+pages, reclaims unreachable keys, fails multi-key capacity requests without a
+partial allocation, and groups resident work by physical page. The selected
+1,024 px page / 128 px tile layout proves 64 logical tiles per pass-sized page,
+16 MiB per full-float RGBA page, 4 MiB per scalar full-float mask page, and a
+1,024-tile initial capacity. A regression test explicitly proves that 48
+touched logical tiles on one page produce one page batch, not 48 tile batches.
+GPU textures and passes are not connected to this planner yet.
+
 ## Current Executable
 
 Run on Atlas:
