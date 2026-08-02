@@ -164,6 +164,13 @@ exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the
 modified marker only if `R` is still the current interactive revision.
 
+Background revision work is limited to one active payload plus one coalesced
+newest pending payload. Completion is serial-token checked, and the immutable
+payload returns to the caller on both success and failure. This bounds snapshot
+retention while preserving a newer request that arrives during I/O. Duplicate
+or older requests add no work; a successful stale write remains a valid file
+but cannot mark the live document clean.
+
 ## Ordered Implementation
 
 1. Separate document metadata/history from the current CPU raster backend

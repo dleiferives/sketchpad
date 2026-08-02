@@ -258,6 +258,19 @@ result is still mapping still needs the retained older anchor plus inverse
 history. Those unsupported cases remain explicit rather than falling back to
 a direction-only record.
 
+Revisioned background work now has a bounded scheduling state machine for the
+save/autosave side of the migration. A payload reports its immutable target
+revision. At most one task is active and one newer task is pending; newer
+requests replace and return the previous pending payload, while duplicate or
+older requests are already covered and returned without retaining another
+snapshot. Serial tokens make completion transactional. Failure, a counterfeit
+token, a future task relative to interactive state, and ID exhaustion all
+return ownership without corrupting the queue. Successful completion reports
+`saved_current_revision` only when the written revision still equals the
+interactive revision, so saving `R` after drawing reaches `R + n` cannot clear
+the modified marker. Pure tests exercise coalescing, stale success, worker
+failure, promotion, token mismatch, and exhaustion.
+
 The first Atlas GPU correctness smoke ran on its Intel UHD Graphics 630. A
 two-tile continuous sweep encoded three instances, two slot clears, 152 bytes,
 and one page pass. A second stroke reused one tile, cleared only that slot,
