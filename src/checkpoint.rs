@@ -259,25 +259,28 @@ pub fn encode_document(
     let mut layers: Vec<_> = document
         .layers()
         .iter()
-        .map(|layer| DocumentEncodingLayer {
-            id: layer.id().get(),
-            name: layer.name(),
-            visible: layer.visible(),
-            opacity: layer.opacity(),
-            tiles: layer
-                .raster()
-                .allocated_tile_coords()
-                .map(|coord| {
-                    (
-                        coord,
-                        layer
-                            .raster()
-                            .tile(coord)
-                            .expect("coordinates came from allocated tiles")
-                            .pixels(),
-                    )
-                })
-                .collect(),
+        .map(|layer| {
+            let raster = document
+                .layer_raster(layer.id())
+                .expect("every document layer must have a raster payload");
+            DocumentEncodingLayer {
+                id: layer.id().get(),
+                name: layer.name(),
+                visible: layer.visible(),
+                opacity: layer.opacity(),
+                tiles: raster
+                    .allocated_tile_coords()
+                    .map(|coord| {
+                        (
+                            coord,
+                            raster
+                                .tile(coord)
+                                .expect("coordinates came from allocated tiles")
+                                .pixels(),
+                        )
+                    })
+                    .collect(),
+            }
         })
         .collect();
     encode_document_parts(
@@ -295,12 +298,15 @@ pub fn snapshot_document(document: &Document) -> Result<DocumentSnapshot, Checkp
     let mut layers = Vec::with_capacity(document.layers().len());
     for layer in document.layers() {
         validate_layer_name(layer.name())?;
+        let raster = document
+            .layer_raster(layer.id())
+            .expect("every document layer must have a raster payload");
         layers.push(LayerSnapshot {
             id: layer.id().get(),
             name: layer.name().to_owned(),
             visible: layer.visible(),
             opacity: layer.opacity(),
-            tiles: layer.raster().checkpoint_tiles(),
+            tiles: raster.checkpoint_tiles(),
         });
     }
     Ok(DocumentSnapshot {
@@ -1029,14 +1035,16 @@ mod tests {
             assert_eq!(actual.name(), expected.name());
             assert_eq!(actual.visible(), expected.visible());
             assert_eq!(actual.opacity(), expected.opacity());
+            let expected_raster = document.layer_raster(expected.id()).unwrap();
+            let actual_raster = restored.layer_raster(actual.id()).unwrap();
             assert_eq!(
-                actual.raster().allocated_tile_count(),
-                expected.raster().allocated_tile_count()
+                actual_raster.allocated_tile_count(),
+                expected_raster.allocated_tile_count()
             );
-            for coord in expected.raster().allocated_tile_coords() {
+            for coord in expected_raster.allocated_tile_coords() {
                 assert_eq!(
-                    actual.raster().tile(coord).unwrap().pixels(),
-                    expected.raster().tile(coord).unwrap().pixels()
+                    actual_raster.tile(coord).unwrap().pixels(),
+                    expected_raster.tile(coord).unwrap().pixels()
                 );
             }
         }

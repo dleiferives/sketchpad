@@ -1870,7 +1870,12 @@ impl App {
                 let tile_count: usize = document
                     .layers()
                     .iter()
-                    .map(|layer| layer.raster().allocated_tile_count())
+                    .map(|layer| {
+                        document
+                            .layer_raster(layer.id())
+                            .expect("every document layer must have a raster payload")
+                            .allocated_tile_count()
+                    })
                     .sum();
                 self.document = document;
                 if let Some(gpu) = &mut self.gpu {
@@ -2664,7 +2669,12 @@ impl App {
                 self.document
                     .layers()
                     .iter()
-                    .map(|layer| layer.raster().allocated_tile_count())
+                    .map(|layer| {
+                        self.document
+                            .layer_raster(layer.id())
+                            .expect("every document layer must have a raster payload")
+                            .allocated_tile_count()
+                    })
                     .sum::<usize>()
             );
         }
@@ -3312,7 +3322,12 @@ fn main() {
                 let tile_count: usize = document
                     .layers()
                     .iter()
-                    .map(|layer| layer.raster().allocated_tile_count())
+                    .map(|layer| {
+                        document
+                            .layer_raster(layer.id())
+                            .expect("every document layer must have a raster payload")
+                            .allocated_tile_count()
+                    })
                     .sum();
                 log::info!(
                     "checkpoint recovered: path={:?} layers={} tiles={}",

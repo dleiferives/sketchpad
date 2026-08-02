@@ -18,9 +18,14 @@ allowing nonconsecutive self-crossings and pressure-separated subpaths to add
 flow. `DocumentRevision` now also provides a monotonic identity for every
 successful committed raster/structural transition and undo/redo; initial,
 failed, empty-history, selection-only, and no-op states do not advance it.
-Their release tests pass on Atlas. The inventory below continues to describe
-the executable at commit `373b0e7`; the new stroke contract is not wired into
-live drawing yet.
+Ordered `DocumentLayer` records now contain metadata only; stable `LayerId`
+keys address a separate CPU raster-payload store. Chronological history keeps
+metadata and IDs rather than owning pixel-bearing layer objects. Detached
+payloads remain live exactly while undo/redo can reach them and are reclaimed
+when a new branch makes them unreachable. Existing layered checkpoint bytes
+and observable undo/composition behavior are unchanged, and release tests pass
+on Atlas. The inventory below continues to describe the executable at commit
+`373b0e7`; the new stroke contract is not wired into live drawing yet.
 
 ## Current Executable
 

@@ -1,7 +1,11 @@
 use crate::raster::{
     Damage, DerivedContentChange, LinearRgba, RasterError, RasterLayer, RectU32, TileCoord,
 };
-use std::{collections::HashSet, error::Error, fmt, mem};
+use std::{
+    collections::{HashMap, HashSet},
+    error::Error,
+    fmt, mem,
+};
 
 pub const MAX_DOCUMENT_HISTORY_ENTRIES: usize = 256;
 
@@ -36,15 +40,15 @@ impl LayerId {
     }
 }
 
-pub struct RasterDocumentLayer {
+#[derive(Clone, Debug, PartialEq)]
+pub struct DocumentLayer {
     id: LayerId,
     name: String,
     visible: bool,
     opacity: f32,
-    raster: RasterLayer,
 }
 
-impl RasterDocumentLayer {
+impl DocumentLayer {
     pub const fn id(&self) -> LayerId {
         self.id
     }
@@ -60,10 +64,6 @@ impl RasterDocumentLayer {
     pub const fn opacity(&self) -> f32 {
         self.opacity
     }
-
-    pub const fn raster(&self) -> &RasterLayer {
-        &self.raster
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -78,7 +78,8 @@ pub struct Document {
     width: u32,
     height: u32,
     tile_size: u32,
-    layers: Vec<RasterDocumentLayer>,
+    layers: Vec<DocumentLayer>,
+    rasters: HashMap<LayerId, RasterLayer>,
     active_layer: LayerId,
     next_layer_id: u64,
     composite: RasterLayer,
@@ -93,12 +94,11 @@ enum DocumentEdit {
         layer: LayerId,
     },
     LayerPresence {
-        layer: LayerId,
+        layer: DocumentLayer,
         index: usize,
         before_active: LayerId,
         after_active: LayerId,
         present_after: bool,
-        stored: Option<Box<RasterDocumentLayer>>,
     },
     Rename {
         layer: LayerId,
@@ -122,6 +122,19 @@ enum DocumentEdit {
     },
 }
 
+impl DocumentEdit {
+    const fn layer_id(&self) -> LayerId {
+        match self {
+            Self::Raster { layer }
+            | Self::Rename { layer, .. }
+            | Self::Visibility { layer, .. }
+            | Self::Opacity { layer, .. }
+            | Self::Move { layer, .. } => *layer,
+            Self::LayerPresence { layer, .. } => layer.id,
+        }
+    }
+}
+
 pub(crate) struct DocumentLayerParts {
     pub id: LayerId,
     pub name: String,
@@ -133,17 +146,18 @@ pub(crate) struct DocumentLayerParts {
 impl Document {
     pub fn new(width: u32, height: u32, tile_size: u32) -> Result<Self, DocumentError> {
         let first_id = LayerId(1);
+        let first_raster = RasterLayer::new(width, height, tile_size)?;
         Ok(Self {
             width,
             height,
             tile_size,
-            layers: vec![RasterDocumentLayer {
+            layers: vec![DocumentLayer {
                 id: first_id,
                 name: "Layer 1".to_owned(),
                 visible: true,
                 opacity: 1.0,
-                raster: RasterLayer::new(width, height, tile_size)?,
             }],
+            rasters: HashMap::from([(first_id, first_raster)]),
             active_layer: first_id,
             next_layer_id: 2,
             composite: RasterLayer::new(width, height, tile_size)?,
@@ -168,13 +182,13 @@ impl Document {
             width,
             height,
             tile_size,
-            layers: vec![RasterDocumentLayer {
+            layers: vec![DocumentLayer {
                 id: first_id,
                 name,
                 visible: true,
                 opacity: 1.0,
-                raster,
             }],
+            rasters: HashMap::from([(first_id, raster)]),
             active_layer: first_id,
             next_layer_id: 2,
             composite,
@@ -197,6 +211,7 @@ impl Document {
         }
         let mut ids = HashSet::new();
         let mut layers = Vec::with_capacity(parts.len());
+        let mut rasters = HashMap::with_capacity(parts.len());
         let mut max_id = 0;
         for part in parts {
             if part.id.get() == 0 || !ids.insert(part.id) {
@@ -213,13 +228,13 @@ impl Document {
                 return Err(DocumentError::InvalidOpacity(part.opacity));
             }
             max_id = max_id.max(part.id.get());
-            layers.push(RasterDocumentLayer {
+            layers.push(DocumentLayer {
                 id: part.id,
                 name,
                 visible: part.visible,
                 opacity: part.opacity,
-                raster: part.raster,
             });
+            rasters.insert(part.id, part.raster);
         }
         if !ids.contains(&active_layer) {
             return Err(DocumentError::LayerNotFound(active_layer));
@@ -232,6 +247,7 @@ impl Document {
             height,
             tile_size,
             layers,
+            rasters,
             active_layer,
             next_layer_id,
             composite: RasterLayer::new(width, height, tile_size)?,
@@ -257,12 +273,17 @@ impl Document {
         self.tile_size
     }
 
-    pub fn layers(&self) -> &[RasterDocumentLayer] {
+    pub fn layers(&self) -> &[DocumentLayer] {
         &self.layers
     }
 
-    pub fn layer(&self, id: LayerId) -> Option<&RasterDocumentLayer> {
+    pub fn layer(&self, id: LayerId) -> Option<&DocumentLayer> {
         self.layers.iter().find(|layer| layer.id == id)
+    }
+
+    pub fn layer_raster(&self, id: LayerId) -> Option<&RasterLayer> {
+        self.layer_index(id)?;
+        self.rasters.get(&id)
     }
 
     pub const fn active_layer_id(&self) -> LayerId {
@@ -275,12 +296,15 @@ impl Document {
     }
 
     pub fn active_layer(&self) -> &RasterLayer {
-        &self.layers[self.active_layer_index()].raster
+        self.rasters
+            .get(&self.active_layer)
+            .expect("the active layer must have a raster payload")
     }
 
     pub fn active_layer_mut(&mut self) -> &mut RasterLayer {
-        let index = self.active_layer_index();
-        &mut self.layers[index].raster
+        self.rasters
+            .get_mut(&self.active_layer)
+            .expect("the active layer must have a raster payload")
     }
 
     pub const fn composite(&self) -> &RasterLayer {
@@ -318,23 +342,22 @@ impl Document {
         let raster = RasterLayer::new(self.width, self.height, self.tile_size)?;
         let before_active = self.active_layer;
         let id = self.allocate_layer_id();
-        let layer = RasterDocumentLayer {
+        let layer = DocumentLayer {
             id,
             name,
             visible: true,
             opacity: 1.0,
-            raster,
         };
         let insertion = self.active_layer_index() + 1;
-        self.layers.insert(insertion, layer);
+        self.layers.insert(insertion, layer.clone());
+        assert!(self.rasters.insert(id, raster).is_none());
         self.active_layer = id;
         self.record_edit(DocumentEdit::LayerPresence {
-            layer: id,
+            layer,
             index: insertion,
             before_active,
             after_active: id,
             present_after: true,
-            stored: None,
         });
         Ok(id)
     }
@@ -355,25 +378,24 @@ impl Document {
         let affected: Vec<_> = raster.allocated_tile_coords().collect();
         let before_active = self.active_layer;
         let id = self.allocate_layer_id();
-        let layer = RasterDocumentLayer {
+        let layer = DocumentLayer {
             id,
             name,
             visible: true,
             opacity: 1.0,
-            raster,
         };
         let insertion = self.active_layer_index() + 1;
-        self.layers.insert(insertion, layer);
+        self.layers.insert(insertion, layer.clone());
+        assert!(self.rasters.insert(id, raster).is_none());
         self.active_layer = id;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
         self.record_edit(DocumentEdit::LayerPresence {
-            layer: id,
+            layer,
             index: insertion,
             before_active,
             after_active: id,
             present_after: true,
-            stored: None,
         });
         Ok((id, damage))
     }
@@ -384,29 +406,32 @@ impl Document {
         let name = format!("{} copy", source.name);
         let visible = source.visible;
         let opacity = source.opacity;
-        let raster = clone_raster(&source.raster)?;
-        let affected = coords_for_layer(source);
+        let source_raster = self
+            .rasters
+            .get(&id)
+            .ok_or(DocumentError::LayerStorageMissing(id))?;
+        let raster = clone_raster(source_raster)?;
+        let affected = coords_for_raster(source_raster);
         let before_active = self.active_layer;
         let duplicate_id = self.allocate_layer_id();
-        let duplicate = RasterDocumentLayer {
+        let duplicate = DocumentLayer {
             id: duplicate_id,
             name,
             visible,
             opacity,
-            raster,
         };
         let insertion = source_index + 1;
-        self.layers.insert(insertion, duplicate);
+        self.layers.insert(insertion, duplicate.clone());
+        assert!(self.rasters.insert(duplicate_id, raster).is_none());
         self.active_layer = duplicate_id;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
         self.record_edit(DocumentEdit::LayerPresence {
-            layer: duplicate_id,
+            layer: duplicate,
             index: insertion,
             before_active,
             after_active: duplicate_id,
             present_after: true,
-            stored: None,
         });
         Ok((duplicate_id, damage))
     }
@@ -416,7 +441,11 @@ impl Document {
             return Err(DocumentError::CannotDeleteLastLayer);
         }
         let index = self.require_layer(id)?;
-        let affected = coords_for_layer(&self.layers[index]);
+        let raster = self
+            .rasters
+            .get(&id)
+            .ok_or(DocumentError::LayerStorageMissing(id))?;
+        let affected = coords_for_raster(raster);
         let before_active = self.active_layer;
         let removed = self.layers.remove(index);
         if self.active_layer == id {
@@ -426,12 +455,11 @@ impl Document {
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
         self.record_edit(DocumentEdit::LayerPresence {
-            layer: id,
+            layer: removed,
             index,
             before_active,
             after_active,
             present_after: false,
-            stored: Some(Box::new(removed)),
         });
         Ok(damage)
     }
@@ -464,7 +492,11 @@ impl Document {
         if self.layers[index].visible == visible {
             return Ok(Damage::default());
         }
-        let affected = coords_for_layer(&self.layers[index]);
+        let affected = self
+            .rasters
+            .get(&id)
+            .map(coords_for_raster)
+            .ok_or(DocumentError::LayerStorageMissing(id))?;
         let before = self.layers[index].visible;
         self.layers[index].visible = visible;
         let damage = self.damage_for_coords(affected);
@@ -489,7 +521,11 @@ impl Document {
         if self.layers[index].opacity == opacity {
             return Ok(Damage::default());
         }
-        let affected = coords_for_layer(&self.layers[index]);
+        let affected = self
+            .rasters
+            .get(&id)
+            .map(coords_for_raster)
+            .ok_or(DocumentError::LayerStorageMissing(id))?;
         let before = self.layers[index].opacity;
         self.layers[index].opacity = opacity;
         let damage = self.damage_for_coords(affected);
@@ -529,8 +565,12 @@ impl Document {
 
     pub fn record_active_raster_edit(&mut self) -> Result<(), DocumentError> {
         let layer = self.active_layer;
-        let index = self.require_layer(layer)?;
-        if self.layers[index].raster.active_gesture_id().is_some() {
+        self.require_layer(layer)?;
+        let raster = self
+            .rasters
+            .get(&layer)
+            .ok_or(DocumentError::LayerStorageMissing(layer))?;
+        if raster.active_gesture_id().is_some() {
             return Err(DocumentError::RasterEditStillActive(layer));
         }
         let tracked = self
@@ -538,7 +578,7 @@ impl Document {
             .iter()
             .filter(|edit| matches!(edit, DocumentEdit::Raster { layer: edit_layer } if *edit_layer == layer))
             .count();
-        let actual = self.layers[index].raster.undo_depth();
+        let actual = raster.undo_depth();
         if actual != tracked + 1 {
             return Err(DocumentError::RasterHistoryMismatch {
                 layer,
@@ -610,12 +650,20 @@ impl Document {
                 RectU32::from_min_max(local_min_x, local_min_y, local_max_x, local_max_y)
                     .expect("nonempty global damage produces nonempty local damage");
             let stride = self.tile_size as usize;
-            let sources: Vec<_> = self
+            let mut sources = Vec::new();
+            for layer in self
                 .layers
                 .iter()
                 .filter(|layer| layer.visible && layer.opacity > 0.0)
-                .filter_map(|layer| layer.raster.tile(coord).map(|tile| (layer.opacity, tile)))
-                .collect();
+            {
+                let raster = self
+                    .rasters
+                    .get(&layer.id)
+                    .ok_or(DocumentError::LayerStorageMissing(layer.id))?;
+                if let Some(tile) = raster.tile(coord) {
+                    sources.push((layer.opacity, tile));
+                }
+            }
             self.composite_stats.source_tile_reads = self
                 .composite_stats
                 .source_tile_reads
@@ -668,21 +716,15 @@ impl Document {
         Ok(recomposed)
     }
 
-    fn record_edit(&mut self, mut edit: DocumentEdit) {
+    fn record_edit(&mut self, edit: DocumentEdit) {
         self.clear_document_redo();
-        if let DocumentEdit::LayerPresence {
-            stored: Some(stored),
-            ..
-        } = &mut edit
-        {
-            stored.raster.clear_redo_history();
-        }
         self.history_undo.push(edit);
         while self.history_undo.len() > MAX_DOCUMENT_HISTORY_ENTRIES {
             let evicted = self.history_undo.remove(0);
             if let DocumentEdit::Raster { layer } = evicted {
                 let raster = self
-                    .raster_mut_in_current_or_history(layer)
+                    .rasters
+                    .get_mut(&layer)
                     .expect("a retained raster edit must retain its stable layer");
                 assert!(
                     raster.discard_oldest_undo(),
@@ -690,12 +732,13 @@ impl Document {
                 );
             }
         }
+        self.prune_detached_rasters();
         self.revision.advance();
     }
 
     fn clear_document_redo(&mut self) {
-        for layer in &mut self.layers {
-            layer.raster.clear_redo_history();
+        for raster in self.rasters.values_mut() {
+            raster.clear_redo_history();
         }
         self.history_redo.clear();
     }
@@ -707,11 +750,15 @@ impl Document {
     ) -> Result<Damage, DocumentError> {
         match edit {
             DocumentEdit::Raster { layer } => {
-                let index = self.require_layer(*layer)?;
+                self.require_layer(*layer)?;
+                let raster = self
+                    .rasters
+                    .get_mut(layer)
+                    .ok_or(DocumentError::LayerStorageMissing(*layer))?;
                 let damage = if apply_after {
-                    self.layers[index].raster.redo()
+                    raster.redo()
                 } else {
-                    self.layers[index].raster.undo()
+                    raster.undo()
                 }
                 .ok_or(DocumentError::RasterHistoryMismatch {
                     layer: *layer,
@@ -726,8 +773,8 @@ impl Document {
                 before_active,
                 after_active,
                 present_after,
-                stored,
             } => {
+                let layer_id = layer.id;
                 let should_be_present = if apply_after {
                     *present_after
                 } else {
@@ -739,23 +786,30 @@ impl Document {
                     *before_active
                 };
                 let affected = if should_be_present {
-                    let restored = stored
-                        .take()
-                        .expect("an absent history layer must retain its raster");
-                    if restored.id != *layer || *index > self.layers.len() {
+                    if self.layer_index(layer_id).is_some()
+                        || !self.rasters.contains_key(&layer_id)
+                        || *index > self.layers.len()
+                    {
                         return Err(DocumentError::HistoryInvariant);
                     }
-                    let affected = coords_for_layer(&restored);
-                    self.layers.insert(*index, *restored);
+                    let affected = self
+                        .rasters
+                        .get(&layer_id)
+                        .map(coords_for_raster)
+                        .ok_or(DocumentError::LayerStorageMissing(layer_id))?;
+                    self.layers.insert(*index, layer.clone());
                     affected
                 } else {
-                    let current = self.require_layer(*layer)?;
-                    if current != *index {
+                    let current = self.require_layer(layer_id)?;
+                    if current != *index || self.layers[current] != *layer {
                         return Err(DocumentError::HistoryInvariant);
                     }
-                    let removed = self.layers.remove(current);
-                    let affected = coords_for_layer(&removed);
-                    *stored = Some(Box::new(removed));
+                    let affected = self
+                        .rasters
+                        .get(&layer_id)
+                        .map(coords_for_raster)
+                        .ok_or(DocumentError::LayerStorageMissing(layer_id))?;
+                    self.layers.remove(current);
                     affected
                 };
                 self.require_layer(target_active)?;
@@ -782,7 +836,11 @@ impl Document {
                 after,
             } => {
                 let index = self.require_layer(*layer)?;
-                let affected = coords_for_layer(&self.layers[index]);
+                let affected = self
+                    .rasters
+                    .get(layer)
+                    .map(coords_for_raster)
+                    .ok_or(DocumentError::LayerStorageMissing(*layer))?;
                 self.layers[index].visible = if apply_after { *after } else { *before };
                 let damage = self.damage_for_coords(affected);
                 self.recompose_damage(&damage)
@@ -793,7 +851,11 @@ impl Document {
                 after,
             } => {
                 let index = self.require_layer(*layer)?;
-                let affected = coords_for_layer(&self.layers[index]);
+                let affected = self
+                    .rasters
+                    .get(layer)
+                    .map(coords_for_raster)
+                    .ok_or(DocumentError::LayerStorageMissing(*layer))?;
                 self.layers[index].opacity = if apply_after { *after } else { *before };
                 let damage = self.damage_for_coords(affected);
                 self.recompose_damage(&damage)
@@ -817,25 +879,6 @@ impl Document {
         }
     }
 
-    fn raster_mut_in_current_or_history(&mut self, id: LayerId) -> Option<&mut RasterLayer> {
-        if let Some(index) = self.layer_index(id) {
-            return Some(&mut self.layers[index].raster);
-        }
-        for edit in &mut self.history_undo {
-            if let DocumentEdit::LayerPresence {
-                layer,
-                stored: Some(stored),
-                ..
-            } = edit
-            {
-                if *layer == id {
-                    return Some(&mut stored.raster);
-                }
-            }
-        }
-        None
-    }
-
     fn allocate_layer_id(&mut self) -> LayerId {
         let id = LayerId(self.next_layer_id);
         self.next_layer_id = self.next_layer_id.wrapping_add(1).max(1);
@@ -854,9 +897,20 @@ impl Document {
         let mut coords = HashSet::new();
         coords.extend(self.composite.allocated_tile_coords());
         for layer in &self.layers {
-            coords.extend(layer.raster.allocated_tile_coords());
+            let raster = self
+                .rasters
+                .get(&layer.id)
+                .expect("every present layer must have a raster payload");
+            coords.extend(raster.allocated_tile_coords());
         }
         coords.into_iter().collect()
+    }
+
+    fn prune_detached_rasters(&mut self) {
+        let mut retained: HashSet<_> = self.layers.iter().map(|layer| layer.id).collect();
+        retained.extend(self.history_undo.iter().map(DocumentEdit::layer_id));
+        retained.extend(self.history_redo.iter().map(DocumentEdit::layer_id));
+        self.rasters.retain(|id, _| retained.contains(id));
     }
 
     fn damage_for_coords(&self, coords: impl IntoIterator<Item = TileCoord>) -> Damage {
@@ -878,8 +932,8 @@ fn include_pixel(bounds: &mut Option<RectU32>, x: u32, y: u32) {
     });
 }
 
-fn coords_for_layer(layer: &RasterDocumentLayer) -> Vec<TileCoord> {
-    layer.raster.allocated_tile_coords().collect()
+fn coords_for_raster(raster: &RasterLayer) -> Vec<TileCoord> {
+    raster.allocated_tile_coords().collect()
 }
 
 fn clone_raster(source: &RasterLayer) -> Result<RasterLayer, RasterError> {
@@ -908,6 +962,7 @@ fn validated_name(name: String) -> Result<String, DocumentError> {
 pub enum DocumentError {
     Raster(RasterError),
     LayerNotFound(LayerId),
+    LayerStorageMissing(LayerId),
     LayerIndexOutOfBounds(usize),
     CannotDeleteLastLayer,
     InvalidOpacity(f32),
@@ -931,6 +986,9 @@ impl fmt::Display for DocumentError {
         match self {
             Self::Raster(error) => error.fmt(formatter),
             Self::LayerNotFound(id) => write!(formatter, "layer {} does not exist", id.get()),
+            Self::LayerStorageMissing(id) => {
+                write!(formatter, "layer {} has no raster payload", id.get())
+            }
             Self::LayerIndexOutOfBounds(index) => {
                 write!(formatter, "layer index {index} is out of bounds")
             }
@@ -1109,7 +1167,7 @@ mod tests {
 
         paint_pixel(&mut document, 2, 2, color(0.0, 0.0, 1.0, 1.0));
         assert_eq!(
-            document.layer(original).unwrap().raster().pixel(2, 2),
+            document.layer_raster(original).unwrap().pixel(2, 2),
             Some(LinearRgba::TRANSPARENT)
         );
 
@@ -1264,16 +1322,20 @@ mod tests {
     fn new_raster_edit_clears_document_wide_redo() {
         let mut document = Document::new(16, 16, 8).unwrap();
         let bottom = document.active_layer_id();
-        document.create_layer("Temporary").unwrap();
+        let temporary = document.create_layer("Temporary").unwrap();
+        assert_eq!(document.rasters.len(), 2);
         document.undo().unwrap().unwrap();
         assert_eq!(document.redo_depth(), 1);
         assert_eq!(document.active_layer_id(), bottom);
+        assert!(document.rasters.contains_key(&temporary));
 
         paint_recorded(&mut document, 1, 1, color(1.0, 0.0, 0.0, 1.0));
 
         assert_eq!(document.redo_depth(), 0);
         assert!(document.redo().unwrap().is_none());
         assert_eq!(document.layers().len(), 1);
+        assert_eq!(document.rasters.len(), 1);
+        assert!(!document.rasters.contains_key(&temporary));
     }
 
     #[test]
@@ -1284,12 +1346,12 @@ mod tests {
         document.set_active_layer(bottom).unwrap();
         paint_recorded(&mut document, 1, 1, color(1.0, 0.0, 0.0, 1.0));
         document.undo().unwrap().unwrap();
-        assert_eq!(document.layer(bottom).unwrap().raster().redo_depth(), 1);
+        assert_eq!(document.layer_raster(bottom).unwrap().redo_depth(), 1);
 
         document.delete_layer(bottom).unwrap();
         document.undo().unwrap().unwrap();
 
-        assert_eq!(document.layer(bottom).unwrap().raster().redo_depth(), 0);
+        assert_eq!(document.layer_raster(bottom).unwrap().redo_depth(), 0);
     }
 
     #[test]
