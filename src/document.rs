@@ -27,10 +27,16 @@ impl DocumentRevision {
         self.0
     }
 
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
     fn advance(&mut self) {
-        self.0 = self
-            .0
-            .checked_add(1)
+        *self = self
+            .checked_next()
             .expect("document revision space is exhausted");
     }
 }
@@ -1012,6 +1018,17 @@ impl From<RasterError> for DocumentError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revision_next_is_checked_without_mutation() {
+        let revision = DocumentRevision::from_raw(41);
+        assert_eq!(
+            revision.checked_next(),
+            Some(DocumentRevision::from_raw(42))
+        );
+        assert_eq!(revision.get(), 41);
+        assert_eq!(DocumentRevision::from_raw(u64::MAX).checked_next(), None);
+    }
 
     fn color(r: f32, g: f32, b: f32, a: f32) -> LinearRgba {
         LinearRgba::from_straight(r, g, b, a)

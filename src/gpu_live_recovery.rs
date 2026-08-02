@@ -104,7 +104,7 @@ impl GpuLiveRecovery {
         })
     }
 
-    fn check_prepared_history_record(
+    pub fn check_prepared_history_record(
         &self,
         prepared: &PreparedGpuHistoryRecoveryRecord,
     ) -> Result<(), GpuLiveRecoveryError> {

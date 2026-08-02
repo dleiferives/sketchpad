@@ -175,6 +175,23 @@ attachment plus retirement, safe reconcile-only disposal, wrong-purpose
 rejection, and preservation of the snapshot, transition, journal, base, and
 pending spill on failure.
 
+The first non-live `GpuResidentDocument` owner now coordinates an ordinary
+GPU raster commit across the atlas, exact GPU history, asynchronous mirror,
+and live recovery state. Before submission it derives one checked next
+revision, previews the stable history ID and exact eviction sequence, validates
+the mirror plan and budgets, prepares journal/spill replacement, and encodes an
+immutable post-commit snapshot in the same command stream as the color write.
+The final call repeats every mutable-state check immediately before its sole
+`Queue::submit`; after submission, target acknowledgement, history insertion,
+recovery advancement, and mirror enqueue reuse those proven identities. Both
+failure stages preserve the opaque color/recovery ownership needed to discard
+the encoded transaction. Constructor tests prove that every subsystem starts
+at one revision with the configured budgets and that invalid history or mirror
+limits fail at the owner boundary. The live application still owns the legacy
+CPU document and does not call this owner; the remaining cutover work is to
+coordinate undo/redo and mirror polling, add layer/presentation ownership, and
+bind the completed transaction path to input and application state.
+
 Asynchronous CPU reconciliation now reaches an exact sparse CPU mirror.
 Each revision reuses the exact undo-region identities and packs initialized
 `Rgba32Float` regions into explicitly bounded readback batches. The default

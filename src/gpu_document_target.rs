@@ -308,6 +308,13 @@ impl GpuDocumentTarget {
         self.commit_pending
     }
 
+    pub fn check_encoded_commit(
+        &self,
+        encoded: &EncodedGpuDocumentCommit,
+    ) -> Result<(), GpuDocumentTargetError> {
+        self.validate_commit_token(encoded.serial)
+    }
+
     pub fn commit_submitted(&mut self) -> Result<(), GpuDocumentTargetError> {
         if !self.commit_pending {
             return Err(GpuDocumentTargetError::NoEncodedCommit);

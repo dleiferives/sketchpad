@@ -237,6 +237,23 @@ previews both succeed does commit attach the pair and advance the mirror base.
 A genuinely reconcile-only transition is returned unused rather than retained
 as duplicate CPU history.
 
+The first `GpuResidentDocument` owner now closes the new-stroke submission
+boundary. It owns the sparse atlas planner, GPU history, mirror dispatcher,
+and live recovery coordinator under one mutable authority. Preparation checks
+the encoded color token, exact next revision, history ID and evictions, mirror
+plan/capacity, recovery journal/spill replacement, and immutable snapshot
+capture while the color commit can still be discarded. Only that complete
+bundle can reach the owner's submission call. The owner rechecks it immediately
+before `Queue::submit`, then acknowledges the target, records the predicted
+history entry, advances recovery, and enqueues the exact mirror capture with no
+remaining data-dependent failure. A rejected preparation returns both the
+encoded color token and semantic recovery command; a rejected final preflight
+also returns the command encoder and prepared bundle, whose tokens can be
+split for explicit target rollback. This owner is not yet the application's
+document path: undo/redo submission, mapped-readback driving, structural
+history, presentation/compositing, and application state cutover still have to
+join the same boundary.
+
 A save request captures metadata at revision `R`, asynchronously copies the
 exact dirty GPU blocks needed for `R`, and writes the existing layered
 `.sketchpad` format. Drawing may continue at `R + 1`. Saving `R` clears the
