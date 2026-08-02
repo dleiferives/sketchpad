@@ -14,6 +14,7 @@ pub mod pipeline;
 pub mod raster;
 pub mod replay;
 pub mod sdf;
+pub mod stroke;
 
 #[cfg(target_os = "linux")]
 pub mod x11_tablet;

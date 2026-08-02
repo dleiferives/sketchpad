@@ -9,8 +9,11 @@ Selected next architecture, 2026-08-01: replace the CPU
 stamp/mutate/recompose/upload loop and pen-up GPU readback boundary with the
 page-batched GPU-resident layer and continuous-mask design in
 [GPU-resident document and continuous brush migration](gpu-resident-document-migration.md).
-This paragraph records the next implementation direction; the inventory below
-continues to describe the executable at commit `373b0e7` until slices land.
+The first non-live groundwork now exists in `stroke`: validated full-precision
+paint/erase material state, separate opacity/flow accumulation, timestamped
+round contacts, and a packet-batching-invariant command stream. Its release
+tests pass on Atlas. The inventory below continues to describe the executable
+at commit `373b0e7`; the new contract is not wired into live drawing yet.
 
 ## Current Executable
 
