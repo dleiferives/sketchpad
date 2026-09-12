@@ -81,9 +81,13 @@ impl HistoryStore {
             .read(true)
             .write(true)
             .create_new(true)
-            .open(directory.join("lease"))
+            .open(directory.join(".lease-new"))
             .map_err(|_| ArchiveError::Unavailable)?;
         lease.try_lock().map_err(|_| ArchiveError::Unavailable)?;
+        // Cleanup must never see an unlocked lease for a session being created.
+        // Renaming publishes the already-locked inode atomically across processes.
+        fs::rename(directory.join(".lease-new"), directory.join("lease"))
+            .map_err(|_| ArchiveError::Unavailable)?;
         Ok(Self(Arc::new(Store {
             directory,
             memory_limit,
@@ -388,15 +392,35 @@ mod tests {
         let parent = first.0.directory.parent().unwrap();
         let live = first.store(&[3; 256]).unwrap();
         let abandoned = parent.join(format!(
-            "session-abandoned-{}",
+            "session-abandoned-{}-{}",
+            std::process::id(),
             NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
         ));
         fs::create_dir(&abandoned).unwrap();
-        fs::write(abandoned.join("lease"), []).unwrap();
         fs::write(abandoned.join("1.blob"), [7; 512]).unwrap();
+        fs::write(abandoned.join("lease"), []).unwrap();
         clean_abandoned_sessions(parent);
         assert!(!abandoned.exists());
         assert_eq!(live.read().unwrap(), [3; 256]);
+    }
+
+    #[test]
+    fn concurrent_session_creation_keeps_every_live_blob_readable() {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for _ in 0..16 {
+                        let store = store(0, 4096);
+                        let blob = store.store(&[9; 256]).unwrap();
+                        std::thread::yield_now();
+                        assert_eq!(blob.read().unwrap(), [9; 256]);
+                    }
+                })
+            })
+            .collect();
+        for worker in workers {
+            worker.join().unwrap();
+        }
     }
 
     #[test]
