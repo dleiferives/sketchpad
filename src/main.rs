@@ -119,6 +119,18 @@ impl Camera {
         ]
     }
 
+    fn zoom_drag(mut self, anchor: [f32; 2], logical_dx: f32) -> Self {
+        if !logical_dx.is_finite() {
+            return self;
+        }
+        let before = self.world_from_screen(anchor);
+        self.zoom = (self.zoom * 2.0_f32.powf(logical_dx / 200.0)).clamp(0.125, 64.0);
+        let after = self.world_from_screen(anchor);
+        self.center[0] += before[0] - after[0];
+        self.center[1] += before[1] - after[1];
+        self
+    }
+
     fn view_bounds(self) -> WorldRect {
         let size = self.view_size();
         WorldRect {
@@ -520,6 +532,14 @@ enum PendingDocumentAction {
     Close,
 }
 
+#[derive(Clone, Copy)]
+struct ZoomDrag {
+    owner: PointerOwner,
+    origin: [f32; 2],
+    camera: Camera,
+    scale: f32,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -528,6 +548,7 @@ struct App {
     canvas_mode: CanvasMode,
     tablet_pan: Option<(u16, [f32; 2])>,
     brush_drag: Option<(PointerOwner, BrushDrag)>,
+    zoom_drag: Option<ZoomDrag>,
     cancelled_tablet_contact: Option<u16>,
     pan_key: Option<KeyCode>,
     opacity_key: Option<KeyCode>,
@@ -628,6 +649,7 @@ impl App {
             canvas_mode: CanvasMode::Draw,
             tablet_pan: None,
             brush_drag: None,
+            zoom_drag: None,
             cancelled_tablet_contact: None,
             pan_key: None,
             opacity_key: None,
@@ -931,6 +953,7 @@ impl App {
             || self.active_pointer.is_some()
             || self.sampling_pointer.is_some()
             || self.brush_drag.is_some()
+            || self.zoom_drag.is_some()
             || self.cancelled_tablet_contact.is_some()
             || self.panning
             || self.tablet_pan.is_some()
@@ -942,6 +965,60 @@ impl App {
             .as_ref()
             .map_or(1.0, |window| window.scale_factor() as f32);
         position.map(|value| value / scale)
+    }
+
+    fn start_zoom_drag(&mut self, owner: PointerOwner, position: [f32; 2]) -> bool {
+        if self.canvas_busy()
+            || self.pan_key.is_none()
+            || !self.modifiers.shift_key()
+            || self.modifiers.control_key()
+            || self.modifiers.super_key()
+            || self.modifiers.alt_key()
+        {
+            return false;
+        }
+        self.zoom_drag = Some(ZoomDrag {
+            owner,
+            origin: position,
+            camera: self.camera(),
+            scale: self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor() as f32),
+        });
+        self.touch_navigation.suppress();
+        self.cursor_contact = false;
+        self.request_redraw();
+        true
+    }
+
+    fn update_zoom_drag(&mut self, position: [f32; 2]) {
+        if let Some(drag) = self.zoom_drag {
+            let camera = drag
+                .camera
+                .zoom_drag(drag.origin, (position[0] - drag.origin[0]) / drag.scale);
+            self.zoom = camera.zoom;
+            self.center = camera.center;
+            self.request_redraw();
+        }
+    }
+
+    fn finish_zoom_drag(&mut self, cancel: bool) -> bool {
+        let Some(drag) = self.zoom_drag.take() else {
+            return false;
+        };
+        if cancel {
+            self.zoom = drag.camera.zoom;
+            self.center = drag.camera.center;
+            if let PointerOwner::Tablet { device_id, .. } = drag.owner {
+                self.cancelled_tablet_contact = Some(device_id);
+            }
+        }
+        if drag.owner == PointerOwner::Mouse {
+            self.restore_mouse_after_adjustment(drag.origin.map(|value| value / drag.scale));
+        }
+        self.request_redraw();
+        true
     }
 
     fn start_brush_drag(&mut self, owner: PointerOwner, position: [f32; 2]) -> bool {
@@ -997,24 +1074,22 @@ impl App {
         self.set_brush_diameter(drag.diameter);
         self.set_brush_opacity(drag.opacity);
         if owner == PointerOwner::Mouse {
-            self.restore_mouse_after_brush_drag(drag);
+            self.restore_mouse_after_adjustment(drag.origin);
         }
         self.request_redraw();
         true
     }
 
-    fn restore_mouse_after_brush_drag(&mut self, drag: BrushDrag) {
+    fn restore_mouse_after_adjustment(&mut self, origin: [f32; 2]) {
         let Some(window) = self.window.as_ref().filter(|window| window.has_focus()) else {
             return;
         };
-        let position = winit::dpi::LogicalPosition::new(drag.origin[0], drag.origin[1]);
+        let position = winit::dpi::LogicalPosition::new(origin[0], origin[1]);
         if let Err(error) = window.set_cursor_position(position) {
-            log::debug!("could not restore the mouse after brush adjustment: {error}");
+            log::debug!("could not restore the mouse after canvas adjustment: {error}");
             return;
         }
-        let physical = drag
-            .origin
-            .map(|value| value * window.scale_factor() as f32);
+        let physical = origin.map(|value| value * window.scale_factor() as f32);
         self.cursor_pos = Some(physical);
         self.last_cursor_pos = Some(physical);
         self.cursor_visible = true;
@@ -1179,7 +1254,9 @@ impl App {
     }
 
     fn cursor_uniform(&self) -> BrushCursorUniform {
-        let screen = if let Some((_, drag)) = self.brush_drag {
+        let screen = if let Some(drag) = self.zoom_drag {
+            drag.origin
+        } else if let Some((_, drag)) = self.brush_drag {
             let scale = self
                 .window
                 .as_ref()
@@ -3131,6 +3208,22 @@ impl App {
             self.cursor_contact = false;
             return;
         }
+        if let Some(drag) = self.zoom_drag {
+            if drag.owner == owner {
+                self.update_zoom_drag(sample.position);
+                if matches!(phase, TabletPhase::Up | TabletPhase::Hover) {
+                    self.finish_zoom_drag(false);
+                }
+                self.cursor_contact = false;
+            }
+            return;
+        }
+        if matches!(phase, TabletPhase::Down | TabletPhase::Move)
+            && sample.pressure > 0.0
+            && self.start_zoom_drag(owner, sample.position)
+        {
+            return;
+        }
         if let Some((captured, _)) = self.brush_drag {
             if captured == owner {
                 self.update_brush_drag(sample.position);
@@ -4141,6 +4234,11 @@ impl ApplicationHandler<TabletEvent> for App {
                 let current = [position.x as f32, position.y as f32];
                 self.update_cursor_orientation(current, [0.0, 0.0]);
                 if self
+                    .zoom_drag
+                    .is_some_and(|drag| drag.owner == PointerOwner::Mouse)
+                {
+                    self.update_zoom_drag(current);
+                } else if self
                     .brush_drag
                     .is_some_and(|(owner, _)| owner == PointerOwner::Mouse)
                 {
@@ -4188,11 +4286,22 @@ impl ApplicationHandler<TabletEvent> for App {
                 (MouseButton::Left, _) if self.tablet_is_recent() => {}
                 (MouseButton::Left, ElementState::Released)
                     if self
+                        .zoom_drag
+                        .is_some_and(|drag| drag.owner == PointerOwner::Mouse) =>
+                {
+                    self.finish_zoom_drag(false);
+                }
+                (MouseButton::Left, ElementState::Pressed)
+                    if self.cursor_pos.is_some_and(|position| {
+                        self.start_zoom_drag(PointerOwner::Mouse, position)
+                    }) => {}
+                (MouseButton::Left, ElementState::Released)
+                    if self
                         .brush_drag
                         .is_some_and(|(owner, _)| owner == PointerOwner::Mouse) =>
                 {
                     if let Some((_, drag)) = self.brush_drag.take() {
-                        self.restore_mouse_after_brush_drag(drag);
+                        self.restore_mouse_after_adjustment(drag.origin);
                     }
                     self.request_redraw();
                 }
@@ -4311,6 +4420,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
                 match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Escape) if self.finish_zoom_drag(true) => {}
                     PhysicalKey::Code(KeyCode::Escape) if self.cancel_brush_drag() => {}
                     PhysicalKey::Code(KeyCode::Escape)
                         if self.panning || self.tablet_pan.is_some() =>
@@ -4336,7 +4446,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     }
                     PhysicalKey::Code(code) => {
                         if let Some(chord) = KeyChord::from_winit(code, self.modifiers) {
-                            if let Some(command) = self.keybindings.command_for(chord) {
+                            if let Some(command) = self.keybindings.canvas_command_for(chord) {
                                 if command == KeyCommand::PanCanvas {
                                     self.pan_key = Some(code);
                                     self.request_redraw();
@@ -4352,6 +4462,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.finish_zoom_drag(true);
                 self.cancel_brush_drag();
                 self.cancelled_tablet_contact = None;
                 self.pan_key = None;
@@ -4932,6 +5043,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn drag_zoom_preserves_anchor_and_returns_to_original_view() {
+        let original = camera();
+        let anchor = [310.0, 240.0];
+        let zoomed = original.zoom_drag(anchor, 200.0);
+        assert_eq!(zoomed.zoom, original.zoom * 2.0);
+        let before = original.world_from_screen(anchor);
+        let after = zoomed.world_from_screen(anchor);
+        for axis in 0..2 {
+            assert!((before[axis] - after[axis]).abs() < 0.001);
+        }
+        assert_eq!(original.zoom_drag(anchor, -200.0).zoom, original.zoom * 0.5);
+        assert_eq!(original.zoom_drag(anchor, 0.0).center, original.center);
+        assert_eq!(original.zoom_drag(anchor, f32::NAN).zoom, original.zoom);
+        for (distance, expected) in [(-100_000.0, 0.125), (100_000.0, 64.0)] {
+            let limited = original.zoom_drag(anchor, distance);
+            assert_eq!(limited.zoom, expected);
+            let after = limited.world_from_screen(anchor);
+            for axis in 0..2 {
+                assert!((before[axis] - after[axis]).abs() < 0.001);
+            }
+        }
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires Atlas X11 and a hardware GPU; uses a hidden window"]
@@ -4984,6 +5119,38 @@ mod tests {
             "this regression must exercise the resident save path"
         );
         app.window = Some(window);
+        for owner in [
+            PointerOwner::Mouse,
+            PointerOwner::Tablet {
+                device_id: 99,
+                tool: ToolKind::Pen,
+            },
+        ] {
+            let original = app.camera();
+            let diameter = app.paint_brush.diameter();
+            app.pan_key = Some(KeyCode::Space);
+            assert!(
+                !app.start_zoom_drag(owner, [128.0; 2]),
+                "plain Space must remain pan"
+            );
+            app.modifiers = ModifiersState::SHIFT;
+            assert!(app.start_zoom_drag(owner, [128.0; 2]));
+            assert!(!app.start_brush_drag(owner, [128.0; 2]));
+            assert!(app.canvas_busy());
+            // Releasing the keys first must not turn a captured drag into paint/pan.
+            app.pan_key = None;
+            app.modifiers = ModifiersState::empty();
+            let scale = app.zoom_drag.unwrap().scale;
+            app.update_zoom_drag([128.0 + 200.0 * scale, 128.0]);
+            assert_eq!(app.zoom, original.zoom * 2.0);
+            assert!(app.finish_zoom_drag(true));
+            assert_eq!(app.zoom, original.zoom);
+            assert_eq!(app.center, original.center);
+            assert_eq!(app.paint_brush.diameter(), diameter);
+            assert!(app.active_stroke.is_none());
+            app.cancelled_tablet_contact = None;
+            assert!(!app.canvas_busy());
+        }
         app.start_stroke([128.0, 128.0], 1.0, [0.0; 2], PointerOwner::Mouse);
         app.update_stroke([180.0, 128.0], 1.0, [0.0; 2]);
         app.finish_stroke();

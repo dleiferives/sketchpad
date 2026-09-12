@@ -470,6 +470,19 @@ impl KeyBindings {
             .find(|command| self.commands[command.index()].slots.contains(&Some(chord)))
     }
 
+    /// Shift modifies the held pan gesture even when Shift was pressed first.
+    /// Explicit user bindings take precedence over this navigation modifier.
+    pub fn canvas_command_for(self, chord: KeyChord) -> Option<KeyCommand> {
+        self.command_for(chord).or_else(|| {
+            let plain = KeyChord {
+                shift: false,
+                ..chord
+            };
+            (chord.shift && self.command_for(plain) == Some(KeyCommand::PanCanvas))
+                .then_some(KeyCommand::PanCanvas)
+        })
+    }
+
     pub fn set(
         &mut self,
         command: KeyCommand,
@@ -744,6 +757,26 @@ fn nonempty_env(name: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shifted_pan_works_with_saved_bindings_and_respects_explicit_shortcuts() {
+        use super::*;
+        let mut bindings = KeyBindings::default();
+        let shifted = KeyChord::new(BindingKey::Space, false, true, false);
+        assert_eq!(
+            bindings.canvas_command_for(shifted),
+            Some(KeyCommand::PanCanvas)
+        );
+        assert_eq!(
+            bindings.canvas_command_for(KeyChord {
+                shift: false,
+                ..shifted
+            }),
+            Some(KeyCommand::PanCanvas)
+        );
+        bindings.set(KeyCommand::Undo, 0, Some(shifted));
+        assert_eq!(bindings.canvas_command_for(shifted), Some(KeyCommand::Undo));
+    }
+
     use super::*;
 
     #[test]

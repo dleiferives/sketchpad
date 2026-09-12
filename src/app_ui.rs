@@ -1499,6 +1499,7 @@ fn show_help_content(
         ui.add_space(14.0);
         ui.label(egui::RichText::new("Keyboard & mouse").strong().color(CONTROL_ACTIVE));
         ui.label("Shift + drag left/right: brush size · Alt + contact: sample color");
+        ui.label("Shift + Space + drag: zoom in to the right, out to the left. If Pan is remapped, hold Shift with that key.");
         ui.label("Mouse wheel: zoom · Middle drag: pan · Trackpad scroll: pan · Trackpad pinch: zoom when supported");
         ui.label("Esc: cancel an adjustment, close panels or return to drawing");
         for command in [KeyCommand::SelectBrush, KeyCommand::SelectEraser, KeyCommand::PanCanvas, KeyCommand::AdjustOpacity, KeyCommand::Undo, KeyCommand::Redo, KeyCommand::ShowColors, KeyCommand::ShowLayers, KeyCommand::ToggleInterface, KeyCommand::ShowHelp] {
