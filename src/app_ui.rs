@@ -1,4 +1,5 @@
 use super::canvas_interaction::{BrushAxis, BrushDrag};
+use super::file_browser::{BrowserOutcome, FileBrowser, FilePurpose, UnsavedChoice};
 use super::keybindings::{
     KeyBindings, KeyChord, KeyCommand, ALL_KEY_COMMANDS, BINDINGS_PER_COMMAND,
 };
@@ -9,6 +10,7 @@ use egui::{
 use sketchpad::document::LayerId;
 use sketchpad::input::{TabletPhase, TabletSample};
 use sketchpad::palette::MAX_RECENT_COLORS;
+use std::path::PathBuf;
 use std::{
     mem,
     time::{Duration, Instant},
@@ -166,6 +168,10 @@ pub enum UiAction {
         name: String,
     },
     MoveActiveLayer(isize),
+    NewDocument,
+    FileChosen(FilePurpose, PathBuf),
+    FileCancelled,
+    ResolveUnsaved(UnsavedChoice),
     OpenDocument,
     SaveDocument,
     SaveDocumentAs,
@@ -285,6 +291,7 @@ struct UiHitRegions {
     color_panel: Rect,
     keybinding_panel: Rect,
     layers_panel: Rect,
+    notification: Rect,
 }
 
 impl Default for UiHitRegions {
@@ -299,13 +306,15 @@ impl Default for UiHitRegions {
             color_panel: Rect::NOTHING,
             keybinding_panel: Rect::NOTHING,
             layers_panel: Rect::NOTHING,
+            notification: Rect::NOTHING,
         }
     }
 }
 
 impl UiHitRegions {
     fn contains(self, position: Pos2) -> bool {
-        self.settings_panel.contains(position)
+        self.notification.contains(position)
+            || self.settings_panel.contains(position)
             || self.brush_dock.contains(position)
             || self.navigation.contains(position)
             || self.toolbar.contains(position)
@@ -377,6 +386,10 @@ impl Default for ColorPickerState {
 #[derive(Clone, Debug, Default, PartialEq)]
 struct UiSessionState {
     dock_right: bool,
+    document_label: String,
+    file_browser: Option<FileBrowser>,
+    unsaved_prompt: bool,
+    notification: Option<(String, bool)>,
     controls_open: bool,
     editing_bindings: bool,
     puck_drag: Option<BrushDrag>,
@@ -523,6 +536,50 @@ impl UiOverlay {
         self.mark_dirty();
     }
 
+    pub fn set_document_label(&mut self, label: String) {
+        if self.session.document_label != label {
+            self.session.document_label = label;
+            self.mark_dirty();
+        }
+    }
+
+    pub fn show_file_browser(&mut self, purpose: FilePurpose, suggested: PathBuf) {
+        self.close_panels();
+        self.session.unsaved_prompt = false;
+        self.session.file_browser = Some(FileBrowser::new(purpose, suggested));
+        self.mark_dirty();
+    }
+
+    pub fn file_operation_finished(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(message) => {
+                self.session.file_browser = None;
+                self.notify(message, false);
+            }
+            Err(message) => {
+                if let Some(browser) = &mut self.session.file_browser {
+                    browser.error = Some(message.clone());
+                }
+                self.notify(message, true);
+            }
+        }
+    }
+
+    pub fn notify(&mut self, message: String, error: bool) {
+        self.session.notification = Some((message, error));
+        self.mark_dirty();
+    }
+
+    pub fn confirm_unsaved(&mut self) {
+        self.session.file_browser = None;
+        self.session.unsaved_prompt = true;
+        self.mark_dirty();
+    }
+
+    fn has_modal(&self) -> bool {
+        self.session.file_browser.is_some() || self.session.unsaved_prompt
+    }
+
     pub fn on_window_event(
         &mut self,
         window: &Window,
@@ -620,6 +677,7 @@ impl UiOverlay {
         if matches!(event, WindowEvent::KeyboardInput { event, .. }
             if event.physical_key == PhysicalKey::Code(KeyCode::Tab))
             && !self.context.egui_wants_keyboard_input()
+            && !self.has_modal()
         {
             return UiEventResponse::default();
         }
@@ -683,6 +741,7 @@ impl UiOverlay {
 
         UiEventResponse {
             consumed: response.consumed
+                || (self.has_modal() && matches!(event, WindowEvent::KeyboardInput { .. }))
                 || (pointer_event
                     && !canvas_owns_mouse
                     && !suppress_mouse
@@ -728,17 +787,97 @@ impl UiOverlay {
         let layers = layer_snapshot();
         let keybindings = keybinding_snapshot();
         let output = context.run_ui(input, |root| {
-            if snapshot.visible {
-                hit_regions = show_toolbar(
-                    root,
-                    snapshot,
-                    &layers,
-                    keybindings,
-                    &mut actions,
-                    &mut session,
-                );
-            } else {
-                hit_regions.toolbar = show_restore_button(root, &mut actions);
+            let modal = session.file_browser.is_some() || session.unsaved_prompt;
+            if !modal {
+                if snapshot.visible {
+                    hit_regions = show_toolbar(
+                        root,
+                        snapshot,
+                        &layers,
+                        keybindings,
+                        &mut actions,
+                        &mut session,
+                    );
+                } else {
+                    hit_regions.toolbar = show_restore_button(root, &mut actions);
+                }
+            }
+            if let Some(browser) = &mut session.file_browser {
+                match browser.show(root.ctx()) {
+                    BrowserOutcome::Chosen(purpose, path) => {
+                        actions.push(UiAction::FileChosen(purpose, path))
+                    }
+                    BrowserOutcome::Cancel => {
+                        session.file_browser = None;
+                        actions.push(UiAction::FileCancelled);
+                    }
+                    BrowserOutcome::None => {}
+                }
+            }
+            if session.unsaved_prompt {
+                let mut choice = None;
+                egui::Window::new("Save changes?")
+                    .id(Id::new("unsaved-document"))
+                    .anchor(Align2::CENTER_CENTER, Vec2::ZERO)
+                    .collapsible(false)
+                    .resizable(false)
+                    .show(root.ctx(), |ui| {
+                        ui.set_width(380.0);
+                        ui.label("This sketch has changes that are not saved to a document file.");
+                        ui.add_space(12.0);
+                        ui.horizontal(|ui| {
+                            for (label, result) in [
+                                ("Save", UnsavedChoice::Save),
+                                ("Discard", UnsavedChoice::Discard),
+                                ("Cancel", UnsavedChoice::Cancel),
+                            ] {
+                                if ui
+                                    .add_sized([112.0, 44.0], egui::Button::new(label))
+                                    .clicked()
+                                {
+                                    choice = Some(result);
+                                }
+                            }
+                        });
+                    });
+                if root
+                    .ctx()
+                    .input(|input| input.key_pressed(egui::Key::Escape))
+                {
+                    choice = Some(UnsavedChoice::Cancel);
+                }
+                if let Some(choice) = choice {
+                    session.unsaved_prompt = false;
+                    actions.push(UiAction::ResolveUnsaved(choice));
+                }
+            }
+            if modal {
+                hit_regions.toolbar = root.ctx().content_rect();
+            }
+            if let Some((message, error)) = session.notification.clone().filter(|_| !modal) {
+                hit_regions.notification = egui::Area::new(Id::new("file-notification"))
+                    .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -96.0))
+                    .order(Order::Tooltip)
+                    .show(root.ctx(), |ui| {
+                        panel_frame().show(ui, |ui| {
+                            ui.set_max_width((root.ctx().content_rect().width() - 64.0).min(580.0));
+                            ui.horizontal(|ui| {
+                                ui.colored_label(
+                                    if error {
+                                        Color32::from_rgb(170, 45, 35)
+                                    } else {
+                                        TEXT
+                                    },
+                                    &message,
+                                );
+                                if icon_button(ui, "×", "Dismiss message", false).clicked() {
+                                    session.notification = None;
+                                }
+                            });
+                        });
+                    })
+                    .response
+                    .rect;
             }
             if let Some(axis) = snapshot.brush_adjusting {
                 egui::Area::new(Id::new("brush-adjustment-readout"))
@@ -999,7 +1138,21 @@ fn show_toolbar(
             panel_frame().show(ui, |ui| {
                 ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                 ui.horizontal(|ui| {
-                    if text_button(ui, "Sketchpad", session.file_panel_open).clicked() {
+                    let full_name = if session.document_label.is_empty() {
+                        "Untitled"
+                    } else {
+                        &session.document_label
+                    };
+                    let name: String = full_name.chars().take(24).collect();
+                    let label = if full_name.chars().count() > 24 {
+                        format!("{name}…")
+                    } else {
+                        name
+                    };
+                    if text_button(ui, &label, session.file_panel_open)
+                        .on_hover_text(format!("{full_name} · File menu"))
+                        .clicked()
+                    {
                         session.file_panel_open = !session.file_panel_open;
                         session.brush_panel_open = false;
                         session.color_panel_open = false;
@@ -1105,10 +1258,11 @@ fn show_toolbar(
         color_panel,
         keybinding_panel,
         layers_panel,
+        notification: Rect::NOTHING,
     }
 }
 
-fn panel_frame() -> egui::Frame {
+pub(super) fn panel_frame() -> egui::Frame {
     egui::Frame::new()
         .fill(PANEL)
         .stroke(Stroke::new(1.0, BORDER))
@@ -1989,11 +2143,15 @@ fn show_file_panel(
                         }
                     });
                 });
+                if menu_button(ui, "New sketch", "Create a blank sketch").clicked() {
+                    actions.push(UiAction::NewDocument);
+                    *file_panel_open = false;
+                }
                 if menu_button(ui, "Open sketch…", "Open a Sketchpad document").clicked() {
                     actions.push(UiAction::OpenDocument);
                     *file_panel_open = false;
                 }
-                if menu_button(ui, "SAVE", "Save the current Sketchpad document").clicked() {
+                if menu_button(ui, "Save", "Save the current Sketchpad document").clicked() {
                     actions.push(UiAction::SaveDocument);
                     *file_panel_open = false;
                 }
@@ -2986,6 +3144,7 @@ mod tests {
     #[test]
     fn disjoint_ui_regions_do_not_capture_the_canvas_between_them() {
         let regions = UiHitRegions {
+            notification: Rect::NOTHING,
             brush_dock: Rect::NOTHING,
             navigation: Rect::NOTHING,
             settings_panel: Rect::NOTHING,

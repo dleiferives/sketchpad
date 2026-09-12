@@ -223,6 +223,7 @@ pub enum KeyCommand {
     SelectLayerBelow,
     MoveLayerAbove,
     MoveLayerBelow,
+    NewDocument,
     SelectBrush,
     SelectEraser,
     PickColor,
@@ -233,7 +234,7 @@ pub enum KeyCommand {
     AdjustOpacity,
 }
 
-pub const ALL_KEY_COMMANDS: [KeyCommand; 40] = [
+pub const ALL_KEY_COMMANDS: [KeyCommand; 41] = [
     KeyCommand::ToggleInterface,
     KeyCommand::Undo,
     KeyCommand::Redo,
@@ -266,6 +267,7 @@ pub const ALL_KEY_COMMANDS: [KeyCommand; 40] = [
     KeyCommand::SelectLayerBelow,
     KeyCommand::MoveLayerAbove,
     KeyCommand::MoveLayerBelow,
+    KeyCommand::NewDocument,
     KeyCommand::SelectBrush,
     KeyCommand::SelectEraser,
     KeyCommand::PickColor,
@@ -296,6 +298,7 @@ impl KeyCommand {
             Self::Redo => "redo",
             Self::SaveDocument => "save_document",
             Self::SaveDocumentAs => "save_document_as",
+            Self::NewDocument => "new_document",
             Self::OpenDocument => "open_document",
             Self::ImportPng => "import_png",
             Self::ExportCanvas => "export_canvas",
@@ -347,6 +350,7 @@ impl KeyCommand {
             Self::Redo => "Redo",
             Self::SaveDocument => "Save document",
             Self::SaveDocumentAs => "Save document as",
+            Self::NewDocument => "New document",
             Self::OpenDocument => "Open document",
             Self::ImportPng => "Import PNG",
             Self::ExportCanvas => "Export canvas",
@@ -392,6 +396,7 @@ impl KeyCommand {
             | Self::Redo
             | Self::SaveDocument
             | Self::SaveDocumentAs
+            | Self::NewDocument
             | Self::OpenDocument
             | Self::ImportPng
             | Self::ExportCanvas
@@ -604,6 +609,7 @@ fn default_bindings(key_command: KeyCommand) -> CommandBindings {
         Command::Redo => CommandBindings::two(command_shift(Key::KeyZ), primary(Key::KeyY)),
         Command::SaveDocument => CommandBindings::one(primary(Key::KeyS)),
         Command::SaveDocumentAs => CommandBindings::one(command_shift(Key::KeyS)),
+        Command::NewDocument => CommandBindings::one(primary(Key::KeyN)),
         Command::OpenDocument => CommandBindings::one(primary(Key::KeyO)),
         Command::ImportPng => CommandBindings::one(primary(Key::KeyI)),
         Command::ExportCanvas => CommandBindings::one(command_shift(Key::KeyE)),

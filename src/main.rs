@@ -1,5 +1,6 @@
 mod app_ui;
 mod canvas_interaction;
+mod file_browser;
 mod keybindings;
 mod latency_probe;
 
@@ -7,6 +8,7 @@ use app_ui::{
     CanvasMode, UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiPanel, UiSnapshot, UiTool,
 };
 use canvas_interaction::{BrushAxis, BrushDrag, TouchAction, TouchNavigation};
+use file_browser::{FilePurpose, UnsavedChoice};
 use keybindings::{KeyBindings, KeyChord, KeyCommand};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
@@ -512,6 +514,12 @@ struct RecoveryJob {
     worker: JoinHandle<Result<checkpoint::CheckpointSummary, CheckpointError>>,
 }
 
+enum PendingDocumentAction {
+    Open(PathBuf),
+    New,
+    Close,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<Gpu>,
@@ -565,6 +573,9 @@ struct App {
     export_path: PathBuf,
     stroke_recorder: Option<StrokeRecorder>,
     persistence_enabled: bool,
+    pending_document_action: Option<PendingDocumentAction>,
+    exit_requested: bool,
+    startup_notice: Option<String>,
     #[cfg(target_os = "linux")]
     tablet_backend: Option<TabletBackend>,
 }
@@ -605,6 +616,10 @@ impl App {
         } else {
             (KeyBindings::default(), false)
         };
+        let canvas_center = [
+            document.width() as f32 * 0.5,
+            document.height() as f32 * 0.5,
+        ];
         Self {
             window: None,
             gpu: None,
@@ -627,7 +642,7 @@ impl App {
             active_stroke: None,
             active_pointer: None,
             sampling_pointer: None,
-            center: [CANVAS_WIDTH as f32 * 0.5, CANVAS_HEIGHT as f32 * 0.5],
+            center: canvas_center,
             zoom: 1.0,
             panning: false,
             cursor_pos: None,
@@ -658,6 +673,9 @@ impl App {
             export_path,
             stroke_recorder: record_stroke.map(StrokeRecorder::new),
             persistence_enabled,
+            pending_document_action: None,
+            exit_requested: false,
+            startup_notice: None,
             #[cfg(target_os = "linux")]
             tablet_backend: None,
         }
@@ -676,7 +694,7 @@ impl App {
         Camera {
             center: self.center,
             zoom: self.zoom,
-            canvas_size: [CANVAS_WIDTH as f32, CANVAS_HEIGHT as f32],
+            canvas_size: [self.document.width() as f32, self.document.height() as f32],
             viewport_size: self.viewport_size(),
         }
     }
@@ -799,9 +817,50 @@ impl App {
             UiAction::DeleteActiveLayer => self.delete_active_layer(),
             UiAction::RenameLayer { layer, name } => self.rename_layer(layer, name),
             UiAction::MoveActiveLayer(offset) => self.move_active_layer(offset),
+            UiAction::NewDocument => self.request_document_action(PendingDocumentAction::New),
+            UiAction::FileChosen(purpose, path) => match purpose {
+                FilePurpose::Open => {
+                    self.request_document_action(PendingDocumentAction::Open(path))
+                }
+                FilePurpose::Save => {
+                    if self.save_document_to(path) {
+                        self.complete_document_action();
+                    }
+                }
+                FilePurpose::Import => self.import_png(&path),
+                FilePurpose::Export { cropped } => self.export_png_to(
+                    &ensure_png_extension(path),
+                    if cropped {
+                        ExportRegion::ContentBounds
+                    } else {
+                        ExportRegion::FullCanvas
+                    },
+                ),
+            },
+            UiAction::FileCancelled => self.pending_document_action = None,
+            UiAction::ResolveUnsaved(choice) => match choice {
+                UnsavedChoice::Save => {
+                    if self.save_document() {
+                        self.complete_document_action();
+                    }
+                }
+                UnsavedChoice::Discard => {
+                    if matches!(
+                        self.pending_document_action,
+                        Some(PendingDocumentAction::Close)
+                    ) {
+                        self.discard_and_close();
+                    } else {
+                        self.complete_document_action();
+                    }
+                }
+                UnsavedChoice::Cancel => self.pending_document_action = None,
+            },
             UiAction::OpenDocument => self.choose_document_open(),
             UiAction::SaveDocument => {
-                self.save_document();
+                if self.save_document() {
+                    self.complete_document_action();
+                }
             }
             UiAction::SaveDocumentAs => {
                 self.choose_document_save_as();
@@ -868,7 +927,8 @@ impl App {
     }
 
     fn canvas_busy(&self) -> bool {
-        self.active_pointer.is_some()
+        self.active_stroke.is_some()
+            || self.active_pointer.is_some()
             || self.sampling_pointer.is_some()
             || self.brush_drag.is_some()
             || self.cancelled_tablet_contact.is_some()
@@ -990,11 +1050,14 @@ impl App {
             KeyCommand::Undo => self.undo(),
             KeyCommand::Redo => self.redo(),
             KeyCommand::SaveDocument => {
-                self.save_document();
+                if self.save_document() {
+                    self.complete_document_action();
+                }
             }
             KeyCommand::SaveDocumentAs => {
                 self.choose_document_save_as();
             }
+            KeyCommand::NewDocument => self.request_document_action(PendingDocumentAction::New),
             KeyCommand::OpenDocument => {
                 self.choose_document_open();
             }
@@ -1325,7 +1388,7 @@ impl App {
         self.cursor_contact = false;
     }
 
-    fn update_window_title(&self, _pressure: Option<f32>) {
+    fn update_window_title(&mut self, _pressure: Option<f32>) {
         let Some(window) = &self.window else {
             return;
         };
@@ -1346,6 +1409,9 @@ impl App {
             ""
         };
         window.set_title(&format!("{name}{dirty} — Sketchpad{recording}"));
+        if let Some(ui) = &mut self.ui {
+            ui.set_document_label(format!("{name}{dirty}"));
+        }
     }
 
     fn start_stroke(
@@ -2405,6 +2471,7 @@ impl App {
             Ok(Ok(summary)) => {
                 if is_current {
                     self.persistence.recovery_saved();
+                    self.remember_session();
                     self.recovery_due = None;
                 }
                 log::info!(
@@ -2480,6 +2547,7 @@ impl App {
             return match result {
                 Ok(summary) => {
                     self.persistence.recovery_saved();
+                    self.remember_session();
                     self.recovery_due = None;
                     log::info!(
                         "GPU-resident checkpoint saved: path={path:?} bytes={} layers={} tiles={} elapsed_ms={}",
@@ -2507,6 +2575,7 @@ impl App {
         match checkpoint::save_document_atomic(&path, &self.document) {
             Ok(summary) => {
                 self.persistence.recovery_saved();
+                self.remember_session();
                 self.recovery_due = None;
                 log::info!(
                     "checkpoint saved: path={:?} bytes={} layers={} tiles={} stored_pixels={} elapsed_ms={}",
@@ -2529,14 +2598,20 @@ impl App {
         }
     }
 
+    fn remember_session(&self) {
+        if let Err(error) = self.persistence.remember_session() {
+            log::warn!("Could not remember the current document filename: {error}");
+        }
+    }
+
     fn save_document_to(&mut self, path: PathBuf) -> bool {
-        if !self.persistence_enabled || self.active_stroke.is_some() {
+        if !self.persistence_enabled || self.canvas_busy() {
+            self.finish_file_operation(Err("Finish the current gesture before saving. Stroke-recording sessions cannot save documents.".into()));
             return false;
         }
         let path = ensure_sketchpad_extension(path);
-        let started = Instant::now();
-        if let Some(document) = self.gpu_resident_document() {
-            let result = document
+        let result = if let Some(document) = self.gpu_resident_document() {
+            document
                 .recovery_snapshot()
                 .build_checkpoint()
                 .map_err(|error| error.to_string())
@@ -2544,43 +2619,34 @@ impl App {
                     checkpoint
                         .save_atomic(&path)
                         .map_err(|error| error.to_string())
-                });
-            return match result {
-                Ok(summary) => {
-                    self.persistence.document_saved(path.clone());
-                    log::info!(
-                        "GPU-resident document saved: path={path:?} bytes={} layers={} tiles={} elapsed_ms={}",
-                        summary.encoded_bytes,
-                        summary.layer_count,
-                        summary.tile_count,
-                        started.elapsed().as_millis()
-                    );
-                    self.update_window_title(None);
-                    true
-                }
-                Err(error) => {
-                    log::error!("GPU-resident document save failed: path={path:?}: {error}");
-                    false
-                }
-            };
-        }
-        match checkpoint::save_document_atomic(&path, &self.document) {
+                })
+        } else {
+            checkpoint::save_document_atomic(&path, &self.document)
+                .map_err(|error| error.to_string())
+        };
+        match result {
             Ok(summary) => {
                 self.persistence.document_saved(path.clone());
+                if !self.persistence.recovery_path().is_file() {
+                    self.persistence.require_recovery();
+                    self.recovery_due = Some(Instant::now());
+                }
+                self.remember_session();
                 log::info!(
-                    "document saved: path={path:?} bytes={} layers={} tiles={} \
-                     stored_pixels={} elapsed_ms={}",
+                    "Document saved: path={path:?} bytes={} layers={} tiles={}",
                     summary.encoded_bytes,
                     summary.layer_count,
-                    summary.tile_count,
-                    summary.stored_pixels,
-                    started.elapsed().as_millis()
+                    summary.tile_count
                 );
                 self.update_window_title(None);
+                self.finish_file_operation(Ok(format!("Saved {}", path.display())));
                 true
             }
             Err(error) => {
-                log::error!("document save failed: path={path:?}: {error}");
+                self.finish_file_operation(Err(format!(
+                    "Could not save {}: {error}",
+                    path.display()
+                )));
                 false
             }
         }
@@ -2593,241 +2659,238 @@ impl App {
         }
     }
 
-    fn choose_document_save_as(&mut self) -> bool {
-        if !self.persistence_enabled
-            || self.active_stroke.is_some()
-            || self.sampling_pointer.is_some()
-        {
-            return false;
+    fn finish_file_operation(&mut self, result: Result<String, String>) {
+        match &result {
+            Ok(message) => log::info!("{message}"),
+            Err(error) => log::error!("{error}"),
         }
+        if let Some(ui) = &mut self.ui {
+            ui.file_operation_finished(result);
+        }
+        self.request_redraw();
+    }
+
+    fn show_file_browser(&mut self, purpose: FilePurpose, path: PathBuf) {
+        if self.canvas_busy() {
+            return;
+        }
+        self.ui_visible = true;
+        if let Some(ui) = &mut self.ui {
+            ui.show_file_browser(purpose, path);
+        }
+        self.request_redraw();
+    }
+
+    fn choose_document_save_as(&mut self) -> bool {
         let suggested = self
             .persistence
             .document_path()
             .map(Path::to_owned)
             .unwrap_or_else(default_document_path);
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Save Sketchpad Document")
-            .add_filter("Sketchpad document", &["sketchpad"]);
-        if let Some(parent) = suggested.parent() {
-            dialog = dialog.set_directory(parent);
-        }
-        if let Some(file_name) = suggested.file_name() {
-            dialog = dialog.set_file_name(file_name.to_string_lossy());
-        }
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        dialog
-            .save_file()
-            .is_some_and(|path| self.save_document_to(path))
+        self.show_file_browser(FilePurpose::Save, suggested);
+        false // The browser submits the save in a later UI action.
     }
 
-    fn confirm_save_before_replacing(&mut self) -> bool {
-        if !self.persistence.document_modified() {
-            return true;
+    fn request_document_action(&mut self, action: PendingDocumentAction) {
+        if self.canvas_busy() {
+            return;
         }
-        if self.persistence.recovery_dirty() && !self.save_recovery_checkpoint() {
-            return false;
-        }
-        let mut dialog = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Save changes before opening?")
-            .set_description(
-                "The current drawing has changes that are not saved to its document file. \
-                 The recovery checkpoint is current.",
-            )
-            .set_buttons(rfd::MessageButtons::YesNoCancel);
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        match dialog.show() {
-            rfd::MessageDialogResult::Yes => self.save_document(),
-            rfd::MessageDialogResult::No => true,
-            _ => false,
+        self.pending_document_action = Some(action);
+        if self.persistence.document_modified() {
+            if let Some(ui) = &mut self.ui {
+                ui.confirm_unsaved();
+            }
+            self.request_redraw();
+        } else {
+            self.complete_document_action();
         }
     }
 
-    fn confirm_close(&mut self) -> bool {
-        if self.persistence.recovery_dirty() && !self.save_recovery_checkpoint() {
-            return false;
+    fn discard_and_close(&mut self) {
+        let result = if let Some(path) = self.persistence.document_path() {
+            checkpoint::load_document(path).map_err(|error| error.to_string())
+        } else {
+            Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE)
+                .map_err(|error| error.to_string())
+        };
+        let result = result.and_then(|document| {
+            self.finish_recovery_checkpoint(true);
+            let path = self.persistence.recovery_path().to_owned();
+            if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+                // Join the previous autosave before writing the state the user kept.
+                resident.checkpoint = GpuCheckpointWorker::new(path.clone());
+            }
+            checkpoint::save_document_atomic(&path, &document).map_err(|error| error.to_string())
+        });
+        match result {
+            Ok(_) => {
+                if let Some(path) = self.persistence.document_path().map(Path::to_owned) {
+                    self.persistence.document_saved(path);
+                } else {
+                    self.persistence =
+                        PersistenceState::fresh(self.persistence.recovery_path().to_owned());
+                }
+                self.persistence.recovery_saved();
+                self.remember_session();
+                self.pending_document_action = None;
+                self.exit_requested = true;
+            }
+            Err(error) => self.finish_file_operation(Err(format!(
+                "Could not finish closing: {error}. Your current sketch is still open."
+            ))),
         }
-        if !self.persistence.document_modified() {
-            return true;
-        }
-        let mut dialog = rfd::MessageDialog::new()
-            .set_level(rfd::MessageLevel::Warning)
-            .set_title("Save changes before closing?")
-            .set_description(
-                "The drawing is current in recovery but has changes that are not saved to its \
-                 document file.",
-            )
-            .set_buttons(rfd::MessageButtons::YesNoCancel);
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        match dialog.show() {
-            rfd::MessageDialogResult::Yes => self.save_document(),
-            rfd::MessageDialogResult::No => true,
-            _ => false,
+    }
+
+    fn complete_document_action(&mut self) {
+        match self.pending_document_action.take() {
+            Some(PendingDocumentAction::Open(path)) => self.open_document(path),
+            Some(PendingDocumentAction::New) => {
+                let result = Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE)
+                    .map_err(|error| error.to_string())
+                    .and_then(|document| self.install_document(document, None));
+                self.finish_file_operation(result.map(|_| "New sketch".into()));
+            }
+            Some(PendingDocumentAction::Close) => {
+                if !self.persistence.recovery_dirty() || self.save_recovery_checkpoint() {
+                    self.exit_requested = true;
+                } else {
+                    self.finish_file_operation(Err("Could not save recovery. Your sketch is still open; use Save as to choose another location.".into()));
+                }
+            }
+            None => {}
         }
     }
 
     fn choose_document_open(&mut self) {
-        if !self.persistence_enabled
-            || self.active_stroke.is_some()
-            || self.sampling_pointer.is_some()
-            || !self.confirm_save_before_replacing()
-        {
-            return;
-        }
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Open Sketchpad Document")
-            .add_filter("Sketchpad document", &["sketchpad"]);
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        if let Some(path) = dialog.pick_file() {
-            self.open_document(path);
-        }
+        let suggested = self
+            .persistence
+            .document_path()
+            .map(Path::to_owned)
+            .unwrap_or_else(default_document_path);
+        self.show_file_browser(FilePurpose::Open, suggested);
     }
 
     fn open_document(&mut self, path: PathBuf) {
-        match checkpoint::load_document(&path) {
-            Ok(document)
-                if document.width() == CANVAS_WIDTH
-                    && document.height() == CANVAS_HEIGHT
-                    && document.tile_size() == self.document.tile_size() =>
-            {
-                let layer_count = document.layers().len();
-                let tile_count: usize = document
-                    .layers()
-                    .iter()
-                    .map(|layer| {
-                        document
-                            .layer_raster(layer.id())
-                            .expect("every document layer must have a raster payload")
-                            .allocated_tile_count()
-                    })
-                    .sum();
-                let replacement_resident = match &mut self.gpu {
-                    Some(gpu) if gpu.resident.is_some() => ResidentGpuCanvas::bootstrap(
-                        &gpu.device,
-                        &gpu.queue,
-                        gpu.config.format,
-                        &document,
-                        self.persistence.recovery_path().to_owned(),
-                    )
-                    .map(Some),
-                    _ => Ok(None),
-                };
-                let replacement_resident = match replacement_resident {
-                    Ok(resident) => resident,
-                    Err(error) => {
-                        log::error!(
-                            "document open left the current canvas unchanged because resident bootstrap failed: path={path:?}: {error}"
-                        );
-                        return;
-                    }
-                };
-                self.document = document;
-                if let Some(gpu) = &mut self.gpu {
-                    if let Some(resident) = replacement_resident {
-                        gpu.resident = Some(resident);
-                    }
-                    gpu.canvas.clear_residency();
-                }
-                self.persistence.document_opened(path.clone());
-                self.recovery_revision = self.gpu_resident_document().map_or_else(
-                    || self.recovery_revision.wrapping_add(1),
-                    |document| document.revision().get(),
-                );
-                self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
-                self.metrics.gpu_baseline = self
-                    .gpu
-                    .as_ref()
-                    .map(|gpu| gpu.canvas.stats())
-                    .unwrap_or_default();
-                log::info!(
-                    "document opened: path={:?} layers={layer_count} tiles={tile_count}",
-                    path
-                );
-                self.update_window_title(None);
-                self.invalidate_ui();
-            }
-            Ok(_) => log::error!(
-                "document geometry is incompatible with the running canvas: {:?}",
-                path
-            ),
-            Err(error) => log::error!("document open failed: path={:?}: {error}", path),
-        }
+        let result = checkpoint::load_document(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|document| self.install_document(document, Some(path.clone())));
+        self.finish_file_operation(
+            result
+                .map(|_| format!("Opened {}", path.display()))
+                .map_err(|error| format!("Could not open {}: {error}", path.display())),
+        );
     }
 
-    fn export_png_to(&self, path: &Path, region: ExportRegion) {
-        if self.active_stroke.is_some() {
+    fn install_document(
+        &mut self,
+        document: Document,
+        path: Option<PathBuf>,
+    ) -> Result<(), String> {
+        // Prepare every GPU resource before replacing the current drawing.
+        let replacement = if let Some(gpu) = &self.gpu {
+            let resident = if gpu.resident.is_some()
+                && document.tile_size() == AtlasLayout::document_default().tile_size()
+            {
+                Some(ResidentGpuCanvas::bootstrap(
+                    &gpu.device,
+                    &gpu.queue,
+                    gpu.config.format,
+                    &document,
+                    self.persistence.recovery_path().to_owned(),
+                )?)
+            } else {
+                None
+            };
+            let canvas =
+                RasterDisplayPipeline::new(&gpu.device, gpu.config.format, document.tile_size());
+            let stroke_target = if gpu.stroke_target.is_some() {
+                Some(
+                    SparseStrokeTarget::new(
+                        &gpu.device,
+                        document.width(),
+                        document.height(),
+                        document.tile_size(),
+                        16,
+                        gpu.config.format,
+                    )
+                    .map_err(|error| error.to_string())?,
+                )
+            } else {
+                None
+            };
+            Some((resident, canvas, stroke_target))
+        } else {
+            None
+        };
+        self.finish_recovery_checkpoint(true);
+        self.document = document;
+        if let (Some(gpu), Some((resident, canvas, stroke_target))) = (&mut self.gpu, replacement) {
+            gpu.resident = resident;
+            gpu.canvas = canvas;
+            gpu.stroke_target = stroke_target;
+        }
+        if let Some(path) = path {
+            self.persistence.document_opened(path);
+        } else {
+            self.persistence = PersistenceState::fresh(self.persistence.recovery_path().to_owned());
+            self.persistence.document_changed();
+        }
+        self.recovery_revision = self.gpu_resident_document().map_or_else(
+            || self.recovery_revision.wrapping_add(1),
+            |document| document.revision().get(),
+        );
+        self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
+        self.metrics.gpu_baseline = self
+            .gpu
+            .as_ref()
+            .map(|gpu| gpu.canvas.stats())
+            .unwrap_or_default();
+        self.canvas_mode = CanvasMode::Draw;
+        self.reset_view();
+        self.update_window_title(None);
+        self.invalidate_ui();
+        Ok(())
+    }
+
+    fn export_png_to(&mut self, path: &Path, region: ExportRegion) {
+        if self.canvas_busy() {
             return;
         }
-        let started = Instant::now();
-        let recovered;
-        let raster = if let Some(document) = self.gpu_resident_document() {
-            recovered = match document.recovery_snapshot().recover_document() {
-                Ok(recovered) => recovered,
-                Err(error) => {
-                    log::error!("GPU-resident PNG export recovery failed: {error}");
-                    return;
-                }
+        let result: Result<_, String> = (|| {
+            let recovered;
+            let raster = if let Some(document) = self.gpu_resident_document() {
+                recovered = document
+                    .recovery_snapshot()
+                    .recover_document()
+                    .map_err(|error| error.to_string())?;
+                recovered.document().composite()
+            } else {
+                self.document.composite()
             };
-            recovered.document().composite()
-        } else {
-            self.document.composite()
-        };
-        match image_io::export_png_file_atomic(path, raster, region) {
-            Ok(summary) => log::info!(
-                "PNG exported: path={path:?} region={region:?} dimensions={}x{} pixels={} bytes={} elapsed_ms={}",
-                summary.width,
-                summary.height,
-                summary.pixels,
-                summary.encoded_bytes,
-                started.elapsed().as_millis()
-            ),
-            Err(error) => log::error!("PNG export failed: path={path:?}: {error}"),
+            image_io::export_png_file_atomic(path, raster, region)
+                .map_err(|error| error.to_string())
+        })();
+        if result.is_ok() {
+            self.export_path = path.to_owned();
         }
+        self.finish_file_operation(
+            result
+                .map(|_| format!("Exported {}", path.display()))
+                .map_err(|error| format!("Could not export {}: {error}", path.display())),
+        );
     }
 
     fn choose_png_import(&mut self) {
-        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
-            return;
-        }
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Import PNG as Layer")
-            .add_filter("PNG image", &["png"]);
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        if let Some(path) = dialog.pick_file() {
-            self.import_png(&path);
-        }
+        self.show_file_browser(FilePurpose::Import, self.export_path.clone());
     }
 
-    fn choose_png_export(&self, region: ExportRegion) {
-        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
-            return;
-        }
-        let suggested = export_path_for_region(&self.export_path, region);
-        let mut dialog = rfd::FileDialog::new()
-            .set_title("Export Visible Composite as PNG")
-            .add_filter("PNG image", &["png"]);
-        if let Some(parent) = suggested.parent() {
-            dialog = dialog.set_directory(parent);
-        }
-        if let Some(file_name) = suggested.file_name() {
-            dialog = dialog.set_file_name(file_name.to_string_lossy());
-        }
-        if let Some(window) = &self.window {
-            dialog = dialog.set_parent(window.as_ref());
-        }
-        if let Some(path) = dialog.save_file() {
-            self.export_png_to(&ensure_png_extension(path), region);
-        }
+    fn choose_png_export(&mut self, region: ExportRegion) {
+        self.show_file_browser(
+            FilePurpose::Export {
+                cropped: region == ExportRegion::ContentBounds,
+            },
+            export_path_for_region(&self.export_path, region),
+        );
     }
 
     fn import_png(&mut self, path: &Path) {
@@ -2844,7 +2907,10 @@ impl App {
         ) {
             Ok(imported) => imported,
             Err(error) => {
-                log::error!("PNG import failed: path={path:?}: {error}");
+                self.finish_file_operation(Err(format!(
+                    "Could not import {}: {error}",
+                    path.display()
+                )));
                 return;
             }
         };
@@ -2873,9 +2939,17 @@ impl App {
                             started.elapsed().as_millis(),
                         );
                         self.mark_document_dirty();
+                        self.toggle_ui_panel(UiPanel::Layers);
+                        self.finish_file_operation(Ok(format!(
+                            "Imported {} as a layer",
+                            path.display()
+                        )));
                     }
                     Err(failure) => {
-                        log::error!("could not insert resident PNG {path:?}: {failure}")
+                        self.finish_file_operation(Err(format!(
+                            "Could not import {}: {failure}",
+                            path.display()
+                        )));
                     }
                 }
                 return;
@@ -2900,8 +2974,13 @@ impl App {
                     summary.assumed_srgb,
                     started.elapsed().as_millis()
                 );
+                self.toggle_ui_panel(UiPanel::Layers);
+                self.finish_file_operation(Ok(format!("Imported {} as a layer", path.display())));
             }
-            Err(error) => log::error!("could not insert imported PNG {path:?}: {error}"),
+            Err(error) => self.finish_file_operation(Err(format!(
+                "Could not import {}: {error}",
+                path.display()
+            ))),
         }
     }
 
@@ -2923,6 +3002,7 @@ impl App {
                     Ok(summary) => {
                         if completion.saved_current_revision {
                             self.persistence.recovery_saved();
+                            self.remember_session();
                             self.recovery_due = None;
                         }
                         log::info!(
@@ -3339,8 +3419,15 @@ impl App {
         let tile_size = document.tile_size();
         let canvas = RasterDisplayPipeline::new(&device, format, tile_size);
         let stroke_target = gpu_strokes_supported.then(|| {
-            SparseStrokeTarget::new(&device, CANVAS_WIDTH, CANVAS_HEIGHT, tile_size, 16, format)
-                .expect("a reported full-float stroke path must create its sparse target")
+            SparseStrokeTarget::new(
+                &device,
+                document.width(),
+                document.height(),
+                tile_size,
+                16,
+                format,
+            )
+            .expect("a reported full-float stroke path must create its sparse target")
         });
         let resident = if gpu_strokes_supported {
             ResidentGpuCanvas::bootstrap(&device, &queue, format, document, recovery_path)
@@ -3962,6 +4049,11 @@ impl ApplicationHandler<TabletEvent> for App {
         }
         self.gpu = Some(gpu);
         self.ui = Some(ui);
+        if let Some(message) = self.startup_notice.take() {
+            if let Some(ui) = &mut self.ui {
+                ui.notify(message, true);
+            }
+        }
         self.window = Some(window);
         self.configured = true;
         self.update_window_title(None);
@@ -4027,11 +4119,22 @@ impl ApplicationHandler<TabletEvent> for App {
         match event {
             WindowEvent::CloseRequested => {
                 self.cancel_stroke();
-                if self.confirm_close() {
+                if !self.persistence_enabled {
                     event_loop.exit();
+                } else {
+                    self.request_document_action(PendingDocumentAction::Close);
                 }
             }
-            WindowEvent::DroppedFile(path) => self.import_png(&path),
+            WindowEvent::DroppedFile(path) => {
+                if path.extension().is_some_and(|extension| {
+                    extension.eq_ignore_ascii_case("sketchpad")
+                        || extension.eq_ignore_ascii_case("skpr")
+                }) {
+                    self.request_document_action(PendingDocumentAction::Open(path));
+                } else {
+                    self.import_png(&path);
+                }
+            }
             WindowEvent::Resized(size) => self.resize(size.width, size.height),
             WindowEvent::RedrawRequested => self.render(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -4365,6 +4468,10 @@ impl ApplicationHandler<TabletEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.exit_requested {
+            event_loop.exit();
+            return;
+        }
         self.report_live_metrics();
         self.poll_gpu_stroke_commit();
         self.drive_gpu_resident_mirror();
@@ -4565,7 +4672,8 @@ fn main() {
         eprintln!("{message}");
         process::exit(2);
     });
-    let checkpoint_path = checkpoint::default_recovery_path();
+    let mut checkpoint_path = checkpoint::default_recovery_path();
+    let mut startup_notice = None;
     let (mut document, recovered) = if startup.record_stroke.is_some() {
         log::info!("stroke recording mode: draw one tablet stroke in the blank window");
         (
@@ -4574,11 +4682,7 @@ fn main() {
         )
     } else {
         match checkpoint::load_document(&checkpoint_path) {
-            Ok(document)
-                if document.width() == CANVAS_WIDTH
-                    && document.height() == CANVAS_HEIGHT
-                    && document.tile_size() == DEFAULT_TILE_SIZE =>
-            {
+            Ok(document) => {
                 let tile_count: usize = document
                     .layers()
                     .iter()
@@ -4597,16 +4701,6 @@ fn main() {
                 );
                 (document, true)
             }
-            Ok(_) => {
-                log::error!(
-                    "checkpoint geometry is incompatible; starting blank without replacing it: {:?}",
-                    checkpoint_path
-                );
-                (
-                    Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
-                    false,
-                )
-            }
             Err(CheckpointError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
                 log::info!("no recovery checkpoint found: {:?}", checkpoint_path);
                 (
@@ -4615,10 +4709,16 @@ fn main() {
                 )
             }
             Err(error) => {
-                log::error!(
-                    "checkpoint recovery failed; starting blank without replacing it: path={:?}: {error}",
-                    checkpoint_path
-                );
+                let preserved = checkpoint_path.clone();
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos();
+                checkpoint_path = checkpoint_path
+                    .with_file_name(format!("recovery-after-error-{stamp}.sketchpad"));
+                let message = format!("Could not recover {}: {error}. The original file has been preserved; new work will use a separate recovery file.", preserved.display());
+                log::error!("{message}");
+                startup_notice = Some(message);
                 (
                     Document::new(CANVAS_WIDTH, CANVAS_HEIGHT, DEFAULT_TILE_SIZE).unwrap(),
                     false,
@@ -4687,21 +4787,21 @@ fn main() {
     let event_loop = EventLoop::<TabletEvent>::with_user_event().build().unwrap();
     let tablet_proxy = event_loop.create_proxy();
     event_loop.set_control_flow(ControlFlow::Wait);
-    event_loop
-        .run_app(&mut App::new(
-            tablet_proxy,
-            document,
-            if recovered {
-                PersistenceState::recovered(checkpoint_path)
-            } else {
-                PersistenceState::fresh(checkpoint_path)
-            },
-            startup.record_stroke,
-            imported_any,
-            default_export_path(),
-            startup.presentation,
-        ))
-        .unwrap();
+    let mut app = App::new(
+        tablet_proxy,
+        document,
+        if recovered {
+            PersistenceState::recover_with_session(checkpoint_path)
+        } else {
+            PersistenceState::fresh(checkpoint_path)
+        },
+        startup.record_stroke,
+        imported_any,
+        default_export_path(),
+        startup.presentation,
+    );
+    app.startup_notice = startup_notice;
+    event_loop.run_app(&mut app).unwrap();
 }
 
 fn import_layer_name(path: &Path) -> String {
@@ -4830,6 +4930,147 @@ mod tests {
             canvas_size: [4096.0, 4096.0],
             viewport_size: [1280.0, 720.0],
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Atlas X11 and a hardware GPU; uses a hidden window"]
+    #[allow(deprecated)]
+    fn file_workflow_preserves_pixels_layers_and_failed_open_state() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(512, 256)),
+                )
+                .unwrap(),
+        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = PathBuf::from(format!(".artifacts/file-workflow-{stamp}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("recovery.sketchpad");
+        let mut document = Document::new(512, 256, DEFAULT_TILE_SIZE).unwrap();
+        let bottom = document.active_layer_id();
+        document.rename_layer(bottom, "Ink").unwrap();
+        let top = document.create_layer("Reference").unwrap();
+        document.set_layer_opacity(top, 0.5).unwrap();
+        document.set_layer_visibility(top, false).unwrap();
+        document.set_active_layer(bottom).unwrap();
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            document,
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("export.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        assert!(
+            app.gpu_resident_document().is_some(),
+            "this regression must exercise the resident save path"
+        );
+        app.window = Some(window);
+        app.start_stroke([128.0, 128.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+        app.update_stroke([180.0, 128.0], 1.0, [0.0; 2]);
+        app.finish_stroke();
+        let saved_path = directory.join("drawing.sketchpad");
+        assert!(app.save_document_to(saved_path.clone()));
+        assert!(app.save_recovery_checkpoint());
+        let session =
+            PersistenceState::recover_with_session(app.persistence.recovery_path().to_owned());
+        assert_eq!(
+            session.document_path(),
+            Some(std::env::current_dir().unwrap().join(&saved_path).as_path())
+        );
+        assert!(!session.document_modified());
+        let saved = checkpoint::load_document(&saved_path).unwrap();
+        assert_eq!((saved.width(), saved.height()), (512, 256));
+        assert_eq!(saved.layers().len(), 2);
+        assert_eq!(saved.layers()[1].name(), "Reference");
+        assert!(!saved.layers()[1].visible());
+        assert_eq!(saved.layers()[1].opacity(), 0.5);
+        assert!(
+            saved
+                .layer_raster(bottom)
+                .unwrap()
+                .pixel(150, 128)
+                .unwrap()
+                .a
+                > 0.0,
+            "save immediately after a stroke must contain that stroke"
+        );
+        app.export_png_to(&directory.join("export.png"), ExportRegion::FullCanvas);
+        assert!(directory.join("export.png").is_file());
+        let bad = directory.join("broken.sketchpad");
+        std::fs::write(&bad, b"not a sketchpad document").unwrap();
+        app.open_document(bad);
+        assert_eq!(app.persistence.document_path(), Some(saved_path.as_path()));
+        assert_eq!(app.camera().canvas_size, [512.0, 256.0]);
+        app.persistence.document_changed();
+        let invalid_save = directory.join("directory.sketchpad");
+        std::fs::create_dir(&invalid_save).unwrap();
+        assert!(!app.save_document_to(invalid_save));
+        assert!(app.persistence.document_modified());
+        assert_eq!(app.persistence.document_path(), Some(saved_path.as_path()));
+        let portrait_path = directory.join("portrait.sketchpad");
+        checkpoint::save_document_atomic(
+            &portrait_path,
+            &Document::new(256, 768, DEFAULT_TILE_SIZE).unwrap(),
+        )
+        .unwrap();
+        app.open_document(portrait_path.clone());
+        assert_eq!(app.camera().canvas_size, [256.0, 768.0]);
+        assert_eq!(app.center, [128.0, 384.0]);
+        assert_eq!(
+            app.persistence.document_path(),
+            Some(portrait_path.as_path())
+        );
+        app.open_document(saved_path);
+        let reopened = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        assert_eq!(
+            reopened
+                .document()
+                .layer_raster(bottom)
+                .unwrap()
+                .pixel(150, 128),
+            saved.layer_raster(bottom).unwrap().pixel(150, 128)
+        );
+
+        app.start_stroke([280.0, 128.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+        app.finish_stroke();
+        assert!(app.persistence.document_modified());
+        app.pending_document_action = Some(PendingDocumentAction::Close);
+        app.apply_ui_action(UiAction::ResolveUnsaved(UnsavedChoice::Cancel));
+        assert!(!app.exit_requested);
+        assert!(app.persistence.document_modified());
+        app.pending_document_action = Some(PendingDocumentAction::Close);
+        app.apply_ui_action(UiAction::ResolveUnsaved(UnsavedChoice::Discard));
+        assert!(app.exit_requested);
+        let recovery = checkpoint::load_document(app.persistence.recovery_path()).unwrap();
+        assert_eq!(
+            recovery.layer_raster(bottom).unwrap().pixel(280, 128),
+            saved.layer_raster(bottom).unwrap().pixel(280, 128),
+            "discarded changes must not reappear through startup recovery"
+        );
     }
 
     #[test]
