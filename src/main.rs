@@ -1096,7 +1096,15 @@ impl App {
     }
 
     fn cursor_uniform(&self) -> BrushCursorUniform {
-        let Some(screen) = self.cursor_pos.filter(|_| self.cursor_visible) else {
+        let screen = if let Some((_, drag)) = self.brush_drag {
+            let scale = self
+                .window
+                .as_ref()
+                .map_or(1.0, |window| window.scale_factor() as f32);
+            drag.origin.map(|coordinate| coordinate * scale)
+        } else if let Some(position) = self.cursor_pos.filter(|_| self.cursor_visible) {
+            position
+        } else {
             return BrushCursorUniform::default();
         };
         let brush = self.brush_for_tool(self.cursor_tool);
@@ -1143,6 +1151,9 @@ impl App {
     }
 
     fn update_cursor_orientation(&mut self, position: [f32; 2], tilt: [f32; 2]) {
+        if self.brush_drag.is_some() {
+            return;
+        }
         self.cursor_tilt = tilt;
         if let Some(direction) = contact_direction_from_tilt(tilt) {
             self.cursor_direction = direction;
