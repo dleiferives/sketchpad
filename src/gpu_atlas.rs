@@ -53,6 +53,21 @@ impl AtlasLayout {
         })
     }
 
+    /// Sparse interactive documents need room for multiple painted layers.
+    /// This is a color-texture ceiling, not an up-front allocation; history,
+    /// mirror and transient masks have their own storage budgets.
+    pub fn interactive_document() -> Self {
+        const COLOR_TEXTURE_BUDGET: u64 = 1024 * 1024 * 1024;
+        let page_bytes = u64::from(DEFAULT_ATLAS_PAGE_SIZE).pow(2)
+            * std::mem::size_of::<crate::raster::LinearRgba>() as u64;
+        Self::new(
+            DEFAULT_ATLAS_PAGE_SIZE,
+            DEFAULT_ATLAS_TILE_SIZE,
+            (COLOR_TEXTURE_BUDGET / page_bytes) as u32,
+        )
+        .expect("interactive atlas geometry is valid")
+    }
+
     pub fn document_default() -> Self {
         Self::new(
             DEFAULT_ATLAS_PAGE_SIZE,
@@ -535,6 +550,25 @@ mod tests {
 
     fn key(layer: u64, x: u32, y: u32) -> LayerTileKey {
         LayerTileKey::new(LayerId::from_raw(layer), TileCoord::new(x, y))
+    }
+
+    #[test]
+    fn interactive_atlas_grows_sparsely_across_multiple_full_canvas_layers() {
+        let layout = AtlasLayout::interactive_document();
+        let mut atlas = SparseAtlasPlanner::new(layout);
+        assert_eq!(atlas.retained_page_count(), 0);
+        for layer in 1..=3 {
+            atlas
+                .allocate_batch((0..32).flat_map(|y| {
+                    (0..32).map(move |x| {
+                        LayerTileKey::new(LayerId::from_raw(layer), TileCoord::new(x, y))
+                    })
+                }))
+                .unwrap();
+        }
+        assert_eq!(atlas.resident_tile_count(), 3 * 1024);
+        assert_eq!(atlas.retained_page_count(), 48);
+        assert_eq!(layout.total_capacity(), 4096);
     }
 
     #[test]

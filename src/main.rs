@@ -227,7 +227,24 @@ impl ResidentGpuCanvas {
         document: &Document,
         recovery_path: PathBuf,
     ) -> Result<Self, String> {
-        let layout = AtlasLayout::document_default();
+        Self::bootstrap_with_layout(
+            device,
+            queue,
+            surface_format,
+            document,
+            recovery_path,
+            AtlasLayout::interactive_document(),
+        )
+    }
+
+    fn bootstrap_with_layout(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        surface_format: wgpu::TextureFormat,
+        document: &Document,
+        recovery_path: PathBuf,
+        layout: AtlasLayout,
+    ) -> Result<Self, String> {
         if document.tile_size() != layout.tile_size() {
             return Err(format!(
                 "document tile size {} does not match resident atlas tile size {}",
@@ -356,6 +373,7 @@ enum ActiveStroke {
 struct GpuResidentRoundStroke {
     path: ContinuousRoundPath,
     started: Instant,
+    update_error_reported: bool,
 }
 
 struct GpuPaletteKnifeStroke {
@@ -1639,6 +1657,7 @@ impl App {
                 Ok(ActiveStroke::GpuResidentRound(GpuResidentRoundStroke {
                     path,
                     started: Instant::now(),
+                    update_error_reported: false,
                 }))
             })()
         } else {
@@ -1745,7 +1764,11 @@ impl App {
                                 .as_micros()
                                 .min(u128::from(u64::MAX)) as u64,
                         );
-                        match stroke.path.update(timed) {
+                        // The renderer rolls back rejected batches. Keep the input
+                        // endpoint at the same last accepted sample so pen-up and
+                        // subsequent samples remain a valid, single stroke.
+                        let previous_path = stroke.path.clone();
+                        let submitted = match stroke.path.update(timed) {
                             Err(error) => Err(error.to_string()),
                             Ok(()) => {
                                 let batch = stroke.path.take_batch();
@@ -1768,7 +1791,11 @@ impl App {
                                     .map(|_| ())
                                     .map_err(|error| error.to_string())
                             }
+                        };
+                        if submitted.is_err() {
+                            stroke.path = previous_path;
                         }
+                        submitted
                     }
                     ActiveStroke::GpuPaletteKnife(stroke) => match stroke.phase {
                         GpuStrokePhase::Drawing => stroke
@@ -1793,7 +1820,21 @@ impl App {
         self.metrics.dabs_per_update.record_value(emitted_dabs);
         if let Err(error) = result {
             log::error!("could not update stroke: {error}");
-            self.cancel_stroke();
+            if let Some(ActiveStroke::GpuResidentRound(stroke)) = &mut self.active_stroke {
+                if !stroke.update_error_reported {
+                    stroke.update_error_reported = true;
+                    if let Some(ui) = &mut self.ui {
+                        ui.notify(
+                            "Could not extend the stroke. Existing marks are kept; lift to finish."
+                                .into(),
+                            true,
+                        );
+                    }
+                }
+                self.request_redraw();
+            } else {
+                self.cancel_stroke();
+            }
             return;
         }
         self.flush_active_damage();
@@ -5191,9 +5232,151 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "requires X11 and a hardware GPU; hidden-window live-stroke capacity regression"]
+    #[allow(deprecated)]
+    fn live_stroke_rejected_update_keeps_preview_path_and_single_undo() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        for constrained in [true, false] {
+            let window = Arc::new(
+                event_loop
+                    .create_window(
+                        Window::default_attributes()
+                            .with_visible(false)
+                            .with_inner_size(winit::dpi::PhysicalSize::new(256, 256)),
+                    )
+                    .unwrap(),
+            );
+            let directory = PathBuf::from(format!(
+                ".artifacts/live-stroke-test-{}-{constrained}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            let recovery = directory.join("recovery.sketchpad");
+            let mut document = Document::new(256, 256, DEFAULT_TILE_SIZE).unwrap();
+            {
+                let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+                for (x, y) in [(16, 16), (144, 16), (16, 144)] {
+                    gesture
+                        .set_pixel(x, y, LinearRgba::from_straight(0.2, 0.3, 0.4, 1.0))
+                        .unwrap();
+                }
+                gesture.commit().unwrap();
+            }
+            let layer = document.create_layer("Active drawing").unwrap();
+            let mut app = App::new(
+                event_loop.create_proxy(),
+                document,
+                PersistenceState::fresh(recovery.clone()),
+                None,
+                false,
+                directory.join("export.png"),
+                PresentationOptions::default(),
+            );
+            let mut gpu = App::init(
+                window.clone(),
+                &app.document,
+                recovery.clone(),
+                PresentationOptions::default(),
+            );
+            if constrained {
+                gpu.resident = Some(
+                    ResidentGpuCanvas::bootstrap_with_layout(
+                        &gpu.device,
+                        &gpu.queue,
+                        gpu.config.format,
+                        &app.document,
+                        recovery,
+                        AtlasLayout::new(256, 128, 1).unwrap(),
+                    )
+                    .unwrap(),
+                );
+            }
+            app.gpu = Some(gpu);
+            app.window = Some(window);
+            app.set_brush_diameter(16.0);
+            app.start_stroke([32.0, 32.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            app.update_stroke([48.0, 32.0], 1.0, [0.0; 2]);
+            let before_batches = app
+                .gpu
+                .as_ref()
+                .unwrap()
+                .resident
+                .as_ref()
+                .unwrap()
+                .strokes
+                .submitted_batches();
+            app.update_stroke([192.0, 192.0], 1.0, [0.0; 2]);
+            let Some(ActiveStroke::GpuResidentRound(stroke)) = &app.active_stroke else {
+                panic!("an atlas-full update erased the live stroke");
+            };
+            assert_eq!(stroke.update_error_reported, constrained);
+            let resident = app.gpu.as_ref().unwrap().resident.as_ref().unwrap();
+            assert!(resident.strokes.active_id().is_some());
+            assert!(resident.strokes.commit_snapshot_bytes().unwrap() > 0);
+            if constrained {
+                assert_eq!(resident.strokes.submitted_batches(), before_batches);
+            }
+            // A rejected sample must not poison the endpoint used by subsequent
+            // input or by pen-up. This also handles an isolated bad device packet.
+            app.update_stroke([64.0, 32.0], 1.0, [0.0; 2]);
+            app.update_stroke([f32::NAN, 32.0], 1.0, [0.0; 2]);
+            app.update_stroke([72.0, 32.0], 1.0, [0.0; 2]);
+            app.finish_stroke();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert_eq!(
+                app.gpu_resident_document().unwrap().history().undo_depth(),
+                1
+            );
+            let pixel = |app: &App, x, y| {
+                app.gpu_resident_document()
+                    .unwrap()
+                    .recovery_snapshot()
+                    .recover_document()
+                    .unwrap()
+                    .document()
+                    .layer_raster(layer)
+                    .unwrap()
+                    .pixel(x, y)
+                    .unwrap()
+            };
+            assert!(pixel(&app, 48, 224).a > 0.9);
+            assert!(pixel(&app, 72, 224).a > 0.9);
+            assert_eq!(pixel(&app, 192, 64).a > 0.9, !constrained);
+            app.undo();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert_eq!(pixel(&app, 48, 224).a, 0.0);
+            assert_eq!(
+                app.gpu_resident_document().unwrap().history().undo_depth(),
+                0
+            );
+            app.redo();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert!(pixel(&app, 48, 224).a > 0.9);
+            assert!(app.save_document_to(directory.join("drawing.sketchpad")));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "requires X11 and a hardware GPU; paints a full 4096px canvas in a hidden window"]
     #[allow(deprecated)]
     fn large_round_stroke_survives_pen_up_and_undo() {
+        exercise_large_round_stroke(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires X11 and a hardware GPU; full stroke across three layers"]
+    fn large_round_stroke_crosses_shared_layer_capacity() {
+        exercise_large_round_stroke(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(deprecated)]
+    fn exercise_large_round_stroke(other_layers: bool) {
         use winit::platform::x11::EventLoopBuilderExtX11;
         let _ = env_logger::builder().is_test(true).try_init();
         let mut builder = EventLoop::<TabletEvent>::with_user_event();
@@ -5215,7 +5398,21 @@ mod tests {
         let directory = PathBuf::from(format!(".artifacts/large-stroke-{stamp}"));
         std::fs::create_dir_all(&directory).unwrap();
         let recovery = directory.join("recovery.sketchpad");
-        let document = Document::new(4096, 4096, DEFAULT_TILE_SIZE).unwrap();
+        let mut document = Document::new(4096, 4096, DEFAULT_TILE_SIZE).unwrap();
+        if other_layers {
+            for index in 0..2 {
+                let layer = document.active_layer_id();
+                let mut gesture = document.active_layer_mut().scoped_gesture().unwrap();
+                gesture
+                    .set_pixel(1, 1, LinearRgba::from_straight(1.0, 0.0, 0.0, 1.0))
+                    .unwrap();
+                gesture.commit().unwrap();
+                document.set_layer_visibility(layer, false).unwrap();
+                document
+                    .create_layer(format!("Layer {}", index + 2))
+                    .unwrap();
+            }
+        }
         let mut app = App::new(
             event_loop.create_proxy(),
             document,
@@ -5250,9 +5447,24 @@ mod tests {
                     app.active_stroke.is_some(),
                     "large stroke disappeared while drawing"
                 );
+                if let Some(ActiveStroke::GpuResidentRound(stroke)) = &app.active_stroke {
+                    assert!(
+                        !stroke.update_error_reported,
+                        "broad stroke was unable to extend across its layer"
+                    );
+                }
             }
         }
         app.finish_stroke();
+        if other_layers {
+            assert!(
+                app.gpu_resident_document()
+                    .unwrap()
+                    .atlas()
+                    .resident_tile_count()
+                    > 1024
+            );
+        }
         assert!(
             app.gpu_resident_document().unwrap().revision() > revision,
             "pen-up must commit the large stroke, not silently cancel it"
@@ -5260,6 +5472,11 @@ mod tests {
         assert!(app.persistence.document_modified());
         assert!(app.save_document_to(directory.join("drawing.sketchpad")));
         let saved = checkpoint::load_document(&directory.join("drawing.sketchpad")).unwrap();
+        assert_eq!(saved.layers().len(), if other_layers { 3 } else { 1 });
+        assert_eq!(
+            app.gpu_resident_document().unwrap().history().undo_depth(),
+            1
+        );
         assert!(
             saved
                 .layer_raster(saved.active_layer_id())

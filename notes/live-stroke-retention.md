@@ -1,0 +1,15 @@
+# Live-stroke retention and shared layer capacity
+
+2026-09-12. A live round-stroke update error previously called `cancel_stroke`, dropping the complete transient mask before pen-up. The application also used the library/control atlas limit: 16 pages of 1024×1024 RGBA32F pixels, shared by all layers and retained history residents. That is 1,024 tiles—one fully occupied 4096×4096 layer. Painting broadly on another layer could exhaust it during the contact.
+
+The application now uses a separate sparse interactive atlas with a 1 GiB color-texture ceiling (64 pages / 4,096 tiles). Pages are allocated as needed, so this does not allocate 1 GiB when opening an empty drawing. Undo buffers, CPU mirror and transient masks are additional allocations with their own limits; this is not a bound on total process memory. The library's 16-page default remains the reproducible control used by existing smoke/replay tools.
+
+Live input updates now commit their path endpoint only after the GPU accepts the batch. If an update fails, the renderer's previous mask and the input path's last accepted endpoint survive together. The app reports the problem once per contact and retains pointer ownership. Later valid samples can continue, and pen-up commits the accepted marks as one undo step. A rejected input sample is not falsely recorded as rendered paint. Invalid device samples get the same rollback behavior.
+
+Rendering already uses small path batches and 128×128 spatial tiles, while retaining one accumulated coverage mask across the contact. Keeping that mask avoids opacity seams or darker overlaps caused by committing arbitrary pieces as separate strokes. Coordinate commands are also retained for recovery, but a coordinate log does not eliminate the need for resident layer pixels during rendering.
+
+Validation includes a hidden-window test with a deliberately full four-tile atlas: it draws a valid prefix, rejects an extension, accepts subsequent valid input, rejects a NaN packet, and verifies pen-up, exact surviving pixels, single-step undo/redo and save. The same gesture completes with the interactive atlas. A separate 4096×4096, 512 px full-canvas regression seeds two other layers, crosses the former 1,024-tile ceiling while the pen is down, then checks commit, save, undo/redo and a following eraser. An allocator test verifies three fully populated canvas layers grow sparsely to 48 pages.
+
+This fixes the shared-capacity case and destructive update-error handling. It does not implement unlimited layer storage or out-of-core paging of current canvas tiles. At the new hard limit, an extension can still be rejected, but previously accepted marks remain visible and can be committed. Such a rejected section is reported rather than silently treated as painted.
+
+The final Apollo test run also exposed a cache-lease publication race. A new session now locks a private lease file before atomically publishing its cleanup-visible name. Concurrent creation/cleanup is covered by a multi-threaded regression; the abandoned-session fixture publishes its deliberately unlocked lease only after its data is ready.

@@ -293,6 +293,7 @@ impl RoundPathBatch {
     }
 }
 
+#[derive(Clone)]
 pub struct ContinuousRoundPath {
     recipe: RoundBrushRecipeV1,
     active_contact: Option<RoundContact>,
