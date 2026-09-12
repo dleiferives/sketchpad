@@ -936,8 +936,28 @@ impl App {
         }
         self.set_brush_diameter(drag.diameter);
         self.set_brush_opacity(drag.opacity);
+        if owner == PointerOwner::Mouse {
+            self.restore_mouse_after_brush_drag(drag);
+        }
         self.request_redraw();
         true
+    }
+
+    fn restore_mouse_after_brush_drag(&mut self, drag: BrushDrag) {
+        let Some(window) = self.window.as_ref().filter(|window| window.has_focus()) else {
+            return;
+        };
+        let position = winit::dpi::LogicalPosition::new(drag.origin[0], drag.origin[1]);
+        if let Err(error) = window.set_cursor_position(position) {
+            log::debug!("could not restore the mouse after brush adjustment: {error}");
+            return;
+        }
+        let physical = drag
+            .origin
+            .map(|value| value * window.scale_factor() as f32);
+        self.cursor_pos = Some(physical);
+        self.last_cursor_pos = Some(physical);
+        self.cursor_visible = true;
     }
 
     fn navigate_touch(&mut self, from: [f32; 2], to: [f32; 2], factor: f32) {
@@ -4068,7 +4088,9 @@ impl ApplicationHandler<TabletEvent> for App {
                         .brush_drag
                         .is_some_and(|(owner, _)| owner == PointerOwner::Mouse) =>
                 {
-                    self.brush_drag = None;
+                    if let Some((_, drag)) = self.brush_drag.take() {
+                        self.restore_mouse_after_brush_drag(drag);
+                    }
                     self.request_redraw();
                 }
                 (MouseButton::Left, ElementState::Pressed)
