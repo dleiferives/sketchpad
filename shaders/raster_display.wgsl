@@ -54,7 +54,7 @@ fn background_fs(@builtin(position) screen_position: vec4f) -> @location(0) vec4
         && world.x <= camera.canvas_size.x
         && world.y <= camera.canvas_size.y;
     if (!inside) {
-        return vec4f(0.055, 0.058, 0.065, 1.0);
+        return vec4f(0.72, 0.73, 0.70, 1.0);
     }
 
     let edge_distance = min(

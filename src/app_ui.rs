@@ -1,3 +1,4 @@
+use super::canvas_interaction::{BrushAxis, BrushDrag};
 use super::keybindings::{
     KeyBindings, KeyChord, KeyCommand, ALL_KEY_COMMANDS, BINDINGS_PER_COMMAND,
 };
@@ -20,17 +21,17 @@ use winit::{
 
 const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
 const FILE_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
-const BRUSH_PANEL_POSITION: Pos2 = Pos2::new(188.0, 82.0);
-const COLOR_PANEL_POSITION: Pos2 = Pos2::new(564.0, 82.0);
+const BRUSH_PANEL_POSITION: Pos2 = Pos2::new(108.0, 96.0);
+const COLOR_PANEL_POSITION: Pos2 = Pos2::new(108.0, 96.0);
 const KEYBINDING_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
-const CONTROL_HEIGHT: f32 = 36.0;
+const CONTROL_HEIGHT: f32 = 44.0;
 const TOOL_BUTTON_WIDTH: f32 = 44.0;
-const SLIDER_WIDTH: f32 = 152.0;
-const COLOR_BUTTON_SIZE: f32 = 32.0;
+const SLIDER_WIDTH: f32 = 212.0;
+const COLOR_BUTTON_SIZE: f32 = 44.0;
 const COLOR_PRESET_COUNT: usize = 6;
-const COLOR_PICKER_WIDTH: f32 = 220.0;
+const COLOR_PICKER_WIDTH: f32 = 244.0;
 const COLOR_PLANE_HEIGHT: f32 = 168.0;
-const HUE_SLIDER_HEIGHT: f32 = 18.0;
+const HUE_SLIDER_HEIGHT: f32 = 44.0;
 const COLOR_MESH_STEPS: usize = 16;
 const KEYBINDING_PANEL_WIDTH: f32 = 510.0;
 const KEYBINDING_LABEL_WIDTH: f32 = 214.0;
@@ -40,13 +41,28 @@ const LAYER_NAME_WIDTH: f32 = 170.0;
 const TOOLBAR_RADIUS: u8 = 14;
 const CONTROL_RADIUS: u8 = 9;
 
-const PANEL: Color32 = Color32::from_rgba_premultiplied(25, 27, 31, 244);
-const CONTROL: Color32 = Color32::from_rgb(39, 42, 48);
-const CONTROL_HOVER: Color32 = Color32::from_rgb(50, 54, 62);
-const CONTROL_ACTIVE: Color32 = Color32::from_rgb(235, 110, 72);
-const BORDER: Color32 = Color32::from_rgb(66, 70, 79);
-const TEXT: Color32 = Color32::from_rgb(234, 232, 225);
-const TEXT_MUTED: Color32 = Color32::from_rgb(166, 168, 176);
+const PANEL: Color32 = Color32::from_rgb(252, 251, 248);
+const CONTROL: Color32 = Color32::from_rgb(245, 243, 238);
+const CONTROL_HOVER: Color32 = Color32::from_rgb(234, 231, 223);
+const CONTROL_ACTIVE: Color32 = Color32::from_rgb(55, 102, 90);
+const BORDER: Color32 = Color32::from_rgb(221, 219, 212);
+const TEXT: Color32 = Color32::from_rgb(46, 50, 47);
+const TEXT_MUTED: Color32 = Color32::from_rgb(112, 116, 108);
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CanvasMode {
+    #[default]
+    Draw,
+    Pan,
+    PickColor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiPanel {
+    Color,
+    Layers,
+    Help,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UiTool {
@@ -70,23 +86,23 @@ impl UiTool {
 
     const fn short_label(self) -> &'static str {
         match self {
-            Self::Pen => "PEN",
-            Self::Eraser => "ERASE",
-            Self::Flat => "FLAT",
-            Self::Pencil => "PCL",
-            Self::PaletteKnife => "KNIFE",
-            Self::Bristle => "BRUSH",
+            Self::Pen => "Ink",
+            Self::Eraser => "Eraser",
+            Self::Flat => "Flat",
+            Self::Pencil => "Pencil",
+            Self::PaletteKnife => "Knife",
+            Self::Bristle => "Bristle",
         }
     }
 
     const fn menu_label(self) -> &'static str {
         match self {
-            Self::Pen => "HARD ROUND",
-            Self::Eraser => "ERASER",
-            Self::Flat => "FLAT NIB",
-            Self::Pencil => "GRAPHITE PENCIL",
-            Self::PaletteKnife => "PALETTE KNIFE",
-            Self::Bristle => "BRISTLE BRUSH",
+            Self::Pen => "Ink pen",
+            Self::Eraser => "Eraser",
+            Self::Flat => "Flat nib",
+            Self::Pencil => "Graphite",
+            Self::PaletteKnife => "Palette knife",
+            Self::Bristle => "Bristle",
         }
     }
 }
@@ -94,6 +110,10 @@ impl UiTool {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct UiSnapshot {
     pub visible: bool,
+    pub canvas_mode: CanvasMode,
+    pub brush_adjusting: Option<BrushAxis>,
+    pub zoom: f32,
+    pub natural_brushes_available: bool,
     pub tool: UiTool,
     pub brush_diameter: f32,
     pub brush_opacity: f32,
@@ -124,6 +144,9 @@ pub enum UiExportRegion {
 #[derive(Clone, Debug, PartialEq)]
 pub enum UiAction {
     SetVisible(bool),
+    SetCanvasMode(CanvasMode),
+    Zoom(f32),
+    FitCanvas,
     SelectTool(UiTool),
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
@@ -254,6 +277,9 @@ impl TabletCapture {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct UiHitRegions {
     toolbar: Rect,
+    brush_dock: Rect,
+    navigation: Rect,
+    settings_panel: Rect,
     file_panel: Rect,
     brush_panel: Rect,
     color_panel: Rect,
@@ -265,6 +291,9 @@ impl Default for UiHitRegions {
     fn default() -> Self {
         Self {
             toolbar: Rect::NOTHING,
+            brush_dock: Rect::NOTHING,
+            navigation: Rect::NOTHING,
+            settings_panel: Rect::NOTHING,
             file_panel: Rect::NOTHING,
             brush_panel: Rect::NOTHING,
             color_panel: Rect::NOTHING,
@@ -276,7 +305,10 @@ impl Default for UiHitRegions {
 
 impl UiHitRegions {
     fn contains(self, position: Pos2) -> bool {
-        self.toolbar.contains(position)
+        self.settings_panel.contains(position)
+            || self.brush_dock.contains(position)
+            || self.navigation.contains(position)
+            || self.toolbar.contains(position)
             || self.file_panel.contains(position)
             || self.brush_panel.contains(position)
             || self.color_panel.contains(position)
@@ -344,6 +376,10 @@ impl Default for ColorPickerState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct UiSessionState {
+    dock_right: bool,
+    controls_open: bool,
+    editing_bindings: bool,
+    puck_drag: Option<BrushDrag>,
     file_panel_open: bool,
     brush_panel_open: bool,
     color_panel_open: bool,
@@ -403,6 +439,7 @@ pub struct UiOverlay {
     hit_regions: UiHitRegions,
     pointer_over: bool,
     mouse_capture: bool,
+    touch_capture: Option<u64>,
     tablet_capture: TabletCapture,
     tablet_position: Option<Pos2>,
     session: UiSessionState,
@@ -417,6 +454,7 @@ pub struct UiOverlay {
 impl UiOverlay {
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let context = egui::Context::default();
+        context.set_visuals(egui::Visuals::light());
         let platform = egui_winit::State::new(
             context.clone(),
             egui::ViewportId::ROOT,
@@ -437,12 +475,10 @@ impl UiOverlay {
             hit_regions: UiHitRegions::default(),
             pointer_over: false,
             mouse_capture: false,
+            touch_capture: None,
             tablet_capture: TabletCapture::default(),
             tablet_position: None,
-            session: UiSessionState {
-                layers_panel_open: true,
-                ..Default::default()
-            },
+            session: UiSessionState::default(),
             modifiers: ModifiersState::empty(),
             cpu_dirty: true,
             gpu_dirty: false,
@@ -450,6 +486,41 @@ impl UiOverlay {
             repaint_deadline: None,
             stats: UiOverlayStats::default(),
         }
+    }
+
+    pub fn toggle_panel(&mut self, panel: UiPanel) {
+        match panel {
+            UiPanel::Color => {
+                self.session.color_panel_open = !self.session.color_panel_open;
+                self.session.brush_panel_open = false;
+                self.session.controls_open = false;
+                self.session.file_panel_open = false;
+                self.session.keybinding_panel_open = false;
+            }
+            UiPanel::Layers => self.session.layers_panel_open = !self.session.layers_panel_open,
+            UiPanel::Help => {
+                self.session.keybinding_panel_open = !self.session.keybinding_panel_open;
+                self.session.editing_bindings = false;
+                self.session.file_panel_open = false;
+                self.session.color_panel_open = false;
+                self.session.brush_panel_open = false;
+                self.session.controls_open = false;
+            }
+        }
+        self.session.key_capture = None;
+        self.mark_dirty();
+    }
+
+    pub fn close_panels(&mut self) {
+        self.session.file_panel_open = false;
+        self.session.color_panel_open = false;
+        self.session.brush_panel_open = false;
+        self.session.controls_open = false;
+        self.session.keybinding_panel_open = false;
+        self.session.layers_panel_open = false;
+        self.session.key_capture = None;
+        self.session.layer_rename = None;
+        self.mark_dirty();
     }
 
     pub fn on_window_event(
@@ -460,6 +531,42 @@ impl UiOverlay {
         suppress_mouse: bool,
     ) -> UiEventResponse {
         if !platform_event_can_invalidate_ui(event) {
+            return UiEventResponse::default();
+        }
+        if let WindowEvent::Touch(touch) = event {
+            let position = Pos2::new(touch.location.x as f32, touch.location.y as f32)
+                / window.scale_factor() as f32;
+            let start = touch.phase == winit::event::TouchPhase::Started;
+            if start
+                && self.touch_capture.is_none()
+                && !canvas_owns_mouse
+                && self.tablet_capture.device_id.is_none()
+                && !self.mouse_capture
+                && self.hit_regions.contains(position)
+            {
+                self.touch_capture = Some(touch.id);
+            }
+            if self.touch_capture != Some(touch.id) {
+                return UiEventResponse::default();
+            }
+            let _ = self.platform.on_window_event(window, event);
+            if matches!(
+                touch.phase,
+                winit::event::TouchPhase::Ended | winit::event::TouchPhase::Cancelled
+            ) {
+                self.touch_capture = None;
+            }
+            self.cpu_dirty = true;
+            return UiEventResponse {
+                consumed: true,
+                repaint: true,
+            };
+        }
+        if matches!(
+            event,
+            WindowEvent::PinchGesture { .. } | WindowEvent::PanGesture { .. }
+        ) && !self.pointer_over
+        {
             return UiEventResponse::default();
         }
         if let WindowEvent::ModifiersChanged(modifiers) = event {
@@ -507,6 +614,14 @@ impl UiOverlay {
                 consumed: true,
                 repaint: false,
             };
+        }
+        // egui reserves Tab for focus traversal even when no editor has focus.
+        // Keep the drawing workspace shortcut available outside text entry.
+        if matches!(event, WindowEvent::KeyboardInput { event, .. }
+            if event.physical_key == PhysicalKey::Code(KeyCode::Tab))
+            && !self.context.egui_wants_keyboard_input()
+        {
+            return UiEventResponse::default();
         }
         let pointer_event = matches!(
             event,
@@ -622,6 +737,35 @@ impl UiOverlay {
                     &mut actions,
                     &mut session,
                 );
+            } else {
+                hit_regions.toolbar = show_restore_button(root, &mut actions);
+            }
+            if let Some(axis) = snapshot.brush_adjusting {
+                egui::Area::new(Id::new("brush-adjustment-readout"))
+                    .anchor(Align2::CENTER_TOP, Vec2::new(0.0, 96.0))
+                    .interactable(false)
+                    .order(Order::Tooltip)
+                    .show(root.ctx(), |ui| {
+                        panel_frame().show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(match axis {
+                                    BrushAxis::Size => {
+                                        format!("Size  {:.1} px", snapshot.brush_diameter)
+                                    }
+                                    BrushAxis::Opacity => {
+                                        format!("Opacity  {:.0}%", snapshot.brush_opacity * 100.0)
+                                    }
+                                })
+                                .size(17.0)
+                                .color(TEXT),
+                            );
+                            ui.label(
+                                egui::RichText::new("Release to keep · Esc to cancel")
+                                    .size(12.0)
+                                    .color(TEXT_MUTED),
+                            );
+                        });
+                    });
             }
         });
         let repaint_delay = output
@@ -730,6 +874,8 @@ impl UiOverlay {
 
     pub fn cancel_pointer_capture(&mut self) {
         self.mouse_capture = false;
+        self.touch_capture = None;
+        self.session.puck_drag = None;
         if self.tablet_capture.device_id.is_some() {
             if let Some(pos) = self.tablet_position {
                 self.platform
@@ -767,6 +913,12 @@ impl UiOverlay {
             sample.position[1] / pixels_per_point,
         );
         let pointer_over = self.hit_regions.contains(position);
+        if self.touch_capture.is_some() {
+            return UiEventResponse {
+                consumed: true,
+                repaint: false,
+            };
+        }
         let route = self.tablet_capture.route(
             phase,
             sample.device_id,
@@ -844,103 +996,72 @@ fn show_toolbar(
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        if text_button(ui, "FILE", session.file_panel_open).clicked() {
-                            session.file_panel_open = !session.file_panel_open;
-                            session.brush_panel_open = false;
-                            session.color_panel_open = false;
-                            session.keybinding_panel_open = false;
-                            session.key_capture = None;
-                        }
-                        if text_button(ui, "KEYS", session.keybinding_panel_open).clicked() {
-                            session.keybinding_panel_open = !session.keybinding_panel_open;
-                            session.file_panel_open = false;
-                            session.brush_panel_open = false;
-                            session.color_panel_open = false;
-                            session.key_capture = None;
-                        }
-                        separator(ui);
-                        ui.add_enabled_ui(snapshot.undo_available, |ui| {
-                            if history_button(ui, false).clicked() {
-                                actions.push(UiAction::Undo);
-                            }
-                        });
-                        ui.add_enabled_ui(snapshot.redo_available, |ui| {
-                            if history_button(ui, true).clicked() {
-                                actions.push(UiAction::Redo);
-                            }
-                        });
-                        separator(ui);
-                        if text_button(ui, snapshot.tool.short_label(), session.brush_panel_open)
-                            .clicked()
-                        {
-                            session.brush_panel_open = !session.brush_panel_open;
-                            session.file_panel_open = false;
-                            session.color_panel_open = false;
-                            session.keybinding_panel_open = false;
-                            session.key_capture = None;
-                        }
-                        separator(ui);
-                        ui.label(
-                            egui::RichText::new("SIZE")
-                                .font(FontId::monospace(11.0))
-                                .color(TEXT_MUTED),
-                        );
-                        if let Some(value) = diameter_slider(ui, snapshot.brush_diameter) {
-                            actions.push(UiAction::SetBrushDiameter(value));
-                        }
-                        let value = format!("{:.0}", snapshot.brush_diameter);
-                        ui.label(
-                            egui::RichText::new(value)
-                                .font(FontId::monospace(12.0))
-                                .color(TEXT),
-                        );
-                        separator(ui);
-                        ui.label(
-                            egui::RichText::new("FLOW")
-                                .font(FontId::monospace(11.0))
-                                .color(TEXT_MUTED),
-                        );
-                        if let Some(value) = opacity_slider(ui, snapshot.brush_opacity) {
-                            actions.push(UiAction::SetBrushOpacity(value));
-                        }
-                        let value = format!("{:.0}%", snapshot.brush_opacity * 100.0);
-                        ui.label(
-                            egui::RichText::new(value)
-                                .font(FontId::monospace(12.0))
-                                .color(TEXT),
-                        );
-                        if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
-                            session.color_panel_open = !session.color_panel_open;
-                            session.file_panel_open = false;
-                            session.brush_panel_open = false;
-                            session.keybinding_panel_open = false;
-                            session.key_capture = None;
-                        }
-                        separator(ui);
-                        if text_button(ui, "LAYERS", session.layers_panel_open).clicked() {
-                            session.layers_panel_open = !session.layers_panel_open;
-                        }
-                        if icon_button(ui, "×", "Hide interface (F1)", false).clicked() {
-                            actions.push(UiAction::SetVisible(false));
+            panel_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    if text_button(ui, "Sketchpad", session.file_panel_open).clicked() {
+                        session.file_panel_open = !session.file_panel_open;
+                        session.brush_panel_open = false;
+                        session.color_panel_open = false;
+                        session.keybinding_panel_open = false;
+                        session.key_capture = None;
+                    }
+                    separator(ui);
+                    ui.add_enabled_ui(snapshot.undo_available, |ui| {
+                        if history_button(ui, false).clicked() {
+                            actions.push(UiAction::Undo);
                         }
                     });
+                    ui.add_enabled_ui(snapshot.redo_available, |ui| {
+                        if history_button(ui, true).clicked() {
+                            actions.push(UiAction::Redo);
+                        }
+                    });
+                    separator(ui);
+                    if text_button(ui, "Layers", session.layers_panel_open).clicked() {
+                        session.layers_panel_open = !session.layers_panel_open;
+                    }
+                    if icon_button(
+                        ui,
+                        "?",
+                        "Help and keyboard shortcuts",
+                        session.keybinding_panel_open,
+                    )
+                    .clicked()
+                    {
+                        session.keybinding_panel_open = !session.keybinding_panel_open;
+                        session.editing_bindings = false;
+                        session.controls_open = false;
+                        session.file_panel_open = false;
+                        session.brush_panel_open = false;
+                        session.color_panel_open = false;
+                    }
+                    if icon_button(ui, "◱", "Focus canvas", false).clicked() {
+                        actions.push(UiAction::SetVisible(false));
+                    }
                 });
+            });
         });
+    let brush_dock = show_brush_dock(root, snapshot, actions, session);
+    let navigation = show_navigation(root, snapshot, actions);
+    let settings_panel = if session.controls_open {
+        show_brush_controls(root, snapshot, actions, session)
+    } else {
+        Rect::NOTHING
+    };
     let file_panel = if session.file_panel_open {
         show_file_panel(root, actions, &mut session.file_panel_open)
     } else {
         Rect::NOTHING
     };
     let brush_panel = if session.brush_panel_open {
-        show_brush_panel(root, snapshot, actions, &mut session.brush_panel_open)
+        show_brush_panel(
+            root,
+            snapshot,
+            actions,
+            &mut session.brush_panel_open,
+            session.dock_right,
+        )
     } else {
         Rect::NOTHING
     };
@@ -951,6 +1072,7 @@ fn show_toolbar(
             actions,
             &mut session.color_panel_open,
             &mut session.color_picker,
+            session.dock_right,
         )
     } else {
         Rect::NOTHING
@@ -968,17 +1090,515 @@ fn show_toolbar(
             actions,
             &mut session.layers_panel_open,
             &mut session.layer_rename,
+            session.dock_right,
         )
     } else {
         Rect::NOTHING
     };
     UiHitRegions {
         toolbar: area.response.rect,
+        brush_dock,
+        navigation,
+        settings_panel,
         file_panel,
         brush_panel,
         color_panel,
         keybinding_panel,
         layers_panel,
+    }
+}
+
+fn panel_frame() -> egui::Frame {
+    egui::Frame::new()
+        .fill(PANEL)
+        .stroke(Stroke::new(1.0, BORDER))
+        .corner_radius(TOOLBAR_RADIUS)
+        .inner_margin(12.0)
+        .shadow(egui::Shadow {
+            offset: [0, 3],
+            blur: 14,
+            spread: 0,
+            color: Color32::from_black_alpha(18),
+        })
+}
+
+fn show_restore_button(root: &mut egui::Ui, actions: &mut Vec<UiAction>) -> Rect {
+    egui::Area::new(Id::new("sketchpad-restore"))
+        .fixed_pos(TOOLBAR_POSITION)
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            panel_frame().show(ui, |ui| {
+                if text_button(ui, "Show tools", false).clicked() {
+                    actions.push(UiAction::SetVisible(true));
+                }
+            });
+        })
+        .response
+        .rect
+}
+
+fn show_navigation(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiAction>) -> Rect {
+    egui::Area::new(Id::new("sketchpad-navigation"))
+        .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -16.0))
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    if text_button(ui, "Draw", snapshot.canvas_mode == CanvasMode::Draw).clicked() {
+                        actions.push(UiAction::SetCanvasMode(CanvasMode::Draw));
+                    }
+                    if text_button(ui, "Pan", snapshot.canvas_mode == CanvasMode::Pan)
+                        .on_hover_text("Drag the canvas with your pen")
+                        .clicked()
+                    {
+                        actions.push(UiAction::SetCanvasMode(CanvasMode::Pan));
+                    }
+                    separator(ui);
+                    if icon_button(ui, "−", "Zoom out", false).clicked() {
+                        actions.push(UiAction::Zoom(0.8));
+                    }
+                    if text_button(ui, &format!("{:.0}%", snapshot.zoom * 100.0), false)
+                        .on_hover_text("Fit canvas")
+                        .clicked()
+                    {
+                        actions.push(UiAction::FitCanvas);
+                    }
+                    if icon_button(ui, "+", "Zoom in", false).clicked() {
+                        actions.push(UiAction::Zoom(1.25));
+                    }
+                });
+            });
+        })
+        .response
+        .rect
+}
+
+fn show_brush_dock(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    session: &mut UiSessionState,
+) -> Rect {
+    egui::Area::new(Id::new("sketchpad-brush-rail"))
+        .anchor(
+            if session.dock_right {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::LEFT_TOP
+            },
+            Vec2::new(if session.dock_right { -16.0 } else { 16.0 }, 96.0),
+        )
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.set_width(64.0);
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 5.0);
+                for tool in [UiTool::Pen, UiTool::Eraser] {
+                    if tool_card(
+                        ui,
+                        tool,
+                        snapshot.tool == tool && snapshot.canvas_mode == CanvasMode::Draw,
+                    )
+                    .clicked()
+                    {
+                        actions.push(UiAction::SelectTool(tool));
+                    }
+                }
+                separator_horizontal(ui);
+                brush_puck(ui, snapshot, actions, session);
+                ui.vertical_centered(|ui| {
+                    if color_swatch(ui, snapshot.color, 1.0).clicked() {
+                        session.color_panel_open = !session.color_panel_open;
+                        session.controls_open = false;
+                        session.brush_panel_open = false;
+                        session.file_panel_open = false;
+                        session.keybinding_panel_open = false;
+                    }
+                    if text_button(ui, "Pick", snapshot.canvas_mode == CanvasMode::PickColor)
+                        .on_hover_text("Pick color from canvas")
+                        .clicked()
+                    {
+                        actions.push(UiAction::SetCanvasMode(
+                            if snapshot.canvas_mode == CanvasMode::PickColor {
+                                CanvasMode::Draw
+                            } else {
+                                CanvasMode::PickColor
+                            },
+                        ));
+                    }
+                    if text_button(ui, "Tune", session.controls_open)
+                        .on_hover_text("Brush settings and presets")
+                        .clicked()
+                    {
+                        session.controls_open = !session.controls_open;
+                        session.brush_panel_open = false;
+                        session.color_panel_open = false;
+                        session.file_panel_open = false;
+                        session.keybinding_panel_open = false;
+                    }
+                    if icon_button(ui, "⇄", "Move tools to the other side", false).clicked() {
+                        session.dock_right = !session.dock_right;
+                        session.controls_open = false;
+                        session.layers_panel_open = false;
+                    }
+                });
+            });
+        })
+        .response
+        .rect
+}
+
+fn brush_puck(
+    ui: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    session: &mut UiSessionState,
+) {
+    let (rect, response) = ui.allocate_exact_size(Vec2::new(64.0, 96.0), Sense::click_and_drag());
+    let center = rect.center_top() + Vec2::new(0.0, 28.0);
+    ui.painter().circle_filled(center, 27.0, CONTROL);
+    ui.painter()
+        .circle_stroke(center, 27.0, Stroke::new(1.0, BORDER));
+    let rgb = snapshot.color.map(linear_to_srgb_u8);
+    ui.painter().circle_filled(
+        center,
+        (snapshot.brush_diameter.sqrt() * 2.0).clamp(3.0, 20.0),
+        Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(snapshot.brush_opacity),
+    );
+    ui.painter().text(
+        rect.center_top() + Vec2::new(0.0, 67.0),
+        Align2::CENTER_CENTER,
+        format!("{:.1} px", snapshot.brush_diameter),
+        FontId::proportional(12.0),
+        TEXT,
+    );
+    ui.painter().text(
+        rect.center_top() + Vec2::new(0.0, 85.0),
+        Align2::CENTER_CENTER,
+        format!("{:.0}%", snapshot.brush_opacity * 100.0),
+        FontId::proportional(12.0),
+        TEXT_MUTED,
+    );
+    if response.is_pointer_button_down_on() && session.puck_drag.is_none() {
+        if let Some(position) = response.interact_pointer_pos() {
+            session.puck_drag = Some(BrushDrag::new(
+                [position.x, position.y],
+                snapshot.brush_diameter,
+                snapshot.brush_opacity,
+                None,
+            ));
+        }
+    }
+    if response.dragged() {
+        if let (Some(drag), Some(position)) =
+            (&mut session.puck_drag, response.interact_pointer_pos())
+        {
+            match drag.update([position.x, position.y]) {
+                Some((BrushAxis::Size, value)) => actions.push(UiAction::SetBrushDiameter(value)),
+                Some((BrushAxis::Opacity, value)) => actions.push(UiAction::SetBrushOpacity(value)),
+                None => {}
+            }
+        }
+    }
+    if response.clicked() {
+        session.controls_open = !session.controls_open;
+        session.color_panel_open = false;
+        session.brush_panel_open = false;
+        session.file_panel_open = false;
+        session.keybinding_panel_open = false;
+    }
+    if response.drag_stopped() || !ui.input(|input| input.pointer.primary_down()) {
+        session.puck_drag = None;
+    }
+    response.widget_info(|| {
+        WidgetInfo::labeled(
+            WidgetType::Slider,
+            ui.is_enabled(),
+            "Brush puck: drag horizontally for size, vertically for opacity; tap for settings",
+        )
+    });
+    response.on_hover_text("Drag left/right: size\nDrag up/down: opacity\nTap: brush settings");
+}
+
+fn show_help_content(
+    ui: &mut egui::Ui,
+    _snapshot: UiSnapshot,
+    bindings: KeyBindings,
+    session: &mut UiSessionState,
+) {
+    ui.horizontal(|ui| {
+        ui.heading("Make yourself at home");
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if icon_button(ui, "×", "Close help", false).clicked() {
+                session.keybinding_panel_open = false;
+            }
+        });
+    });
+    egui::ScrollArea::vertical().id_salt("input-help").max_height((ui.ctx().content_rect().height() - 220.0).max(180.0)).show(ui, |ui| {
+        ui.label(egui::RichText::new("With a pen · no keyboard needed").strong().color(CONTROL_ACTIVE));
+        for text in ["Tap Ink or Eraser to draw. Pick samples a color, then returns to drawing.", "Drag the round puck sideways for size, or vertically for opacity. Tune opens sliders and presets.", "Pan lets you drag the canvas. Use − / + to zoom; tap the percentage to fit.", "Undo, redo, color and layers are always a tap away. Focus hides tools; Show tools brings them back.", "On a touchscreen: two fingers pan/pinch, two-finger tap undoes, three-finger tap redoes. One finger on the canvas does not paint."] {
+            ui.add_space(8.0); ui.label(text);
+        }
+        ui.add_space(14.0);
+        ui.label(egui::RichText::new("Keyboard & mouse").strong().color(CONTROL_ACTIVE));
+        ui.label("Shift + drag left/right: brush size · Alt + contact: sample color");
+        ui.label("Mouse wheel: zoom · Middle drag: pan · Trackpad scroll: pan · Trackpad pinch: zoom when supported");
+        ui.label("Esc: cancel an adjustment, close panels or return to drawing");
+        for command in [KeyCommand::SelectBrush, KeyCommand::SelectEraser, KeyCommand::PanCanvas, KeyCommand::AdjustOpacity, KeyCommand::Undo, KeyCommand::Redo, KeyCommand::ShowColors, KeyCommand::ShowLayers, KeyCommand::ToggleInterface, KeyCommand::ShowHelp] {
+            let keys = bindings.for_command(command).slots.into_iter().flatten().map(|key| key.label()).collect::<Vec<_>>().join(" / ");
+            ui.horizontal(|ui| {
+                ui.label(command.label());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| { ui.label(if keys.is_empty() { "Unassigned".to_owned() } else { keys }); });
+            });
+        }
+        ui.add_space(12.0);
+        if menu_button(ui, "Edit keyboard shortcuts", "Change or restore shortcuts").clicked() { session.editing_bindings = true; }
+    });
+}
+
+fn show_brush_controls(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    session: &mut UiSessionState,
+) -> Rect {
+    let anchor = if session.dock_right {
+        Align2::RIGHT_TOP
+    } else {
+        Align2::LEFT_TOP
+    };
+    let offset = Vec2::new(if session.dock_right { -108.0 } else { 108.0 }, 96.0);
+    egui::Area::new(Id::new("sketchpad-brush-controls"))
+        .anchor(anchor, offset)
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.set_width(212.0);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("brush-dock-scroll")
+                    .max_height(
+                        (root.ctx().content_rect().height()
+                            - if root.ctx().content_rect().width() < 960.0 {
+                                212.0
+                            } else {
+                                132.0
+                            })
+                        .max(160.0),
+                    )
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("Brush settings")
+                                    .size(15.0)
+                                    .strong()
+                                    .color(TEXT),
+                            );
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icon_button(ui, "×", "Close brush settings", false).clicked() {
+                                    session.controls_open = false;
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            for tool in [UiTool::Pen, UiTool::Eraser] {
+                                if tool_card(
+                                    ui,
+                                    tool,
+                                    snapshot.tool == tool
+                                        && snapshot.canvas_mode == CanvasMode::Draw,
+                                )
+                                .clicked()
+                                {
+                                    actions.push(UiAction::SelectTool(tool));
+                                }
+                            }
+                            if custom_button(
+                                ui,
+                                Vec2::new(64.0, 66.0),
+                                session.brush_panel_open,
+                                "More brushes",
+                                |ui, rect, color| {
+                                    ui.painter().text(
+                                        rect.center() - Vec2::new(0.0, 9.0),
+                                        Align2::CENTER_CENTER,
+                                        "•••",
+                                        FontId::proportional(19.0),
+                                        color,
+                                    );
+                                    ui.painter().text(
+                                        rect.center() + Vec2::new(0.0, 19.0),
+                                        Align2::CENTER_CENTER,
+                                        "More",
+                                        FontId::proportional(12.0),
+                                        color,
+                                    );
+                                },
+                            )
+                            .clicked()
+                            {
+                                session.brush_panel_open = !session.brush_panel_open;
+                                session.color_panel_open = false;
+                                session.file_panel_open = false;
+                                session.keybinding_panel_open = false;
+                            }
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(snapshot.tool.menu_label())
+                                .size(13.0)
+                                .color(TEXT_MUTED),
+                        );
+                        brush_preview(ui, snapshot);
+                        control_label(ui, "Size", &format!("{:.1} px", snapshot.brush_diameter));
+                        if let Some(value) = diameter_slider(ui, snapshot.brush_diameter) {
+                            actions.push(UiAction::SetBrushDiameter(value));
+                        }
+                        ui.horizontal(|ui| {
+                            for value in [2.0, 8.0, 24.0, 64.0] {
+                                if text_button(
+                                    ui,
+                                    &format!("{value:.0}"),
+                                    (snapshot.brush_diameter - value).abs() < 0.1,
+                                )
+                                .clicked()
+                                {
+                                    actions.push(UiAction::SetBrushDiameter(value));
+                                }
+                            }
+                        });
+                        control_label(
+                            ui,
+                            "Opacity",
+                            &format!("{:.0}%", snapshot.brush_opacity * 100.0),
+                        );
+                        if let Some(value) = opacity_slider(ui, snapshot.brush_opacity) {
+                            actions.push(UiAction::SetBrushOpacity(value));
+                        }
+                        separator_horizontal(ui);
+                        ui.horizontal(|ui| {
+                            if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
+                                session.color_panel_open = !session.color_panel_open;
+                                session.brush_panel_open = false;
+                                session.file_panel_open = false;
+                                session.keybinding_panel_open = false;
+                            }
+                            if text_button(ui, "Color", session.color_panel_open).clicked() {
+                                session.color_panel_open = !session.color_panel_open;
+                                session.brush_panel_open = false;
+                                session.file_panel_open = false;
+                                session.keybinding_panel_open = false;
+                            }
+                            if text_button(
+                                ui,
+                                "Pick",
+                                snapshot.canvas_mode == CanvasMode::PickColor,
+                            )
+                            .on_hover_text(
+                                "Pick a color from the canvas; lift to return to drawing",
+                            )
+                            .clicked()
+                            {
+                                actions.push(UiAction::SetCanvasMode(
+                                    if snapshot.canvas_mode == CanvasMode::PickColor {
+                                        CanvasMode::Draw
+                                    } else {
+                                        CanvasMode::PickColor
+                                    },
+                                ));
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            for color in snapshot.color_presets.iter().take(4) {
+                                if color_button(ui, *color, *color == snapshot.color).clicked() {
+                                    actions.push(UiAction::CommitColor(*color));
+                                }
+                            }
+                        });
+                    });
+            });
+        })
+        .response
+        .rect
+}
+
+fn control_label(ui: &mut egui::Ui, label: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(label).size(13.0).color(TEXT_MUTED));
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(egui::RichText::new(value).size(13.0).color(TEXT));
+        });
+    });
+}
+
+fn tool_card(ui: &mut egui::Ui, tool: UiTool, selected: bool) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(64.0, 66.0),
+        selected,
+        tool.menu_label(),
+        |ui, rect, color| {
+            let c = rect.center() - Vec2::new(0.0, 9.0);
+            let points = if tool == UiTool::Eraser {
+                vec![
+                    c + Vec2::new(-11.0, 2.0),
+                    c + Vec2::new(1.0, -10.0),
+                    c + Vec2::new(11.0, 0.0),
+                    c + Vec2::new(0.0, 11.0),
+                    c + Vec2::new(-4.0, 11.0),
+                ]
+            } else {
+                vec![
+                    c + Vec2::new(-10.0, 11.0),
+                    c + Vec2::new(-6.0, 0.0),
+                    c + Vec2::new(6.0, -12.0),
+                    c + Vec2::new(12.0, -6.0),
+                    c + Vec2::new(0.0, 6.0),
+                ]
+            };
+            ui.painter()
+                .add(egui::Shape::closed_line(points, Stroke::new(1.7, color)));
+            ui.painter().text(
+                rect.center() + Vec2::new(0.0, 19.0),
+                Align2::CENTER_CENTER,
+                tool.short_label(),
+                FontId::proportional(12.0),
+                color,
+            );
+        },
+    )
+}
+
+fn brush_preview(ui: &mut egui::Ui, snapshot: UiSnapshot) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(212.0, 52.0), Sense::hover());
+    ui.painter().rect_filled(rect, 8, CONTROL);
+    let rgb = snapshot.color.map(linear_to_srgb_u8);
+    let color = if snapshot.tool == UiTool::Eraser {
+        TEXT_MUTED
+    } else {
+        Color32::from_rgb(rgb[0], rgb[1], rgb[2])
+    };
+    let color = color.gamma_multiply(snapshot.brush_opacity);
+    let width = snapshot.brush_diameter.clamp(1.0, 22.0);
+    for i in 0..48 {
+        let point = |t: f32| {
+            Pos2::new(
+                rect.left() + 16.0 + t * 180.0,
+                rect.center().y + (t * std::f32::consts::TAU).sin() * 9.0,
+            )
+        };
+        let t = i as f32 / 48.0;
+        ui.painter().line_segment(
+            [point(t), point((i + 1) as f32 / 48.0)],
+            Stroke::new(
+                width * (0.2 + (t * std::f32::consts::PI).sin() * 0.8),
+                color,
+            ),
+        );
     }
 }
 
@@ -995,107 +1615,100 @@ fn show_keybinding_panel(
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(KEYBINDING_PANEL_WIDTH);
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.horizontal(|ui| {
-                        palette_label(ui, "KEY BINDINGS");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, "×", "Close key bindings", false).clicked() {
-                                session.keybinding_panel_open = false;
-                                session.key_capture = None;
+            panel_frame().show(ui, |ui| {
+                ui.set_width(KEYBINDING_PANEL_WIDTH);
+                if !session.editing_bindings {
+                    show_help_content(ui, snapshot, keybindings, session);
+                    return;
+                }
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    palette_label(ui, "KEY BINDINGS");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "×", "Close key bindings", false).clicked() {
+                            session.keybinding_panel_open = false;
+                            session.key_capture = None;
+                            session.reset_keybindings_armed = false;
+                        }
+                        let reset_label = if session.reset_keybindings_armed {
+                            "CONFIRM RESET"
+                        } else {
+                            "RESET DEFAULTS"
+                        };
+                        if small_menu_button(
+                            ui,
+                            reset_label,
+                            "Restore every default shortcut",
+                            session.reset_keybindings_armed,
+                        )
+                        .clicked()
+                        {
+                            if session.reset_keybindings_armed {
+                                actions.push(UiAction::ResetKeyBindings);
                                 session.reset_keybindings_armed = false;
-                            }
-                            let reset_label = if session.reset_keybindings_armed {
-                                "CONFIRM RESET"
+                                session.key_capture = None;
                             } else {
-                                "RESET DEFAULTS"
-                            };
-                            if small_menu_button(
-                                ui,
-                                reset_label,
-                                "Restore every default shortcut",
-                                session.reset_keybindings_armed,
-                            )
-                            .clicked()
-                            {
-                                if session.reset_keybindings_armed {
-                                    actions.push(UiAction::ResetKeyBindings);
-                                    session.reset_keybindings_armed = false;
-                                    session.key_capture = None;
-                                } else {
-                                    session.reset_keybindings_armed = true;
-                                }
+                                session.reset_keybindings_armed = true;
                             }
-                        });
+                        }
                     });
-                    let (instruction, instruction_color) = if let Some(target) = session.key_capture
-                    {
-                        (
-                            format!(
-                                "PRESS A KEY FOR {} · BACKSPACE CLEARS · ESC CANCELS",
-                                target.command.label().to_uppercase()
-                            ),
-                            CONTROL_ACTIVE,
-                        )
-                    } else if snapshot.keybindings_save_error {
-                        (
-                            "ACTIVE FOR THIS SESSION · COULD NOT SAVE SETTINGS".to_owned(),
-                            CONTROL_ACTIVE,
-                        )
-                    } else {
-                        (
-                            "CLICK A SLOT TO REBIND · DUPLICATES MOVE TO THE NEW ACTION".to_owned(),
-                            TEXT_MUTED,
-                        )
-                    };
-                    ui.label(
-                        egui::RichText::new(instruction)
-                            .font(FontId::monospace(10.0))
-                            .color(instruction_color),
-                    );
-                    separator_horizontal(ui);
-                    egui::ScrollArea::vertical()
-                        .id_salt("sketchpad-keybinding-list")
-                        .max_height(560.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            let mut category = "";
-                            for command in ALL_KEY_COMMANDS {
-                                if command.category() != category {
-                                    category = command.category();
-                                    if !category.is_empty() {
-                                        palette_label(ui, category);
+                });
+                let (instruction, instruction_color) = if let Some(target) = session.key_capture {
+                    (
+                        format!(
+                            "PRESS A KEY FOR {} · BACKSPACE CLEARS · ESC CANCELS",
+                            target.command.label().to_uppercase()
+                        ),
+                        CONTROL_ACTIVE,
+                    )
+                } else if snapshot.keybindings_save_error {
+                    (
+                        "ACTIVE FOR THIS SESSION · COULD NOT SAVE SETTINGS".to_owned(),
+                        CONTROL_ACTIVE,
+                    )
+                } else {
+                    (
+                        "CLICK A SLOT TO REBIND · DUPLICATES MOVE TO THE NEW ACTION".to_owned(),
+                        TEXT_MUTED,
+                    )
+                };
+                ui.label(
+                    egui::RichText::new(instruction)
+                        .font(FontId::monospace(10.0))
+                        .color(instruction_color),
+                );
+                separator_horizontal(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("sketchpad-keybinding-list")
+                    .max_height((root.ctx().content_rect().height() - 230.0).max(160.0))
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        let mut category = "";
+                        for command in ALL_KEY_COMMANDS {
+                            if command.category() != category {
+                                category = command.category();
+                                if !category.is_empty() {
+                                    palette_label(ui, category);
+                                }
+                            }
+                            ui.horizontal(|ui| {
+                                keybinding_action_label(ui, command.label());
+                                let bindings = keybindings.for_command(command);
+                                for slot in 0..BINDINGS_PER_COMMAND {
+                                    let target = KeyBindingTarget { command, slot };
+                                    let capturing = session.key_capture == Some(target);
+                                    if keybinding_button(ui, bindings.slots[slot], capturing, slot)
+                                        .clicked()
+                                    {
+                                        session.key_capture =
+                                            if capturing { None } else { Some(target) };
+                                        session.reset_keybindings_armed = false;
                                     }
                                 }
-                                ui.horizontal(|ui| {
-                                    keybinding_action_label(ui, command.label());
-                                    let bindings = keybindings.for_command(command);
-                                    for slot in 0..BINDINGS_PER_COMMAND {
-                                        let target = KeyBindingTarget { command, slot };
-                                        let capturing = session.key_capture == Some(target);
-                                        if keybinding_button(
-                                            ui,
-                                            bindings.slots[slot],
-                                            capturing,
-                                            slot,
-                                        )
-                                        .clicked()
-                                        {
-                                            session.key_capture =
-                                                if capturing { None } else { Some(target) };
-                                            session.reset_keybindings_armed = false;
-                                        }
-                                    }
-                                });
-                            }
-                        });
-                });
+                            });
+                        }
+                    });
+            });
         });
     area.response.rect
 }
@@ -1106,68 +1719,76 @@ fn show_color_panel(
     actions: &mut Vec<UiAction>,
     color_panel_open: &mut bool,
     picker: &mut ColorPickerState,
+    dock_right: bool,
 ) -> Rect {
     let area = egui::Area::new(Id::new("sketchpad-color-panel"))
-        .fixed_pos(COLOR_PANEL_POSITION)
+        .anchor(
+            if dock_right {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::LEFT_TOP
+            },
+            Vec2::new(
+                if dock_right {
+                    -COLOR_PANEL_POSITION.x
+                } else {
+                    COLOR_PANEL_POSITION.x
+                },
+                COLOR_PANEL_POSITION.y,
+            ),
+        )
         .order(Order::Foreground)
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(COLOR_PICKER_WIDTH);
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.horizontal(|ui| {
-                        palette_label(ui, "COLOR");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, "×", "Close color picker", false).clicked() {
-                                *color_panel_open = false;
-                            }
-                            ui.label(
-                                egui::RichText::new(linear_rgb_hex(picker.source_linear))
-                                    .font(FontId::monospace(11.0))
-                                    .color(TEXT),
-                            );
-                        });
+            panel_frame().show(ui, |ui| {
+                ui.set_width(COLOR_PICKER_WIDTH);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    palette_label(ui, "Color");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "×", "Close color picker", false).clicked() {
+                            *color_panel_open = false;
+                        }
+                        ui.label(
+                            egui::RichText::new(linear_rgb_hex(picker.source_linear))
+                                .font(FontId::proportional(13.0))
+                                .color(TEXT),
+                        );
                     });
-                    let plane = saturation_value_picker(ui, *picker);
-                    apply_picker_interaction(plane, picker, actions, |picker, position, rect| {
-                        let saturation =
-                            ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        let value =
-                            (1.0 - (position.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                        picker.set_sv(saturation, value)
-                    });
-                    let hue = hue_picker(ui, *picker);
-                    apply_picker_interaction(hue, picker, actions, |picker, position, rect| {
-                        let hue = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                        picker.set_hue(hue)
-                    });
-                    separator_horizontal(ui);
-                    palette_label(ui, "PALETTE");
-                    ui.horizontal(|ui| {
-                        for color in snapshot.color_presets {
+                });
+                let plane = saturation_value_picker(ui, *picker);
+                apply_picker_interaction(plane, picker, actions, |picker, position, rect| {
+                    let saturation = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    let value = (1.0 - (position.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
+                    picker.set_sv(saturation, value)
+                });
+                let hue = hue_picker(ui, *picker);
+                apply_picker_interaction(hue, picker, actions, |picker, position, rect| {
+                    let hue = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                    picker.set_hue(hue)
+                });
+                separator_horizontal(ui);
+                palette_label(ui, "Palette");
+                ui.horizontal_wrapped(|ui| {
+                    for color in snapshot.color_presets {
+                        if color_button(ui, color, color == snapshot.color).clicked() {
+                            actions.push(UiAction::CommitColor(color));
+                        }
+                    }
+                });
+                if snapshot.recent_color_count > 0 {
+                    palette_label(ui, "Recent colors");
+                    ui.horizontal_wrapped(|ui| {
+                        let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
+                        for &color in &snapshot.recent_colors[..count] {
                             if color_button(ui, color, color == snapshot.color).clicked() {
                                 actions.push(UiAction::CommitColor(color));
                             }
                         }
                     });
-                    if snapshot.recent_color_count > 0 {
-                        palette_label(ui, "RECENT");
-                        ui.horizontal(|ui| {
-                            let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
-                            for &color in &snapshot.recent_colors[..count] {
-                                if color_button(ui, color, color == snapshot.color).clicked() {
-                                    actions.push(UiAction::CommitColor(color));
-                                }
-                            }
-                        });
-                    }
-                });
+                }
+            });
         });
     area.response.rect
 }
@@ -1268,39 +1889,42 @@ fn show_brush_panel(
     snapshot: UiSnapshot,
     actions: &mut Vec<UiAction>,
     brush_panel_open: &mut bool,
+    dock_right: bool,
 ) -> Rect {
     let area = egui::Area::new(Id::new("sketchpad-brush-panel"))
-        .fixed_pos(BRUSH_PANEL_POSITION)
+        .anchor(if dock_right { Align2::RIGHT_TOP } else { Align2::LEFT_TOP }, Vec2::new(if dock_right { -BRUSH_PANEL_POSITION.x } else { BRUSH_PANEL_POSITION.x }, BRUSH_PANEL_POSITION.y))
         .order(Order::Foreground)
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
+            panel_frame()
                 .show(ui, |ui| {
-                    ui.set_width(190.0);
+                    ui.set_width(220.0);
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                     ui.horizontal(|ui| {
-                        palette_label(ui, "BRUSH PRESET");
+                        palette_label(ui, "Brush library");
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             if icon_button(ui, "×", "Close brush presets", false).clicked() {
                                 *brush_panel_open = false;
                             }
                         });
                     });
+                    if !snapshot.natural_brushes_available {
+                        ui.label(egui::RichText::new("Ink and eraser are available. Other brushes are coming to this renderer.").size(12.0).color(TEXT_MUTED));
+                    }
                     for tool in UiTool::ALL {
                         let label = if tool == snapshot.tool {
                             format!("{}  •", tool.menu_label())
                         } else {
                             tool.menu_label().to_owned()
                         };
-                        if menu_button(ui, &label, "Select brush preset").clicked() {
-                            actions.push(UiAction::SelectTool(tool));
-                            *brush_panel_open = false;
-                        }
+                        let available = snapshot.natural_brushes_available || matches!(tool, UiTool::Pen | UiTool::Eraser);
+                        ui.add_enabled_ui(available, |ui| {
+                            if menu_button(ui, &label, "Select brush preset").clicked() {
+                                actions.push(UiAction::SelectTool(tool));
+                                *brush_panel_open = false;
+                            }
+                        });
                     }
                 });
         });
@@ -1354,51 +1978,45 @@ fn show_file_panel(
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(220.0);
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.horizontal(|ui| {
-                        palette_label(ui, "FILE");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, "×", "Close file menu", false).clicked() {
-                                *file_panel_open = false;
-                            }
-                        });
+            panel_frame().show(ui, |ui| {
+                ui.set_width(220.0);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    palette_label(ui, "Your sketch");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "×", "Close file menu", false).clicked() {
+                            *file_panel_open = false;
+                        }
                     });
-                    if menu_button(ui, "OPEN", "Open a Sketchpad document").clicked() {
-                        actions.push(UiAction::OpenDocument);
-                        *file_panel_open = false;
-                    }
-                    if menu_button(ui, "SAVE", "Save the current Sketchpad document").clicked() {
-                        actions.push(UiAction::SaveDocument);
-                        *file_panel_open = false;
-                    }
-                    if menu_button(ui, "SAVE AS", "Save to a new Sketchpad document").clicked() {
-                        actions.push(UiAction::SaveDocumentAs);
-                        *file_panel_open = false;
-                    }
-                    separator_horizontal(ui);
-                    if menu_button(ui, "IMPORT PNG", "Import a PNG as a new layer").clicked() {
-                        actions.push(UiAction::ImportPng);
-                        *file_panel_open = false;
-                    }
-                    if menu_button(ui, "EXPORT CANVAS", "Export the full visible canvas").clicked()
-                    {
-                        actions.push(UiAction::ExportPng(UiExportRegion::FullCanvas));
-                        *file_panel_open = false;
-                    }
-                    if menu_button(ui, "EXPORT CONTENT", "Export exact visible content bounds")
-                        .clicked()
-                    {
-                        actions.push(UiAction::ExportPng(UiExportRegion::ContentBounds));
-                        *file_panel_open = false;
-                    }
                 });
+                if menu_button(ui, "Open sketch…", "Open a Sketchpad document").clicked() {
+                    actions.push(UiAction::OpenDocument);
+                    *file_panel_open = false;
+                }
+                if menu_button(ui, "SAVE", "Save the current Sketchpad document").clicked() {
+                    actions.push(UiAction::SaveDocument);
+                    *file_panel_open = false;
+                }
+                if menu_button(ui, "Save as…", "Save to a new Sketchpad document").clicked() {
+                    actions.push(UiAction::SaveDocumentAs);
+                    *file_panel_open = false;
+                }
+                separator_horizontal(ui);
+                if menu_button(ui, "Import image…", "Import a PNG as a new layer").clicked() {
+                    actions.push(UiAction::ImportPng);
+                    *file_panel_open = false;
+                }
+                if menu_button(ui, "Export canvas…", "Export the full visible canvas").clicked() {
+                    actions.push(UiAction::ExportPng(UiExportRegion::FullCanvas));
+                    *file_panel_open = false;
+                }
+                if menu_button(ui, "Export artwork…", "Export exact visible content bounds")
+                    .clicked()
+                {
+                    actions.push(UiAction::ExportPng(UiExportRegion::ContentBounds));
+                    *file_panel_open = false;
+                }
+            });
         });
     area.response.rect
 }
@@ -1410,6 +2028,7 @@ fn show_layers_panel(
     actions: &mut Vec<UiAction>,
     layers_panel_open: &mut bool,
     layer_rename: &mut Option<LayerRenameState>,
+    dock_right: bool,
 ) -> Rect {
     if layer_rename
         .as_ref()
@@ -1418,139 +2037,141 @@ fn show_layers_panel(
         *layer_rename = None;
     }
     let area = egui::Area::new(Id::new("sketchpad-layers-panel"))
-        .anchor(Align2::RIGHT_TOP, Vec2::new(-16.0, 16.0))
+        .anchor(
+            if dock_right {
+                Align2::LEFT_TOP
+            } else {
+                Align2::RIGHT_TOP
+            },
+            Vec2::new(if dock_right { 16.0 } else { -16.0 }, 96.0),
+        )
         .order(Order::Foreground)
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            egui::Frame::new()
-                .fill(PANEL)
-                .stroke(Stroke::new(1.0, BORDER))
-                .corner_radius(TOOLBAR_RADIUS)
-                .inner_margin(10.0)
-                .show(ui, |ui| {
-                    ui.set_width(LAYER_PANEL_WIDTH);
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.horizontal(|ui| {
-                        palette_label(ui, "LAYERS");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, "×", "Close layers", false).clicked() {
-                                *layers_panel_open = false;
-                                *layer_rename = None;
-                            }
-                            ui.add_enabled_ui(layers.len() > 1, |ui| {
-                                if compact_text_button(ui, "DEL", "Delete active layer").clicked() {
-                                    actions.push(UiAction::DeleteActiveLayer);
-                                }
-                            });
-                            if compact_text_button(ui, "COPY", "Duplicate active layer").clicked() {
-                                actions.push(UiAction::DuplicateActiveLayer);
-                            }
-                            if icon_button(ui, "+", "Create layer", false).clicked() {
-                                actions.push(UiAction::CreateLayer);
+            panel_frame().show(ui, |ui| {
+                ui.set_width(LAYER_PANEL_WIDTH);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    palette_label(ui, "Layers");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "×", "Close layers", false).clicked() {
+                            *layers_panel_open = false;
+                            *layer_rename = None;
+                        }
+                        ui.add_enabled_ui(layers.len() > 1, |ui| {
+                            if compact_text_button(ui, "−", "Delete active layer").clicked() {
+                                actions.push(UiAction::DeleteActiveLayer);
                             }
                         });
-                    });
-                    ui.horizontal(|ui| {
-                        if compact_text_button(ui, "UP", "Move active layer up").clicked() {
-                            actions.push(UiAction::MoveActiveLayer(1));
+                        if compact_text_button(ui, "Copy", "Duplicate active layer").clicked() {
+                            actions.push(UiAction::DuplicateActiveLayer);
                         }
-                        if compact_text_button(ui, "DOWN", "Move active layer down").clicked() {
-                            actions.push(UiAction::MoveActiveLayer(-1));
-                        }
-                        if compact_text_button(ui, "NAME", "Rename active layer").clicked() {
-                            if let Some(active) = layers
-                                .iter()
-                                .find(|layer| layer.id == snapshot.active_layer)
-                            {
-                                *layer_rename = Some(LayerRenameState {
-                                    layer: active.id,
-                                    name: active.name.to_owned(),
-                                    focus_requested: false,
-                                });
-                            }
+                        if icon_button(ui, "+", "Create layer", false).clicked() {
+                            actions.push(UiAction::CreateLayer);
                         }
                     });
-                    let mut rename_finished = None;
-                    if let Some(rename) = layer_rename.as_mut() {
-                        let response = ui.add(
-                            egui::TextEdit::singleline(&mut rename.name)
-                                .id(Id::new(("sketchpad-layer-name", rename.layer.get())))
-                                .desired_width(LAYER_PANEL_WIDTH)
-                                .char_limit(128)
-                                .font(FontId::proportional(13.0))
-                                .text_color(TEXT),
-                        );
-                        if !rename.focus_requested {
-                            response.request_focus();
-                            rename.focus_requested = true;
-                        }
-                        let cancel = response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Escape));
-                        let enter = response.has_focus()
-                            && ui.input(|input| input.key_pressed(egui::Key::Enter));
-                        let valid = !rename.name.trim().is_empty();
-                        let mut commit = enter && valid;
-                        let mut cancel_clicked = false;
-                        ui.horizontal(|ui| {
-                            ui.add_enabled_ui(valid, |ui| {
-                                if compact_text_button(ui, "SAVE", "Commit layer name").clicked() {
-                                    commit = true;
-                                }
+                });
+                ui.horizontal(|ui| {
+                    if compact_text_button(ui, "↑", "Move active layer up").clicked() {
+                        actions.push(UiAction::MoveActiveLayer(1));
+                    }
+                    if compact_text_button(ui, "↓", "Move active layer down").clicked() {
+                        actions.push(UiAction::MoveActiveLayer(-1));
+                    }
+                    if compact_text_button(ui, "Name", "Rename active layer").clicked() {
+                        if let Some(active) = layers
+                            .iter()
+                            .find(|layer| layer.id == snapshot.active_layer)
+                        {
+                            *layer_rename = Some(LayerRenameState {
+                                layer: active.id,
+                                name: active.name.to_owned(),
+                                focus_requested: false,
                             });
-                            if compact_text_button(ui, "CANCEL", "Cancel layer rename").clicked() {
-                                cancel_clicked = true;
-                            }
-                        });
-                        if cancel || cancel_clicked {
-                            rename_finished = Some(None);
-                        } else if commit {
-                            rename_finished = Some(Some((rename.layer, rename.name.clone())));
                         }
-                    }
-                    if let Some(result) = rename_finished {
-                        *layer_rename = None;
-                        if let Some((layer, name)) = result {
-                            actions.push(UiAction::RenameLayer { layer, name });
-                        }
-                    }
-                    separator_horizontal(ui);
-                    egui::ScrollArea::vertical()
-                        .id_salt("sketchpad-layer-list")
-                        .max_height(360.0)
-                        .auto_shrink([false, true])
-                        .show(ui, |ui| {
-                            for layer in layers.iter().rev() {
-                                show_layer_row(ui, *layer, snapshot.active_layer, actions);
-                            }
-                        });
-                    separator_horizontal(ui);
-                    if let Some(active) = layers
-                        .iter()
-                        .find(|layer| layer.id == snapshot.active_layer)
-                    {
-                        ui.horizontal(|ui| {
-                            palette_label(ui, "OPACITY");
-                            if icon_button(ui, "−", "Decrease layer opacity", false).clicked() {
-                                actions.push(UiAction::AdjustLayerOpacity {
-                                    layer: active.id,
-                                    delta: -0.1,
-                                });
-                            }
-                            ui.label(
-                                egui::RichText::new(format!("{:.0}%", active.opacity * 100.0))
-                                    .font(FontId::monospace(12.0))
-                                    .color(TEXT),
-                            );
-                            if icon_button(ui, "+", "Increase layer opacity", false).clicked() {
-                                actions.push(UiAction::AdjustLayerOpacity {
-                                    layer: active.id,
-                                    delta: 0.1,
-                                });
-                            }
-                        });
                     }
                 });
+                let mut rename_finished = None;
+                if let Some(rename) = layer_rename.as_mut() {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut rename.name)
+                            .id(Id::new(("sketchpad-layer-name", rename.layer.get())))
+                            .desired_width(LAYER_PANEL_WIDTH)
+                            .char_limit(128)
+                            .font(FontId::proportional(13.0))
+                            .text_color(TEXT),
+                    );
+                    if !rename.focus_requested {
+                        response.request_focus();
+                        rename.focus_requested = true;
+                    }
+                    let cancel = response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Escape));
+                    let enter = response.has_focus()
+                        && ui.input(|input| input.key_pressed(egui::Key::Enter));
+                    let valid = !rename.name.trim().is_empty();
+                    let mut commit = enter && valid;
+                    let mut cancel_clicked = false;
+                    ui.horizontal(|ui| {
+                        ui.add_enabled_ui(valid, |ui| {
+                            if compact_text_button(ui, "SAVE", "Commit layer name").clicked() {
+                                commit = true;
+                            }
+                        });
+                        if compact_text_button(ui, "CANCEL", "Cancel layer rename").clicked() {
+                            cancel_clicked = true;
+                        }
+                    });
+                    if cancel || cancel_clicked {
+                        rename_finished = Some(None);
+                    } else if commit {
+                        rename_finished = Some(Some((rename.layer, rename.name.clone())));
+                    }
+                }
+                if let Some(result) = rename_finished {
+                    *layer_rename = None;
+                    if let Some((layer, name)) = result {
+                        actions.push(UiAction::RenameLayer { layer, name });
+                    }
+                }
+                separator_horizontal(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("sketchpad-layer-list")
+                    .max_height(360.0)
+                    .auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for layer in layers.iter().rev() {
+                            show_layer_row(ui, *layer, snapshot.active_layer, actions);
+                        }
+                    });
+                separator_horizontal(ui);
+                if let Some(active) = layers
+                    .iter()
+                    .find(|layer| layer.id == snapshot.active_layer)
+                {
+                    ui.horizontal(|ui| {
+                        palette_label(ui, "Opacity");
+                        if icon_button(ui, "−", "Decrease layer opacity", false).clicked() {
+                            actions.push(UiAction::AdjustLayerOpacity {
+                                layer: active.id,
+                                delta: -0.1,
+                            });
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}%", active.opacity * 100.0))
+                                .font(FontId::proportional(13.0))
+                                .color(TEXT),
+                        );
+                        if icon_button(ui, "+", "Increase layer opacity", false).clicked() {
+                            actions.push(UiAction::AdjustLayerOpacity {
+                                layer: active.id,
+                                delta: 0.1,
+                            });
+                        }
+                    });
+                }
+            });
         });
     area.response.rect
 }
@@ -1575,7 +2196,7 @@ fn show_layer_row(
         }
         ui.label(
             egui::RichText::new(format!("{:.0}%", layer.opacity * 100.0))
-                .font(FontId::monospace(11.0))
+                .font(FontId::proportional(13.0))
                 .color(TEXT_MUTED),
         );
     });
@@ -1635,16 +2256,23 @@ fn history_button(ui: &mut egui::Ui, redo: bool) -> egui::Response {
         |ui, rect, color| {
             let center = rect.center();
             let direction = if redo { 1.0 } else { -1.0 };
+            let tip = center + Vec2::new(9.0 * direction, -5.0);
             let points = [
-                Pos2::new(center.x - 7.0 * direction, center.y - 5.0),
-                Pos2::new(center.x + 2.0 * direction, center.y - 5.0),
-                Pos2::new(center.x + 7.0 * direction, center.y),
-                Pos2::new(center.x + 2.0 * direction, center.y + 5.0),
+                center + Vec2::new(-5.0 * direction, 9.0),
+                center + Vec2::new(-9.0 * direction, 3.0),
+                center + Vec2::new(-6.0 * direction, -5.0),
+                tip,
             ];
-            for segment in points.windows(2) {
-                ui.painter()
-                    .line_segment([segment[0], segment[1]], Stroke::new(1.8, color));
-            }
+            ui.painter()
+                .add(egui::Shape::line(points.to_vec(), Stroke::new(1.8, color)));
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    tip + Vec2::new(-5.0 * direction, -5.0),
+                    tip,
+                    tip + Vec2::new(-5.0 * direction, 5.0),
+                ],
+                Stroke::new(1.8, color),
+            ));
         },
     )
     .on_hover_text(description)
@@ -1680,7 +2308,7 @@ fn menu_button(ui: &mut egui::Ui, text: &str, description: &str) -> egui::Respon
                 Pos2::new(rect.left() + 10.0, rect.center().y),
                 Align2::LEFT_CENTER,
                 text,
-                FontId::monospace(11.0),
+                FontId::proportional(13.0),
                 color,
             );
         },
@@ -1763,7 +2391,7 @@ fn keybinding_button(
 fn palette_label(ui: &mut egui::Ui, text: &str) {
     ui.label(
         egui::RichText::new(text)
-            .font(FontId::monospace(11.0))
+            .font(FontId::proportional(13.0))
             .color(TEXT_MUTED),
     );
 }
@@ -1780,20 +2408,63 @@ fn icon_button(ui: &mut egui::Ui, icon: &str, description: &str, selected: bool)
         selected,
         description,
         |ui, rect, color| {
-            ui.painter().text(
-                rect.center(),
-                Align2::CENTER_CENTER,
-                icon,
-                FontId::proportional(19.0),
-                color,
-            );
+            if matches!(icon, "⇄" | "◱" | "⋮") {
+                let c = rect.center();
+                let stroke = Stroke::new(1.6, color);
+                match icon {
+                    "⋮" => {
+                        for y in [-6.0, 0.0, 6.0] {
+                            ui.painter()
+                                .circle_filled(c + Vec2::new(0.0, y), 1.7, color);
+                        }
+                    }
+                    "⇄" => {
+                        for direction in [-1.0, 1.0] {
+                            let tip = c + Vec2::new(9.0 * direction, -4.0 * direction);
+                            ui.painter().line_segment(
+                                [tip, tip - Vec2::new(18.0 * direction, 0.0)],
+                                stroke,
+                            );
+                            ui.painter().add(egui::Shape::line(
+                                vec![
+                                    tip + Vec2::new(-4.0 * direction, -4.0),
+                                    tip,
+                                    tip + Vec2::new(-4.0 * direction, 4.0),
+                                ],
+                                stroke,
+                            ));
+                        }
+                    }
+                    _ => {
+                        for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                            let corner = c + Vec2::new(8.0 * x, 8.0 * y);
+                            ui.painter().add(egui::Shape::line(
+                                vec![
+                                    corner - Vec2::new(5.0 * x, 0.0),
+                                    corner,
+                                    corner - Vec2::new(0.0, 5.0 * y),
+                                ],
+                                stroke,
+                            ));
+                        }
+                    }
+                }
+            } else {
+                ui.painter().text(
+                    rect.center(),
+                    Align2::CENTER_CENTER,
+                    icon,
+                    FontId::proportional(19.0),
+                    color,
+                );
+            }
         },
     )
     .on_hover_text(description)
 }
 
 fn text_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response {
-    let width = TOOL_BUTTON_WIDTH.max(text.chars().count() as f32 * 7.0 + 16.0);
+    let width = TOOL_BUTTON_WIDTH.max(text.chars().count() as f32 * 7.5 + 20.0);
     custom_button(
         ui,
         Vec2::new(width, CONTROL_HEIGHT),
@@ -1804,7 +2475,7 @@ fn text_button(ui: &mut egui::Ui, text: &str, selected: bool) -> egui::Response 
                 rect.center(),
                 Align2::CENTER_CENTER,
                 text,
-                FontId::monospace(11.0),
+                FontId::proportional(13.0),
                 color,
             );
         },
@@ -1830,12 +2501,25 @@ fn custom_button(
     } else {
         CONTROL
     };
-    let text = if selected { Color32::BLACK } else { TEXT };
+    let text = if !ui.is_enabled() {
+        TEXT_MUTED.gamma_multiply(0.45)
+    } else if selected {
+        Color32::WHITE
+    } else {
+        TEXT
+    };
     ui.painter().rect(
         rect,
         CONTROL_RADIUS,
         fill,
-        Stroke::new(1.0, if selected { CONTROL_ACTIVE } else { BORDER }),
+        Stroke::new(
+            1.0,
+            if selected {
+                CONTROL_ACTIVE
+            } else {
+                Color32::TRANSPARENT
+            },
+        ),
         StrokeKind::Inside,
     );
     paint_contents(ui, rect, text);
@@ -1875,11 +2559,11 @@ fn unit_slider(
     ui.painter().rect_filled(track, 2, CONTROL);
     ui.painter().rect_filled(fill, 2, CONTROL_ACTIVE);
     ui.painter()
-        .circle_filled(Pos2::new(knob_x, track.center().y), 7.0, TEXT);
+        .circle_filled(Pos2::new(knob_x, track.center().y), 9.0, PANEL);
     ui.painter().circle_stroke(
         Pos2::new(knob_x, track.center().y),
-        7.0,
-        Stroke::new(1.0, BORDER),
+        9.0,
+        Stroke::new(1.5, CONTROL_ACTIVE),
     );
 
     let keyboard_delta = if response.has_focus() {
@@ -1923,13 +2607,13 @@ fn unit_to_diameter(unit: f32) -> f32 {
     (min + unit.clamp(0.0, 1.0) * (max - min)).exp()
 }
 
-fn color_swatch(ui: &mut egui::Ui, linear_rgb: [f32; 3], opacity: f32) -> egui::Response {
+fn color_swatch(ui: &mut egui::Ui, linear_rgb: [f32; 3], _opacity: f32) -> egui::Response {
     let (rect, response) = ui.allocate_exact_size(Vec2::splat(CONTROL_HEIGHT), Sense::click());
     let rgb = linear_rgb.map(linear_to_srgb_u8);
-    let fill = Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(opacity.clamp(0.0, 1.0));
-    ui.painter().circle_filled(rect.center(), 11.0, fill);
+    let fill = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
+    ui.painter().circle_filled(rect.center(), 15.0, fill);
     ui.painter()
-        .circle_stroke(rect.center(), 11.0, Stroke::new(1.0, TEXT_MUTED));
+        .circle_stroke(rect.center(), 15.0, Stroke::new(1.0, TEXT_MUTED));
     response.widget_info(|| {
         WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), "Choose brush color")
     });
@@ -2048,6 +2732,115 @@ fn separator(ui: &mut egui::Ui) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_snapshot() -> UiSnapshot {
+        let document = sketchpad::document::Document::new(1024, 1024, 256).unwrap();
+        UiSnapshot {
+            visible: true,
+            canvas_mode: CanvasMode::Draw,
+            brush_adjusting: None,
+            zoom: 1.0,
+            natural_brushes_available: false,
+            tool: UiTool::Pen,
+            brush_diameter: 8.0,
+            brush_opacity: 1.0,
+            color: [0.0; 3],
+            color_presets: [[0.0; 3]; COLOR_PRESET_COUNT],
+            recent_colors: [[0.0; 3]; MAX_RECENT_COLORS],
+            recent_color_count: MAX_RECENT_COLORS,
+            active_layer: document.active_layer_id(),
+            undo_available: true,
+            redo_available: false,
+            keybindings_save_error: false,
+        }
+    }
+
+    #[test]
+    fn tablet_layout_stays_inside_landscape_and_portrait_windows() {
+        for size in [
+            Vec2::new(1280.0, 720.0),
+            Vec2::new(768.0, 1024.0),
+            Vec2::new(800.0, 600.0),
+        ] {
+            for dock_right in [false, true] {
+                let context = egui::Context::default();
+                let mut session = UiSessionState {
+                    dock_right,
+                    ..Default::default()
+                };
+                let screen = Rect::from_min_size(Pos2::ZERO, size);
+                let mut regions = UiHitRegions::default();
+                for _ in 0..3 {
+                    let _ = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |root| {
+                            regions = show_toolbar(
+                                root,
+                                test_snapshot(),
+                                &[],
+                                KeyBindings::default(),
+                                &mut Vec::new(),
+                                &mut session,
+                            );
+                        },
+                    );
+                }
+                for rect in [regions.toolbar, regions.brush_dock, regions.navigation] {
+                    assert!(screen.contains_rect(rect), "{size:?}: {rect:?}");
+                }
+                assert!(!regions.toolbar.intersects(regions.brush_dock));
+                assert!(
+                    !regions.navigation.intersects(regions.brush_dock),
+                    "{size:?}: {:?}",
+                    regions.brush_dock
+                );
+                assert!(!regions.contains(Pos2::new(size.x * 0.5, size.y * 0.5)));
+            }
+        }
+    }
+
+    #[test]
+    fn focus_mode_can_be_exited_with_a_pointer_without_a_keyboard() {
+        let context = egui::Context::default();
+        let mut actions = Vec::new();
+        let mut rect = Rect::NOTHING;
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        for _ in 0..3 {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |root| {
+                    rect = show_restore_button(root, &mut actions);
+                },
+            );
+        }
+        for pressed in [true, false] {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(rect.center()),
+                        egui::Event::PointerButton {
+                            pos: rect.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |root| {
+                    show_restore_button(root, &mut actions);
+                },
+            );
+        }
+        assert_eq!(actions, vec![UiAction::SetVisible(true)]);
+    }
 
     #[test]
     fn diameter_mapping_preserves_endpoints_and_midpoints() {
@@ -2193,6 +2986,9 @@ mod tests {
     #[test]
     fn disjoint_ui_regions_do_not_capture_the_canvas_between_them() {
         let regions = UiHitRegions {
+            brush_dock: Rect::NOTHING,
+            navigation: Rect::NOTHING,
+            settings_panel: Rect::NOTHING,
             toolbar: Rect::from_min_max(Pos2::new(0.0, 0.0), Pos2::new(10.0, 10.0)),
             file_panel: Rect::from_min_max(Pos2::new(60.0, 60.0), Pos2::new(70.0, 70.0)),
             brush_panel: Rect::from_min_max(Pos2::new(100.0, 100.0), Pos2::new(110.0, 110.0)),

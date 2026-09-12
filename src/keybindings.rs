@@ -223,9 +223,17 @@ pub enum KeyCommand {
     SelectLayerBelow,
     MoveLayerAbove,
     MoveLayerBelow,
+    SelectBrush,
+    SelectEraser,
+    PickColor,
+    ShowColors,
+    ShowLayers,
+    ShowHelp,
+    PanCanvas,
+    AdjustOpacity,
 }
 
-pub const ALL_KEY_COMMANDS: [KeyCommand; 32] = [
+pub const ALL_KEY_COMMANDS: [KeyCommand; 40] = [
     KeyCommand::ToggleInterface,
     KeyCommand::Undo,
     KeyCommand::Redo,
@@ -258,6 +266,14 @@ pub const ALL_KEY_COMMANDS: [KeyCommand; 32] = [
     KeyCommand::SelectLayerBelow,
     KeyCommand::MoveLayerAbove,
     KeyCommand::MoveLayerBelow,
+    KeyCommand::SelectBrush,
+    KeyCommand::SelectEraser,
+    KeyCommand::PickColor,
+    KeyCommand::ShowColors,
+    KeyCommand::ShowLayers,
+    KeyCommand::ShowHelp,
+    KeyCommand::PanCanvas,
+    KeyCommand::AdjustOpacity,
 ];
 
 impl KeyCommand {
@@ -267,6 +283,14 @@ impl KeyCommand {
 
     pub const fn id(self) -> &'static str {
         match self {
+            Self::SelectBrush => "select_brush",
+            Self::SelectEraser => "select_eraser",
+            Self::PickColor => "pick_color",
+            Self::ShowColors => "show_colors",
+            Self::ShowLayers => "show_layers",
+            Self::ShowHelp => "show_help",
+            Self::PanCanvas => "pan_canvas",
+            Self::AdjustOpacity => "adjust_opacity",
             Self::ToggleInterface => "toggle_interface",
             Self::Undo => "undo",
             Self::Redo => "redo",
@@ -310,6 +334,14 @@ impl KeyCommand {
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::SelectBrush => "Select brush",
+            Self::SelectEraser => "Select eraser",
+            Self::PickColor => "Pick canvas color",
+            Self::ShowColors => "Open colors",
+            Self::ShowLayers => "Open layers",
+            Self::ShowHelp => "Help and shortcuts",
+            Self::PanCanvas => "Hold to pan canvas",
+            Self::AdjustOpacity => "Hold and drag for opacity",
             Self::ToggleInterface => "Show / hide interface",
             Self::Undo => "Undo",
             Self::Redo => "Redo",
@@ -347,6 +379,14 @@ impl KeyCommand {
 
     pub const fn category(self) -> &'static str {
         match self {
+            Self::SelectBrush => "BRUSH",
+            Self::SelectEraser => "BRUSH",
+            Self::PickColor => "COLOR",
+            Self::ShowColors => "COLOR",
+            Self::ShowLayers => "LAYERS",
+            Self::ShowHelp => "GENERAL",
+            Self::PanCanvas => "GENERAL",
+            Self::AdjustOpacity => "BRUSH",
             Self::ToggleInterface | Self::ResetView => "GENERAL",
             Self::Undo
             | Self::Redo
@@ -482,7 +522,11 @@ impl KeyBindings {
         if persisted.version != KEYBINDING_FORMAT_VERSION {
             return Err(KeyBindingError::UnsupportedVersion(persisted.version));
         }
-        let mut result = Self::default();
+        // Validate explicit entries separately. Saved bindings take priority over
+        // defaults added in later versions, without accepting duplicate saved chords.
+        let mut explicit = Self {
+            commands: [CommandBindings::default(); ALL_KEY_COMMANDS.len()],
+        };
         let mut seen = [false; ALL_KEY_COMMANDS.len()];
         for entry in persisted.commands {
             let Some(command) = KeyCommand::from_id(&entry.command) else {
@@ -492,7 +536,21 @@ impl KeyBindings {
                 return Err(KeyBindingError::DuplicateCommand(entry.command));
             }
             seen[command.index()] = true;
-            result.commands[command.index()].slots = entry.bindings;
+            explicit.commands[command.index()].slots = entry.bindings;
+        }
+        explicit.validate_unique()?;
+        let mut result = Self::default();
+        for command in ALL_KEY_COMMANDS {
+            if seen[command.index()] {
+                result.commands[command.index()] = CommandBindings::default();
+            }
+        }
+        for command in ALL_KEY_COMMANDS {
+            if seen[command.index()] {
+                for (slot, chord) in explicit.for_command(command).slots.into_iter().enumerate() {
+                    result.set(command, slot, chord);
+                }
+            }
         }
         result.validate_unique()?;
         Ok(result)
@@ -533,7 +591,15 @@ fn default_bindings(key_command: KeyCommand) -> CommandBindings {
     let command_shift = |key| KeyChord::new(key, true, true, false);
     let command_alt_shift = |key| KeyChord::new(key, true, true, true);
     match key_command {
-        Command::ToggleInterface => CommandBindings::one(plain(Key::F1)),
+        Command::SelectBrush => CommandBindings::one(plain(Key::KeyB)),
+        Command::SelectEraser => CommandBindings::one(plain(Key::KeyE)),
+        Command::PickColor => CommandBindings::one(plain(Key::KeyI)),
+        Command::ShowColors => CommandBindings::one(plain(Key::KeyC)),
+        Command::ShowLayers => CommandBindings::one(plain(Key::KeyL)),
+        Command::ShowHelp => CommandBindings::one(shift(Key::Slash)),
+        Command::PanCanvas => CommandBindings::one(plain(Key::Space)),
+        Command::AdjustOpacity => CommandBindings::one(plain(Key::KeyO)),
+        Command::ToggleInterface => CommandBindings::two(plain(Key::Tab), plain(Key::F1)),
         Command::Undo => CommandBindings::one(primary(Key::KeyZ)),
         Command::Redo => CommandBindings::two(command_shift(Key::KeyZ), primary(Key::KeyY)),
         Command::SaveDocument => CommandBindings::one(primary(Key::KeyS)),
@@ -547,8 +613,8 @@ fn default_bindings(key_command: KeyCommand) -> CommandBindings {
         Command::BrushLarger => CommandBindings::one(plain(Key::BracketRight)),
         Command::BrushOpacityDown => CommandBindings::one(shift(Key::BracketLeft)),
         Command::BrushOpacityUp => CommandBindings::one(shift(Key::BracketRight)),
-        Command::ToggleEraser => CommandBindings::one(plain(Key::KeyE)),
-        Command::CycleBrushPreset => CommandBindings::one(plain(Key::KeyB)),
+        Command::ToggleEraser => CommandBindings::default(),
+        Command::CycleBrushPreset => CommandBindings::one(shift(Key::KeyB)),
         Command::RecentColorOlder => CommandBindings::one(plain(Key::KeyX)),
         Command::RecentColorNewer => CommandBindings::one(shift(Key::KeyX)),
         Command::PresetColor1 => CommandBindings::one(plain(Key::Digit1)),
@@ -673,6 +739,53 @@ fn nonempty_env(name: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_legacy_keys_take_priority_over_new_defaults() {
+        // Build serialized chords through the public representation to keep the
+        // compatibility test independent of serde's enum spelling.
+        let mut saved = PersistedKeyBindings {
+            version: 1,
+            commands: Vec::new(),
+        };
+        saved.commands.push(PersistedCommand {
+            command: "cycle_brush_preset".to_owned(),
+            bindings: [
+                Some(KeyChord::new(BindingKey::KeyB, false, false, false)),
+                None,
+            ],
+        });
+        let bindings = KeyBindings::decode(&serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            bindings.command_for(KeyChord::new(BindingKey::KeyB, false, false, false)),
+            Some(KeyCommand::CycleBrushPreset)
+        );
+        assert_eq!(
+            bindings.for_command(KeyCommand::SelectBrush).slots,
+            [None, None]
+        );
+        assert_eq!(
+            bindings.command_for(KeyChord::new(BindingKey::Space, false, false, false)),
+            Some(KeyCommand::PanCanvas)
+        );
+    }
+
+    #[test]
+    fn drawing_defaults_have_direct_tools_and_hold_commands() {
+        let bindings = KeyBindings::default();
+        for (key, command) in [
+            (BindingKey::KeyB, KeyCommand::SelectBrush),
+            (BindingKey::KeyE, KeyCommand::SelectEraser),
+            (BindingKey::Space, KeyCommand::PanCanvas),
+            (BindingKey::KeyO, KeyCommand::AdjustOpacity),
+            (BindingKey::Tab, KeyCommand::ToggleInterface),
+        ] {
+            assert_eq!(
+                bindings.command_for(KeyChord::new(key, false, false, false)),
+                Some(command)
+            );
+        }
+    }
 
     #[test]
     fn defaults_are_unique_and_preserve_the_existing_shortcuts() {

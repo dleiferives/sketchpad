@@ -1,8 +1,12 @@
 mod app_ui;
+mod canvas_interaction;
 mod keybindings;
 mod latency_probe;
 
-use app_ui::{UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiSnapshot, UiTool};
+use app_ui::{
+    CanvasMode, UiAction, UiExportRegion, UiLayerSnapshot, UiOverlay, UiPanel, UiSnapshot, UiTool,
+};
+use canvas_interaction::{BrushAxis, BrushDrag, TouchAction, TouchNavigation};
 use keybindings::{KeyBindings, KeyChord, KeyCommand};
 use latency_probe::{FrameStageMetrics, LatencySeries, TabletLatencyMetrics};
 use sketchpad::{
@@ -513,6 +517,14 @@ struct App {
     gpu: Option<Gpu>,
     ui: Option<UiOverlay>,
     ui_visible: bool,
+    canvas_mode: CanvasMode,
+    tablet_pan: Option<(u16, [f32; 2])>,
+    brush_drag: Option<(PointerOwner, BrushDrag)>,
+    cancelled_tablet_contact: Option<u16>,
+    pan_key: Option<KeyCode>,
+    opacity_key: Option<KeyCode>,
+    touch_navigation: TouchNavigation,
+    input_epoch: Instant,
     configured: bool,
     document: Document,
     paint_brush: HardRoundBrush,
@@ -540,6 +552,7 @@ struct App {
     keybindings_save_error: bool,
     tablet_proxy: EventLoopProxy<TabletEvent>,
     last_tablet_activity: Option<Instant>,
+    last_touch_activity: Option<Instant>,
     last_tablet_title_update: Option<Instant>,
     tablet_sample_count: u64,
     tablet_max_pressure: f32,
@@ -571,7 +584,7 @@ impl App {
             persistence.document_changed();
         }
         let recovery_dirty = persistence_enabled && persistence.recovery_dirty();
-        let paint_brush = HardRoundBrush::new([0.035, 0.07, 0.16], 48.0, 1.0, 0.18).unwrap();
+        let paint_brush = HardRoundBrush::new([0.035, 0.07, 0.16], 12.0, 1.0, 0.18).unwrap();
         let recent_colors =
             RecentColors::new(paint_brush.color()).expect("the default pen color is valid");
         let keybindings_path = keybindings::default_keybindings_path();
@@ -597,6 +610,14 @@ impl App {
             gpu: None,
             ui: None,
             ui_visible: true,
+            canvas_mode: CanvasMode::Draw,
+            tablet_pan: None,
+            brush_drag: None,
+            cancelled_tablet_contact: None,
+            pan_key: None,
+            opacity_key: None,
+            touch_navigation: TouchNavigation::default(),
+            input_epoch: Instant::now(),
             configured: false,
             document,
             paint_brush,
@@ -624,6 +645,7 @@ impl App {
             keybindings_save_error,
             tablet_proxy,
             last_tablet_activity: None,
+            last_touch_activity: None,
             last_tablet_title_update: None,
             tablet_sample_count: 0,
             tablet_max_pressure: 0.0,
@@ -679,24 +701,6 @@ impl App {
         )
     }
 
-    fn active_layer_summary(&self) -> (&str, usize, usize) {
-        if let Some(document) = self.gpu_resident_document() {
-            let layers = document.metadata().layers();
-            let active = document.metadata().active_layer();
-            let index = layers
-                .iter()
-                .position(|layer| layer.id() == active)
-                .expect("resident active-layer identity remains in metadata");
-            return (layers[index].name(), index, layers.len());
-        }
-        let index = self.document.active_layer_index();
-        (
-            self.document.layers()[index].name(),
-            index,
-            self.document.layers().len(),
-        )
-    }
-
     fn reject_legacy_document_action(&self, action: &str) -> bool {
         if self.gpu_resident_document().is_none() {
             return false;
@@ -722,6 +726,14 @@ impl App {
         recent_colors[..recent_color_count].copy_from_slice(self.recent_colors.colors());
         UiSnapshot {
             visible: self.ui_visible,
+            canvas_mode: if self.pan_key.is_some() {
+                CanvasMode::Pan
+            } else {
+                self.canvas_mode
+            },
+            brush_adjusting: self.brush_drag.and_then(|(_, drag)| drag.axis),
+            zoom: self.zoom,
+            natural_brushes_available: self.gpu_resident_document().is_none(),
             tool,
             brush_diameter: brush.diameter(),
             brush_opacity: brush.opacity(),
@@ -759,6 +771,19 @@ impl App {
                 }
                 self.request_redraw();
             }
+            UiAction::SetCanvasMode(mode) => {
+                if !self.canvas_busy() {
+                    self.canvas_mode = mode;
+                    self.request_redraw();
+                }
+            }
+            UiAction::Zoom(factor) => {
+                if !self.canvas_busy() {
+                    self.zoom = (self.zoom * factor).clamp(0.125, 64.0);
+                    self.request_redraw();
+                }
+            }
+            UiAction::FitCanvas => self.reset_view(),
             UiAction::SelectTool(tool) => self.select_ui_tool(tool),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
@@ -834,8 +859,111 @@ impl App {
         self.request_redraw();
     }
 
+    fn toggle_ui_panel(&mut self, panel: UiPanel) {
+        self.ui_visible = true;
+        if let Some(ui) = &mut self.ui {
+            ui.toggle_panel(panel);
+        }
+        self.request_redraw();
+    }
+
+    fn canvas_busy(&self) -> bool {
+        self.active_pointer.is_some()
+            || self.sampling_pointer.is_some()
+            || self.brush_drag.is_some()
+            || self.cancelled_tablet_contact.is_some()
+            || self.panning
+            || self.tablet_pan.is_some()
+    }
+
+    fn logical_position(&self, position: [f32; 2]) -> [f32; 2] {
+        let scale = self
+            .window
+            .as_ref()
+            .map_or(1.0, |window| window.scale_factor() as f32);
+        position.map(|value| value / scale)
+    }
+
+    fn start_brush_drag(&mut self, owner: PointerOwner, position: [f32; 2]) -> bool {
+        if self.canvas_busy() || self.pan_key.is_some() || self.canvas_mode != CanvasMode::Draw {
+            return false;
+        }
+        let axis = if self.opacity_key.is_some() {
+            BrushAxis::Opacity
+        } else if self.modifiers.shift_key()
+            && !self.modifiers.control_key()
+            && !self.modifiers.super_key()
+            && !self.modifiers.alt_key()
+        {
+            BrushAxis::Size
+        } else {
+            return false;
+        };
+        let brush = self.brush_for_tool(self.mouse_tool);
+        self.brush_drag = Some((
+            owner,
+            BrushDrag::new(
+                self.logical_position(position),
+                brush.diameter(),
+                brush.opacity(),
+                Some(axis),
+            ),
+        ));
+        self.cursor_contact = false;
+        self.request_redraw();
+        true
+    }
+
+    fn update_brush_drag(&mut self, position: [f32; 2]) {
+        let position = self.logical_position(position);
+        let change = self
+            .brush_drag
+            .as_mut()
+            .and_then(|(_, drag)| drag.update(position));
+        match change {
+            Some((BrushAxis::Size, value)) => self.set_brush_diameter(value),
+            Some((BrushAxis::Opacity, value)) => self.set_brush_opacity(value),
+            None => {}
+        }
+    }
+
+    fn cancel_brush_drag(&mut self) -> bool {
+        let Some((owner, drag)) = self.brush_drag.take() else {
+            return false;
+        };
+        if let PointerOwner::Tablet { device_id, .. } = owner {
+            self.cancelled_tablet_contact = Some(device_id);
+        }
+        self.set_brush_diameter(drag.diameter);
+        self.set_brush_opacity(drag.opacity);
+        self.request_redraw();
+        true
+    }
+
+    fn navigate_touch(&mut self, from: [f32; 2], to: [f32; 2], factor: f32) {
+        if !factor.is_finite() || factor <= 0.0 {
+            return;
+        }
+        let before = self.camera().world_from_screen(from);
+        self.zoom = (self.zoom * factor).clamp(0.125, 64.0);
+        let after = self.camera().world_from_screen(to);
+        self.center[0] += before[0] - after[0];
+        self.center[1] += before[1] - after[1];
+        self.request_redraw();
+    }
+
     fn execute_key_command(&mut self, command: KeyCommand) {
         match command {
+            KeyCommand::SelectBrush => self.select_ui_tool(UiTool::Pen),
+            KeyCommand::SelectEraser => self.select_ui_tool(UiTool::Eraser),
+            KeyCommand::PickColor => {
+                self.apply_ui_action(UiAction::SetCanvasMode(CanvasMode::PickColor))
+            }
+            KeyCommand::ShowColors => self.toggle_ui_panel(UiPanel::Color),
+            KeyCommand::ShowLayers => self.toggle_ui_panel(UiPanel::Layers),
+            KeyCommand::ShowHelp => self.toggle_ui_panel(UiPanel::Help),
+            // Hold commands are started with the physical key in window_event.
+            KeyCommand::PanCanvas | KeyCommand::AdjustOpacity => {}
             KeyCommand::ToggleInterface => {
                 self.apply_ui_action(UiAction::SetVisible(!self.ui_visible))
             }
@@ -886,7 +1014,7 @@ impl App {
     }
 
     fn select_ui_tool(&mut self, tool: UiTool) {
-        if self.active_stroke.is_some() {
+        if self.canvas_busy() {
             return;
         }
         if self.gpu_resident_document().is_some() && !matches!(tool, UiTool::Pen | UiTool::Eraser) {
@@ -919,6 +1047,7 @@ impl App {
                 self.paint_engine = PaintEngine::Bristle;
             }
         }
+        self.canvas_mode = CanvasMode::Draw;
         self.cursor_tool = self.mouse_tool;
         self.cursor_pressure = 0.0;
         self.cursor_contact = false;
@@ -1165,52 +1294,27 @@ impl App {
         self.cursor_contact = false;
     }
 
-    fn update_window_title(&self, pressure: Option<f32>) {
+    fn update_window_title(&self, _pressure: Option<f32>) {
         let Some(window) = &self.window else {
             return;
         };
-        let brush = self.brush_for_tool(self.cursor_tool);
-        let pressure = pressure.map_or_else(String::new, |value| format!(" p={value:.3}"));
-        let dirty = if self.persistence.document_modified() {
-            " *"
-        } else {
-            ""
-        };
-        let recording = if self.stroke_recorder.is_some() {
-            " [RECORD NEXT STROKE]"
-        } else {
-            ""
-        };
-        let tool_label = match self.cursor_tool {
-            ToolKind::Pen => self.paint_engine.label(),
-            ToolKind::Eraser => "Eraser",
-        };
-        let document_name = self
+        let name = self
             .persistence
             .document_path()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
             .unwrap_or("Untitled");
-        let (active_layer_name, active_layer_index, layer_count) = self.active_layer_summary();
-        window.set_title(&format!(
-            "Sketchpad — {}{}{} — {} ({}/{}) — {} {:.0}px {:.0}% — color {}/{} \
-             ({:.3},{:.3},{:.3}){}",
-            document_name,
-            dirty,
-            recording,
-            active_layer_name,
-            active_layer_index + 1,
-            layer_count,
-            tool_label,
-            brush.diameter(),
-            brush.opacity() * 100.0,
-            self.recent_colors.selected_index() + 1,
-            self.recent_colors.colors().len(),
-            self.paint_brush.color()[0],
-            self.paint_brush.color()[1],
-            self.paint_brush.color()[2],
-            pressure
-        ));
+        let dirty = if self.persistence.document_modified() {
+            " •"
+        } else {
+            ""
+        };
+        let recording = if self.stroke_recorder.is_some() {
+            " · Recording stroke"
+        } else {
+            ""
+        };
+        window.set_title(&format!("{name}{dirty} — Sketchpad{recording}"));
     }
 
     fn start_stroke(
@@ -1220,6 +1324,7 @@ impl App {
         tilt: [f32; 2],
         owner: PointerOwner,
     ) {
+        self.touch_navigation.suppress();
         if self.active_stroke.is_some() {
             return;
         }
@@ -1333,7 +1438,8 @@ impl App {
                         blade,
                         phase: GpuStrokePhase::Drawing,
                     }))
-                })(),
+                })(
+                ),
                 (ToolKind::Pen, PaintEngine::PaletteKnife) => {
                     let knife = palette_knife_from_paint(brush);
                     PaletteKnifeStroke::begin(self.document.active_layer_mut(), knife, sample)
@@ -2104,11 +2210,7 @@ impl App {
         if self.active_stroke.is_some() || layer == self.active_layer_id() {
             return;
         }
-        if let Some(resident) = self
-            .gpu
-            .as_mut()
-            .and_then(|gpu| gpu.resident.as_mut())
-        {
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
             match resident.document.set_active_layer(layer) {
                 Ok(()) => {
                     self.invalidate_ui();
@@ -2604,11 +2706,10 @@ impl App {
                     gpu.canvas.clear_residency();
                 }
                 self.persistence.document_opened(path.clone());
-                self.recovery_revision = self
-                    .gpu_resident_document()
-                    .map_or_else(|| self.recovery_revision.wrapping_add(1), |document| {
-                        document.revision().get()
-                    });
+                self.recovery_revision = self.gpu_resident_document().map_or_else(
+                    || self.recovery_revision.wrapping_add(1),
+                    |document| document.revision().get(),
+                );
                 self.recovery_due = Some(Instant::now() + AUTOSAVE_DELAY);
                 self.metrics.gpu_baseline = self
                     .gpu
@@ -2662,9 +2763,7 @@ impl App {
     }
 
     fn choose_png_import(&mut self) {
-        if self.active_stroke.is_some()
-            || self.sampling_pointer.is_some()
-        {
+        if self.active_stroke.is_some() || self.sampling_pointer.is_some() {
             return;
         }
         let mut dialog = rfd::FileDialog::new()
@@ -2891,7 +2990,7 @@ impl App {
         self.cursor_pos = Some(sample.position);
         self.last_cursor_pos = Some(sample.position);
         self.cursor_visible = true;
-        self.cursor_tool = sample.tool;
+        self.cursor_tool = effective_tablet_tool(sample.tool, self.mouse_tool);
         self.cursor_pressure = sample.pressure.clamp(0.0, 1.0);
         self.cursor_contact =
             matches!(phase, TabletPhase::Down | TabletPhase::Move) && sample.pressure > 0.0;
@@ -2904,6 +3003,61 @@ impl App {
         sample: TabletSample,
         handling_start: Instant,
     ) {
+        let sample = TabletSample {
+            tool: effective_tablet_tool(sample.tool, self.mouse_tool),
+            ..sample
+        };
+        let owner = PointerOwner::Tablet {
+            device_id: sample.device_id,
+            tool: sample.tool,
+        };
+        if let Some(device_id) = self.cancelled_tablet_contact {
+            if device_id == sample.device_id
+                && matches!(phase, TabletPhase::Up | TabletPhase::Hover)
+            {
+                self.cancelled_tablet_contact = None;
+            }
+            self.cursor_contact = false;
+            return;
+        }
+        if let Some((captured, _)) = self.brush_drag {
+            if captured == owner {
+                self.update_brush_drag(sample.position);
+                if matches!(phase, TabletPhase::Up | TabletPhase::Hover) {
+                    self.brush_drag = None;
+                }
+                self.cursor_contact = false;
+                self.request_redraw();
+            }
+            return;
+        }
+        if matches!(phase, TabletPhase::Down | TabletPhase::Move)
+            && sample.pressure > 0.0
+            && self.start_brush_drag(owner, sample.position)
+        {
+            return;
+        }
+        if (self.active_pointer.is_none()
+            && (self.canvas_mode == CanvasMode::Pan || self.pan_key.is_some()))
+            || self.tablet_pan.is_some()
+        {
+            self.cursor_contact = false;
+            if let Some((device, previous)) = self.tablet_pan {
+                if device != sample.device_id {
+                    return;
+                }
+                self.pan_from_cursor(previous, sample.position);
+            }
+            self.tablet_pan = if matches!(phase, TabletPhase::Down | TabletPhase::Move)
+                && sample.pressure > 0.0
+            {
+                Some((sample.device_id, sample.position))
+            } else {
+                None
+            };
+            self.request_redraw();
+            return;
+        }
         let owner = PointerOwner::Tablet {
             device_id: sample.device_id,
             tool: sample.tool,
@@ -2911,7 +3065,7 @@ impl App {
         let continuing_sample = self.sampling_pointer == Some(owner);
         let starting_sample = self.active_pointer.is_none()
             && self.sampling_pointer.is_none()
-            && self.modifiers.alt_key()
+            && (self.modifiers.alt_key() || self.canvas_mode == CanvasMode::PickColor)
             && sample.pressure > 0.0
             && matches!(phase, TabletPhase::Down | TabletPhase::Move);
         if continuing_sample || starting_sample {
@@ -2920,6 +3074,7 @@ impl App {
             if matches!(phase, TabletPhase::Up | TabletPhase::Hover) {
                 self.sampling_pointer = None;
                 self.commit_picked_color();
+                self.canvas_mode = CanvasMode::Draw;
             } else {
                 self.pick_color(sample.position);
             }
@@ -3040,6 +3195,7 @@ impl App {
         self.center = fitted.center;
         self.zoom = fitted.zoom;
         self.panning = false;
+        self.tablet_pan = None;
         self.request_redraw();
     }
 
@@ -3157,13 +3313,13 @@ impl App {
         });
         let resident = if gpu_strokes_supported {
             ResidentGpuCanvas::bootstrap(&device, &queue, format, document, recovery_path)
-            .map_err(|error| {
-                log::error!(
+                .map_err(|error| {
+                    log::error!(
                     "GPU-resident document initialization failed; retaining CPU renderer: {error}"
                 );
-                error
-            })
-            .ok()
+                    error
+                })
+                .ok()
         } else {
             log::warn!(
                 "GPU-resident document unavailable: float32_blend={} tile_size={} required_tile_size={}",
@@ -3787,10 +3943,28 @@ impl ApplicationHandler<TabletEvent> for App {
         _: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        let canvas_owns_mouse = self.active_pointer == Some(PointerOwner::Mouse)
-            || self.sampling_pointer == Some(PointerOwner::Mouse)
-            || self.panning;
-        let suppress_mouse = self.tablet_is_recent();
+        if let WindowEvent::KeyboardInput { event, .. } = &event {
+            if event.state == ElementState::Released {
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if self.pan_key == Some(code) {
+                        self.pan_key = None;
+                        self.request_redraw();
+                    }
+                    if self.opacity_key == Some(code) {
+                        self.opacity_key = None;
+                        self.request_redraw();
+                    }
+                }
+            }
+        }
+        if matches!(event, WindowEvent::Touch(_)) {
+            self.last_touch_activity = Some(Instant::now());
+        }
+        let touch_is_recent = self
+            .last_touch_activity
+            .is_some_and(|time| time.elapsed() < TABLET_MOUSE_SUPPRESSION);
+        let canvas_owns_mouse = self.canvas_busy() || self.touch_navigation.is_active();
+        let suppress_mouse = self.tablet_is_recent() || touch_is_recent;
         let ui_response = match (&self.window, &mut self.ui) {
             (Some(window), Some(ui)) => {
                 ui.on_window_event(window, &event, canvas_owns_mouse, suppress_mouse)
@@ -3811,6 +3985,14 @@ impl ApplicationHandler<TabletEvent> for App {
             return;
         }
 
+        if touch_is_recent
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. }
+            )
+        {
+            return;
+        }
         match event {
             WindowEvent::CloseRequested => {
                 self.cancel_stroke();
@@ -3824,7 +4006,12 @@ impl ApplicationHandler<TabletEvent> for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let current = [position.x as f32, position.y as f32];
                 self.update_cursor_orientation(current, [0.0, 0.0]);
-                if self.panning {
+                if self
+                    .brush_drag
+                    .is_some_and(|(owner, _)| owner == PointerOwner::Mouse)
+                {
+                    self.update_brush_drag(current);
+                } else if self.panning {
                     if let Some(previous) = self.last_cursor_pos {
                         self.pan_from_cursor(previous, current);
                         self.request_redraw();
@@ -3865,7 +4052,31 @@ impl ApplicationHandler<TabletEvent> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => match (button, state) {
                 (MouseButton::Left, _) if self.tablet_is_recent() => {}
-                (MouseButton::Left, ElementState::Pressed) if self.modifiers.alt_key() => {
+                (MouseButton::Left, ElementState::Released)
+                    if self
+                        .brush_drag
+                        .is_some_and(|(owner, _)| owner == PointerOwner::Mouse) =>
+                {
+                    self.brush_drag = None;
+                    self.request_redraw();
+                }
+                (MouseButton::Left, ElementState::Pressed)
+                    if self.cursor_pos.is_some_and(|position| {
+                        self.start_brush_drag(PointerOwner::Mouse, position)
+                    }) => {}
+                (MouseButton::Left, ElementState::Pressed)
+                    if self.canvas_mode == CanvasMode::Pan || self.pan_key.is_some() =>
+                {
+                    self.panning = true;
+                    self.last_cursor_pos = self.cursor_pos;
+                }
+                (MouseButton::Left, ElementState::Released) if self.panning => {
+                    self.panning = false;
+                    self.tablet_pan = None;
+                }
+                (MouseButton::Left, ElementState::Pressed)
+                    if self.modifiers.alt_key() || self.canvas_mode == CanvasMode::PickColor =>
+                {
                     let handling_start = Instant::now();
                     self.sampling_pointer = Some(PointerOwner::Mouse);
                     self.cursor_pressure = 0.0;
@@ -3891,6 +4102,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 {
                     self.sampling_pointer = None;
                     self.commit_picked_color();
+                    self.canvas_mode = CanvasMode::Draw;
                     self.cursor_pressure = 0.0;
                     self.cursor_contact = false;
                     self.request_redraw();
@@ -3911,33 +4123,92 @@ impl ApplicationHandler<TabletEvent> for App {
                 (MouseButton::Middle, ElementState::Released) => self.panning = false,
                 _ => {}
             },
-            WindowEvent::MouseWheel { delta, .. } => {
-                let scroll = match delta {
-                    winit::event::MouseScrollDelta::LineDelta(_, y) => y * 0.1,
-                    winit::event::MouseScrollDelta::PixelDelta(position) => {
-                        position.y as f32 * 0.005
+            WindowEvent::MouseWheel { delta, .. } if !self.canvas_busy() => {
+                match delta {
+                    winit::event::MouseScrollDelta::LineDelta(_, y) => self.zoom_at_cursor(y * 0.1),
+                    winit::event::MouseScrollDelta::PixelDelta(delta) => {
+                        self.pan_from_cursor([0.0; 2], [delta.x as f32, delta.y as f32]);
                     }
-                };
-                self.zoom_at_cursor(scroll);
+                }
                 self.request_redraw();
+            }
+            WindowEvent::PinchGesture { delta, .. } if !self.canvas_busy() => {
+                let position = self
+                    .cursor_pos
+                    .unwrap_or_else(|| self.viewport_size().map(|v| v * 0.5));
+                self.navigate_touch(position, position, (delta as f32).exp());
+            }
+            WindowEvent::PanGesture { delta, .. } if !self.canvas_busy() => {
+                self.pan_from_cursor([0.0; 2], [delta.x, delta.y]);
+                self.request_redraw();
+            }
+            WindowEvent::Touch(touch) => {
+                let position = [touch.location.x as f32, touch.location.y as f32];
+                let logical = self.logical_position(position);
+                let busy = self.canvas_busy();
+                let action = self.touch_navigation.event(
+                    touch.id,
+                    touch.phase,
+                    logical,
+                    self.input_epoch.elapsed().as_millis() as u64,
+                    busy,
+                );
+                let scale = self
+                    .window
+                    .as_ref()
+                    .map_or(1.0, |window| window.scale_factor() as f32);
+                match action {
+                    TouchAction::Navigate {
+                        from,
+                        to,
+                        scale: factor,
+                    } => {
+                        self.navigate_touch(from.map(|v| v * scale), to.map(|v| v * scale), factor)
+                    }
+                    TouchAction::Undo => self.undo(),
+                    TouchAction::Redo => self.redo(),
+                    TouchAction::None => {}
+                }
             }
             WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
             WindowEvent::KeyboardInput { event, .. }
                 if event.state == ElementState::Pressed && !event.repeat =>
             {
                 match event.physical_key {
+                    PhysicalKey::Code(KeyCode::Escape) if self.cancel_brush_drag() => {}
+                    PhysicalKey::Code(KeyCode::Escape)
+                        if self.panning || self.tablet_pan.is_some() =>
+                    {
+                        self.panning = false;
+                        if let Some((device_id, _)) = self.tablet_pan.take() {
+                            self.cancelled_tablet_contact = Some(device_id);
+                        }
+                        self.pan_key = None;
+                    }
+                    PhysicalKey::Code(KeyCode::Escape) if self.canvas_mode != CanvasMode::Draw => {
+                        self.canvas_mode = CanvasMode::Draw;
+                        self.request_redraw();
+                    }
                     PhysicalKey::Code(KeyCode::Escape) if self.active_stroke.is_some() => {
                         self.cancel_stroke()
                     }
                     PhysicalKey::Code(KeyCode::Escape) => {
-                        if self.confirm_close() {
-                            event_loop.exit();
+                        if let Some(ui) = &mut self.ui {
+                            ui.close_panels();
                         }
+                        self.request_redraw();
                     }
                     PhysicalKey::Code(code) => {
                         if let Some(chord) = KeyChord::from_winit(code, self.modifiers) {
                             if let Some(command) = self.keybindings.command_for(chord) {
-                                self.execute_key_command(command);
+                                if command == KeyCommand::PanCanvas {
+                                    self.pan_key = Some(code);
+                                    self.request_redraw();
+                                } else if command == KeyCommand::AdjustOpacity {
+                                    self.opacity_key = Some(code);
+                                } else if !self.canvas_busy() {
+                                    self.execute_key_command(command);
+                                }
                             }
                         }
                     }
@@ -3945,7 +4216,14 @@ impl ApplicationHandler<TabletEvent> for App {
                 }
             }
             WindowEvent::Focused(false) => {
+                self.cancel_brush_drag();
+                self.cancelled_tablet_contact = None;
+                self.pan_key = None;
+                self.opacity_key = None;
+                self.touch_navigation.cancel();
+                self.modifiers = ModifiersState::empty();
                 self.panning = false;
+                self.tablet_pan = None;
                 if self.sampling_pointer.is_some() {
                     self.commit_picked_color();
                 }
@@ -3973,9 +4251,7 @@ impl ApplicationHandler<TabletEvent> for App {
                     handled_at,
                 );
                 self.observe_tablet_sample(phase, sample);
-                let canvas_owns_pointer = self.active_pointer.is_some()
-                    || self.sampling_pointer.is_some()
-                    || self.panning;
+                let canvas_owns_pointer = self.canvas_busy() || self.touch_navigation.is_active();
                 let ui_response = match (&self.window, &mut self.ui) {
                     (Some(window), Some(ui)) => ui.on_tablet_sample(
                         window,
@@ -4501,6 +4777,15 @@ fn straight_rgb(pixel: LinearRgba) -> Option<[f32; 3]> {
     ])
 }
 
+// A physical eraser always erases; the pen tip follows the selected on-screen tool.
+fn effective_tablet_tool(physical: ToolKind, selected: ToolKind) -> ToolKind {
+    if physical == ToolKind::Eraser {
+        ToolKind::Eraser
+    } else {
+        selected
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4512,6 +4797,26 @@ mod tests {
             canvas_size: [4096.0, 4096.0],
             viewport_size: [1280.0, 720.0],
         }
+    }
+
+    #[test]
+    fn tablet_tip_follows_the_selected_tool_and_physical_eraser_always_erases() {
+        assert_eq!(
+            effective_tablet_tool(ToolKind::Pen, ToolKind::Pen),
+            ToolKind::Pen
+        );
+        assert_eq!(
+            effective_tablet_tool(ToolKind::Pen, ToolKind::Eraser),
+            ToolKind::Eraser
+        );
+        assert_eq!(
+            effective_tablet_tool(ToolKind::Eraser, ToolKind::Pen),
+            ToolKind::Eraser
+        );
+        assert_eq!(
+            effective_tablet_tool(ToolKind::Eraser, ToolKind::Eraser),
+            ToolKind::Eraser
+        );
     }
 
     #[test]

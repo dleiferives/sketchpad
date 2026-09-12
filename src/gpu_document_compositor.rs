@@ -263,10 +263,12 @@ impl GpuDocumentCompositor {
         if atlas.layout() != target.layout() || metadata.tile_size() != atlas.layout().tile_size() {
             return Err(GpuDocumentCompositeError::LayoutMismatch);
         }
-        let (instances, batches, visible_layers) = build_plan(metadata, atlas, None)?;
+        let (instances, batches, visible_layers) = build_plan(metadata, atlas, None, |slot| {
+            target.initialized_resident(slot).is_some()
+        })?;
         for (key, slot) in atlas.allocations() {
             let actual = target.initialized_resident(slot);
-            if actual != Some(key) {
+            if actual.is_some() && actual != Some(key) {
                 return Err(GpuDocumentCompositeError::ResidentMismatch {
                     slot,
                     expected: key,
@@ -348,8 +350,7 @@ impl GpuDocumentCompositor {
         }
         for (key, slot) in atlas.allocations() {
             let actual = target.initialized_resident(slot);
-            let is_transient = active_tiles.contains_key(&key);
-            if actual != Some(key) && !(is_transient && actual.is_none()) {
+            if actual.is_some() && actual != Some(key) {
                 return Err(GpuDocumentCompositeError::ResidentMismatch {
                     slot,
                     expected: key,
@@ -358,7 +359,9 @@ impl GpuDocumentCompositor {
             }
         }
         let (instances, batches, visible_layers) =
-            build_plan(metadata, atlas, Some(&active_tiles))?;
+            build_plan(metadata, atlas, Some(&active_tiles), |slot| {
+                target.initialized_resident(slot).is_some()
+            })?;
         self.ensure_color_bind_groups(device, target)?;
         self.ensure_transient_bind_groups(device, target, mask)?;
         self.write_prepared_state(
@@ -537,6 +540,7 @@ fn build_plan(
     metadata: &DocumentMetadata,
     atlas: &SparseAtlasPlanner,
     active_tiles: Option<&HashMap<LayerTileKey, bool>>,
+    initialized: impl Fn(AtlasSlot) -> bool,
 ) -> Result<(Vec<CompositeInstance>, Vec<CompositeBatch>, u32), GpuDocumentCompositeError> {
     let tile_size = metadata.tile_size();
     let mut instances = Vec::new();
@@ -549,7 +553,13 @@ fn build_plan(
     {
         let mut residents: Vec<_> = atlas
             .allocations()
-            .filter(|(key, _)| key.layer == layer.id())
+            // History pins atlas reservations after undo has made their pixels
+            // logically blank. Only initialized color or an active mask is visible.
+            .filter(|(key, slot)| {
+                key.layer == layer.id()
+                    && (initialized(*slot)
+                        || active_tiles.is_some_and(|tiles| tiles.contains_key(key)))
+            })
             .collect();
         if residents.is_empty() {
             continue;
@@ -780,7 +790,8 @@ mod tests {
             .allocate(LayerTileKey::new(top, TileCoord::new(0, 0)))
             .unwrap();
 
-        let (instances, batches, visible_layers) = build_plan(&metadata, &atlas, None).unwrap();
+        let (instances, batches, visible_layers) =
+            build_plan(&metadata, &atlas, None, |_| true).unwrap();
         assert_eq!(visible_layers, 2);
         assert_eq!(instances.len(), 6);
         assert_eq!(batches.len(), 3);
@@ -809,7 +820,8 @@ mod tests {
             .allocate(LayerTileKey::new(top, TileCoord::new(0, 0)))
             .unwrap();
 
-        let (instances, batches, visible_layers) = build_plan(&metadata, &atlas, None).unwrap();
+        let (instances, batches, visible_layers) =
+            build_plan(&metadata, &atlas, None, |_| true).unwrap();
         assert!(instances.is_empty());
         assert!(batches.is_empty());
         assert_eq!(visible_layers, 0);
@@ -825,7 +837,7 @@ mod tests {
             .allocate(LayerTileKey::new(layer, TileCoord::new(1, 1)))
             .unwrap();
 
-        let (instances, _, _) = build_plan(&metadata, &atlas, None).unwrap();
+        let (instances, _, _) = build_plan(&metadata, &atlas, None, |_| true).unwrap();
         assert_eq!(instances.len(), 1);
         assert_eq!(instances[0].logical_origin, [128.0, 128.0]);
         assert_eq!(instances[0].logical_extent, [22.0, 12.0]);
@@ -856,7 +868,7 @@ mod tests {
         let active_tiles = HashMap::from([(active_base.key, true), (active_blank.key, false)]);
 
         let (instances, batches, visible_layers) =
-            build_plan(&metadata, &atlas, Some(&active_tiles)).unwrap();
+            build_plan(&metadata, &atlas, Some(&active_tiles), |_| true).unwrap();
 
         assert_eq!(visible_layers, 3);
         assert_eq!(instances.len(), 4);

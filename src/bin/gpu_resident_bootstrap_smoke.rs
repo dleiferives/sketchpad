@@ -461,22 +461,31 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("recovered clone destination is missing")?;
     if source_raster.allocated_tile_coords().collect::<Vec<_>>()
         != clone_raster.allocated_tile_coords().collect::<Vec<_>>()
-        || (0..TILE_SIZE).any(|y| {
-            (0..PAGE_SIZE).any(|x| source_raster.pixel(x, y) != clone_raster.pixel(x, y))
-        })
+        || (0..TILE_SIZE)
+            .any(|y| (0..PAGE_SIZE).any(|x| source_raster.pixel(x, y) != clone_raster.pixel(x, y)))
     {
         return Err("resident layer clone recovery differs from its source".into());
     }
     resident
         .swap_metadata_history(GpuHistoryDirection::Undo)?
         .ok_or("resident clone undo was unavailable")?;
-    if resident.metadata().layers().iter().any(|layer| layer.id() == clone) {
+    if resident
+        .metadata()
+        .layers()
+        .iter()
+        .any(|layer| layer.id() == clone)
+    {
         return Err("resident clone undo retained duplicate metadata".into());
     }
     resident
         .swap_metadata_history(GpuHistoryDirection::Redo)?
         .ok_or("resident clone redo was unavailable")?;
-    if !resident.metadata().layers().iter().any(|layer| layer.id() == clone) {
+    if !resident
+        .metadata()
+        .layers()
+        .iter()
+        .any(|layer| layer.id() == clone)
+    {
         return Err("resident clone redo did not restore duplicate metadata".into());
     }
 
@@ -487,13 +496,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         gesture.set_pixel(31, 47, imported_color)?;
         gesture.commit()?;
     }
-    let (imported_layer, import_commit) = resident.insert_raster_layer(
-        &mut target,
-        &device,
-        &queue,
-        "Imported",
-        imported_raster,
-    )?;
+    let (imported_layer, import_commit) =
+        resident.insert_raster_layer(&mut target, &device, &queue, "Imported", imported_raster)?;
     if import_commit.stats.uploaded_tiles != 1
         || resident.metadata().active_layer() != imported_layer
         || resident.metadata().layers().len() != 4
@@ -550,13 +554,124 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err("resident import redo did not restore imported metadata".into());
     }
 
+    verify_history_presentation(&device, &queue)?;
+
     if let Some(error) = pollster::block_on(error_scope.pop()) {
         return Err(error.into());
     }
     println!(
-        "gpu_resident_bootstrap_smoke adapter={:?} layers=4 tiles=5 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact clone=gpu_exact import=gpu_exact recovery=exact undo_redo=exact",
+        "gpu_resident_bootstrap_smoke adapter={:?} layers=4 tiles=5 upload=exact mirror=exact composite=exact transient_paint=exact cancel=reclaimed transient_erase=exact commit=exact snapshot=exact clone=gpu_exact import=gpu_exact recovery=exact undo_redo=exact history_presentation=exact",
         adapter.get_info().name
     );
+    Ok(())
+}
+
+// Undo keeps atlas slots pinned for redo while their logical pixels become blank.
+// Both idle presentation and a new stroke must tolerate those reservations.
+fn verify_history_presentation(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+) -> Result<(), Box<dyn Error>> {
+    let cpu = Document::new(PAGE_SIZE, TILE_SIZE, TILE_SIZE)?;
+    let layout = AtlasLayout::new(PAGE_SIZE, TILE_SIZE, 2)?;
+    let mut target = GpuDocumentTarget::new(device, layout)?;
+    let mut resident = GpuResidentDocument::from_cpu_document(
+        &cpu,
+        &mut target,
+        device,
+        queue,
+        GpuResidentDocumentLimits::default(),
+    )?
+    .into_document();
+    let mut compositor =
+        GpuDocumentCompositor::new(device, wgpu::TextureFormat::Rgba32Float, &target);
+    let mut strokes = GpuResidentRoundStrokeEngine::new(device, &resident)?;
+    let contact = RoundContact {
+        center: [20.0, 20.0],
+        radius: 4.0,
+        elapsed_micros: 0,
+    };
+    let recipe = RoundBrushRecipeV1::with_minimum_pressure_fraction(
+        StrokeMaterial::paint([0.2, 0.4, 0.6], 1.0, 1.0)?,
+        8.0,
+        1.0,
+    )?;
+    let commands = [
+        RoundPathCommand::Begin(contact),
+        RoundPathCommand::End {
+            at: contact,
+            elapsed_micros: 1,
+        },
+    ];
+    strokes.begin(&mut resident, &target, recipe)?;
+    strokes.submit_commands(&mut resident, device, queue, &commands)?;
+    strokes
+        .commit(&mut resident, &mut target, device, queue)?
+        .ok_or("history control did not paint")?;
+    for direction in [
+        GpuHistoryDirection::Undo,
+        GpuHistoryDirection::Redo,
+        GpuHistoryDirection::Undo,
+    ] {
+        while resident.mirror().pending_revision_count() > 0 {
+            let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+            let prepared = resident
+                .prepare_next_mirror_readback(device, encoder)?
+                .ok_or("history mirror did not prepare")?;
+            resident.submit_mirror_readback(queue, prepared)?;
+            device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(std::time::Duration::from_secs(10)),
+            })?;
+            resident
+                .try_finish_mirror()?
+                .ok_or("history mirror did not finish")?;
+        }
+        let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let prepared = resident
+            .prepare_history_swap(&mut target, device, encoder, direction)?
+            .ok_or("history control unavailable")?;
+        resident.submit_history_swap(queue, &mut target, prepared)?;
+        let stats = compositor.prepare(
+            device,
+            queue,
+            resident.metadata(),
+            resident.atlas(),
+            &target,
+            canvas_uniform(),
+        )?;
+        let expected = if direction == GpuHistoryDirection::Redo {
+            1
+        } else {
+            0
+        };
+        if stats.visible_tiles != expected || resident.atlas().resident_tile_count() != 1 {
+            return Err(format!("incorrect history presentation: {stats:?}").into());
+        }
+    }
+    let next = RoundContact {
+        center: [150.0, 20.0],
+        ..contact
+    };
+    strokes.begin(&mut resident, &target, recipe)?;
+    strokes.submit_commands(
+        &mut resident,
+        device,
+        queue,
+        &[RoundPathCommand::Begin(next)],
+    )?;
+    let stats = strokes.prepare_composite(
+        &resident,
+        &target,
+        &mut compositor,
+        device,
+        queue,
+        canvas_uniform(),
+    )?;
+    if stats.visible_tiles != 1 || stats.transient_tiles != 1 {
+        return Err(format!("blank history reservation leaked into preview: {stats:?}").into());
+    }
+    strokes.cancel(&mut resident)?;
     Ok(())
 }
 
