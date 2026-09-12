@@ -1,3 +1,4 @@
+use crate::history_storage::{ArchiveError, HistoryBlob, HistoryStore};
 use crate::{
     document::{DocumentRevision, LayerId},
     gpu_document_mirror::{
@@ -6,6 +7,7 @@ use crate::{
     gpu_document_undo::GPU_UNDO_BLOCK_SIZE,
     raster::{Damage, LinearRgba, RasterLayer, RectU32, TileCoord},
 };
+use std::borrow::Cow;
 use std::{collections::BTreeMap, error::Error, fmt, mem::size_of, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -28,10 +30,111 @@ struct GpuExactRasterRecoveryTile {
 #[derive(Clone, Debug, PartialEq)]
 struct GpuExactRasterRecoveryRegion {
     local_bounds: RectU32,
-    pixels: Arc<[LinearRgba]>,
+    pixels: RecoveryPixels,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum RecoveryPixels {
+    Raw(Arc<[LinearRgba]>),
+    Archived(HistoryBlob),
+}
+impl RecoveryPixels {
+    fn read(&self) -> Result<Cow<'_, [LinearRgba]>, ArchiveError> {
+        match self {
+            Self::Raw(pixels) => Ok(Cow::Borrowed(pixels)),
+            Self::Archived(blob) => {
+                let bytes = blob.read()?;
+                if !bytes.len().is_multiple_of(size_of::<LinearRgba>()) {
+                    return Err(ArchiveError::Corrupt);
+                }
+                let mut pixels =
+                    vec![LinearRgba::TRANSPARENT; bytes.len() / size_of::<LinearRgba>()];
+                bytemuck::cast_slice_mut(&mut pixels).copy_from_slice(&bytes);
+                Ok(Cow::Owned(pixels))
+            }
+        }
+    }
 }
 
 impl GpuExactRasterRecoveryCommand {
+    pub(crate) fn archived(&self, store: &HistoryStore) -> Result<Self, ArchiveError> {
+        let mut command = self.clone();
+        for tile in &mut command.tiles {
+            for region in &mut tile.regions {
+                if let RecoveryPixels::Raw(pixels) = &region.pixels {
+                    region.pixels =
+                        RecoveryPixels::Archived(store.store(bytemuck::cast_slice(pixels))?);
+                }
+            }
+        }
+        command.retained_byte_len = retained_byte_len(command.tiles.len(), command.region_count, 0)
+            .expect("validated metadata size")
+            + command
+                .tiles
+                .iter()
+                .flat_map(|t| t.regions.iter())
+                .map(|r| match &r.pixels {
+                    RecoveryPixels::Archived(b) => b.memory_bytes(),
+                    RecoveryPixels::Raw(p) => (p.len() * size_of::<LinearRgba>()) as u64,
+                })
+                .sum::<u64>();
+        Ok(command)
+    }
+
+    /// Validate every source before a GPU history transaction changes pixels.
+    /// Mirror batches may split a captured rectangle into several regions.
+    pub(crate) fn write_memento(
+        &self,
+        plan: &crate::gpu_document_undo::GpuUndoCapturePlan,
+        mut write: impl FnMut(u64, &[u8]),
+    ) -> Result<(), ArchiveError> {
+        if self.tile_size != plan.layout().tile_size() {
+            return Err(ArchiveError::Corrupt);
+        }
+        for region in plan.regions() {
+            if region.key.layer != self.layer {
+                return Err(ArchiveError::Corrupt);
+            }
+            let tile = self
+                .tiles
+                .iter()
+                .find(|t| t.coord == region.key.tile)
+                .ok_or(ArchiveError::Corrupt)?;
+            let mut out = vec![0u8; region.byte_len() as usize];
+            if !tile.initialized {
+                write(region.buffer_offset, &out);
+                continue;
+            }
+            let mut copied = 0u64;
+            for source in &tile.regions {
+                let pixels = source.pixels.read()?;
+                let x0 = source.local_bounds.min_x().max(region.local_bounds.min_x());
+                let y0 = source.local_bounds.min_y().max(region.local_bounds.min_y());
+                let x1 = source.local_bounds.max_x().min(region.local_bounds.max_x());
+                let y1 = source.local_bounds.max_y().min(region.local_bounds.max_y());
+                if x1 <= x0 || y1 <= y0 {
+                    continue;
+                }
+                for y in y0..y1 {
+                    let from = ((y - source.local_bounds.min_y()) * source.local_bounds.width()
+                        + x0
+                        - source.local_bounds.min_x()) as usize;
+                    let to = ((y - region.local_bounds.min_y()) * region.bytes_per_row
+                        + (x0 - region.local_bounds.min_x()) * 16)
+                        as usize;
+                    let bytes = bytemuck::cast_slice(&pixels[from..from + (x1 - x0) as usize]);
+                    out[to..to + bytes.len()].copy_from_slice(bytes);
+                }
+                copied += u64::from(x1 - x0) * u64::from(y1 - y0);
+            }
+            if copied != region.local_bounds.area() {
+                return Err(ArchiveError::Corrupt);
+            }
+            write(region.buffer_offset, &out);
+        }
+        Ok(())
+    }
+
     pub fn from_regions(
         tile_size: u32,
         regions: Vec<GpuMirrorPatchRegion>,
@@ -118,6 +221,27 @@ pub struct GpuExactRasterRecoveryTransition {
 }
 
 impl GpuExactRasterRecoveryTransition {
+    pub(crate) fn is_archived(&self) -> bool {
+        [&self.before, &self.after]
+            .into_iter()
+            .flat_map(|c| c.tiles.iter())
+            .flat_map(|t| t.regions.iter())
+            .all(|r| matches!(r.pixels, RecoveryPixels::Archived(_)))
+    }
+
+    pub(crate) fn archived(&self, store: &HistoryStore) -> Result<Self, ArchiveError> {
+        let before = self.before.archived(store)?;
+        let after = self.after.archived(store)?;
+        let retained_byte_len =
+            transition_retained_byte_len(&before, &after).ok_or(ArchiveError::Corrupt)?;
+        Ok(Self {
+            before,
+            after,
+            retained_byte_len,
+            ..self.clone()
+        })
+    }
+
     pub fn from_mirror_revision(
         before: &GpuCpuMirrorSnapshot,
         plan: &GpuMirrorReadbackPlan,
@@ -406,7 +530,7 @@ fn build_validated_command(
                 .into_iter()
                 .map(|region| GpuExactRasterRecoveryRegion {
                     local_bounds: region.local_bounds,
-                    pixels: region.pixels,
+                    pixels: RecoveryPixels::Raw(region.pixels),
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
@@ -480,7 +604,8 @@ pub fn replay_exact_raster_recovery_command(
                     valid_width,
                     valid_height,
                     region,
-                );
+                )
+                .map_err(GpuExactRasterRecoveryReplayError::Archive)?;
             }
         } else {
             pixels.fill(LinearRgba::TRANSPARENT);
@@ -735,11 +860,12 @@ fn copy_clipped_region(
     valid_width: u32,
     valid_height: u32,
     region: &GpuExactRasterRecoveryRegion,
-) {
+) -> Result<(), ArchiveError> {
+    let source = region.pixels.read()?;
     let copy_max_x = region.local_bounds.max_x().min(valid_width);
     let copy_max_y = region.local_bounds.max_y().min(valid_height);
     if region.local_bounds.min_x() >= copy_max_x || region.local_bounds.min_y() >= copy_max_y {
-        return;
+        return Ok(());
     }
     let source_stride = region.local_bounds.width() as usize;
     let copy_width = (copy_max_x - region.local_bounds.min_x()) as usize;
@@ -748,8 +874,9 @@ fn copy_clipped_region(
             y as usize * tile_size as usize + region.local_bounds.min_x() as usize;
         let source_start = (y - region.local_bounds.min_y()) as usize * source_stride;
         destination[destination_start..destination_start + copy_width]
-            .copy_from_slice(&region.pixels[source_start..source_start + copy_width]);
+            .copy_from_slice(&source[source_start..source_start + copy_width]);
     }
+    Ok(())
 }
 
 fn changed_pixel_bounds(
@@ -1041,6 +1168,7 @@ impl Error for GpuExactRasterRecoveryBuildError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GpuExactRasterRecoveryReplayError {
+    Archive(ArchiveError),
     LayerMismatch { expected: LayerId, actual: LayerId },
     TileSizeMismatch { expected: u32, actual: u32 },
     TileOutOfBounds(TileCoord),
@@ -1049,6 +1177,7 @@ pub enum GpuExactRasterRecoveryReplayError {
 impl fmt::Display for GpuExactRasterRecoveryReplayError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Archive(error) => error.fmt(formatter),
             Self::LayerMismatch { expected, actual } => write!(
                 formatter,
                 "GPU raster recovery layer {} does not match target {}",
@@ -1182,10 +1311,9 @@ mod tests {
         assert_eq!(command.pixel_count(), 512);
         assert!(command.retained_byte_len() >= 512 * size_of::<LinearRgba>() as u64);
         let cloned = command.clone();
-        assert!(Arc::ptr_eq(
-            &command.tiles[0].regions[0].pixels,
-            &cloned.tiles[0].regions[0].pixels
-        ));
+        assert!(
+            matches!((&command.tiles[0].regions[0].pixels, &cloned.tiles[0].regions[0].pixels), (RecoveryPixels::Raw(a), RecoveryPixels::Raw(b)) if Arc::ptr_eq(a, b))
+        );
 
         let overlap = vec![
             region(
@@ -1320,10 +1448,9 @@ mod tests {
         assert_eq!(transition.layer(), key.layer);
         assert!(transition.retained_byte_len() >= 2 * 32 * 32 * 16);
         let cloned = transition.clone();
-        assert!(Arc::ptr_eq(
-            &transition.after.tiles[0].regions[0].pixels,
-            &cloned.after.tiles[0].regions[0].pixels
-        ));
+        assert!(
+            matches!((&transition.after.tiles[0].regions[0].pixels, &cloned.after.tiles[0].regions[0].pixels), (RecoveryPixels::Raw(a), RecoveryPixels::Raw(b)) if Arc::ptr_eq(a, b))
+        );
 
         let mut raster = base.raster_layer(key.layer).unwrap();
         replay_exact_raster_recovery_command(key.layer, &mut raster, transition.after()).unwrap();

@@ -43,3 +43,5 @@ pub mod stroke;
 
 #[cfg(target_os = "linux")]
 pub mod x11_tablet;
+
+pub mod history_storage;

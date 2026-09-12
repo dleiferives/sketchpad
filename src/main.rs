@@ -180,7 +180,17 @@ impl ResidentGpuCanvas {
                 "Stroke snapshot needs {required} bytes; capacity is {maximum}"
             ));
         }
-        while self.document.mirror().resident_snapshot_bytes() > maximum - required {
+        // A history-pressure commit needs exact old transitions available for
+        // archiving, even when the readback queue itself still has free space.
+        let archive_pressure = self.document.archive_usage().is_some()
+            && self.document.history().resident_bytes()
+                > self.document.history().max_bytes().saturating_sub(required);
+        let retain = if archive_pressure {
+            0
+        } else {
+            maximum - required
+        };
+        while self.document.mirror().resident_snapshot_bytes() > retain {
             if !self.mirror_readback_in_flight {
                 let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("Mirror backpressure before document edit"),
@@ -239,7 +249,22 @@ impl ResidentGpuCanvas {
             "GPU-resident document bootstrapped: {:?}",
             bootstrap.stats()
         );
-        let resident_document = bootstrap.into_document();
+        let mut resident_document = bootstrap.into_document();
+        let cache_parent = std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .unwrap_or_else(std::env::temp_dir)
+            .join("sketchpad/undo");
+        match sketchpad::history_storage::HistoryStore::new(
+            &cache_parent,
+            32 * 1024 * 1024,
+            512 * 1024 * 1024,
+        ) {
+            Ok(store) => resident_document.enable_history_archive(store),
+            Err(error) => {
+                log::warn!("Undo archive unavailable; using bounded GPU history: {error}")
+            }
+        }
         let strokes = GpuResidentRoundStrokeEngine::new(device, &resident_document)
             .map_err(|error| error.to_string())?;
         let compositor = GpuDocumentCompositor::new(device, surface_format, &target);
@@ -1811,6 +1836,7 @@ impl App {
                     .commit_snapshot_bytes()
                     .map_err(|error| error.to_string())?;
                 resident.make_mirror_room(&gpu.device, &gpu.queue, bytes)?;
+                resident.document.make_history_room(bytes);
                 resident
                     .strokes
                     .commit(
@@ -2203,10 +2229,13 @@ impl App {
                 self.mark_document_dirty();
             }
             Ok(None) => {}
-            Err(error) => log::warn!(
-                "GPU-resident {:?} is not ready without blocking: {error}",
-                direction
-            ),
+            Err(error) => {
+                log::warn!("GPU-resident {direction:?} failed: {error}");
+                if let Some(ui) = &mut self.ui {
+                    ui.notify(format!("Could not {direction:?}: {error}"), true);
+                }
+                self.request_redraw();
+            }
         }
     }
 
@@ -4675,6 +4704,9 @@ impl ApplicationHandler<TabletEvent> for App {
         self.report_live_metrics();
         self.poll_gpu_stroke_commit();
         self.drive_gpu_resident_mirror();
+        if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut()) {
+            resident.document.poll_history_archive();
+        }
         self.maybe_autosave();
 
         let now = Instant::now();
@@ -4719,6 +4751,7 @@ impl ApplicationHandler<TabletEvent> for App {
                 resident.mirror_readback_in_flight
                     || resident.document.mirror().pending_revision_count() > 0
                     || !resident.checkpoint.is_idle()
+                    || resident.document.archive_busy()
             })
         }) {
             let poll_due = Instant::now() + AUTOSAVE_POLL_INTERVAL;

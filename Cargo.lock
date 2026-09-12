@@ -2112,6 +2112,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "env_logger",
+ "flate2",
  "log",
  "png",
  "pollster",

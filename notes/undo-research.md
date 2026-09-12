@@ -2,7 +2,9 @@
 
 2026-09-12. Recommendation: keep exact recent undo, retain stroke commands, and make older history cheaper through lossless compression, sharing, and bounded disk storage. Evaluate checkpointed GPU replay for older history after measuring its latency and exactness. The broad-stroke fix in `0fe4948` is a correctness repair, not the finished memory optimization.
 
-## What the app does today
+Implementation update: [lossless archive storage and validation](undo-storage-implementation.md). The observations below describe the pre-archive baseline.
+
+## Baseline before archive storage
 
 `src/gpu_document_undo.rs` saves affected, block-aligned regions of the active layer. The document uses 128×128 tiles; undo damage is rounded to 16×16 blocks and merged into a rectangle within each affected tile. This is not a screenshot of every layer or a copy of the entire canvas on every input sample. One completed round stroke creates one undo transaction. However, painting across most tiles can still make its saved regions cover the entire canvas.
 

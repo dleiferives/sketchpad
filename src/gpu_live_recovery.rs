@@ -279,6 +279,34 @@ impl GpuLiveRecovery {
         Ok(())
     }
 
+    /// Metadata and exact layer installs advance the CPU mirror without a GPU
+    /// readback. Retire these only when no raster handoff would be skipped.
+    pub(crate) fn advance_structural_mirror(&mut self, snapshot: GpuCpuMirrorSnapshot) -> bool {
+        if self.timeline.check_advance_base(&snapshot).is_err() {
+            return false;
+        }
+        let structural_only = self
+            .timeline
+            .journal()
+            .records()
+            .take_while(|record| record.revision() <= snapshot.revision())
+            .all(|record| {
+                self.spills.id_for_revision(record.revision()).is_none()
+                    && matches!(
+                        record.command(),
+                        GpuRasterRecoveryCommand::MetadataOnly
+                            | GpuRasterRecoveryCommand::LayerSnapshot(_)
+                    )
+            });
+        if !structural_only {
+            return false;
+        }
+        self.timeline
+            .advance_base(snapshot)
+            .expect("structural mirror advancement was checked");
+        true
+    }
+
     pub fn prepare_mirror_handoff(
         &self,
         purpose: GpuMirrorRecoveryPurpose,
@@ -394,6 +422,18 @@ impl GpuLiveRecovery {
 
     pub const fn timeline(&self) -> &GpuRecoveryTimeline<GpuRasterRecoveryCommand> {
         &self.timeline
+    }
+
+    pub(crate) fn enable_archive(&mut self) {
+        self.spills.enable_archive();
+    }
+
+    pub(crate) fn replace_archived(
+        &mut self,
+        id: GpuHistoryId,
+        transition: GpuExactRasterRecoveryTransition,
+    ) -> bool {
+        self.spills.replace_archived(id, transition)
     }
 
     pub const fn spills(&self) -> &GpuHistoryRecoverySpills {
@@ -985,6 +1025,39 @@ mod tests {
             &command
         );
         assert!(state.spills().is_empty());
+    }
+
+    #[test]
+    fn structural_mirror_advances_but_never_skips_a_pending_raster_handoff() {
+        let mut state = empty_state(4);
+        let metadata = state
+            .prepare_metadata_history_record(&[], revision(1))
+            .unwrap();
+        state.commit_metadata_history_record(metadata).unwrap();
+        let snapshot = GpuCpuMirror::new(32, 32, 32, revision(1))
+            .unwrap()
+            .snapshot();
+        assert!(state.advance_structural_mirror(snapshot));
+        assert!(state.timeline().journal().is_empty());
+        let raster = state
+            .prepare_history_record(
+                GpuHistoryId::from_raw(2),
+                &[],
+                revision(2),
+                GpuRasterRecoveryCommand::MetadataOnly,
+            )
+            .unwrap();
+        state.commit_history_record(raster).unwrap();
+        let metadata = state
+            .prepare_metadata_history_record(&[], revision(3))
+            .unwrap();
+        state.commit_metadata_history_record(metadata).unwrap();
+        let snapshot = GpuCpuMirror::new(32, 32, 32, revision(3))
+            .unwrap()
+            .snapshot();
+        assert!(!state.advance_structural_mirror(snapshot));
+        assert_eq!(state.timeline().base_revision(), revision(1));
+        assert_eq!(state.timeline().journal().len(), 2);
     }
 
     fn ready_state() -> (GpuLiveRecovery, GpuHistoryId) {

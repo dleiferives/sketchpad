@@ -22,6 +22,7 @@ pub struct GpuHistoryRecoverySpills {
     resident_bytes: u64,
     max_entries: usize,
     max_bytes: u64,
+    archive_allowance: u64,
 }
 
 impl GpuHistoryRecoverySpills {
@@ -39,7 +40,52 @@ impl GpuHistoryRecoverySpills {
             resident_bytes: 0,
             max_entries,
             max_bytes,
+            archive_allowance: 0,
         })
+    }
+
+    pub(crate) fn enable_archive(&mut self) {
+        if self.archive_allowance == 0 {
+            self.archive_allowance = 64 * 1024 * 1024;
+            self.max_bytes = self.max_bytes.saturating_add(self.archive_allowance);
+        }
+    }
+
+    pub(crate) fn replace_archived(
+        &mut self,
+        id: GpuHistoryId,
+        transition: GpuExactRasterRecoveryTransition,
+    ) -> bool {
+        let archived_bytes: u64 = self
+            .entries
+            .iter()
+            .filter(|(key, _)| **key != id)
+            .filter_map(|(_, e)| e.transition.as_ref())
+            .filter(|t| t.is_archived())
+            .map(|t| t.retained_byte_len())
+            .sum();
+        if archived_bytes + transition.retained_byte_len() > self.archive_allowance {
+            return false;
+        }
+        let Some(entry) = self.entries.get_mut(&id) else {
+            return false;
+        };
+        let Some(previous) = &entry.transition else {
+            return false;
+        };
+        if previous.source_revision() != transition.source_revision()
+            || previous.revision() != transition.revision()
+        {
+            return false;
+        }
+        let bytes =
+            self.resident_bytes - previous.retained_byte_len() + transition.retained_byte_len();
+        if bytes > self.max_bytes {
+            return false;
+        }
+        self.resident_bytes = bytes;
+        entry.transition = Some(transition);
+        true
     }
 
     pub fn register(

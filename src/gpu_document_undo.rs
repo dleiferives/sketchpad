@@ -38,7 +38,8 @@ pub struct GpuUndoCapturePlan {
 
 pub struct GpuDocumentMemento {
     plan: GpuUndoCapturePlan,
-    buffer: wgpu::Buffer,
+    buffer: Option<wgpu::Buffer>,
+    archived: Option<crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand>,
     resident_states: Vec<GpuMementoResidentState>,
 }
 
@@ -90,9 +91,56 @@ impl GpuDocumentMemento {
         });
         Ok(Self {
             plan,
-            buffer,
+            buffer: Some(buffer),
+            archived: None,
             resident_states,
         })
+    }
+
+    pub(crate) fn archive(
+        &mut self,
+        command: crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand,
+    ) {
+        self.archived = Some(command);
+        self.buffer = None;
+    }
+
+    pub fn resident_byte_len(&self) -> u64 {
+        if self.buffer.is_some() {
+            self.byte_len()
+        } else {
+            0
+        }
+    }
+
+    pub fn hydrate(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Result<(), crate::history_storage::ArchiveError> {
+        let Some(command) = &self.archived else {
+            return Ok(());
+        };
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Restored exact undo memento"),
+            size: self.byte_len(),
+            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: true,
+        });
+        {
+            let mut mapped = buffer
+                .slice(..)
+                .get_mapped_range_mut()
+                .map_err(|_| crate::history_storage::ArchiveError::Unavailable)?;
+            command.write_memento(&self.plan, |offset, bytes| {
+                mapped
+                    .slice(offset as usize..offset as usize + bytes.len())
+                    .copy_from_slice(bytes)
+            })?;
+        }
+        buffer.unmap();
+        self.buffer = Some(buffer);
+        self.archived = None;
+        Ok(())
     }
 
     pub fn plan(&self) -> &GpuUndoCapturePlan {
@@ -120,8 +168,10 @@ impl GpuDocumentMemento {
         }
     }
 
-    pub(crate) const fn buffer(&self) -> &wgpu::Buffer {
-        &self.buffer
+    pub(crate) fn buffer(&self) -> &wgpu::Buffer {
+        self.buffer
+            .as_ref()
+            .expect("GPU memento must be hydrated before encoding")
     }
 }
 

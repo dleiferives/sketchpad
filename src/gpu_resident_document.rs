@@ -1,3 +1,4 @@
+use crate::history_storage::{ArchiveError, ArchiveUsage, HistoryStore};
 use crate::{
     document::{Document, DocumentRevision, LayerId},
     document_metadata::{
@@ -118,6 +119,9 @@ pub struct GpuResidentDocument {
     pending_mirror_handoff: Option<PendingGpuResidentMirrorHandoff>,
     active_round_stroke: Option<GpuResidentRoundStrokeId>,
     next_round_stroke_id: u64,
+    archive: Option<HistoryStore>,
+    archive_job: Option<ArchiveJob>,
+    archive_failed: std::collections::HashSet<GpuHistoryId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -129,7 +133,148 @@ impl GpuResidentRoundStrokeId {
     }
 }
 
+struct ArchiveJob {
+    id: GpuHistoryId,
+    task: Option<
+        std::thread::JoinHandle<
+            Result<crate::gpu_raster_recovery::GpuExactRasterRecoveryTransition, ArchiveError>,
+        >,
+    >,
+}
+impl Drop for ArchiveJob {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            let _ = task.join();
+        }
+    }
+}
+
 impl GpuResidentDocument {
+    pub fn enable_history_archive(&mut self, store: HistoryStore) {
+        self.recovery.enable_archive();
+        self.archive = Some(store);
+    }
+    pub fn archive_usage(&self) -> Option<ArchiveUsage> {
+        self.archive.as_ref().map(HistoryStore::usage)
+    }
+    pub fn archive_busy(&self) -> bool {
+        self.archive_job.is_some()
+    }
+
+    fn finish_archive(&mut self) {
+        let Some(mut job) = self.archive_job.take() else {
+            return;
+        };
+        match job
+            .task
+            .take()
+            .unwrap()
+            .join()
+            .unwrap_or(Err(ArchiveError::Unavailable))
+        {
+            Ok(transition) => {
+                // An edit may have branched or evicted history while compression ran.
+                // Choose the memento side from the current stack, not the old job.
+                if self.recovery.replace_archived(job.id, transition.clone()) {
+                    self.history
+                        .archive(job.id, transition.before(), transition.after());
+                } else {
+                    self.archive_failed.insert(job.id);
+                }
+            }
+            Err(error) => {
+                log::warn!("Older undo compression failed; retaining existing history: {error}");
+                self.archive_failed.insert(job.id);
+            }
+        }
+    }
+
+    fn start_archive(&mut self, keep_recent: usize) -> bool {
+        let Some(store) = self.archive.clone() else {
+            return false;
+        };
+        if self.archive_job.is_some() {
+            return false;
+        }
+        // Bound failed-ID metadata to entries still owned by history.
+        self.archive_failed
+            .retain(|id| self.recovery.spills().entry(*id).is_some());
+        for (id, _) in self.history.archive_candidates(keep_recent) {
+            if self.archive_failed.contains(&id) {
+                continue;
+            }
+            let Some(transition) = self
+                .recovery
+                .spills()
+                .entry(id)
+                .and_then(|e| e.transition())
+                .cloned()
+            else {
+                continue;
+            };
+            if transition.is_archived() {
+                return self
+                    .history
+                    .archive(id, transition.before(), transition.after());
+            }
+            match std::thread::Builder::new()
+                .name("undo-compression".into())
+                .spawn(move || transition.archived(&store))
+            {
+                Ok(task) => {
+                    self.archive_job = Some(ArchiveJob {
+                        id,
+                        task: Some(task),
+                    })
+                }
+                Err(_) => {
+                    self.archive_failed.insert(id);
+                }
+            }
+            return self.archive_job.is_some();
+        }
+        false
+    }
+
+    /// Compress off the input thread. Keep the nearest two edits on each side
+    /// ready on the GPU; memory pressure can archive these too before a commit.
+    pub fn poll_history_archive(&mut self) {
+        if self
+            .archive_job
+            .as_ref()
+            .is_some_and(|job| job.task.as_ref().unwrap().is_finished())
+        {
+            self.finish_archive();
+        }
+        while self.start_archive(2) && self.archive_job.is_none() {}
+    }
+
+    /// Called after mirror backpressure, before a new transaction is prepared.
+    /// Cache failure only falls back to normal bounded oldest-history eviction.
+    pub fn make_history_room(&mut self, incoming: u64) {
+        if self.archive.is_none() {
+            return;
+        }
+        let target = self.history.max_bytes().saturating_sub(incoming);
+        if self.history.resident_bytes() <= target {
+            if self
+                .archive_job
+                .as_ref()
+                .is_some_and(|job| job.task.as_ref().unwrap().is_finished())
+            {
+                self.finish_archive();
+            }
+            return;
+        }
+        self.finish_archive();
+        while self.history.resident_bytes() > target {
+            if !self.start_archive(0) {
+                break;
+            }
+            self.finish_archive();
+        }
+    }
+
     pub fn new(
         metadata: DocumentMetadata,
         target: &GpuDocumentTarget,
@@ -204,6 +349,9 @@ impl GpuResidentDocument {
             pending_mirror_handoff: None,
             active_round_stroke: None,
             next_round_stroke_id: 1,
+            archive: None,
+            archive_job: None,
+            archive_failed: Default::default(),
         })
     }
 
@@ -472,6 +620,27 @@ impl GpuResidentDocument {
                     actual: GpuHistoryEntryKind::Metadata,
                 }
                 .into(),
+            ));
+        }
+        if self
+            .archive_job
+            .as_ref()
+            .is_some_and(|job| job.task.as_ref().unwrap().is_finished())
+        {
+            self.finish_archive();
+        }
+        let incoming = self.history.next_hydration_bytes(direction);
+        if incoming != 0 {
+            self.make_history_room(incoming);
+            if self.history.resident_bytes() > self.history.max_bytes().saturating_sub(incoming) {
+                return Err(history_swap_prepare_failure(
+                    GpuResidentDocumentError::Archive(ArchiveError::Full),
+                ));
+            }
+        }
+        if let Err(error) = self.history.hydrate_next(device, direction) {
+            return Err(history_swap_prepare_failure(
+                GpuResidentDocumentError::Archive(error),
             ));
         }
         let recovery = match self
@@ -782,6 +951,8 @@ impl GpuResidentDocument {
             .pop_front()
             .expect("a completed resident mirror handoff retains its queued purpose");
         assert_eq!(queued_purpose, pending.requested_purpose);
+        self.recovery
+            .advance_structural_mirror(self.mirror.snapshot());
         Ok(GpuResidentMirrorCompletion {
             revision: pending.revision,
             batch_index: pending.batch_index,
@@ -1136,6 +1307,8 @@ impl GpuResidentDocument {
             .register_layer_clone_revision(self.revision(), revision, source, destination)
             .expect("mirror layer clone was checked immediately before submission");
         self.metadata = metadata;
+        self.recovery
+            .advance_structural_mirror(self.mirror.snapshot());
         assert!(history
             .evicted
             .iter()
@@ -1269,6 +1442,8 @@ impl GpuResidentDocument {
             .register_layer_snapshot_revision(self.revision(), revision, layer_snapshot)
             .expect("mirror import snapshot was checked immediately before upload");
         self.metadata = metadata;
+        self.recovery
+            .advance_structural_mirror(self.mirror.snapshot());
         assert!(history
             .evicted
             .iter()
@@ -1393,6 +1568,8 @@ impl GpuResidentDocument {
             .register_metadata_revision(self.revision(), revision)
             .expect("metadata mirror revision was checked immediately before recording");
         self.metadata = metadata;
+        self.recovery
+            .advance_structural_mirror(self.mirror.snapshot());
         assert!(history
             .evicted
             .iter()
@@ -1500,6 +1677,8 @@ impl GpuResidentDocument {
             .expect("the begun metadata history swap remains pending");
         assert_eq!(finished_id, history_id);
         self.metadata = metadata;
+        self.recovery
+            .advance_structural_mirror(self.mirror.snapshot());
         Ok(Some(GpuResidentMetadataHistorySwapCommit {
             revision,
             history_id,
@@ -1858,6 +2037,7 @@ impl Error for GpuResidentDocumentSubmitFailure {
 
 #[derive(Debug)]
 pub enum GpuResidentDocumentError {
+    Archive(ArchiveError),
     RevisionExhausted,
     ImportedLayerGeometryMismatch,
     MirrorRevisionMismatch {
@@ -1910,6 +2090,7 @@ pub enum GpuResidentDocumentError {
 impl fmt::Display for GpuResidentDocumentError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Archive(error) => error.fmt(formatter),
             Self::RevisionExhausted => {
                 write!(formatter, "GPU document revision space is exhausted")
             }

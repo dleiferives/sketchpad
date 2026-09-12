@@ -194,6 +194,86 @@ impl GpuDocumentHistory {
         })
     }
 
+    /// Residency changes never release atlas pins or alter logical history.
+    pub(crate) fn archive_candidates(
+        &self,
+        keep_recent: usize,
+    ) -> Vec<(GpuHistoryId, GpuHistoryDirection)> {
+        if self.core.pending.is_some() {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for (entries, direction) in [
+            (&self.core.undo, GpuHistoryDirection::Undo),
+            (&self.core.redo, GpuHistoryDirection::Redo),
+        ] {
+            candidates.extend(
+                entries
+                    .iter()
+                    .take(entries.len().saturating_sub(keep_recent))
+                    .filter(|e| {
+                        e.value
+                            .raster_memento()
+                            .is_some_and(|m| m.resident_byte_len() != 0)
+                    })
+                    .map(|e| (e.id, direction)),
+            );
+        }
+        candidates
+    }
+
+    pub(crate) fn archive(
+        &mut self,
+        id: GpuHistoryId,
+        before: &crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand,
+        after: &crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand,
+    ) -> bool {
+        if self.core.pending.is_some() {
+            return false;
+        }
+        for (entries, command) in [(&mut self.core.undo, before), (&mut self.core.redo, after)] {
+            if let Some(entry) = entries.iter_mut().find(|e| e.id == id) {
+                if let Some(memento) = entry.value.raster_memento_mut() {
+                    memento.archive(command.clone());
+                    self.core.resident_bytes -= entry.byte_len;
+                    entry.byte_len = 0;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub(crate) fn next_hydration_bytes(&self, direction: GpuHistoryDirection) -> u64 {
+        self.core
+            .check_begin_entry(direction)
+            .ok()
+            .flatten()
+            .and_then(|e| e.value.raster_memento())
+            .filter(|m| m.resident_byte_len() == 0)
+            .map_or(0, |m| m.byte_len())
+    }
+
+    pub(crate) fn hydrate_next(
+        &mut self,
+        device: &wgpu::Device,
+        direction: GpuHistoryDirection,
+    ) -> Result<(), crate::history_storage::ArchiveError> {
+        let entries = match direction {
+            GpuHistoryDirection::Undo => &mut self.core.undo,
+            GpuHistoryDirection::Redo => &mut self.core.redo,
+        };
+        if let Some(entry) = entries.back_mut() {
+            if let Some(memento) = entry.value.raster_memento_mut() {
+                memento.hydrate(device)?;
+                self.core.resident_bytes =
+                    self.core.resident_bytes - entry.byte_len + memento.resident_byte_len();
+                entry.byte_len = memento.resident_byte_len();
+            }
+        }
+        Ok(())
+    }
+
     pub fn record(
         &mut self,
         atlas: &mut SparseAtlasPlanner,
