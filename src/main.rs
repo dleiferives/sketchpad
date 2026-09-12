@@ -166,6 +166,50 @@ struct ResidentGpuCanvas {
 }
 
 impl ResidentGpuCanvas {
+    /// Only wait when pending snapshots would reject the next operation. Keep
+    /// the active stroke preview and its single undo transaction intact.
+    fn make_mirror_room(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        required: u64,
+    ) -> Result<(), String> {
+        let maximum = self.document.mirror().max_snapshot_bytes();
+        if required > maximum {
+            return Err(format!(
+                "Stroke snapshot needs {required} bytes; capacity is {maximum}"
+            ));
+        }
+        while self.document.mirror().resident_snapshot_bytes() > maximum - required {
+            if !self.mirror_readback_in_flight {
+                let encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("Mirror backpressure before document edit"),
+                });
+                let prepared = self
+                    .document
+                    .prepare_next_mirror_readback(device, encoder)
+                    .map_err(|error| error.to_string())?
+                    .ok_or("Pending recovery snapshot did not provide a readback")?;
+                self.document
+                    .submit_mirror_readback(queue, prepared)
+                    .map_err(|error| error.to_string())?;
+                self.mirror_readback_in_flight = true;
+            }
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: Some(Duration::from_secs(10)),
+                })
+                .map_err(|error| error.to_string())?;
+            self.document
+                .try_finish_mirror()
+                .map_err(|error| error.to_string())?
+                .ok_or("GPU recovery readback did not finish after waiting")?;
+            self.mirror_readback_in_flight = false;
+        }
+        Ok(())
+    }
+
     fn bootstrap(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -188,7 +232,7 @@ impl ResidentGpuCanvas {
             &mut target,
             device,
             queue,
-            GpuResidentDocumentLimits::default(),
+            GpuResidentDocumentLimits::for_canvas([document.width(), document.height()], layout),
         )
         .map_err(|error| error.to_string())?;
         log::info!(
@@ -1762,6 +1806,11 @@ impl App {
                         batch.commands(),
                     )
                     .map_err(|error| error.to_string())?;
+                let bytes = resident
+                    .strokes
+                    .commit_snapshot_bytes()
+                    .map_err(|error| error.to_string())?;
+                resident.make_mirror_room(&gpu.device, &gpu.queue, bytes)?;
                 resident
                     .strokes
                     .commit(
@@ -1781,6 +1830,9 @@ impl App {
                     if let Some(resident) = self.gpu.as_mut().and_then(|gpu| gpu.resident.as_mut())
                     {
                         let _ = resident.strokes.cancel(&mut resident.document);
+                    }
+                    if let Some(ui) = &mut self.ui {
+                        ui.notify(format!("Could not keep this stroke: {error}"), true);
                     }
                     self.request_redraw();
                 }
@@ -2110,7 +2162,13 @@ impl App {
                         commit.map(|commit| (commit.revision, commit.history_id, "metadata"))
                     })
                     .map_err(|error| error.to_string()),
-                Ok(Some(GpuHistoryEntryKind::Raster)) => {
+                Ok(Some(GpuHistoryEntryKind::Raster)) => (|| {
+                    // Exact undo/redo recovery depends on the preceding mirror revision.
+                    resident.make_mirror_room(
+                        &gpu.device,
+                        &gpu.queue,
+                        resident.document.mirror().max_snapshot_bytes(),
+                    )?;
                     let encoder =
                         gpu.device
                             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2130,7 +2188,7 @@ impl App {
                         Ok(None) => Ok(None),
                         Err(failure) => Err(failure.error.to_string()),
                     }
-                }
+                })(),
                 Ok(None) => Ok(None),
                 Err(error) => Err(error.to_string()),
             }
@@ -2596,11 +2654,25 @@ impl App {
         }
     }
 
+    fn reconcile_gpu_mirror_for_file(&mut self) -> Result<(), String> {
+        if let Some(gpu) = &mut self.gpu {
+            if let Some(resident) = &mut gpu.resident {
+                let bytes = resident.document.mirror().max_snapshot_bytes();
+                resident.make_mirror_room(&gpu.device, &gpu.queue, bytes)?;
+            }
+        }
+        Ok(())
+    }
+
     fn save_recovery_checkpoint(&mut self) -> bool {
         if !self.persistence_enabled || self.active_stroke.is_some() {
             return false;
         }
         if self.gpu_resident_document().is_some() {
+            if let Err(error) = self.reconcile_gpu_mirror_for_file() {
+                log::error!("Could not reconcile GPU recovery before saving: {error}");
+                return false;
+            }
             let path = self.persistence.recovery_path().to_owned();
             let started = Instant::now();
             let result = {
@@ -2687,20 +2759,24 @@ impl App {
             return false;
         }
         let path = ensure_sketchpad_extension(path);
-        let result = if let Some(document) = self.gpu_resident_document() {
-            document
-                .recovery_snapshot()
-                .build_checkpoint()
-                .map_err(|error| error.to_string())
-                .and_then(|checkpoint| {
-                    checkpoint
-                        .save_atomic(&path)
-                        .map_err(|error| error.to_string())
-                })
-        } else {
-            checkpoint::save_document_atomic(&path, &self.document)
-                .map_err(|error| error.to_string())
-        };
+        // Prefer exact GPU pixels over replaying a large stroke across millions
+        // of pixels on the CPU when Save is pressed immediately after pen-up.
+        let result = self.reconcile_gpu_mirror_for_file().and_then(|()| {
+            if let Some(document) = self.gpu_resident_document() {
+                document
+                    .recovery_snapshot()
+                    .build_checkpoint()
+                    .map_err(|error| error.to_string())
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .save_atomic(&path)
+                            .map_err(|error| error.to_string())
+                    })
+            } else {
+                checkpoint::save_document_atomic(&path, &self.document)
+                    .map_err(|error| error.to_string())
+            }
+        });
         match result {
             Ok(summary) => {
                 self.persistence.document_saved(path.clone());
@@ -2934,6 +3010,7 @@ impl App {
             return;
         }
         let result: Result<_, String> = (|| {
+            self.reconcile_gpu_mirror_for_file()?;
             let recovered;
             let raster = if let Some(document) = self.gpu_resident_document() {
                 recovered = document
@@ -3116,6 +3193,18 @@ impl App {
                     .recovery_due
                     .is_some_and(|deadline| Instant::now() >= deadline)
             {
+                if self
+                    .gpu_resident_document()
+                    .expect("resident mode was checked")
+                    .mirror()
+                    .pending_revision_count()
+                    > 0
+                {
+                    // The renderer is already copying exact pixels. Avoid replaying
+                    // a broad stroke on the checkpoint worker while that completes.
+                    self.recovery_due = Some(Instant::now() + AUTOSAVE_POLL_INTERVAL);
+                    return;
+                }
                 let snapshot = self
                     .gpu_resident_document()
                     .expect("resident mode was checked")
@@ -5065,6 +5154,156 @@ mod tests {
                 assert!((before[axis] - after[axis]).abs() < 0.001);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires X11 and a hardware GPU; paints a full 4096px canvas in a hidden window"]
+    #[allow(deprecated)]
+    fn large_round_stroke_survives_pen_up_and_undo() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(512, 512)),
+                )
+                .unwrap(),
+        );
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = PathBuf::from(format!(".artifacts/large-stroke-{stamp}"));
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("recovery.sketchpad");
+        let document = Document::new(4096, 4096, DEFAULT_TILE_SIZE).unwrap();
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            document,
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("export.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+        assert!(app.gpu_resident_document().is_some());
+        app.set_brush_diameter(512.0);
+        let revision = app.gpu_resident_document().unwrap().revision();
+        let viewport = app.viewport_size();
+        let screen = |x: f32, y: f32| [x / 4096.0 * viewport[0], y / 4096.0 * viewport[1]];
+        app.start_stroke(screen(256.0, 256.0), 1.0, [0.0; 2], PointerOwner::Mouse);
+        for row in 0..11 {
+            for column in 0..17 {
+                let x = if row % 2 == 0 { column } else { 16 - column };
+                app.update_stroke(
+                    screen(256.0 + x as f32 * 224.0, 256.0 + row as f32 * 358.4),
+                    1.0,
+                    [0.0; 2],
+                );
+                assert!(
+                    app.active_stroke.is_some(),
+                    "large stroke disappeared while drawing"
+                );
+            }
+        }
+        app.finish_stroke();
+        assert!(
+            app.gpu_resident_document().unwrap().revision() > revision,
+            "pen-up must commit the large stroke, not silently cancel it"
+        );
+        assert!(app.persistence.document_modified());
+        assert!(app.save_document_to(directory.join("drawing.sketchpad")));
+        let saved = checkpoint::load_document(&directory.join("drawing.sketchpad")).unwrap();
+        assert!(
+            saved
+                .layer_raster(saved.active_layer_id())
+                .unwrap()
+                .pixel(2048, 2048)
+                .unwrap()
+                .a
+                > 0.9
+        );
+        drop(saved);
+        let painted_revision = app.gpu_resident_document().unwrap().revision();
+        app.undo();
+        assert!(
+            app.gpu_resident_document().unwrap().revision() > painted_revision,
+            "large-stroke undo must complete"
+        );
+        {
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let document = recovered.document();
+            assert_eq!(
+                document
+                    .layer_raster(document.active_layer_id())
+                    .unwrap()
+                    .pixel(2048, 2048)
+                    .unwrap()
+                    .a,
+                0.0
+            );
+        }
+        let undone_revision = app.gpu_resident_document().unwrap().revision();
+        app.redo();
+        assert!(
+            app.gpu_resident_document().unwrap().revision() > undone_revision,
+            "large-stroke redo must complete"
+        );
+        {
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let document = recovered.document();
+            assert!(
+                document
+                    .layer_raster(document.active_layer_id())
+                    .unwrap()
+                    .pixel(2048, 2048)
+                    .unwrap()
+                    .a
+                    > 0.9
+            );
+        }
+        // Redo left a full snapshot in flight. Another stroke must make room
+        // without dropping either the existing paint or this new transaction.
+        let before_followup = app.gpu_resident_document().unwrap().revision();
+        app.mouse_tool = ToolKind::Eraser;
+        app.set_brush_diameter(512.0);
+        app.start_stroke(screen(2048.0, 2048.0), 1.0, [0.0; 2], PointerOwner::Mouse);
+        app.finish_stroke();
+        assert!(app.gpu_resident_document().unwrap().revision() > before_followup);
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        let document = recovered.document();
+        let raster = document.layer_raster(document.active_layer_id()).unwrap();
+        assert_eq!(raster.pixel(2048, 2048).unwrap().a, 0.0);
+        assert!(raster.pixel(256, 256).unwrap().a > 0.9);
     }
 
     #[cfg(target_os = "linux")]

@@ -30,11 +30,11 @@ use crate::{
         GpuHistoryRecoveryEntry, DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
         DEFAULT_GPU_HISTORY_RECOVERY_ENTRIES,
     },
+    gpu_layer_recovery::{GpuExactLayerRecoveryBuildError, GpuExactLayerRecoveryCommand},
     gpu_live_recovery::{
         GpuLiveRecovery, GpuLiveRecoveryError, GpuMirrorRecoveryCommit, GpuMirrorRecoveryPurpose,
         PreparedGpuHistoryRecoveryRecord, PreparedGpuHistoryRecoverySwap,
     },
-    gpu_layer_recovery::{GpuExactLayerRecoveryBuildError, GpuExactLayerRecoveryCommand},
     gpu_raster_recovery::GpuExactRasterRecoveryTransition,
     gpu_recovery_journal::{
         DEFAULT_GPU_RECOVERY_JOURNAL_BYTES, DEFAULT_GPU_RECOVERY_JOURNAL_ENTRIES,
@@ -75,6 +75,34 @@ impl Default for GpuResidentDocumentLimits {
             recovery_journal_bytes: DEFAULT_GPU_RECOVERY_JOURNAL_BYTES,
             recovery_spill_entries: DEFAULT_GPU_HISTORY_RECOVERY_ENTRIES,
             recovery_spill_bytes: DEFAULT_GPU_HISTORY_RECOVERY_BYTES,
+        }
+    }
+}
+
+impl GpuResidentDocumentLimits {
+    /// Reserve enough budget for one stroke over every resident tile of a layer.
+    /// These are ceilings; buffers are allocated only for actual stroke damage.
+    pub fn for_canvas(canvas: [u32; 2], layout: AtlasLayout) -> Self {
+        let defaults = Self::default();
+        let tiles = u64::from(canvas[0].div_ceil(layout.tile_size()))
+            * u64::from(canvas[1].div_ceil(layout.tile_size()));
+        let pixels =
+            tiles.min(u64::from(layout.total_capacity())) * u64::from(layout.tile_size()).pow(2);
+        let history_bytes = defaults
+            .history_bytes
+            .max(pixels * u64::from(crate::gpu_document_undo::GPU_UNDO_PIXEL_BYTES));
+        // Recovery retains before/after pixels plus canonical region metadata.
+        let metadata_allowance = 32 * 1024 * 1024;
+        Self {
+            history_bytes,
+            mirror_snapshot_bytes: defaults.mirror_snapshot_bytes.max(history_bytes),
+            recovery_journal_bytes: defaults
+                .recovery_journal_bytes
+                .max(history_bytes + metadata_allowance),
+            recovery_spill_bytes: defaults
+                .recovery_spill_bytes
+                .max(2 * history_bytes + metadata_allowance),
+            ..defaults
         }
     }
 }
@@ -1001,26 +1029,20 @@ impl GpuResidentDocument {
             Ok(preview) => preview,
             Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
         };
-        let recovered = match replay_gpu_raster_recovery(
-            &self.recovery.timeline().snapshot(),
-            source,
-        ) {
-            Ok(recovered) => recovered,
-            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
-        };
-        let recovery_command = match GpuExactLayerRecoveryCommand::from_raster(
-            destination,
-            recovered.raster(),
-        ) {
-            Ok(command) => GpuRasterRecoveryCommand::from(command),
-            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
-        };
-        if let Err(error) = self.mirror.check_layer_clone_revision(
-            self.revision(),
-            revision,
-            source,
-            destination,
-        ) {
+        let recovered =
+            match replay_gpu_raster_recovery(&self.recovery.timeline().snapshot(), source) {
+                Ok(recovered) => recovered,
+                Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+            };
+        let recovery_command =
+            match GpuExactLayerRecoveryCommand::from_raster(destination, recovered.raster()) {
+                Ok(command) => GpuRasterRecoveryCommand::from(command),
+                Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+            };
+        if let Err(error) =
+            self.mirror
+                .check_layer_clone_revision(self.revision(), revision, source, destination)
+        {
             return Err(metadata_edit_failure(error.into(), Some(edit)));
         }
         let recovery = match self.recovery.prepare_structural_history_record(
@@ -1066,16 +1088,20 @@ impl GpuResidentDocument {
             Ok(allocations) => allocations,
             Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
         };
-        debug_assert!(allocations.iter().all(|allocation| allocation.newly_allocated));
+        debug_assert!(allocations
+            .iter()
+            .all(|allocation| allocation.newly_allocated));
         let clones: Vec<_> = source_residents
             .iter()
             .zip(&allocations)
-            .map(|((source_key, source_slot), destination)| GpuDocumentResidentClone {
-                source_key: *source_key,
-                source_slot: *source_slot,
-                destination_key: destination.key,
-                destination_slot: destination.slot,
-            })
+            .map(
+                |((source_key, source_slot), destination)| GpuDocumentResidentClone {
+                    source_key: *source_key,
+                    source_slot: *source_slot,
+                    destination_key: destination.key,
+                    destination_slot: destination.slot,
+                },
+            )
             .collect();
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("GPU Resident Layer Clone"),
@@ -1182,11 +1208,10 @@ impl GpuResidentDocument {
             Ok(command) => command,
             Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
         };
-        if let Err(error) = self.mirror.check_layer_snapshot_revision(
-            self.revision(),
-            revision,
-            &layer_snapshot,
-        ) {
+        if let Err(error) =
+            self.mirror
+                .check_layer_snapshot_revision(self.revision(), revision, &layer_snapshot)
+        {
             return Err(metadata_edit_failure(error.into(), Some(edit)));
         }
         let recovery = match self.recovery.prepare_structural_history_record(
@@ -1207,7 +1232,9 @@ impl GpuResidentDocument {
             Ok(allocations) => allocations,
             Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
         };
-        debug_assert!(allocations.iter().all(|allocation| allocation.newly_allocated));
+        debug_assert!(allocations
+            .iter()
+            .all(|allocation| allocation.newly_allocated));
         let uploads: Vec<_> = tiles
             .into_iter()
             .zip(&allocations)
@@ -1887,7 +1914,10 @@ impl fmt::Display for GpuResidentDocumentError {
                 write!(formatter, "GPU document revision space is exhausted")
             }
             Self::ImportedLayerGeometryMismatch => {
-                write!(formatter, "imported raster geometry does not match the resident document")
+                write!(
+                    formatter,
+                    "imported raster geometry does not match the resident document"
+                )
             }
             Self::MirrorRevisionMismatch { metadata, mirror } => write!(
                 formatter,

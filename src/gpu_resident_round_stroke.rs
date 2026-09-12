@@ -297,6 +297,17 @@ impl GpuResidentRoundStrokeEngine {
             .unwrap_or(0)
     }
 
+    /// Exact block-aligned snapshot cost, used to relieve mirror backpressure
+    /// before ending the preview or allocating a commit memento.
+    pub fn commit_snapshot_bytes(&self) -> Result<u64, crate::gpu_document_undo::GpuUndoPlanError> {
+        let tiles = self.mask.active_tiles();
+        if tiles.is_empty() {
+            return Ok(0);
+        }
+        crate::gpu_document_undo::GpuUndoCapturePlan::from_active_tiles(self.layout, &tiles)
+            .map(|plan| plan.byte_len())
+    }
+
     pub fn provisional_tile_count(&self) -> usize {
         self.active
             .as_ref()

@@ -360,7 +360,12 @@ impl ContinuousRoundPath {
         match self.active_contact.replace(contact) {
             None => self.push(RoundPathCommand::Begin(contact)),
             Some(previous)
-                if previous.center == contact.center && previous.radius == contact.radius => {}
+                if previous.center == contact.center && previous.radius == contact.radius =>
+            {
+                // No command was emitted: retain the exact endpoint (including its
+                // timestamp) that the renderer and recovery replay last received.
+                self.active_contact = Some(previous);
+            }
             Some(previous) => self.push(RoundPathCommand::Sweep {
                 from: previous,
                 to: contact,
@@ -578,6 +583,30 @@ mod tests {
         assert!(matches!(commands[1], RoundPathCommand::End { .. }));
         assert!(matches!(commands[2], RoundPathCommand::Begin(_)));
         assert!(matches!(commands[3], RoundPathCommand::End { .. }));
+    }
+
+    #[test]
+    fn stationary_samples_keep_render_and_recovery_paths_continuous() {
+        for move_again in [false, true] {
+            let mut path = ContinuousRoundPath::begin(recipe(1.0), sample(2.0, 1.0, 0)).unwrap();
+            let mut geometry = crate::round_geometry::RoundStrokeGeometry::default();
+            geometry
+                .apply_commands(path.take_batch().into_commands())
+                .unwrap();
+            path.update(sample(2.0, 1.0, 100)).unwrap();
+            assert!(path.take_batch().is_empty());
+            if move_again {
+                path.update(sample(20.0, 1.0, 200)).unwrap();
+                geometry
+                    .apply_commands(path.take_batch().into_commands())
+                    .unwrap();
+                path.update(sample(20.0, 1.0, 300)).unwrap();
+            }
+            path.finish().unwrap();
+            geometry
+                .apply_commands(path.take_batch().into_commands())
+                .unwrap();
+        }
     }
 
     #[test]

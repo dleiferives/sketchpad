@@ -22,6 +22,14 @@ Implemented an in-app file browser, overwrite confirmation, unsaved-change modal
 
 Atlas validation passed: full Cargo tests; hidden-window hardware GPU regression covering immediate save, metadata/pixel round-trip, export, failed open/save, different canvas geometry, filename recovery, and cancel/discard; Clippy (with the existing too-many-arguments allowance); formatting. A live isolated native window saved and reopened a real document through the new browser using mouse and keyboard.
 
+## Large-stroke reliability
+
+A 512 px stroke covering the 4096×4096 canvas reproduced a pen-up failure: the GPU undo memento required 268,435,456 bytes against a 67,108,864-byte limit. Application budgets now allow one layer-wide stroke within the resident atlas capacity, with matching mirror and exact recovery budgets. Pending mirror snapshots are drained when the next commit needs room, and before exact undo/redo or immediate save/export. Autosave waits for the existing GPU readback instead of needlessly replaying a large stroke on the CPU.
+
+Repeated stationary input also replaced a path endpoint timestamp without emitting a command, making the next segment or pen-up discontinuous. The producer now retains the last emitted endpoint; a regression checks recovery geometry with stationary samples before movement and before lift.
+
+Apollo hardware release regressions passed: full-canvas stroke, immediate save/reopen with pixel checks, exact undo and redo, and a following eraser stroke while a full snapshot remained pending; existing file workflow passed as well. Atlas regular tests, Clippy with existing-lint allowances, and formatting passed. These are functional checks, not isolated performance benchmarks. The raised budgets are a correctness fix; compressed history and replay/checkpoint tradeoffs still require separate measurement.
+
 ## Next editing work
 
 - Color: improve picking precision and preview, editable values, and palette organization.
