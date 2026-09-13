@@ -1,5 +1,8 @@
 # Compact drawing workspace
 
+The [brush-engine research](brush-research.html) includes the programmable material
+proposal and actual knife opacity comparison. See [implementation and validation](../brush-engine-research.md).
+
 Current direction: a visible brush palette and persistent brush/color/size/opacity strip, with compact and touch sizing. See [the redesign research](../ui-redesign.md) and [current native renders](ui-redesign.html). The sections below record earlier gesture validation. `research.html` contains the official references and ergonomic comparison; `index.html` includes the generated concepts and actual Atlas screenshots.
 
 ## Controls
