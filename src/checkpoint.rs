@@ -17,6 +17,7 @@ const MAGIC: [u8; 8] = *b"SKPRASTR";
 const VERSION: u32 = 1;
 const DOCUMENT_MAGIC: [u8; 8] = *b"SKPDOC02";
 const DOCUMENT_VERSION: u32 = 1;
+const MATERIAL_DOCUMENT_VERSION: u32 = 2;
 const FLAGS: u32 = 0;
 const HEADER_SIZE: usize = 32;
 const MAX_CANVAS_DIMENSION: u32 = 1_048_576;
@@ -48,6 +49,7 @@ struct LayerSnapshot {
     visible: bool,
     opacity: f32,
     tiles: Vec<RasterCheckpointTile>,
+    material: Vec<RasterCheckpointTile>,
 }
 
 #[derive(Debug)]
@@ -145,6 +147,20 @@ fn encode_raster_parts(
     tile_size: u32,
     tiles: &mut [(TileCoord, &[LinearRgba])],
 ) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
+    let mut encoded = Vec::new();
+    let summary = append_raster_parts(&mut encoded, width, height, tile_size, tiles)?;
+    Ok((encoded, summary))
+}
+
+// Append nested rasters directly to the document buffer. No second full-layer
+// encoded allocation is needed alongside the already encoded document.
+fn append_raster_parts(
+    payload: &mut Vec<u8>,
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    tiles: &mut [(TileCoord, &[LinearRgba])],
+) -> Result<CheckpointSummary, CheckpointError> {
     validate_geometry(width, height, tile_size)?;
     let expected_pixels = usize::try_from(
         tile_size
@@ -160,11 +176,12 @@ fn encode_raster_parts(
         ));
     }
 
-    let mut payload = Vec::new();
-    push_u32(&mut payload, width);
-    push_u32(&mut payload, height);
-    push_u32(&mut payload, tile_size);
-    push_u32(&mut payload, tile_count);
+    let header_start = payload.len();
+    payload.resize(header_start + HEADER_SIZE, 0);
+    push_u32(payload, width);
+    push_u32(payload, height);
+    push_u32(payload, tile_size);
+    push_u32(payload, tile_count);
 
     tiles.sort_unstable_by_key(|(coord, _)| (coord.y, coord.x));
     let mut stored_pixels = 0_u64;
@@ -184,10 +201,10 @@ fn encode_raster_parts(
         let origin_y = coord.y * tile_size;
         let valid_width = tile_size.min(width - origin_x);
         let valid_height = tile_size.min(height - origin_y);
-        push_u32(&mut payload, coord.x);
-        push_u32(&mut payload, coord.y);
+        push_u32(payload, coord.x);
+        push_u32(payload, coord.y);
         let run_count_offset = payload.len();
-        push_u32(&mut payload, 0);
+        push_u32(payload, 0);
         let mut run_count = 0_u32;
 
         for y in 0..valid_height {
@@ -205,12 +222,12 @@ fn encode_raster_parts(
                     x += 1;
                 }
                 let run_length = x - run_start;
-                push_u32(&mut payload, y);
-                push_u32(&mut payload, run_start);
-                push_u32(&mut payload, run_length);
+                push_u32(payload, y);
+                push_u32(payload, run_start);
+                push_u32(payload, run_length);
                 for pixel in &pixels[row_start + run_start as usize..row_start + x as usize] {
                     validate_pixel(*pixel)?;
-                    push_pixel(&mut payload, *pixel);
+                    push_pixel(payload, *pixel);
                 }
                 run_count = run_count
                     .checked_add(1)
@@ -226,7 +243,7 @@ fn encode_raster_parts(
         payload[run_count_offset..run_count_offset + 4].copy_from_slice(&run_count.to_le_bytes());
     }
 
-    let payload_len = u64::try_from(payload.len())
+    let payload_len = u64::try_from(payload.len() - header_start - HEADER_SIZE)
         .map_err(|_| CheckpointError::invalid("payload length does not fit u64"))?;
     let encoded_len = payload_len
         .checked_add(HEADER_SIZE as u64)
@@ -235,22 +252,22 @@ fn encode_raster_parts(
         return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
     }
 
-    let mut encoded = Vec::with_capacity(HEADER_SIZE + payload.len());
+    let mut encoded = Vec::with_capacity(HEADER_SIZE);
     encoded.extend_from_slice(&MAGIC);
     push_u32(&mut encoded, VERSION);
     push_u32(&mut encoded, FLAGS);
     push_u64(&mut encoded, payload_len);
-    push_u64(&mut encoded, checksum(&payload));
-    encoded.extend_from_slice(&payload);
-    Ok((
-        encoded,
-        CheckpointSummary {
-            encoded_bytes: encoded_len,
-            layer_count: 1,
-            tile_count,
-            stored_pixels,
-        },
-    ))
+    push_u64(
+        &mut encoded,
+        checksum(&payload[header_start + HEADER_SIZE..]),
+    );
+    payload[header_start..header_start + HEADER_SIZE].copy_from_slice(&encoded);
+    Ok(CheckpointSummary {
+        encoded_bytes: encoded_len,
+        layer_count: 1,
+        tile_count,
+        stored_pixels,
+    })
 }
 
 pub fn encode_document(
@@ -264,6 +281,15 @@ pub fn encode_document(
                 .layer_raster(layer.id())
                 .expect("every document layer must have a raster payload");
             DocumentEncodingLayer {
+                material: document
+                    .material_raster(layer.id())
+                    .map(|raster| {
+                        raster
+                            .allocated_tile_coords()
+                            .map(|coord| (coord, raster.tile(coord).unwrap().pixels()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 id: layer.id().get(),
                 name: layer.name(),
                 visible: layer.visible(),
@@ -307,6 +333,10 @@ pub fn snapshot_document(document: &Document) -> Result<DocumentSnapshot, Checkp
             visible: layer.visible(),
             opacity: layer.opacity(),
             tiles: raster.checkpoint_tiles(),
+            material: document
+                .material_raster(layer.id())
+                .map(RasterLayer::checkpoint_tiles)
+                .unwrap_or_default(),
         });
     }
     Ok(DocumentSnapshot {
@@ -318,6 +348,37 @@ pub fn snapshot_document(document: &Document) -> Result<DocumentSnapshot, Checkp
     })
 }
 
+/// Snapshot recovered layer planes without constructing a flattened Document.
+pub(crate) fn snapshot_layer_parts(
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    active_layer: LayerId,
+    parts: &[(DocumentLayerParts, RasterLayer)],
+) -> Result<DocumentSnapshot, CheckpointError> {
+    validate_geometry(width, height, tile_size)?;
+    validate_layer_count(parts.len())?;
+    let mut layers = Vec::with_capacity(parts.len());
+    for (layer, material) in parts {
+        validate_layer_name(&layer.name)?;
+        layers.push(LayerSnapshot {
+            id: layer.id.get(),
+            name: layer.name.clone(),
+            visible: layer.visible,
+            opacity: layer.opacity,
+            tiles: layer.raster.checkpoint_tiles(),
+            material: material.checkpoint_tiles(),
+        });
+    }
+    Ok(DocumentSnapshot {
+        width,
+        height,
+        tile_size,
+        active_layer: active_layer.get(),
+        layers,
+    })
+}
+
 pub fn encode_document_snapshot(
     snapshot: &DocumentSnapshot,
 ) -> Result<(Vec<u8>, CheckpointSummary), CheckpointError> {
@@ -325,6 +386,11 @@ pub fn encode_document_snapshot(
         .layers
         .iter()
         .map(|layer| DocumentEncodingLayer {
+            material: layer
+                .material
+                .iter()
+                .map(|tile| (tile.coord, tile.pixels.as_ref()))
+                .collect(),
             id: layer.id,
             name: &layer.name,
             visible: layer.visible,
@@ -351,6 +417,7 @@ struct DocumentEncodingLayer<'a> {
     visible: bool,
     opacity: f32,
     tiles: Vec<(TileCoord, &'a [LinearRgba])>,
+    material: Vec<(TileCoord, &'a [LinearRgba])>,
 }
 
 fn encode_document_parts(
@@ -368,19 +435,34 @@ fn encode_document_parts(
         ));
     }
 
-    let mut payload = Vec::new();
+    let mut payload = vec![0; HEADER_SIZE];
     push_u32(&mut payload, width);
     push_u32(&mut payload, height);
     push_u32(&mut payload, tile_size);
     push_u32(&mut payload, layer_count);
     push_u64(&mut payload, active_layer);
 
+    let material_version = layers.iter().any(|layer| !layer.material.is_empty());
     let mut tile_count = 0_u32;
     let mut stored_pixels = 0_u64;
     for layer in layers {
         validate_layer_name(layer.name)?;
-        let (encoded_raster, summary) =
-            encode_raster_parts(width, height, tile_size, &mut layer.tiles)?;
+        let name = layer.name.as_bytes();
+        push_u64(&mut payload, layer.id);
+        push_u32(&mut payload, u32::from(layer.visible));
+        push_u32(&mut payload, layer.opacity.to_bits());
+        push_u32(
+            &mut payload,
+            u32::try_from(name.len())
+                .map_err(|_| CheckpointError::invalid("layer name length does not fit u32"))?,
+        );
+        payload.extend_from_slice(name);
+        let length_offset = payload.len();
+        push_u64(&mut payload, 0);
+        let summary =
+            append_raster_parts(&mut payload, width, height, tile_size, &mut layer.tiles)?;
+        payload[length_offset..length_offset + 8]
+            .copy_from_slice(&summary.encoded_bytes.to_le_bytes());
         tile_count = tile_count
             .checked_add(summary.tile_count)
             .ok_or_else(|| CheckpointError::invalid("document tile count overflow"))?;
@@ -393,25 +475,28 @@ fn encode_document_parts(
             .checked_add(summary.stored_pixels)
             .ok_or_else(|| CheckpointError::invalid("stored pixel count overflow"))?;
 
-        let name = layer.name.as_bytes();
-        push_u64(&mut payload, layer.id);
-        push_u32(&mut payload, u32::from(layer.visible));
-        push_u32(&mut payload, layer.opacity.to_bits());
-        push_u32(
-            &mut payload,
-            u32::try_from(name.len())
-                .map_err(|_| CheckpointError::invalid("layer name length does not fit u32"))?,
-        );
-        payload.extend_from_slice(name);
-        push_u64(
-            &mut payload,
-            u64::try_from(encoded_raster.len())
-                .map_err(|_| CheckpointError::invalid("layer payload length does not fit u64"))?,
-        );
-        payload.extend_from_slice(&encoded_raster);
+        if material_version {
+            let length_offset = payload.len();
+            push_u64(&mut payload, 0);
+            let summary =
+                append_raster_parts(&mut payload, width, height, tile_size, &mut layer.material)?;
+            payload[length_offset..length_offset + 8]
+                .copy_from_slice(&summary.encoded_bytes.to_le_bytes());
+            tile_count = tile_count
+                .checked_add(summary.tile_count)
+                .ok_or_else(|| CheckpointError::invalid("material tile count overflow"))?;
+            if tile_count > MAX_TILE_COUNT {
+                return Err(CheckpointError::invalid(
+                    "document material tile count exceeds limit",
+                ));
+            }
+            stored_pixels = stored_pixels
+                .checked_add(summary.stored_pixels)
+                .ok_or_else(|| CheckpointError::invalid("material pixel count overflow"))?;
+        }
     }
 
-    let payload_len = u64::try_from(payload.len())
+    let payload_len = u64::try_from(payload.len() - HEADER_SIZE)
         .map_err(|_| CheckpointError::invalid("payload length does not fit u64"))?;
     let encoded_len = payload_len
         .checked_add(HEADER_SIZE as u64)
@@ -419,13 +504,21 @@ fn encode_document_parts(
     if encoded_len > MAX_CHECKPOINT_BYTES {
         return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
     }
-    let mut encoded = Vec::with_capacity(HEADER_SIZE + payload.len());
+    let mut encoded = Vec::with_capacity(HEADER_SIZE);
     encoded.extend_from_slice(&DOCUMENT_MAGIC);
-    push_u32(&mut encoded, DOCUMENT_VERSION);
+    push_u32(
+        &mut encoded,
+        if material_version {
+            MATERIAL_DOCUMENT_VERSION
+        } else {
+            DOCUMENT_VERSION
+        },
+    );
     push_u32(&mut encoded, FLAGS);
     push_u64(&mut encoded, payload_len);
-    push_u64(&mut encoded, checksum(&payload));
-    encoded.extend_from_slice(&payload);
+    push_u64(&mut encoded, checksum(&payload[HEADER_SIZE..]));
+    payload[..HEADER_SIZE].copy_from_slice(&encoded);
+    let encoded = payload;
     Ok((
         encoded,
         CheckpointSummary {
@@ -468,7 +561,8 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
             "document checkpoint magic does not match",
         ));
     }
-    if header.u32()? != DOCUMENT_VERSION {
+    let version = header.u32()?;
+    if version != DOCUMENT_VERSION && version != MATERIAL_DOCUMENT_VERSION {
         return Err(CheckpointError::invalid(
             "unsupported document checkpoint version",
         ));
@@ -503,6 +597,7 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
     }
     let active_layer = LayerId::from_raw(reader.u64()?);
     let mut parts = Vec::with_capacity(layer_count as usize);
+    let mut materials = Vec::new();
     let mut total_tiles = 0_u32;
 
     for _ in 0..layer_count {
@@ -537,6 +632,20 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
                 "document tile count exceeds limit",
             ));
         }
+        if version == MATERIAL_DOCUMENT_VERSION {
+            let length = usize::try_from(reader.u64()?)
+                .map_err(|_| CheckpointError::invalid("material length overflow"))?;
+            let material = decode(reader.take(length)?)?;
+            total_tiles = total_tiles
+                .checked_add(material.allocated_tile_count() as u32)
+                .ok_or_else(|| CheckpointError::invalid("material tile count overflow"))?;
+            if total_tiles > MAX_TILE_COUNT {
+                return Err(CheckpointError::invalid(
+                    "material tile count exceeds limit",
+                ));
+            }
+            materials.push((id, material));
+        }
         parts.push(DocumentLayerParts {
             id,
             name,
@@ -546,13 +655,11 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
         });
     }
     reader.finish()?;
-    Ok(Document::from_layer_parts(
-        width,
-        height,
-        tile_size,
-        active_layer,
-        parts,
-    )?)
+    let mut document = Document::from_layer_parts(width, height, tile_size, active_layer, parts)?;
+    for (id, material) in materials {
+        document.install_material_raster(id, material)?;
+    }
+    Ok(document)
 }
 
 pub fn decode(encoded: &[u8]) -> Result<RasterLayer, CheckpointError> {
@@ -1009,6 +1116,57 @@ mod tests {
 
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn material_planes_round_trip_and_duplicate_without_extra_drawing_layers() {
+        let mut document = Document::new(17, 19, 8).unwrap();
+        let id = document.active_layer_id();
+        let mut material = RasterLayer::new(17, 19, 8).unwrap();
+        let expected = LinearRgba::premultiplied(0.125, 0.025, 0.0, 0.25);
+        let mut gesture = material.scoped_gesture().unwrap();
+        gesture.set_pixel(8, 9, expected).unwrap();
+        gesture.commit().unwrap();
+        document.install_material_raster(id, material).unwrap();
+        let (encoded, summary) = encode_document(&document).unwrap();
+        assert_eq!(summary.layer_count, 1);
+        assert_eq!(
+            u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
+            MATERIAL_DOCUMENT_VERSION
+        );
+        let mut loaded = decode_document(&encoded).unwrap();
+        assert_eq!(loaded.layers().len(), 1);
+        assert_eq!(
+            loaded.material_raster(id).unwrap().pixel(8, 9),
+            Some(expected)
+        );
+        assert_eq!(encode_document(&loaded).unwrap().0, encoded);
+        assert_eq!(
+            loaded.composite().pixel(8, 9),
+            Some(LinearRgba::TRANSPARENT),
+            "material never composites as color"
+        );
+        let (duplicate, _) = loaded.duplicate_layer(id).unwrap();
+        assert_eq!(
+            loaded.material_raster(duplicate).unwrap().pixel(8, 9),
+            Some(expected)
+        );
+        loaded.delete_layer(duplicate).unwrap();
+        loaded.undo().unwrap();
+        assert_eq!(
+            loaded.material_raster(duplicate).unwrap().pixel(8, 9),
+            Some(expected)
+        );
+        let blank = Document::new(17, 19, 8).unwrap();
+        let encoded = encode_document(&blank).unwrap().0;
+        assert_eq!(
+            u32::from_le_bytes(encoded[8..12].try_into().unwrap()),
+            DOCUMENT_VERSION
+        );
+        assert!(decode_document(&encoded)
+            .unwrap()
+            .material_raster(id)
+            .is_none());
     }
 
     #[test]

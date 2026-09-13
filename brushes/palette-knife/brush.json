@@ -1,8 +1,9 @@
 {
-  "api_version": 1,
+  "api_version": 2,
+  "engine": "loaded-paint",
   "id": "palette-knife",
   "name": "Palette knife",
-  "description": "Built-in shader brush",
+  "description": "Loaded paint · opaque body and retained surface relief",
   "footprint": "knife",
   "extent": 1.0,
   "diameter": 80,

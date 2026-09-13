@@ -1,28 +1,21 @@
-fn brush_coverage(input: BrushInput) -> f32 {
+// Material ABI v2: coverage and deposited thickness in document-pixel units.
+// Grain shapes the paint surface. It cannot exclude the same interior pixels.
+fn brush_deposit(input: BrushInput) -> vec2<f32> {
     let surface = media_surface(input, 3u);
-    let distance = surface.distance; let pressure = surface.pressure;
-    let radius = surface.radius; let aspect = surface.aspect;
-    let world = input.point;
-    let paper = paper_sample(world,0.45);
-    // Loaded paint is opaque. Grain cuts occasional grooves and chips out of
-    // the deposit instead of reducing the alpha of every painted pixel.
-    // Extend fixed paper tooth along travel, independently of blade orientation.
-    // Local symmetric offsets preserve phase on curves and on a 180-degree return.
+    let radius = surface.radius;
+    let paper = paper_sample(input.point, 0.45);
+    let edge_depth = (1.0-paper) * min(1.3, radius * 0.025);
+    let coverage = clamp(0.5 - surface.distance - edge_depth, 0.0, 1.0);
     let motion = input.end - input.start;
-    let motion_length = length(motion);
-    var step = vec2<f32>(0.0);
-    if motion_length > 1e-6 { step = motion / motion_length; }
-    var drag = 1.0;
-    for (var i = -2; i <= 2; i += 1) {
-        drag = min(drag, paper_sample(world + step * f32(i), 0.65));
+    let direction = motion / max(length(motion), 1e-6);
+    var tooth = 0.0;
+    // Elongated microrelief follows travel, independently of the held blade.
+    for (var i = -4; i <= 4; i += 1) {
+        tooth += paper_sample(input.point + direction * f32(i) * 1.5, 0.65) / 9.0;
     }
-    let breakup = paper_sample(world,2.2);
-    let edge_depth = (1.0-paper)*min(min(2.0+radius*0.10,4.0),radius*aspect*0.5);
-    let edge = clamp(0.5-distance-edge_depth,0.0,1.0);
-    let body = smoothstep(0.0,max(radius*aspect*0.7,1.0),-distance);
-    let threshold = 0.14 + (1.0-pressure)*0.04 + (1.0-body)*0.07;
-    let scrape = 1.0-smoothstep(threshold,threshold+0.06,drag+breakup*0.10);
-    // Subpixel nibs cannot resolve internal grooves. Keep their coverage stable.
-    let detail = smoothstep(0.5,2.0,radius*aspect);
-    return edge*(1.0-scrape*detail);
+    let interior = smoothstep(0.0, max(radius * surface.aspect * 0.65, 1.0), -surface.distance);
+    let rim = exp(-pow((surface.distance + 1.8) / 1.3, 2.0));
+    let detail = smoothstep(0.5, 3.0, radius * surface.aspect);
+    let height = (0.65 + 0.35 * surface.pressure) * (0.6 + detail * (1.15 * tooth + 0.7 * rim)) * mix(0.65, 1.0, interior);
+    return vec2<f32>(coverage, height);
 }

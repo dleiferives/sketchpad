@@ -232,10 +232,7 @@ impl DocumentMetadata {
         self.revision = revision;
     }
 
-    pub(crate) fn set_active_layer(
-        &mut self,
-        layer: LayerId,
-    ) -> Result<(), DocumentMetadataError> {
+    pub(crate) fn set_active_layer(&mut self, layer: LayerId) -> Result<(), DocumentMetadataError> {
         if !self.layers.iter().any(|candidate| candidate.id == layer) {
             return Err(DocumentMetadataError::MissingLayer(layer));
         }
@@ -249,11 +246,13 @@ impl DocumentMetadata {
         visible: bool,
     ) -> Result<Option<DocumentMetadataEdit>, DocumentMetadataError> {
         let current = self.require_layer(layer)?.visible;
-        Ok((current != visible).then_some(DocumentMetadataEdit::Visibility {
-            layer,
-            before: current,
-            after: visible,
-        }))
+        Ok(
+            (current != visible).then_some(DocumentMetadataEdit::Visibility {
+                layer,
+                before: current,
+                after: visible,
+            }),
+        )
     }
 
     pub fn prepare_create_layer(
@@ -269,7 +268,8 @@ impl DocumentMetadata {
             .checked_add(1)
             .ok_or(DocumentMetadataError::LayerIdExhausted)?;
         let id = LayerId::from_raw(self.next_layer_id);
-        if id.get() == 0 || self.layers.iter().any(|layer| layer.id == id) {
+        if id.get() == 0 || id.is_material_plane() || self.layers.iter().any(|layer| layer.id == id)
+        {
             return Err(DocumentMetadataError::LayerIdExhausted);
         }
         debug_assert_ne!(next_layer_id, 0);
@@ -298,7 +298,8 @@ impl DocumentMetadata {
             .checked_add(1)
             .ok_or(DocumentMetadataError::LayerIdExhausted)?;
         let id = LayerId::from_raw(self.next_layer_id);
-        if id.get() == 0 || self.layers.iter().any(|layer| layer.id == id) {
+        if id.get() == 0 || id.is_material_plane() || self.layers.iter().any(|layer| layer.id == id)
+        {
             return Err(DocumentMetadataError::LayerIdExhausted);
         }
         debug_assert_ne!(next_layer_id, 0);
@@ -351,11 +352,13 @@ impl DocumentMetadata {
             return Err(DocumentMetadataError::InvalidOpacity);
         }
         let current = self.require_layer(layer)?.opacity;
-        Ok((current != opacity).then_some(DocumentMetadataEdit::Opacity {
-            layer,
-            before: current,
-            after: opacity,
-        }))
+        Ok(
+            (current != opacity).then_some(DocumentMetadataEdit::Opacity {
+                layer,
+                before: current,
+                after: opacity,
+            }),
+        )
     }
 
     pub fn prepare_layer_name(
@@ -384,11 +387,13 @@ impl DocumentMetadata {
             return Err(DocumentMetadataError::LayerIndexOutOfBounds(destination));
         }
         let current = self.require_layer_index(layer)?;
-        Ok((current != destination).then_some(DocumentMetadataEdit::Move {
-            layer,
-            before: current,
-            after: destination,
-        }))
+        Ok(
+            (current != destination).then_some(DocumentMetadataEdit::Move {
+                layer,
+                before: current,
+                after: destination,
+            }),
+        )
     }
 
     pub fn apply_edit(
@@ -549,11 +554,7 @@ impl DocumentMetadata {
     }
 }
 
-fn edit_sides<T: Copy>(
-    before: T,
-    after: T,
-    direction: DocumentMetadataEditDirection,
-) -> (T, T) {
+fn edit_sides<T: Copy>(before: T, after: T, direction: DocumentMetadataEditDirection) -> (T, T) {
     match direction {
         DocumentMetadataEditDirection::Forward => (before, after),
         DocumentMetadataEditDirection::Reverse => (after, before),
@@ -598,7 +599,10 @@ impl fmt::Display for DocumentMetadataError {
             }
             Self::InvalidOpacity => write!(formatter, "document metadata opacity is invalid"),
             Self::LayerIndexOutOfBounds(index) => {
-                write!(formatter, "document metadata layer index {index} is out of bounds")
+                write!(
+                    formatter,
+                    "document metadata layer index {index} is out of bounds"
+                )
             }
             Self::RevisionNotNext { current, requested } => write!(
                 formatter,
@@ -730,11 +734,7 @@ mod tests {
             .unwrap();
         let revision_3 = revision_2.checked_next().unwrap();
         metadata
-            .apply_edit(
-                &opacity,
-                DocumentMetadataEditDirection::Forward,
-                revision_3,
-            )
+            .apply_edit(&opacity, DocumentMetadataEditDirection::Forward, revision_3)
             .unwrap();
         assert_eq!(metadata.require_layer(second).unwrap().opacity(), 0.25);
         assert_eq!(metadata.active_layer(), second);
@@ -750,11 +750,7 @@ mod tests {
         let revision_1 = metadata.revision().checked_next().unwrap();
 
         metadata
-            .apply_edit(
-                &edit,
-                DocumentMetadataEditDirection::Forward,
-                revision_1,
-            )
+            .apply_edit(&edit, DocumentMetadataEditDirection::Forward, revision_1)
             .unwrap();
         assert_eq!(metadata.layers()[0].id(), second);
         assert_eq!(metadata.layers()[1].id(), first);

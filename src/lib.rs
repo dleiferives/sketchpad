@@ -49,3 +49,5 @@ pub mod x11_tablet;
 pub mod history_storage;
 
 pub mod shader_brush;
+
+pub mod gpu_material;

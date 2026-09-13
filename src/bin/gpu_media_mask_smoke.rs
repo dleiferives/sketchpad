@@ -56,6 +56,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         BrushTip::Charcoal,
     ] {
         for package in [false, true] {
+            // API 2 retains a material surface; its oracle is the native material
+            // regression, not equality with the historical coverage-only knife.
+            if package && tip == BrushTip::PaletteKnife {
+                continue;
+            }
             for scale in [1.0, 0.01] {
                 let mut atlas = SparseAtlasPlanner::new(layout);
                 atlas.allocate_batch(

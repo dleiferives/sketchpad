@@ -91,7 +91,7 @@ impl GpuResidentDocumentLimits {
             tiles.min(u64::from(layout.total_capacity())) * u64::from(layout.tile_size()).pow(2);
         let history_bytes = defaults
             .history_bytes
-            .max(pixels * u64::from(crate::gpu_document_undo::GPU_UNDO_PIXEL_BYTES));
+            .max(2 * pixels * u64::from(crate::gpu_document_undo::GPU_UNDO_PIXEL_BYTES));
         // Recovery retains before/after pixels plus canonical region metadata.
         let metadata_allowance = 32 * 1024 * 1024;
         Self {
@@ -367,14 +367,11 @@ impl GpuResidentDocument {
         let mut resident =
             Self::new_with_mirror(metadata, target.layout(), target.id(), mirror, limits)?;
         let mut uploads = Vec::new();
-        for layer in document.layers() {
-            let raster = document
-                .layer_raster(layer.id())
-                .expect("every document layer must retain its raster payload");
+        for (layer_id, raster) in document.raster_planes() {
             let mut tiles = raster.checkpoint_tiles();
             tiles.sort_unstable_by_key(|tile| (tile.coord.y, tile.coord.x));
             for tile in tiles {
-                let key = LayerTileKey::new(layer.id(), tile.coord);
+                let key = LayerTileKey::new(layer_id, tile.coord);
                 let slot = resident.atlas.allocate(key)?.slot;
                 uploads.push(GpuDocumentResidentUpload {
                     key,
@@ -1049,6 +1046,19 @@ impl GpuResidentDocument {
         Ok(scheduler.schedule(&mut self.atlas, commands)?)
     }
 
+    pub(crate) fn allocate_material_tiles(
+        &mut self,
+        id: GpuResidentRoundStrokeId,
+        tiles: &[crate::gpu_round_target::ActiveRoundMaskTile],
+    ) -> Result<Vec<AtlasAllocation>, GpuResidentDocumentError> {
+        self.check_active_round_stroke(Some(id))?;
+        Ok(self.atlas.allocate_batch(
+            tiles
+                .iter()
+                .map(|tile| LayerTileKey::new(tile.key.layer.material_plane(), tile.key.tile)),
+        )?)
+    }
+
     pub(crate) fn rollback_round_stroke_allocations(
         &mut self,
         id: GpuResidentRoundStrokeId,
@@ -1205,8 +1215,17 @@ impl GpuResidentDocument {
                 Ok(recovered) => recovered,
                 Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
             };
+        let recovered_material = match replay_gpu_raster_recovery(
+            &self.recovery.timeline().snapshot(),
+            source.material_plane(),
+        ) {
+            Ok(recovered) => recovered,
+            Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
+        };
         let recovery_command =
-            match GpuExactLayerRecoveryCommand::from_raster(destination, recovered.raster()) {
+            match GpuExactLayerRecoveryCommand::from_raster(destination, recovered.raster())
+                .and_then(|command| command.with_material(recovered_material.raster()))
+            {
                 Ok(command) => GpuRasterRecoveryCommand::from(command),
                 Err(error) => return Err(metadata_edit_failure(error.into(), Some(edit))),
             };
@@ -1228,7 +1247,7 @@ impl GpuResidentDocument {
         let mut source_residents: Vec<_> = self
             .atlas
             .allocations()
-            .filter(|(key, _)| key.layer == source)
+            .filter(|(key, _)| key.layer.color_layer() == source)
             .collect();
         source_residents.sort_unstable_by_key(|(key, _)| (key.tile.y, key.tile.x));
         if let Some((key, slot, actual)) = source_residents.iter().find_map(|(key, slot)| {
@@ -1253,7 +1272,16 @@ impl GpuResidentDocument {
         });
         let destination_keys: Vec<_> = source_residents
             .iter()
-            .map(|(key, _)| LayerTileKey::new(destination, key.tile))
+            .map(|(key, _)| {
+                LayerTileKey::new(
+                    if key.layer.is_material_plane() {
+                        destination.material_plane()
+                    } else {
+                        destination
+                    },
+                    key.tile,
+                )
+            })
             .collect();
         let allocations = match self.atlas.allocate_batch(destination_keys) {
             Ok(allocations) => allocations,
@@ -1597,6 +1625,7 @@ impl GpuResidentDocument {
         let candidates: HashSet<_> = evicted
             .iter()
             .flat_map(GpuHistoryEntry::referenced_layers)
+            .map(LayerId::color_layer)
             .collect();
         let mut candidates: Vec<_> = candidates.into_iter().collect();
         candidates.sort_by_key(|layer| layer.get());
@@ -1607,15 +1636,22 @@ impl GpuResidentDocument {
                 .layers()
                 .iter()
                 .any(|candidate| candidate.id() == layer);
-            if present || self.history.references_layer(layer) {
+            if present
+                || self.history.references_layer(layer)
+                || self.history.references_layer(layer.material_plane())
+            {
                 continue;
             }
             let released = self
                 .atlas
                 .release_layer(layer)
                 .expect("an unreachable layer has no remaining history pins");
+            let material_released = self
+                .atlas
+                .release_layer(layer.material_plane())
+                .expect("unreachable companion has no history pins");
             reclamation.layers += 1;
-            reclamation.atlas_tiles += released.len();
+            reclamation.atlas_tiles += released.len() + material_released.len();
             reclamation.mirror_tiles_retired_immediately +=
                 self.mirror.retire_layer_when_idle(layer);
         }

@@ -27,6 +27,8 @@ const MAX_PACKAGES: usize = 128;
 #[serde(deny_unknown_fields)]
 pub struct BrushManifest {
     pub api_version: u32,
+    #[serde(default)]
+    pub engine: Option<String>,
     pub id: String,
     pub name: String,
     #[serde(default)]
@@ -72,8 +74,10 @@ impl Footprint {
 impl BrushManifest {
     pub fn parse(source: &str) -> Result<Self, String> {
         let manifest: Self = serde_json::from_str(source).map_err(|e| e.to_string())?;
-        if manifest.api_version != 1 {
-            return Err("unsupported brush api_version (expected 1)".into());
+        if !((manifest.api_version == 1 && manifest.engine.is_none())
+            || (manifest.api_version == 2 && manifest.engine.as_deref() == Some("loaded-paint")))
+        {
+            return Err("expected coverage API 1, or API 2 with engine loaded-paint".into());
         }
         if manifest.id.is_empty()
             || manifest.id.len() > 64
@@ -162,7 +166,11 @@ impl BrushLibrary {
                     BrushManifest::parse(include_str!(concat!("../brushes/", $id, "/brush.json")))?;
                 let source: Arc<str> =
                     include_str!(concat!("../brushes/", $id, "/brush.wgsl")).into();
-                let pipeline = RoundMaskTarget::compile_brush(device, layout, &source)?;
+                let pipeline = if manifest.api_version == 2 {
+                    RoundMaskTarget::compile_material_brush(device, layout, &source)?
+                } else {
+                    RoundMaskTarget::compile_brush(device, layout, &source)?
+                };
                 brushes.insert(
                     manifest.id.clone(),
                     ShaderBrush {
@@ -328,7 +336,11 @@ fn scan(
                 if !brushes.contains_key(&manifest.id) && brushes.len() >= MAX_PACKAGES {
                     return Err(format!("Brush library already retains {MAX_PACKAGES} brushes; restart after removing unused packages"));
                 }
-                let pipeline = RoundMaskTarget::compile_brush(device, layout, &source)?;
+                let pipeline = if manifest.api_version == 2 {
+                    RoundMaskTarget::compile_material_brush(device, layout, &source)?
+                } else {
+                    RoundMaskTarget::compile_brush(device, layout, &source)?
+                };
                 brushes.insert(
                     manifest.id.clone(),
                     ShaderBrush {

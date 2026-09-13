@@ -57,13 +57,19 @@ impl AtlasLayout {
     /// This is a color-texture ceiling, not an up-front allocation; history,
     /// mirror and transient masks have their own storage budgets.
     pub fn interactive_document() -> Self {
+        Self::interactive_document_for_buffer_limit(1024 * 1024 * 1024)
+    }
+
+    /// The largest possible raster transaction must fit a hardware undo buffer.
+    /// Both color and material consume slots inside this shared ceiling.
+    pub fn interactive_document_for_buffer_limit(max_buffer_bytes: u64) -> Self {
         const COLOR_TEXTURE_BUDGET: u64 = 1024 * 1024 * 1024;
         let page_bytes = u64::from(DEFAULT_ATLAS_PAGE_SIZE).pow(2)
             * std::mem::size_of::<crate::raster::LinearRgba>() as u64;
         Self::new(
             DEFAULT_ATLAS_PAGE_SIZE,
             DEFAULT_ATLAS_TILE_SIZE,
-            (COLOR_TEXTURE_BUDGET / page_bytes) as u32,
+            (COLOR_TEXTURE_BUDGET.min(max_buffer_bytes) / page_bytes).max(1) as u32,
         )
         .expect("interactive atlas geometry is valid")
     }

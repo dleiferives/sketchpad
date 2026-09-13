@@ -234,7 +234,7 @@ impl ResidentGpuCanvas {
             surface_format,
             document,
             recovery_path,
-            AtlasLayout::interactive_document(),
+            AtlasLayout::interactive_document_for_buffer_limit(device.limits().max_buffer_size),
         )
     }
 
@@ -668,6 +668,7 @@ struct App {
     paint_engine: PaintEngine,
     shader_brush: Option<String>,
     shader_selection_dirty: bool,
+    paint_load: f32,
     shader_settings: std::collections::HashMap<String, [f32; 2]>,
     active_stroke: Option<ActiveStroke>,
     active_pointer: Option<PointerOwner>,
@@ -779,6 +780,7 @@ impl App {
             paint_engine: PaintEngine::default(),
             shader_brush: None,
             shader_selection_dirty: true,
+            paint_load: 1.0,
             shader_settings: Default::default(),
             active_stroke: None,
             active_pointer: None,
@@ -896,6 +898,11 @@ impl App {
             tool,
             brush_diameter: brush.diameter(),
             brush_opacity: brush.opacity(),
+            paint_load: self.paint_load,
+            material_brush: self
+                .selected_shader()
+                .is_some_and(|brush| brush.manifest.api_version == 2)
+                && tool != UiTool::Eraser,
             color: self.paint_brush.color(),
             color_presets: COLOR_PRESETS,
             recent_colors,
@@ -947,6 +954,13 @@ impl App {
             UiAction::SelectShaderBrush(id) => self.select_shader_brush(id),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
+            UiAction::SetPaintLoad(load) => {
+                self.finish_stroke();
+                if load.is_finite() {
+                    self.paint_load = load.clamp(0.1, 3.0);
+                    self.invalidate_ui();
+                }
+            }
             UiAction::PreviewColor(color) => self.set_paint_color(color, false),
             UiAction::CommitColor(color) => self.set_paint_color(color, true),
             UiAction::SelectLayer(layer) => self.select_layer(layer),
@@ -1833,12 +1847,22 @@ impl App {
                     .as_mut()
                     .expect("resident round eligibility requires a resident canvas");
                 if let Some(shader) = shader {
-                    resident.strokes.begin_shader(
-                        &mut resident.document,
-                        &resident.target,
-                        recipe,
-                        shader.pipeline,
-                    )
+                    if shader.manifest.api_version == 2 {
+                        resident.strokes.begin_loaded(
+                            &mut resident.document,
+                            &resident.target,
+                            recipe,
+                            shader.pipeline,
+                            self.paint_load,
+                        )
+                    } else {
+                        resident.strokes.begin_shader(
+                            &mut resident.document,
+                            &resident.target,
+                            recipe,
+                            shader.pipeline,
+                        )
+                    }
                 } else {
                     resident
                         .strokes
@@ -3800,7 +3824,7 @@ impl App {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-            apply_limit_buckets: true,
+            apply_limit_buckets: false,
         }))
         .unwrap();
         let paint_format = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba32Float);
@@ -3822,6 +3846,12 @@ impl App {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("Sketchpad Device"),
             required_features,
+            // A full color+material transaction can exceed WebGPU's default
+            // 256 MiB buffer cap. This requests a limit, not an allocation.
+            required_limits: wgpu::Limits {
+                max_buffer_size: adapter.limits().max_buffer_size.min(1024 * 1024 * 1024),
+                ..Default::default()
+            },
             ..Default::default()
         }))
         .unwrap();
@@ -5875,6 +5905,313 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "native material preview, exact history, persistence and broad-contact regression"]
+    #[allow(deprecated)]
+    fn material_engine_preserves_surface_history_and_files() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(768, 640)),
+                )
+                .unwrap(),
+        );
+        let directory = PathBuf::from(".artifacts/material-engine");
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("study.sketchpad");
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            Document::new(768, 640, DEFAULT_TILE_SIZE).unwrap(),
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("study.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+
+        fn snapshot(app: &mut App) -> (Vec<LinearRgba>, Vec<LinearRgba>) {
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let doc = recovered.document();
+            let color = doc.active_layer();
+            let material = doc.material_raster(doc.active_layer_id());
+            let pixels = (0..640)
+                .flat_map(|y| (0..768).map(move |x| color.pixel(x, y).unwrap()))
+                .collect();
+            let surface = (0..640)
+                .flat_map(|y| {
+                    (0..768).map(move |x| {
+                        material.map_or(LinearRgba::TRANSPARENT, |raster| {
+                            raster.pixel(x, y).unwrap()
+                        })
+                    })
+                })
+                .collect();
+            (pixels, surface)
+        }
+        fn prepare_preview(app: &mut App) {
+            let camera = app.camera();
+            let viewport = app.viewport_size();
+            let gpu = app.gpu.as_mut().unwrap();
+            let resident = gpu.resident.as_mut().unwrap();
+            resident
+                .strokes
+                .prepare_composite(
+                    &resident.document,
+                    &resident.target,
+                    &mut resident.compositor,
+                    &gpu.device,
+                    &gpu.queue,
+                    CanvasUniform {
+                        center: camera.center,
+                        zoom: camera.zoom,
+                        _padding: 0.0,
+                        viewport_size: viewport,
+                        canvas_size: camera.canvas_size,
+                    },
+                )
+                .unwrap();
+        }
+        fn draw(app: &mut App, from: [f32; 2], to: [f32; 2], steps: u32) {
+            app.start_stroke(from, 1.0, [0.0; 2], PointerOwner::Mouse);
+            for step in 1..=steps {
+                let t = step as f32 / steps as f32;
+                app.update_stroke(
+                    [
+                        from[0] + (to[0] - from[0]) * t,
+                        from[1] + (to[1] - from[1]) * t,
+                    ],
+                    1.0,
+                    [0.0; 2],
+                );
+                assert!(
+                    matches!(&app.active_stroke,Some(ActiveStroke::GpuResidentRound(stroke)) if !stroke.update_error_reported)
+                );
+                if step % 8 == 0 {
+                    prepare_preview(app);
+                }
+            }
+            app.finish_stroke();
+        }
+        fn preview_pixel(app: &App, x: u32, y: u32) -> LinearRgba {
+            let gpu = app.gpu.as_ref().unwrap();
+            let resident = gpu.resident.as_ref().unwrap();
+            let size = resident.document.atlas().layout().tile_size();
+            let (texture, origin) = resident
+                .strokes
+                .material_preview()
+                .unwrap()
+                .color_tile(sketchpad::raster::TileCoord::new(x / size, y / size))
+                .unwrap();
+            let buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Material preview oracle"),
+                size: 256,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = gpu.device.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: origin[0] + x % size,
+                        y: origin[1] + y % size,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(256),
+                        rows_per_image: Some(1),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: 1,
+                    height: 1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            gpu.queue.submit([encoder.finish()]);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    tx.send(result).unwrap();
+                });
+            gpu.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            let mapped = buffer.slice(..).get_mapped_range().unwrap();
+            bytemuck::pod_read_unaligned(&mapped[..16])
+        }
+        app.select_ui_tool(UiTool::PaletteKnife);
+        app.set_brush_diameter(96.0);
+        app.set_paint_color([0.55, 0.075, 0.015], false);
+        let before = snapshot(&mut app);
+        draw(&mut app, [60.0, 180.0], [700.0, 180.0], 64);
+        let first = snapshot(&mut app);
+        let index = (460 * 768 + 380) as usize;
+        assert_eq!(first.0[index].a, 1.0);
+        assert!(first.1[index].a > 0.0);
+        assert_eq!(
+            app.gpu_resident_document().unwrap().history().undo_depth(),
+            1
+        );
+        draw(&mut app, [60.0, 180.0], [700.0, 180.0], 64);
+        let second = snapshot(&mut app);
+        assert!(
+            second.1[index].a > first.1[index].a * 1.9,
+            "separate contacts must build material"
+        );
+        app.undo();
+        assert_eq!(snapshot(&mut app), first);
+        app.redo();
+        assert_eq!(snapshot(&mut app), second);
+        app.start_stroke([20.0, 400.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+        app.update_stroke([730.0, 400.0], 1.0, [0.0; 2]);
+        prepare_preview(&mut app);
+        app.cancel_stroke();
+        assert_eq!(
+            snapshot(&mut app),
+            second,
+            "cancel must not leave hidden material behind"
+        );
+        for tool in [UiTool::Pen, UiTool::Eraser] {
+            app.select_ui_tool(tool);
+            app.set_brush_diameter(32.0);
+            draw(&mut app, [380.0, 100.0], [380.0, 260.0], 32);
+            let changed = snapshot(&mut app);
+            assert_eq!(
+                changed.1[index].a, 0.0,
+                "ordinary paint/erase must flatten covered material"
+            );
+            if tool == UiTool::Eraser {
+                assert_eq!(changed.0[index].a, 0.0);
+            }
+            app.undo();
+            assert_eq!(
+                snapshot(&mut app),
+                second,
+                "mixed-media undo restores both planes"
+            );
+        }
+        app.duplicate_active_layer();
+        assert_eq!(
+            snapshot(&mut app),
+            second,
+            "duplicate must copy the material plane"
+        );
+        assert_eq!(
+            app.gpu_resident_document()
+                .unwrap()
+                .metadata()
+                .layers()
+                .len(),
+            2,
+            "companion planes never appear as drawing layers"
+        );
+        app.move_active_layer(-1);
+        assert_eq!(snapshot(&mut app), second);
+        app.delete_active_layer();
+        assert_eq!(snapshot(&mut app), second);
+        app.undo();
+        assert_eq!(snapshot(&mut app), second);
+        let saved = directory.join("material.sketchpad");
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        checkpoint::save_document_atomic(&saved, recovered.document()).unwrap();
+        app.select_ui_tool(UiTool::PaletteKnife);
+        app.set_brush_diameter(96.0);
+        draw(&mut app, [250.0, 120.0], [500.0, 240.0], 64);
+        let continued = snapshot(&mut app);
+        app.install_document(checkpoint::load_document(&saved).unwrap(), Some(saved))
+            .unwrap();
+        assert_eq!(
+            snapshot(&mut app),
+            second,
+            "native save/load must retain exact material"
+        );
+        draw(&mut app, [250.0, 120.0], [500.0, 240.0], 64);
+        assert_eq!(
+            snapshot(&mut app),
+            continued,
+            "the next stroke after reload must see the same surface"
+        );
+        // One huge contact, with real GPU preview reads before pen-up.
+        app.install_document(Document::new(768, 640, DEFAULT_TILE_SIZE).unwrap(), None)
+            .unwrap();
+        app.select_ui_tool(UiTool::PaletteKnife);
+        app.set_brush_diameter(512.0);
+        app.start_stroke([40.0, 90.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+        for row in 0..6 {
+            for step in 0..17 {
+                let t = if row % 2 == 0 { step } else { 16 - step };
+                app.update_stroke(
+                    [40.0 + t as f32 * 43.0, 90.0 + row as f32 * 90.0],
+                    1.0,
+                    [0.0; 2],
+                );
+                assert!(
+                    matches!(&app.active_stroke,Some(ActiveStroke::GpuResidentRound(stroke)) if !stroke.update_error_reported)
+                );
+            }
+            prepare_preview(&mut app);
+            assert_eq!(
+                preview_pixel(&app, 80, 550).a,
+                1.0,
+                "earlier live paint must survive a broad contact"
+            );
+        }
+        let preview = preview_pixel(&app, 80, 550);
+        app.finish_stroke();
+        let broad = snapshot(&mut app);
+        assert_eq!(
+            broad.0[550 * 768 + 80],
+            preview,
+            "preview and committed paint must match exactly"
+        );
+        assert_eq!(
+            app.gpu_resident_document().unwrap().history().undo_depth(),
+            1
+        );
+        app.undo();
+        assert_eq!(snapshot(&mut app), before);
+        app.redo();
+        assert_eq!(snapshot(&mut app), broad);
+        println!("Material buildup, mixed-media flattening, cancel, duplicate/delete/reorder, exact undo/redo, native reload/continuation and live 512px contact passed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "hardware knife opacity and texture review, using a hidden window"]
     #[allow(deprecated)]
     fn palette_knife_opacity_study() {
@@ -5961,9 +6298,24 @@ mod tests {
                 solid > samples * 70 / 100,
                 "loaded paint must reach the selected opacity"
             );
+            assert_eq!(
+                gaps, 0,
+                "a loaded interior must not contain a permanent grain stencil"
+            );
+            let material = doc
+                .material_raster(doc.active_layer_id())
+                .expect("knife retains material");
+            let heights: Vec<_> = (120..780)
+                .map(|x| {
+                    material.pixel(x, 559 - (70 + row * 140) as u32).unwrap().a
+                        * sketchpad::gpu_material::MAX_PAINT_HEIGHT
+                })
+                .collect();
+            let min = heights.iter().copied().fold(f32::INFINITY, f32::min);
+            let max = heights.iter().copied().fold(0.0_f32, f32::max);
             assert!(
-                gaps > samples / 500 && gaps < samples / 4,
-                "texture must be localized"
+                min > 0.0 && max - min > 0.005,
+                "texture must be retained as material relief: {min}..{max}"
             );
         }
         let mut review = RasterLayer::new(900, 560, DEFAULT_TILE_SIZE).unwrap();
@@ -6096,6 +6448,8 @@ mod tests {
                     }
                 }
             }
+            assert_eq!(zero, 0, "fresh loaded passes must cover the interior");
+            assert_eq!(opaque, 5280);
             csv.push_str(&format!("{pass},5280,{zero},{opaque}\n"));
             let mut gesture = overlap.scoped_gesture().unwrap();
             for sy in 230..330 {
@@ -6113,6 +6467,56 @@ mod tests {
         image_io::export_png_file_atomic(
             &directory.join("overlap.png"),
             &overlap,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
+        // Actual material-load comparison, including a crossing over existing relief.
+        for _ in 0..8 {
+            app.undo();
+        }
+        app.set_paint_color([0.025, 0.15, 0.42], false);
+        app.set_brush_diameter(180.0);
+        let blue = line([470.0, 20.0], [470.0, 540.0]);
+        app.start_stroke(blue[0], 1.0, [0.0; 2], PointerOwner::Mouse);
+        for point in &blue[1..] {
+            app.update_stroke(*point, 1.0, [0.0; 2]);
+        }
+        app.finish_stroke();
+        app.set_paint_color([0.55, 0.075, 0.015], false);
+        app.set_brush_diameter(96.0);
+        for (row, load) in [0.15, 1.0, 3.0].into_iter().enumerate() {
+            app.paint_load = load;
+            let path = line(
+                [70.0, 90.0 + row as f32 * 180.0],
+                [830.0, 90.0 + row as f32 * 180.0],
+            );
+            app.start_stroke(path[0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            for point in &path[1..] {
+                app.update_stroke(*point, 1.0, [0.0; 2]);
+            }
+            app.finish_stroke();
+        }
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        let doc = recovered.document();
+        let mut load_sheet = RasterLayer::new(900, 560, DEFAULT_TILE_SIZE).unwrap();
+        let mut gesture = load_sheet.scoped_gesture().unwrap();
+        for y in 0..560 {
+            for x in 0..900 {
+                gesture
+                    .set_pixel(x, y, doc.active_layer().pixel(x, 559 - y).unwrap())
+                    .unwrap();
+            }
+        }
+        gesture.commit().unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("load.png"),
+            &load_sheet,
             ExportRegion::FullCanvas,
         )
         .unwrap();
@@ -6399,19 +6803,26 @@ mod tests {
     #[ignore = "requires X11 and a hardware GPU; paints a full 4096px canvas in a hidden window"]
     #[allow(deprecated)]
     fn large_round_stroke_survives_pen_up_and_undo() {
-        exercise_large_round_stroke(false);
+        exercise_large_round_stroke(false, false);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "requires X11 and a hardware GPU; full stroke across three layers"]
     fn large_round_stroke_crosses_shared_layer_capacity() {
-        exercise_large_round_stroke(true);
+        exercise_large_round_stroke(true, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "hardware GPU material coverage of a 4096px document, exact history and large-contact recovery"]
+    fn large_material_stroke_survives_pen_up_and_undo() {
+        exercise_large_round_stroke(false, true);
     }
 
     #[cfg(target_os = "linux")]
     #[allow(deprecated)]
-    fn exercise_large_round_stroke(other_layers: bool) {
+    fn exercise_large_round_stroke(other_layers: bool, material: bool) {
         use winit::platform::x11::EventLoopBuilderExtX11;
         let _ = env_logger::builder().is_test(true).try_init();
         let mut builder = EventLoop::<TabletEvent>::with_user_event();
@@ -6465,16 +6876,22 @@ mod tests {
         ));
         app.window = Some(window);
         assert!(app.gpu_resident_document().is_some());
+        if material {
+            app.select_ui_tool(UiTool::PaletteKnife);
+        }
         app.set_brush_diameter(512.0);
         let revision = app.gpu_resident_document().unwrap().revision();
         let viewport = app.viewport_size();
         let screen = |x: f32, y: f32| [x / 4096.0 * viewport[0], y / 4096.0 * viewport[1]];
         app.start_stroke(screen(256.0, 256.0), 1.0, [0.0; 2], PointerOwner::Mouse);
-        for row in 0..11 {
+        for row in 0..if material { 41 } else { 11 } {
             for column in 0..17 {
                 let x = if row % 2 == 0 { column } else { 16 - column };
                 app.update_stroke(
-                    screen(256.0 + x as f32 * 224.0, 256.0 + row as f32 * 358.4),
+                    screen(
+                        256.0 + x as f32 * 224.0,
+                        256.0 + row as f32 * if material { 89.6 } else { 358.4 },
+                    ),
                     1.0,
                     [0.0; 2],
                 );
@@ -6490,7 +6907,9 @@ mod tests {
                 }
             }
         }
+        eprintln!("large stroke: committing");
         app.finish_stroke();
+        eprintln!("large stroke: committed");
         if other_layers {
             assert!(
                 app.gpu_resident_document()
@@ -6505,7 +6924,9 @@ mod tests {
             "pen-up must commit the large stroke, not silently cancel it"
         );
         assert!(app.persistence.document_modified());
+        eprintln!("large stroke: saving");
         assert!(app.save_document_to(directory.join("drawing.sketchpad")));
+        eprintln!("large stroke: loading");
         let saved = checkpoint::load_document(&directory.join("drawing.sketchpad")).unwrap();
         assert_eq!(saved.layers().len(), if other_layers { 3 } else { 1 });
         assert_eq!(
@@ -6523,6 +6944,7 @@ mod tests {
         );
         drop(saved);
         let painted_revision = app.gpu_resident_document().unwrap().revision();
+        eprintln!("large stroke: undo");
         app.undo();
         assert!(
             app.gpu_resident_document().unwrap().revision() > painted_revision,
@@ -6547,6 +6969,7 @@ mod tests {
             );
         }
         let undone_revision = app.gpu_resident_document().unwrap().revision();
+        eprintln!("large stroke: redo");
         app.redo();
         assert!(
             app.gpu_resident_document().unwrap().revision() > undone_revision,

@@ -77,6 +77,7 @@ fn composite_fs(input: CompositeVertexOutput) -> @location(0) vec4f {
         return textureLoad(color_page, atlas_pixel, 0) * input.opacity;
     }
 
+    if material.operation == 2u { return textureLoad(mask_page, atlas_pixel, 0) * input.opacity; }
     var base = vec4f(0.0);
     if input.base_initialized != 0u {
         base = textureLoad(color_page, atlas_pixel, 0);

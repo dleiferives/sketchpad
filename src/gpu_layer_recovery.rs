@@ -6,6 +6,7 @@ use std::{error::Error, fmt, mem::size_of, sync::Arc};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct GpuExactLayerRecoveryCommand {
+    material: Option<Box<GpuExactLayerRecoveryCommand>>,
     layer: LayerId,
     width: u32,
     height: u32,
@@ -64,6 +65,7 @@ impl GpuExactLayerRecoveryCommand {
             .into_boxed_slice();
 
         Ok(Self {
+            material: None,
             layer,
             width: raster.width(),
             height: raster.height(),
@@ -71,6 +73,28 @@ impl GpuExactLayerRecoveryCommand {
             tiles,
             retained_byte_len,
         })
+    }
+
+    pub fn with_material(
+        mut self,
+        raster: &RasterLayer,
+    ) -> Result<Self, GpuExactLayerRecoveryBuildError> {
+        if raster.allocated_tile_count() != 0 {
+            let material = Self::from_raster(self.layer.material_plane(), raster)?;
+            self.retained_byte_len = self
+                .retained_byte_len
+                .checked_add(material.retained_byte_len())
+                .ok_or(GpuExactLayerRecoveryBuildError::ByteCountOverflow)?;
+            self.material = Some(Box::new(material));
+        }
+        Ok(self)
+    }
+
+    pub fn material_raster(&self) -> Result<RasterLayer, RasterError> {
+        self.material.as_ref().map_or_else(
+            || RasterLayer::new(self.width, self.height, self.tile_size),
+            |material| material.raster_layer(),
+        )
     }
 
     pub const fn layer(&self) -> LayerId {
@@ -107,6 +131,17 @@ pub fn replay_exact_layer_recovery_command(
     layer: &mut RasterLayer,
     command: &GpuExactLayerRecoveryCommand,
 ) -> Result<GpuExactLayerRecoveryReplay, GpuExactLayerRecoveryReplayError> {
+    if layer_id.is_material_plane()
+        && !command.layer.is_material_plane()
+        && layer_id.color_layer() == command.layer
+    {
+        let previous_tiles_discarded = layer.allocated_tile_count() as u32;
+        *layer = command.material_raster()?;
+        return Ok(GpuExactLayerRecoveryReplay {
+            tiles_installed: layer.allocated_tile_count() as u32,
+            previous_tiles_discarded,
+        });
+    }
     if layer_id != command.layer {
         return Err(GpuExactLayerRecoveryReplayError::LayerMismatch {
             expected: command.layer,

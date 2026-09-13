@@ -92,6 +92,7 @@ struct PageEncoding {
 }
 
 pub struct RoundMaskTarget {
+    material: bool,
     layout: AtlasLayout,
     pages: Vec<MaskPage>,
     bind_group: wgpu::BindGroup,
@@ -118,6 +119,19 @@ pub struct ActiveRoundMaskTile {
 
 impl RoundMaskTarget {
     pub fn new(device: &wgpu::Device, layout: AtlasLayout) -> Result<Self, RoundMaskTargetError> {
+        Self::new_internal(device, layout, false)
+    }
+    pub fn new_material(
+        device: &wgpu::Device,
+        layout: AtlasLayout,
+    ) -> Result<Self, RoundMaskTargetError> {
+        Self::new_internal(device, layout, true)
+    }
+    fn new_internal(
+        device: &wgpu::Device,
+        layout: AtlasLayout,
+        material: bool,
+    ) -> Result<Self, RoundMaskTargetError> {
         if layout.page_size() > device.limits().max_texture_dimension_2d {
             return Err(RoundMaskTargetError::PageExceedsDeviceLimit {
                 requested: layout.page_size(),
@@ -200,9 +214,14 @@ impl RoundMaskTarget {
         });
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Continuous Round Mask Shader"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/round_mask.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(if material {
+                material_brush_source(include_str!("../brushes/palette-knife/brush.wgsl")).into()
+            } else {
+                include_str!("shaders/round_mask.wgsl").into()
+            }),
         });
-        let round_pipeline = Self::create_brush_pipeline(device, &pipeline_layout, &shader);
+        let round_pipeline =
+            Self::create_brush_pipeline(device, &pipeline_layout, &shader, material);
         let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Round Mask Slot Clear Pipeline"),
             layout: Some(&pipeline_layout),
@@ -217,9 +236,17 @@ impl RoundMaskTarget {
                 entry_point: Some("clear_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
+                    format: if material {
+                        wgpu::TextureFormat::Rg32Float
+                    } else {
+                        wgpu::TextureFormat::R32Float
+                    },
                     blend: None,
-                    write_mask: wgpu::ColorWrites::RED,
+                    write_mask: if material {
+                        wgpu::ColorWrites::ALL
+                    } else {
+                        wgpu::ColorWrites::RED
+                    },
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
@@ -239,6 +266,7 @@ impl RoundMaskTarget {
             INITIAL_INSTANCE_BUFFER_BYTES,
         );
         Ok(Self {
+            material,
             layout,
             pages: Vec::new(),
             bind_group,
@@ -277,14 +305,33 @@ impl RoundMaskTarget {
         layout: &wgpu::PipelineLayout,
         source: &str,
     ) -> Result<wgpu::RenderPipeline, String> {
+        Self::compile_brush_kind(device, layout, source, false)
+    }
+
+    pub fn compile_material_brush(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        source: &str,
+    ) -> Result<wgpu::RenderPipeline, String> {
+        Self::compile_brush_kind(device, layout, source, true)
+    }
+
+    fn compile_brush_kind(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        source: &str,
+        material: bool,
+    ) -> Result<wgpu::RenderPipeline, String> {
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Brush package"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{}\n{}", include_str!("shaders/brush_host.wgsl"), source).into(),
-            ),
+            source: wgpu::ShaderSource::Wgsl(if material {
+                material_brush_source(source).into()
+            } else {
+                format!("{}\n{}", include_str!("shaders/brush_host.wgsl"), source).into()
+            }),
         });
-        let pipeline = Self::create_brush_pipeline(device, layout, &shader);
+        let pipeline = Self::create_brush_pipeline(device, layout, &shader, material);
         match pollster::block_on(scope.pop()) {
             Some(error) => Err(error.to_string()),
             None => Ok(pipeline),
@@ -295,6 +342,7 @@ impl RoundMaskTarget {
         device: &wgpu::Device,
         pipeline_layout: &wgpu::PipelineLayout,
         shader: &wgpu::ShaderModule,
+        material: bool,
     ) -> wgpu::RenderPipeline {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Continuous Round Union Mask Pipeline"),
@@ -310,7 +358,11 @@ impl RoundMaskTarget {
                 entry_point: Some("round_fs"),
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
+                    format: if material {
+                        wgpu::TextureFormat::Rg32Float
+                    } else {
+                        wgpu::TextureFormat::R32Float
+                    },
                     blend: Some(wgpu::BlendState {
                         color: wgpu::BlendComponent {
                             src_factor: wgpu::BlendFactor::One,
@@ -323,7 +375,11 @@ impl RoundMaskTarget {
                             operation: wgpu::BlendOperation::Max,
                         },
                     }),
-                    write_mask: wgpu::ColorWrites::RED,
+                    write_mask: if material {
+                        wgpu::ColorWrites::ALL
+                    } else {
+                        wgpu::ColorWrites::RED
+                    },
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
@@ -356,6 +412,17 @@ impl RoundMaskTarget {
         }
         self.active = false;
         Ok(())
+    }
+
+    /// Material envelopes are contact-local; do not retain a full-canvas high-water allocation.
+    pub fn release_material_pages(&mut self) {
+        assert!(!self.active && !self.encoded_batch_pending);
+        if self.material {
+            for page in self.pages.drain(..) {
+                page.texture.destroy();
+            }
+            self.active_tiles.clear();
+        }
     }
 
     pub const fn stroke_is_active(&self) -> bool {
@@ -587,7 +654,8 @@ impl RoundMaskTarget {
             });
         }
         while self.pages.len() <= highest_page as usize {
-            self.pages.push(create_mask_page(device, self.layout));
+            self.pages
+                .push(create_mask_page(device, self.layout, self.material));
         }
         Ok(())
     }
@@ -621,7 +689,7 @@ impl RoundMaskTarget {
     }
 }
 
-fn create_mask_page(device: &wgpu::Device, layout: AtlasLayout) -> MaskPage {
+fn create_mask_page(device: &wgpu::Device, layout: AtlasLayout, material: bool) -> MaskPage {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("Continuous Round R32Float Mask Page"),
         size: wgpu::Extent3d {
@@ -632,7 +700,11 @@ fn create_mask_page(device: &wgpu::Device, layout: AtlasLayout) -> MaskPage {
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: wgpu::TextureFormat::R32Float,
+        format: if material {
+            wgpu::TextureFormat::Rg32Float
+        } else {
+            wgpu::TextureFormat::R32Float
+        },
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT
             | wgpu::TextureUsages::TEXTURE_BINDING
             | wgpu::TextureUsages::COPY_SRC,
@@ -748,6 +820,24 @@ impl fmt::Display for RoundMaskTargetError {
 }
 
 impl Error for RoundMaskTargetError {}
+
+// ABI v2 outputs coverage and a thickness envelope; the host owns surface state.
+fn material_brush_source(source: &str) -> String {
+    let host = include_str!("shaders/brush_host.wgsl")
+        .replace(
+            "fn clear_fs() -> @location(0) f32 {\n    return 0.0;",
+            "fn clear_fs() -> @location(0) vec2<f32> {\n    return vec2<f32>(0.0);",
+        )
+        .replace(
+            "fn round_fs(input: RoundVertexOutput) -> @location(0) f32",
+            "fn round_fs(input: RoundVertexOutput) -> @location(0) vec2<f32>",
+        );
+    let start = host
+        .find("    let coverage = brush_coverage(brush);")
+        .unwrap();
+    let end = host[start..].find("\n}").unwrap() + start;
+    format!("{}    let deposit = brush_deposit(brush);\n    let coverage = select(0.0, min(deposit.x, 1.0), deposit.x > 0.0);\n    let height = select(0.0, min(deposit.y, 4.0), deposit.y > 0.0);\n    return vec2<f32>(coverage, height * coverage);{}\n{}", &host[..start], &host[end..], source)
+}
 
 #[cfg(test)]
 mod tests {

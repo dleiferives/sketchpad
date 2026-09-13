@@ -24,6 +24,11 @@ struct ActiveRoundStroke {
     provisional_allocations: Vec<AtlasAllocation>,
     submitted_batches: u32,
     shader_brush: bool,
+    loaded: bool,
+    material_surface: bool,
+    load: f32,
+    material_slots:
+        std::collections::HashMap<crate::raster::TileCoord, crate::gpu_atlas::AtlasSlot>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -39,7 +44,10 @@ pub struct GpuResidentRoundStrokeEngine {
     target_id: GpuDocumentTargetId,
     layout: AtlasLayout,
     mask: RoundMaskTarget,
+    deposition: RoundMaskTarget,
+    surface: crate::gpu_material::MaterialTarget,
     active: Option<ActiveRoundStroke>,
+    material_submissions: std::collections::VecDeque<wgpu::SubmissionIndex>,
 }
 
 impl GpuResidentRoundStrokeEngine {
@@ -52,7 +60,10 @@ impl GpuResidentRoundStrokeEngine {
             target_id: document.target_id(),
             layout,
             mask: RoundMaskTarget::new(device, layout)?,
+            deposition: RoundMaskTarget::new_material(device, layout)?,
+            surface: crate::gpu_material::MaterialTarget::new(device, layout),
             active: None,
+            material_submissions: Default::default(),
         })
     }
 
@@ -68,7 +79,7 @@ impl GpuResidentRoundStrokeEngine {
         pipeline: wgpu::RenderPipeline,
     ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
         self.mask.set_brush_pipeline(Some(pipeline))?;
-        self.begin_internal(document, target, recipe, true)
+        self.begin_internal(document, target, recipe, true, false, 1.0)
     }
 
     pub fn begin(
@@ -78,7 +89,22 @@ impl GpuResidentRoundStrokeEngine {
         recipe: RoundBrushRecipeV1,
     ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
         self.mask.set_brush_pipeline(None)?;
-        self.begin_internal(document, target, recipe, false)
+        self.begin_internal(document, target, recipe, false, false, 1.0)
+    }
+
+    pub fn begin_loaded(
+        &mut self,
+        document: &mut GpuResidentDocument,
+        target: &GpuDocumentTarget,
+        recipe: RoundBrushRecipeV1,
+        pipeline: wgpu::RenderPipeline,
+        load: f32,
+    ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
+        if !load.is_finite() {
+            return Err(GpuResidentRoundStrokeError::InvalidPaintLoad(load));
+        }
+        self.deposition.set_brush_pipeline(Some(pipeline))?;
+        self.begin_internal(document, target, recipe, true, true, load.clamp(0.05, 4.0))
     }
 
     fn begin_internal(
@@ -87,6 +113,8 @@ impl GpuResidentRoundStrokeEngine {
         target: &GpuDocumentTarget,
         recipe: RoundBrushRecipeV1,
         shader_brush: bool,
+        loaded: bool,
+        load: f32,
     ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
         if self.active.is_some() {
             return Err(GpuResidentRoundStrokeError::StrokeAlreadyActive);
@@ -117,12 +145,18 @@ impl GpuResidentRoundStrokeEngine {
             scheduler
         };
         let id = document.begin_round_stroke(target, layer)?;
-        if let Err(error) = self.mask.begin_stroke() {
+        let mask = if loaded {
+            &mut self.deposition
+        } else {
+            &mut self.mask
+        };
+        if let Err(error) = mask.begin_stroke() {
             document
                 .finish_round_stroke(id)
                 .expect("a newly acquired round stroke guard can be released");
             return Err(error.into());
         }
+        self.surface.begin();
         self.active = Some(ActiveRoundStroke {
             id,
             recipe,
@@ -131,6 +165,10 @@ impl GpuResidentRoundStrokeEngine {
             provisional_allocations: Vec::new(),
             submitted_batches: 0,
             shader_brush,
+            loaded,
+            material_surface: false,
+            load,
+            material_slots: Default::default(),
         });
         Ok(id)
     }
@@ -142,6 +180,18 @@ impl GpuResidentRoundStrokeEngine {
         queue: &wgpu::Queue,
         commands: &[RoundPathCommand],
     ) -> Result<GpuResidentRoundBatchStats, GpuResidentRoundStrokeError> {
+        // Bound driver/transfer allocations when input or replay outruns the GPU.
+        // Waiting for the oldest of four submissions preserves every command.
+        if self.material_submissions.len() >= 4 {
+            let oldest = self.material_submissions.front().unwrap().clone();
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest),
+                    timeout: None,
+                })
+                .map_err(|_| GpuResidentRoundStrokeError::TargetBusy)?;
+            self.material_submissions.pop_front();
+        }
         let active = self
             .active
             .as_mut()
@@ -155,25 +205,101 @@ impl GpuResidentRoundStrokeEngine {
                 return Err(error.into());
             }
         };
+        let mask = if active.loaded {
+            &mut self.deposition
+        } else {
+            &mut self.mask
+        };
+        let needs_surface = active.loaded
+            || active.material_surface
+            || batch.touched_tiles().iter().any(|tile| {
+                document
+                    .atlas()
+                    .slot(crate::gpu_atlas::LayerTileKey::new(
+                        tile.key.layer.material_plane(),
+                        tile.key.tile,
+                    ))
+                    .is_some()
+            });
+        let mut material_allocations = Vec::new();
+        if needs_surface {
+            let mut tiles = if active.material_surface {
+                Vec::new()
+            } else {
+                mask.active_tiles()
+            };
+            for tile in batch.touched_tiles() {
+                tiles.push(crate::gpu_round_target::ActiveRoundMaskTile {
+                    key: tile.key,
+                    slot: document.atlas().slot(tile.key).unwrap(),
+                    local_damage: tile.local_damage,
+                });
+            }
+            tiles.sort_by_key(|tile| (tile.key.tile.y, tile.key.tile.x));
+            tiles.dedup_by_key(|tile| tile.key);
+            if !active.loaded {
+                tiles.retain(|tile| {
+                    document
+                        .atlas()
+                        .slot(crate::gpu_atlas::LayerTileKey::new(
+                            tile.key.layer.material_plane(),
+                            tile.key.tile,
+                        ))
+                        .is_some()
+                });
+            }
+            material_allocations = match document.allocate_material_tiles(active.id, &tiles) {
+                Ok(allocations) => allocations,
+                Err(error) => {
+                    document.rollback_round_stroke_allocations(active.id, batch.allocations())?;
+                    active.scheduler = previous_scheduler;
+                    return Err(error.into());
+                }
+            };
+        }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("GPU Resident Active Round Mask Batch"),
         });
-        let mask_stats = match self.mask.encode_batch(device, queue, &mut encoder, &batch) {
+        let mask_stats = match mask.encode_batch(device, queue, &mut encoder, &batch) {
             Ok(stats) => stats,
             Err(error) => {
+                document.rollback_round_stroke_allocations(active.id, &material_allocations)?;
                 document.rollback_round_stroke_allocations(active.id, batch.allocations())?;
                 active.scheduler = previous_scheduler;
                 return Err(error.into());
             }
         };
         if !batch.is_empty() {
-            queue.submit([encoder.finish()]);
-            self.mask
-                .encoded_batch_submitted()
+            let submission = queue.submit([encoder.finish()]);
+            if active.loaded {
+                self.material_submissions.push_back(submission);
+            }
+            mask.encoded_batch_submitted()
                 .expect("a submitted nonempty mask batch retains its acknowledgement");
             active.submitted_batches = active.submitted_batches.saturating_add(1);
         }
-        if !active.shader_brush {
+        if needs_surface {
+            if !active.material_surface {
+                for tile in mask.active_tiles() {
+                    self.surface.damage(tile.key.tile);
+                }
+            }
+            for tile in batch.touched_tiles() {
+                self.surface.damage(tile.key.tile);
+            }
+            active.material_surface = true;
+            for allocation in &material_allocations {
+                active
+                    .material_slots
+                    .insert(allocation.key.tile, allocation.slot);
+            }
+            active.provisional_allocations.extend(
+                material_allocations
+                    .into_iter()
+                    .filter(|allocation| allocation.newly_allocated),
+            );
+        }
+        if !active.shader_brush && !active.material_surface {
             active.commands.extend_from_slice(commands);
         }
         active.provisional_allocations.extend(
@@ -197,7 +323,7 @@ impl GpuResidentRoundStrokeEngine {
     }
 
     pub fn prepare_composite(
-        &self,
+        &mut self,
         document: &GpuResidentDocument,
         target: &GpuDocumentTarget,
         compositor: &mut GpuDocumentCompositor,
@@ -211,13 +337,36 @@ impl GpuResidentRoundStrokeEngine {
             .ok_or(GpuResidentRoundStrokeError::NoActiveStroke)?;
         document.check_active_round_stroke(Some(active.id))?;
         self.check_target(document, target)?;
+        let mask = if active.loaded {
+            &self.deposition
+        } else {
+            &self.mask
+        };
+        if active.material_surface {
+            self.surface.refresh(
+                device,
+                queue,
+                document.atlas(),
+                target,
+                mask,
+                active.recipe.material(),
+                active.loaded,
+                active.load,
+            );
+        }
+        let preview: &dyn crate::gpu_document_compositor::StrokePreview = if active.material_surface
+        {
+            &self.surface
+        } else {
+            mask
+        };
         Ok(compositor.prepare_active_stroke(
             device,
             queue,
             document.metadata(),
             document.atlas(),
             target,
-            &self.mask,
+            preview,
             active.recipe.material(),
             camera,
         )?)
@@ -232,13 +381,25 @@ impl GpuResidentRoundStrokeEngine {
             .as_ref()
             .ok_or(GpuResidentRoundStrokeError::NoActiveStroke)?;
         document.check_active_round_stroke(Some(active.id))?;
-        if self.mask.encoded_batch_is_pending() {
+        if (if active.loaded {
+            &self.deposition
+        } else {
+            &self.mask
+        })
+        .encoded_batch_is_pending()
+        {
             return Err(GpuResidentRoundStrokeError::MaskBatchAwaitingSubmission);
         }
-        self.mask.end_stroke()?;
+        if active.loaded {
+            self.deposition.end_stroke()?;
+        } else {
+            self.mask.end_stroke()?;
+        }
         document.rollback_round_stroke_allocations(active.id, &active.provisional_allocations)?;
         document.finish_round_stroke(active.id)?;
         self.active = None;
+        self.surface.release();
+        self.deposition.release_material_pages();
         Ok(())
     }
 
@@ -249,6 +410,15 @@ impl GpuResidentRoundStrokeEngine {
         device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) -> Result<Option<GpuResidentDocumentCommit>, GpuResidentRoundStrokeError> {
+        if let Some(last) = self.material_submissions.back().cloned() {
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(last),
+                    timeout: None,
+                })
+                .map_err(|_| GpuResidentRoundStrokeError::TargetBusy)?;
+            self.material_submissions.clear();
+        }
         let active = self
             .active
             .as_ref()
@@ -258,7 +428,7 @@ impl GpuResidentRoundStrokeEngine {
         if active.scheduler.is_active() {
             return Err(GpuResidentRoundStrokeError::PathStillActive);
         }
-        let recovery = if active.shader_brush {
+        let recovery = if active.shader_brush || active.material_surface {
             crate::gpu_recovery_replay::GpuRasterRecoveryCommand::AwaitingPixels(
                 active.scheduler.layer(),
             )
@@ -273,18 +443,46 @@ impl GpuResidentRoundStrokeEngine {
         };
         let id = active.id;
         let provisional_allocations = active.provisional_allocations.clone();
-        self.mask.end_stroke()?;
+        let mask = if active.loaded {
+            &mut self.deposition
+        } else {
+            &mut self.mask
+        };
+        if active.material_surface {
+            self.surface.refresh(
+                device,
+                queue,
+                document.atlas(),
+                target,
+                mask,
+                active.recipe.material(),
+                active.loaded,
+                active.load,
+            );
+        }
+        mask.end_stroke()?;
+        if active.loaded {
+            // The submitted surface pass has consumed the envelope; the exact
+            // commit copies retained surface outputs, not the deposition mask.
+            mask.release_material_pages();
+        }
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("GPU Resident Round Stroke Commit"),
         });
-        let encoded = match target.encode_full_flow_commit_with_undo(
-            device,
-            queue,
-            &mut encoder,
-            &self.mask,
-            active.recipe.material(),
-        ) {
+        let encoded_result = if active.material_surface {
+            let copies = self.surface.copies(document.atlas())?;
+            target.encode_material_commit(device, &mut encoder, &copies)
+        } else {
+            target.encode_full_flow_commit_with_undo(
+                device,
+                queue,
+                &mut encoder,
+                mask,
+                active.recipe.material(),
+            )
+        };
+        let encoded = match encoded_result {
             Ok(Some(encoded)) => encoded,
             Ok(None) => {
                 self.abandon_ended(document, id, &provisional_allocations)?;
@@ -317,6 +515,8 @@ impl GpuResidentRoundStrokeEngine {
                     .finish_round_stroke(id)
                     .expect("a submitted round commit retains its active-stroke guard");
                 self.active = None;
+                self.surface.release();
+                self.deposition.release_material_pages();
                 Ok(Some(committed))
             }
             Err(failure) => {
@@ -327,6 +527,13 @@ impl GpuResidentRoundStrokeEngine {
                 Err(failure.error.into())
             }
         }
+    }
+
+    pub fn material_preview(&self) -> Option<&crate::gpu_material::MaterialTarget> {
+        self.active
+            .as_ref()
+            .filter(|active| active.material_surface)
+            .map(|_| &self.surface)
     }
 
     pub fn active_id(&self) -> Option<GpuResidentRoundStrokeId> {
@@ -343,7 +550,32 @@ impl GpuResidentRoundStrokeEngine {
     /// Exact block-aligned snapshot cost, used to relieve mirror backpressure
     /// before ending the preview or allocating a commit memento.
     pub fn commit_snapshot_bytes(&self) -> Result<u64, crate::gpu_document_undo::GpuUndoPlanError> {
-        let tiles = self.mask.active_tiles();
+        let Some(active) = &self.active else {
+            return Ok(0);
+        };
+        let mut tiles = if active.loaded {
+            self.deposition.active_tiles()
+        } else {
+            self.mask.active_tiles()
+        };
+        if active.material_surface {
+            let material: Vec<_> = tiles
+                .iter()
+                .filter_map(|tile| {
+                    active.material_slots.get(&tile.key.tile).map(|slot| {
+                        crate::gpu_round_target::ActiveRoundMaskTile {
+                            key: crate::gpu_atlas::LayerTileKey::new(
+                                tile.key.layer.material_plane(),
+                                tile.key.tile,
+                            ),
+                            slot: *slot,
+                            local_damage: tile.local_damage,
+                        }
+                    })
+                })
+                .collect();
+            tiles.extend(material);
+        }
         if tiles.is_empty() {
             return Ok(0);
         }
@@ -384,6 +616,8 @@ impl GpuResidentRoundStrokeEngine {
         document.rollback_round_stroke_allocations(id, allocations)?;
         document.finish_round_stroke(id)?;
         self.active = None;
+        self.surface.release();
+        self.deposition.release_material_pages();
         Ok(())
     }
 }
@@ -394,6 +628,7 @@ pub enum GpuResidentRoundStrokeError {
     NoActiveStroke,
     NoEffect,
     UnsupportedFlow(f32),
+    InvalidPaintLoad(f32),
     PathStillActive,
     MaskBatchAwaitingSubmission,
     TargetBusy,
@@ -416,6 +651,9 @@ impl fmt::Display for GpuResidentRoundStrokeError {
             Self::StrokeAlreadyActive => write!(formatter, "a GPU round stroke is already active"),
             Self::NoActiveStroke => write!(formatter, "no GPU round stroke is active"),
             Self::NoEffect => write!(formatter, "the GPU round stroke has no effect"),
+            Self::InvalidPaintLoad(load) => {
+                write!(formatter, "paint load must be finite, got {load}")
+            }
             Self::UnsupportedFlow(flow) => {
                 write!(
                     formatter,

@@ -9,6 +9,41 @@ use crate::{
 };
 use std::{collections::HashMap, error::Error, fmt, mem::size_of, num::NonZeroU64};
 
+pub trait StrokePreview {
+    fn layout(&self) -> crate::gpu_atlas::AtlasLayout;
+    fn stroke_is_active(&self) -> bool;
+    fn encoded_batch_is_pending(&self) -> bool;
+    fn active_tiles(&self) -> Vec<crate::gpu_round_target::ActiveRoundMaskTile>;
+    fn page_view(&self, page: AtlasPageId) -> Option<&wgpu::TextureView>;
+    fn retained_page_count(&self) -> usize;
+    fn generation(&self) -> u64 {
+        0
+    }
+    fn replaces_color(&self) -> bool {
+        false
+    }
+}
+impl StrokePreview for RoundMaskTarget {
+    fn layout(&self) -> crate::gpu_atlas::AtlasLayout {
+        self.layout()
+    }
+    fn stroke_is_active(&self) -> bool {
+        self.stroke_is_active()
+    }
+    fn encoded_batch_is_pending(&self) -> bool {
+        self.encoded_batch_is_pending()
+    }
+    fn active_tiles(&self) -> Vec<crate::gpu_round_target::ActiveRoundMaskTile> {
+        self.active_tiles()
+    }
+    fn page_view(&self, page: AtlasPageId) -> Option<&wgpu::TextureView> {
+        self.page_view(page)
+    }
+    fn retained_page_count(&self) -> usize {
+        self.retained_page_count()
+    }
+}
+
 const INITIAL_INSTANCE_BUFFER_BYTES: u64 = 4_096;
 
 #[repr(C)]
@@ -110,6 +145,8 @@ pub struct GpuDocumentCompositor {
     color_bind_groups: Vec<wgpu::BindGroup>,
     transient_bind_groups: Vec<wgpu::BindGroup>,
     transient_color_page_count: usize,
+    transient_replaces_color: bool,
+    transient_generation: u64,
     camera_buffer: wgpu::Buffer,
     material_buffer: wgpu::Buffer,
     _dummy_color_texture: wgpu::Texture,
@@ -232,6 +269,8 @@ impl GpuDocumentCompositor {
             color_bind_groups: Vec::new(),
             transient_bind_groups: Vec::new(),
             transient_color_page_count: 0,
+            transient_replaces_color: false,
+            transient_generation: 0,
             camera_buffer,
             material_buffer,
             _dummy_color_texture: dummy_color_texture,
@@ -295,7 +334,7 @@ impl GpuDocumentCompositor {
         metadata: &DocumentMetadata,
         atlas: &SparseAtlasPlanner,
         target: &GpuDocumentTarget,
-        mask: &RoundMaskTarget,
+        mask: &dyn StrokePreview,
         material: StrokeMaterial,
         camera: CanvasUniform,
     ) -> Result<GpuDocumentCompositeStats, GpuDocumentCompositeError> {
@@ -318,7 +357,10 @@ impl GpuDocumentCompositor {
             return Err(GpuDocumentCompositeError::MaskBatchAwaitingSubmission);
         }
         let active_layer = metadata.active_layer();
-        let composite_material = CompositeMaterial::for_stroke(material)?;
+        let mut composite_material = CompositeMaterial::for_stroke(material)?;
+        if mask.replaces_color() {
+            composite_material.operation = 2;
+        }
         let mut active_tiles = HashMap::new();
         for active in mask.active_tiles() {
             if active.key.layer != active_layer {
@@ -474,9 +516,14 @@ impl GpuDocumentCompositor {
         &mut self,
         device: &wgpu::Device,
         target: &GpuDocumentTarget,
-        mask: &RoundMaskTarget,
+        mask: &dyn StrokePreview,
     ) -> Result<(), GpuDocumentCompositeError> {
-        if self.transient_color_page_count != target.retained_page_count() {
+        if self.transient_color_page_count != target.retained_page_count()
+            || self.transient_replaces_color != mask.replaces_color()
+            || self.transient_generation != mask.generation()
+        {
+            self.transient_generation = mask.generation();
+            self.transient_replaces_color = mask.replaces_color();
             self.transient_bind_groups.clear();
             self.transient_color_page_count = target.retained_page_count();
         }

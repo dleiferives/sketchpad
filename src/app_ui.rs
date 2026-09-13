@@ -112,7 +112,7 @@ impl UiTool {
             Self::Eraser => "Clean, pressure-sensitive removal",
             Self::Pencil => "Fine graphite · tilt for side shading",
             Self::Marker => "Translucent chisel · layer to deepen",
-            Self::PaletteKnife => "Loaded blade · irregular scraped edges",
+            Self::PaletteKnife => "Loaded paint · opaque body and surface relief",
             Self::Charcoal => "Dense charcoal · grain and side shading",
         }
     }
@@ -128,6 +128,8 @@ pub struct UiSnapshot {
     pub tool: UiTool,
     pub brush_diameter: f32,
     pub brush_opacity: f32,
+    pub paint_load: f32,
+    pub material_brush: bool,
     pub color: [f32; 3],
     pub color_presets: [[f32; 3]; COLOR_PRESET_COUNT],
     pub recent_colors: [[f32; 3]; MAX_RECENT_COLORS],
@@ -162,6 +164,7 @@ pub enum UiAction {
     SelectShaderBrush(String),
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
+    SetPaintLoad(f32),
     PreviewColor([f32; 3]),
     CommitColor([f32; 3]),
     SelectLayer(LayerId),
@@ -1749,6 +1752,9 @@ fn show_brush_context(
                     ) {
                         actions.push(UiAction::SetBrushOpacity(value));
                     }
+                    if wide && snapshot.material_brush {
+                        show_paint_load(ui, snapshot, actions, height);
+                    }
                 });
             });
         })
@@ -2094,6 +2100,25 @@ fn picker_marker(ui: &egui::Ui, position: Pos2) {
         .circle_stroke(position, 7.0, Stroke::new(2.0, Color32::WHITE));
 }
 
+fn show_paint_load(
+    ui: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    height: f32,
+) {
+    let label = format!("Load {:.0}%", snapshot.paint_load * 100.0);
+    if let Some(unit) = unit_slider(
+        ui,
+        (snapshot.paint_load - 0.1) / 2.9,
+        snapshot.paint_load,
+        &label,
+        0.05,
+        Vec2::new(108.0, height),
+    ) {
+        actions.push(UiAction::SetPaintLoad(0.1 + unit * 2.9));
+    }
+}
+
 fn show_brush_panel(
     root: &mut egui::Ui,
     snapshot: UiSnapshot,
@@ -2140,6 +2165,16 @@ fn show_brush_panel(
                         }
                     });
                 });
+                if snapshot.material_brush {
+                    show_paint_load(ui, snapshot, actions, 36.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "More load builds stronger relief. Paint stays replenished.",
+                        )
+                        .small()
+                        .color(TEXT_MUTED),
+                    );
+                }
                 ui.add_sized(
                     [244.0, 36.0],
                     egui::TextEdit::singleline(query)
@@ -2991,6 +3026,8 @@ mod tests {
             tool: UiTool::Pen,
             brush_diameter: 8.0,
             brush_opacity: 1.0,
+            paint_load: 1.0,
+            material_brush: false,
             color: [0.0; 3],
             color_presets: [[0.0; 3]; COLOR_PRESET_COUNT],
             recent_colors: [[0.0; 3]; MAX_RECENT_COLORS],

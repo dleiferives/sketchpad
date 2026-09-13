@@ -92,13 +92,16 @@ pub fn replay_gpu_raster_recovery(
 
     for record in snapshot.journal().records() {
         let command = record.command();
-        if command.layer() != Some(layer) {
+        if command.layer() != Some(layer.color_layer()) {
             stats.commands_skipped = stats.commands_skipped.saturating_add(1);
             continue;
         }
         stats.commands_applied = stats.commands_applied.saturating_add(1);
         match command {
             GpuRasterRecoveryCommand::Round(command) => {
+                if layer.is_material_plane() {
+                    continue;
+                }
                 let replay = replay_round_recovery_command(&mut raster, command)?;
                 stats.pixels_evaluated = stats
                     .pixels_evaluated

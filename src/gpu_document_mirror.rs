@@ -2,11 +2,11 @@ use crate::{
     document::{Document, DocumentRevision, LayerId},
     gpu_atlas::{AtlasLayout, AtlasSlot, LayerTileKey},
     gpu_document_target::GpuDocumentTarget,
-    gpu_layer_recovery::GpuExactLayerRecoveryCommand,
     gpu_document_undo::{
         GpuDocumentMemento, GpuMementoResidentState, GpuUndoCapturePlan, GPU_UNDO_BLOCK_BYTES,
         GPU_UNDO_BLOCK_SIZE, GPU_UNDO_PIXEL_BYTES,
     },
+    gpu_layer_recovery::GpuExactLayerRecoveryCommand,
     raster::{LinearRgba, RasterError, RasterLayer, RectU32, TileCoord},
 };
 use std::{
@@ -816,15 +816,12 @@ impl GpuCpuMirror {
             document.tile_size(),
             document.revision(),
         )?;
-        for layer in document.layers() {
-            let raster = document
-                .layer_raster(layer.id())
-                .expect("every document layer must retain its raster payload");
+        for (layer_id, raster) in document.raster_planes() {
             if raster.active_gesture_id().is_some() {
-                return Err(GpuMirrorReconcileError::ActiveRasterGesture(layer.id()));
+                return Err(GpuMirrorReconcileError::ActiveRasterGesture(layer_id));
             }
             for tile in raster.checkpoint_tiles() {
-                let key = LayerTileKey::new(layer.id(), tile.coord);
+                let key = LayerTileKey::new(layer_id, tile.coord);
                 if let Some((index, _)) = tile.pixels.iter().enumerate().find(|(_, pixel)| {
                     !pixel.r.is_finite()
                         || !pixel.g.is_finite()
@@ -850,7 +847,8 @@ impl GpuCpuMirror {
 
     fn retire_layer(&mut self, layer: LayerId) -> usize {
         let before = self.tiles.len();
-        self.tiles.retain(|key, _| key.layer != layer);
+        self.tiles
+            .retain(|key, _| key.layer.color_layer() != layer.color_layer());
         before - self.tiles.len()
     }
 
@@ -860,10 +858,17 @@ impl GpuCpuMirror {
         let copies: Vec<_> = self
             .tiles
             .iter()
-            .filter(|(key, _)| key.layer == source)
+            .filter(|(key, _)| key.layer.color_layer() == source)
             .map(|(key, pixels)| {
                 (
-                    LayerTileKey::new(destination, key.tile),
+                    LayerTileKey::new(
+                        if key.layer.is_material_plane() {
+                            destination.material_plane()
+                        } else {
+                            destination
+                        },
+                        key.tile,
+                    ),
                     Arc::clone(pixels),
                 )
             })
@@ -872,6 +877,16 @@ impl GpuCpuMirror {
     }
 
     fn install_layer_snapshot(&mut self, command: GpuExactLayerRecoveryCommand) {
+        let material = command
+            .material_raster()
+            .expect("validated companion plane");
+        self.tiles
+            .extend(material.checkpoint_tiles().into_iter().map(|tile| {
+                (
+                    LayerTileKey::new(command.layer().material_plane(), tile.coord),
+                    tile.pixels,
+                )
+            }));
         let layer = command.layer();
         debug_assert!(self.tiles.keys().all(|key| key.layer != layer));
         let raster = command
@@ -2307,7 +2322,10 @@ mod tests {
         reconciler
             .complete_batch(solid_patch(&raster_revision.batches()[0], red))
             .unwrap();
-        assert_eq!(reconciler.mirror().revision(), DocumentRevision::from_raw(2));
+        assert_eq!(
+            reconciler.mirror().revision(),
+            DocumentRevision::from_raw(2)
+        );
         assert_eq!(
             reconciler.mirror().tile_pixels(imported_key).unwrap()[9 * 128 + 7],
             blue

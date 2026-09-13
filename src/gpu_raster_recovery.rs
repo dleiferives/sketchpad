@@ -22,6 +22,7 @@ pub struct GpuExactRasterRecoveryCommand {
 
 #[derive(Clone, Debug, PartialEq)]
 struct GpuExactRasterRecoveryTile {
+    material: bool,
     coord: TileCoord,
     initialized: bool,
     regions: Box<[GpuExactRasterRecoveryRegion]>,
@@ -92,13 +93,15 @@ impl GpuExactRasterRecoveryCommand {
             return Err(ArchiveError::Corrupt);
         }
         for region in plan.regions() {
-            if region.key.layer != self.layer {
+            if region.key.layer.color_layer() != self.layer {
                 return Err(ArchiveError::Corrupt);
             }
             let tile = self
                 .tiles
                 .iter()
-                .find(|t| t.coord == region.key.tile)
+                .find(|t| {
+                    t.coord == region.key.tile && t.material == region.key.layer.is_material_plane()
+                })
                 .ok_or(ArchiveError::Corrupt)?;
             let mut out = vec![0u8; region.byte_len() as usize];
             if !tile.initialized {
@@ -505,6 +508,7 @@ fn build_validated_command(
 
     regions.sort_by_key(|region| {
         (
+            region.key.layer.is_material_plane(),
             region.key.tile.y,
             region.key.tile.x,
             region.local_bounds.min_y(),
@@ -514,16 +518,20 @@ fn build_validated_command(
         )
     });
     let region_count = regions.len();
-    let mut grouped = BTreeMap::<(u32, u32), Vec<GpuMirrorPatchRegion>>::new();
+    let mut grouped = BTreeMap::<(bool, u32, u32), Vec<GpuMirrorPatchRegion>>::new();
     for region in regions {
         grouped
-            .entry((region.key.tile.y, region.key.tile.x))
+            .entry((
+                region.key.layer.is_material_plane(),
+                region.key.tile.y,
+                region.key.tile.x,
+            ))
             .or_default()
             .push(region);
     }
 
     let mut tiles = Vec::with_capacity(grouped.len());
-    for ((tile_y, tile_x), grouped_regions) in grouped {
+    for ((material, tile_y, tile_x), grouped_regions) in grouped {
         let initialized = grouped_regions[0].initialized;
         let regions = if initialized {
             grouped_regions
@@ -538,6 +546,7 @@ fn build_validated_command(
             Box::new([])
         };
         tiles.push(GpuExactRasterRecoveryTile {
+            material,
             coord: TileCoord::new(tile_x, tile_y),
             initialized,
             regions,
@@ -559,7 +568,7 @@ pub fn replay_exact_raster_recovery_command(
     layer: &mut RasterLayer,
     command: &GpuExactRasterRecoveryCommand,
 ) -> Result<GpuExactRasterRecoveryReplay, GpuExactRasterRecoveryReplayError> {
-    if layer_id != command.layer {
+    if layer_id.color_layer() != command.layer {
         return Err(GpuExactRasterRecoveryReplayError::LayerMismatch {
             expected: command.layer,
             actual: layer_id,
@@ -583,7 +592,11 @@ pub fn replay_exact_raster_recovery_command(
     let mut damage = Damage::default();
     let mut pixels_changed = 0_u64;
 
-    for tile in &command.tiles {
+    for tile in command
+        .tiles
+        .iter()
+        .filter(|tile| tile.material == layer_id.is_material_plane())
+    {
         let valid_bounds = layer.tile_bounds(tile.coord).ok_or(
             GpuExactRasterRecoveryReplayError::TileOutOfBounds(tile.coord),
         )?;
@@ -675,11 +688,11 @@ fn validate_regions(
     let Some(first) = regions.first() else {
         return Err(GpuExactRasterRecoveryBuildError::EmptyCommand);
     };
-    let layer = first.key.layer;
-    let mut by_tile = BTreeMap::<(u32, u32), Vec<&GpuMirrorPatchRegion>>::new();
+    let layer = first.key.layer.color_layer();
+    let mut by_tile = BTreeMap::<(bool, u32, u32), Vec<&GpuMirrorPatchRegion>>::new();
     let mut pixel_count = 0_usize;
     for &region in regions {
-        if region.key.layer != layer {
+        if region.key.layer.color_layer() != layer {
             return Err(GpuExactRasterRecoveryBuildError::MixedLayers {
                 first: layer,
                 second: region.key.layer,
@@ -743,7 +756,11 @@ fn validate_regions(
             .checked_add(region.pixels.len())
             .ok_or(GpuExactRasterRecoveryBuildError::ByteCountOverflow)?;
         by_tile
-            .entry((region.key.tile.y, region.key.tile.x))
+            .entry((
+                region.key.layer.is_material_plane(),
+                region.key.tile.y,
+                region.key.tile.x,
+            ))
             .or_default()
             .push(region);
     }

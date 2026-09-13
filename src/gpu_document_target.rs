@@ -508,7 +508,9 @@ impl GpuDocumentTarget {
         let mut slots = HashSet::with_capacity(uploads.len());
         for upload in uploads {
             if !keys.insert(upload.key) {
-                return Err(GpuDocumentTargetError::DuplicateBootstrapResident(upload.key));
+                return Err(GpuDocumentTargetError::DuplicateBootstrapResident(
+                    upload.key,
+                ));
             }
             if !slots.insert(upload.slot) {
                 return Err(GpuDocumentTargetError::DuplicateBootstrapSlot(upload.slot));
@@ -646,8 +648,7 @@ impl GpuDocumentTarget {
         });
         for clone in clones {
             let source = &self.pages[clone.source_slot.page().get() as usize].texture;
-            let destination =
-                &self.pages[clone.destination_slot.page().get() as usize].texture;
+            let destination = &self.pages[clone.destination_slot.page().get() as usize].texture;
             encoder.copy_texture_to_texture(
                 texture_copy(source, clone.source_slot.origin()),
                 texture_copy(
@@ -824,6 +825,111 @@ impl GpuDocumentTarget {
             return Err(GpuDocumentTargetError::CommitTokenMismatch);
         }
         Ok(())
+    }
+
+    /// Atomically snapshot and replace color plus companion material tiles.
+    /// Sources are complete preview tiles, including unchanged pixels outside damage.
+    pub(crate) fn encode_material_commit(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+        copies: &[crate::gpu_material::MaterialCopy<'_>],
+    ) -> Result<Option<EncodedGpuDocumentCommit>, GpuDocumentTargetError> {
+        if self.commit_pending {
+            return Err(GpuDocumentTargetError::CommitAwaitingSubmission);
+        }
+        if self.undo_swap_pending {
+            return Err(GpuDocumentTargetError::UndoSwapAwaitingSubmission);
+        }
+        if self.resident_clone_pending {
+            return Err(GpuDocumentTargetError::ResidentCloneAwaitingSubmission);
+        }
+        if copies.is_empty() {
+            return Ok(None);
+        }
+        let tiles: Vec<_> = copies.iter().map(|copy| copy.destination).collect();
+        let plan = GpuUndoCapturePlan::from_active_tiles(self.layout, &tiles)
+            .map_err(GpuDocumentTargetError::UndoPlan)?;
+        let initialized = plan
+            .regions()
+            .iter()
+            .map(|region| self.initialized_residents.get(&region.slot) == Some(&region.key))
+            .collect();
+        let memento = GpuDocumentMemento::new(device, plan, initialized)
+            .map_err(GpuDocumentTargetError::UndoResource)?;
+        let serial = self.next_commit_serial;
+        let next = serial
+            .checked_add(1)
+            .ok_or(GpuDocumentTargetError::CommitSerialOverflow)?;
+        self.ensure_pages(
+            device,
+            tiles
+                .iter()
+                .map(|tile| tile.slot.page().get())
+                .max()
+                .unwrap(),
+        )?;
+        for region in memento.plan().regions() {
+            if self.initialized_residents.get(&region.slot) == Some(&region.key) {
+                encoder.copy_texture_to_buffer(
+                    texture_copy(
+                        &self.pages[region.slot.page().get() as usize].texture,
+                        region.physical_origin,
+                    ),
+                    buffer_copy(
+                        memento.buffer(),
+                        region.buffer_offset,
+                        region.bytes_per_row,
+                        region.extent[1],
+                    ),
+                    copy_extent(region.extent),
+                );
+            } else {
+                encoder.clear_buffer(
+                    memento.buffer(),
+                    region.buffer_offset,
+                    Some(region.byte_len()),
+                );
+            }
+        }
+        let mut changes = Vec::new();
+        for copy in copies {
+            let tile = copy.destination;
+            encoder.copy_texture_to_texture(
+                texture_copy(copy.source, copy.source_origin),
+                texture_copy(
+                    &self.pages[tile.slot.page().get() as usize].texture,
+                    tile.slot.origin(),
+                ),
+                copy_extent([self.layout.tile_size(); 2]),
+            );
+            if self.initialized_residents.get(&tile.slot) != Some(&tile.key) {
+                changes.push((
+                    tile.slot,
+                    self.initialized_residents.insert(tile.slot, tile.key),
+                ));
+            }
+        }
+        let stats = ColorCommitStats {
+            retained_pages: self.pages.len() as u32,
+            committed_slots: tiles.len() as u32,
+            cleared_slots: changes.len() as u32,
+            undo_copy_regions: memento.plan().regions().len() as u32,
+            undo_blocks: memento.block_count(),
+            undo_bytes: memento.byte_len(),
+            ..Default::default()
+        };
+        self.pending_resident_changes = changes;
+        self.commit_pending = true;
+        self.pending_commit_serial = Some(serial);
+        self.pending_commit_requires_memento = true;
+        self.next_commit_serial = next;
+        Ok(Some(EncodedGpuDocumentCommit {
+            target_id: self.id,
+            stats,
+            serial,
+            memento,
+        }))
     }
 
     pub fn encode_full_flow_commit(
@@ -1167,7 +1273,16 @@ impl GpuDocumentTarget {
                 return Err(GpuDocumentTargetError::MissingColorPage(region.slot.page()));
             }
         }
-        self.ensure_undo_scratch_capacity(device, memento.byte_len())?;
+        // Regions are disjoint. Swap each through one reusable region-sized
+        // buffer instead of retaining a second full transaction-sized copy.
+        let scratch_bytes = memento
+            .plan()
+            .regions()
+            .iter()
+            .map(|region| region.byte_len())
+            .max()
+            .unwrap_or(0);
+        self.ensure_undo_scratch_capacity(device, scratch_bytes)?;
         let copy_regions = checked_u32(memento.plan().regions().len())?;
         let bytes_copied = memento
             .byte_len()
@@ -1184,15 +1299,12 @@ impl GpuDocumentTarget {
                 texture_copy(&page.texture, region.physical_origin),
                 buffer_copy(
                     &self.undo_scratch_buffer,
-                    region.buffer_offset,
+                    0,
                     region.bytes_per_row,
                     region.extent[1],
                 ),
                 copy_extent(region.extent),
             );
-        }
-        for region in memento.plan().regions() {
-            let page = &self.pages[region.slot.page().get() as usize];
             encoder.copy_buffer_to_texture(
                 buffer_copy(
                     memento.buffer(),
@@ -1203,11 +1315,9 @@ impl GpuDocumentTarget {
                 texture_copy(&page.texture, region.physical_origin),
                 copy_extent(region.extent),
             );
-        }
-        for region in memento.plan().regions() {
             encoder.copy_buffer_to_buffer(
                 &self.undo_scratch_buffer,
-                region.buffer_offset,
+                0,
                 memento.buffer(),
                 region.buffer_offset,
                 region.byte_len(),
@@ -1654,7 +1764,10 @@ impl fmt::Display for GpuDocumentTargetError {
                 write!(formatter, "GPU resident clone byte count overflows")
             }
             Self::InvalidResidentClone => {
-                write!(formatter, "GPU resident clone source and destination overlap")
+                write!(
+                    formatter,
+                    "GPU resident clone source and destination overlap"
+                )
             }
             Self::DuplicateResidentCloneDestination(slot) => write!(
                 formatter,

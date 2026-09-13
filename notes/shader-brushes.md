@@ -1,4 +1,4 @@
-# Shader brush packages (coverage API v1)
+# Shader brush packages (coverage v1 and loaded-paint v2)
 
 Sketchpad's five built-in paint brushes now use individual WGSL packages. Eraser
 and standalone replay controls retain the legacy pipeline. Drop a directory in
@@ -130,3 +130,35 @@ could acquire the abandoned session's cleanup lease before the test's own
 cleaner, invalidating its immediate-deletion assertion. That test now uses a
 private parent directory. All six cache tests passed 20 consecutive runs on
 Apollo and a separate Atlas run; Atlas also passed the formatter check.
+
+
+## Loaded-paint API v2
+
+The palette knife now opts into `"api_version": 2, "engine": "loaded-paint"`.
+The same `BrushInput` and footprint bounds apply. Its entry point is:
+
+```wgsl
+fn brush_deposit(input: BrushInput) -> vec2<f32> {
+    let surface = media_surface(input, 3u);
+    return vec2<f32>(clamp(0.5 - surface.distance, 0.0, 1.0), 1.0);
+}
+```
+
+The first output is coverage (0–1), the second is thickness (0–4 document-pixel
+units before paint load). Invalid/negative values produce zero. The host stores
+maximum coverage and maximum covered thickness within one contact. This is a
+loaded-deposit envelope, **not** sequential fluid transport. Separate contacts
+add to the retained surface; opacity linearly blends the material transaction.
+
+The surface stage owns unlit pigment, bounded height (64 document-pixel units),
+lighting, layer compositing and exact color/material history. Paint load changes
+deposited thickness and is pinned at contact start. Paint is automatically
+replenished. The shader cannot access arbitrary document resources or perform
+pickup yet. Normal v1 painting and erasing flatten material in proportion to their
+coverage, so covered/erased relief cannot return later. See
+[the material-engine plan](material-engine.md) for the wet-transport roadmap.
+
+Both APIs share discovery, immutable active-contact pipelines and validation on
+reload. A material pipeline is compiled for RG32Float envelope attachments;
+a coverage pipeline retains R32Float. The older CPU/legacy knife remains a v1
+replay/control implementation, not an oracle for the new material brush.

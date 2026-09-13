@@ -64,6 +64,38 @@ impl GpuDocumentRecoverySnapshot {
     }
 
     pub fn recover_document(&self) -> Result<GpuRecoveredDocument, GpuDocumentRecoveryError> {
+        let (layers, stats) = self.recover_layer_parts()?;
+        let mut materials = Vec::with_capacity(layers.len());
+        let parts = layers
+            .into_iter()
+            .map(|(part, material)| {
+                materials.push((part.id, material));
+                part
+            })
+            .collect();
+        let mut document = Document::from_layer_parts_at_revision(
+            self.metadata.width(),
+            self.metadata.height(),
+            self.metadata.tile_size(),
+            self.metadata.active_layer(),
+            parts,
+            self.metadata.revision(),
+        )?;
+        for (layer, material) in materials {
+            document.install_material_raster(layer, material)?;
+        }
+        Ok(GpuRecoveredDocument { document, stats })
+    }
+
+    fn recover_layer_parts(
+        &self,
+    ) -> Result<
+        (
+            Vec<(DocumentLayerParts, crate::raster::RasterLayer)>,
+            GpuDocumentRecoveryStats,
+        ),
+        GpuDocumentRecoveryError,
+    > {
         let mut parts = Vec::with_capacity(self.metadata.layers().len());
         let mut stats = GpuDocumentRecoveryStats::default();
         for layer in self.metadata.layers() {
@@ -90,32 +122,38 @@ impl GpuDocumentRecoverySnapshot {
             stats.layer_snapshots_applied = stats
                 .layer_snapshots_applied
                 .saturating_add(recovered.stats().layer_snapshots_applied);
-            parts.push(DocumentLayerParts {
-                id: layer.id(),
-                name: layer.name().to_owned(),
-                visible: layer.visible(),
-                opacity: layer.opacity(),
-                raster: recovered.into_raster(),
-            });
+            let material = replay_gpu_raster_recovery(&self.rasters, layer.id().material_plane())
+                .map_err(|error| GpuDocumentRecoveryError::Raster {
+                layer: layer.id(),
+                error,
+            })?;
+            parts.push((
+                DocumentLayerParts {
+                    id: layer.id(),
+                    name: layer.name().to_owned(),
+                    visible: layer.visible(),
+                    opacity: layer.opacity(),
+                    raster: recovered.into_raster(),
+                },
+                material.into_raster(),
+            ));
         }
-        let document = Document::from_layer_parts_at_revision(
-            self.metadata.width(),
-            self.metadata.height(),
-            self.metadata.tile_size(),
-            self.metadata.active_layer(),
-            parts,
-            self.metadata.revision(),
-        )?;
-        Ok(GpuRecoveredDocument { document, stats })
+        Ok((parts, stats))
     }
 
     pub fn build_checkpoint(
         &self,
     ) -> Result<GpuDocumentCheckpoint, GpuDocumentCheckpointBuildError> {
-        let recovered = self.recover_document()?;
-        let revision = recovered.document.revision();
-        let stats = recovered.stats;
-        let snapshot = checkpoint::snapshot_document(&recovered.document)?;
+        // A native checkpoint needs layer pixels, not an extra flattened composite.
+        let (parts, stats) = self.recover_layer_parts()?;
+        let revision = self.revision();
+        let snapshot = checkpoint::snapshot_layer_parts(
+            self.metadata.width(),
+            self.metadata.height(),
+            self.metadata.tile_size(),
+            self.metadata.active_layer(),
+            &parts,
+        )?;
         Ok(GpuDocumentCheckpoint {
             revision,
             snapshot,

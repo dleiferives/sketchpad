@@ -45,6 +45,17 @@ impl DocumentRevision {
 pub struct LayerId(u64);
 
 impl LayerId {
+    /// Companion planes share sparse raster infrastructure, never the UI layer stack.
+    pub const fn material_plane(self) -> Self {
+        Self(self.0 | (1 << 63))
+    }
+    pub const fn color_layer(self) -> Self {
+        Self(self.0 & !(1 << 63))
+    }
+    pub const fn is_material_plane(self) -> bool {
+        self.0 & (1 << 63) != 0
+    }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -197,7 +208,7 @@ impl Document {
         let mut rasters = HashMap::with_capacity(parts.len());
         let mut max_id = 0;
         for part in parts {
-            if part.id.get() == 0 || !ids.insert(part.id) {
+            if part.id.get() == 0 || part.id.is_material_plane() || !ids.insert(part.id) {
                 return Err(DocumentError::InvalidLayerId(part.id));
             }
             if part.raster.width() != width
@@ -266,6 +277,35 @@ impl Document {
     pub fn layer_raster(&self, id: LayerId) -> Option<&RasterLayer> {
         self.layer_index(id)?;
         self.rasters.get(&id)
+    }
+
+    pub fn material_raster(&self, layer: LayerId) -> Option<&RasterLayer> {
+        self.rasters.get(&layer.material_plane())
+    }
+
+    pub(crate) fn install_material_raster(
+        &mut self,
+        layer: LayerId,
+        raster: RasterLayer,
+    ) -> Result<(), DocumentError> {
+        self.require_layer(layer)?;
+        if raster.width() != self.width
+            || raster.height() != self.height
+            || raster.tile_size() != self.tile_size
+        {
+            return Err(DocumentError::LayerGeometryMismatch(layer));
+        }
+        if raster.allocated_tile_count() != 0 {
+            self.rasters.insert(layer.material_plane(), raster);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn raster_planes(&self) -> impl Iterator<Item = (LayerId, &RasterLayer)> {
+        self.layers
+            .iter()
+            .flat_map(|layer| [layer.id, layer.id.material_plane()])
+            .filter_map(|id| self.rasters.get(&id).map(|raster| (id, raster)))
     }
 
     pub const fn active_layer_id(&self) -> LayerId {
@@ -397,6 +437,7 @@ impl Document {
             .get(&id)
             .ok_or(DocumentError::LayerStorageMissing(id))?;
         let raster = clone_raster(source_raster)?;
+        let material = self.material_raster(id).map(clone_raster).transpose()?;
         let affected = coords_for_raster(source_raster);
         let before_active = self.active_layer;
         let duplicate_id = self.allocate_layer_id();
@@ -409,6 +450,9 @@ impl Document {
         let insertion = source_index + 1;
         self.layers.insert(insertion, duplicate.clone());
         assert!(self.rasters.insert(duplicate_id, raster).is_none());
+        if let Some(material) = material {
+            self.rasters.insert(duplicate_id.material_plane(), material);
+        }
         self.active_layer = duplicate_id;
         let damage = self.damage_for_coords(affected);
         self.recompose_damage(&damage)?;
@@ -890,7 +934,8 @@ impl Document {
     fn prune_detached_rasters(&mut self) {
         let mut retained: HashSet<_> = self.layers.iter().map(|layer| layer.id).collect();
         retained.extend(self.history.referenced_layer_ids());
-        self.rasters.retain(|id, _| retained.contains(id));
+        self.rasters
+            .retain(|id, _| retained.contains(&id.color_layer()));
     }
 
     fn damage_for_coords(&self, coords: impl IntoIterator<Item = TileCoord>) -> Damage {
