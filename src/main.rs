@@ -3846,6 +3846,9 @@ impl App {
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("Sketchpad Device"),
             required_features,
+            // Integrated GPUs share the user's RAM. Prefer smaller allocation
+            // pools so freed stroke resources do not leave large reserved heaps.
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             // A full color+material transaction can exceed WebGPU's default
             // 256 MiB buffer cap. This requests a limit, not an allocation.
             required_limits: wgpu::Limits {
@@ -6924,6 +6927,16 @@ mod tests {
             "pen-up must commit the large stroke, not silently cancel it"
         );
         assert!(app.persistence.document_modified());
+        if material {
+            assert_eq!(
+                app.gpu_resident_document()
+                    .unwrap()
+                    .history()
+                    .resident_bytes(),
+                0,
+                "a material stroke over an empty layer must retain implicit blank undo"
+            );
+        }
         eprintln!("large stroke: saving");
         assert!(app.save_document_to(directory.join("drawing.sketchpad")));
         eprintln!("large stroke: loading");
@@ -6971,6 +6984,17 @@ mod tests {
         let undone_revision = app.gpu_resident_document().unwrap().revision();
         eprintln!("large stroke: redo");
         app.redo();
+        eprintln!("large stroke: redone");
+        if material {
+            assert_eq!(
+                app.gpu_resident_document()
+                    .unwrap()
+                    .history()
+                    .resident_bytes(),
+                0,
+                "redo to a blank before-state must release hydrated material undo pixels"
+            );
+        }
         assert!(
             app.gpu_resident_document().unwrap().revision() > undone_revision,
             "large-stroke redo must complete"
@@ -6993,6 +7017,7 @@ mod tests {
                     > 0.9
             );
         }
+        eprintln!("large stroke: follow-up");
         // Redo left a full snapshot in flight. Another stroke must make room
         // without dropping either the existing paint or this new transaction.
         let before_followup = app.gpu_resident_document().unwrap().revision();
@@ -7001,6 +7026,7 @@ mod tests {
         app.start_stroke(screen(2048.0, 2048.0), 1.0, [0.0; 2], PointerOwner::Mouse);
         app.finish_stroke();
         assert!(app.gpu_resident_document().unwrap().revision() > before_followup);
+        eprintln!("large stroke: follow-up committed");
         app.reconcile_gpu_mirror_for_file().unwrap();
         let recovered = app
             .gpu_resident_document()

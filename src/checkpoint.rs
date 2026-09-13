@@ -3,6 +3,7 @@ use crate::{
     raster::{LinearRgba, RasterCheckpointTile, RasterError, RasterLayer, TileCoord},
 };
 use std::{
+    borrow::Cow,
     collections::HashSet,
     env,
     error::Error,
@@ -587,40 +588,85 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
     }
 
     let mut reader = Reader::new(payload);
-    let width = reader.u32()?;
-    let height = reader.u32()?;
-    let tile_size = reader.u32()?;
+    let parts = decode_document_parts(|length| reader.take(length).map(Cow::Borrowed), version)?;
+    reader.finish()?;
+    parts.into_document()
+}
+
+struct DecodedDocumentParts {
+    width: u32,
+    height: u32,
+    tile_size: u32,
+    active_layer: LayerId,
+    parts: Vec<DocumentLayerParts>,
+    materials: Vec<(LayerId, RasterLayer)>,
+}
+impl DecodedDocumentParts {
+    fn into_document(self) -> Result<Document, CheckpointError> {
+        let mut document = Document::from_layer_parts(
+            self.width,
+            self.height,
+            self.tile_size,
+            self.active_layer,
+            self.parts,
+        )?;
+        for (id, material) in self.materials {
+            document.install_material_raster(id, material)?;
+        }
+        Ok(document)
+    }
+}
+
+fn document_u32<'a>(
+    take: &mut impl FnMut(usize) -> Result<Cow<'a, [u8]>, CheckpointError>,
+) -> Result<u32, CheckpointError> {
+    Ok(u32::from_le_bytes(take(4)?.as_ref().try_into().unwrap()))
+}
+fn document_u64<'a>(
+    take: &mut impl FnMut(usize) -> Result<Cow<'a, [u8]>, CheckpointError>,
+) -> Result<u64, CheckpointError> {
+    Ok(u64::from_le_bytes(take(8)?.as_ref().try_into().unwrap()))
+}
+
+fn decode_document_parts<'a>(
+    mut take: impl FnMut(usize) -> Result<Cow<'a, [u8]>, CheckpointError>,
+    version: u32,
+) -> Result<DecodedDocumentParts, CheckpointError> {
+    let width = document_u32(&mut take)?;
+    let height = document_u32(&mut take)?;
+    let tile_size = document_u32(&mut take)?;
     validate_geometry(width, height, tile_size)?;
-    let layer_count = reader.u32()?;
+    let layer_count = document_u32(&mut take)?;
     if layer_count == 0 || layer_count > MAX_LAYER_COUNT {
         return Err(CheckpointError::invalid("layer count is outside limits"));
     }
-    let active_layer = LayerId::from_raw(reader.u64()?);
+    let active_layer = LayerId::from_raw(document_u64(&mut take)?);
     let mut parts = Vec::with_capacity(layer_count as usize);
     let mut materials = Vec::new();
     let mut total_tiles = 0_u32;
 
     for _ in 0..layer_count {
-        let id = LayerId::from_raw(reader.u64()?);
-        let layer_flags = reader.u32()?;
+        let id = LayerId::from_raw(document_u64(&mut take)?);
+        let layer_flags = document_u32(&mut take)?;
         if layer_flags & !1 != 0 {
             return Err(CheckpointError::invalid("unsupported layer flags"));
         }
         let visible = layer_flags & 1 != 0;
-        let opacity = f32::from_bits(reader.u32()?);
-        let name_len = reader.u32()? as usize;
+        let opacity = f32::from_bits(document_u32(&mut take)?);
+        let name_len = document_u32(&mut take)? as usize;
         if name_len == 0 || name_len > MAX_LAYER_NAME_BYTES {
             return Err(CheckpointError::invalid(
                 "layer name length is outside limits",
             ));
         }
-        let name = std::str::from_utf8(reader.take(name_len)?)
+        let name = std::str::from_utf8(take(name_len)?.as_ref())
             .map_err(|_| CheckpointError::invalid("layer name is not UTF-8"))?
             .to_owned();
-        let raster_len = usize::try_from(reader.u64()?)
+        let raster_len = usize::try_from(document_u64(&mut take)?)
             .map_err(|_| CheckpointError::invalid("layer payload length does not fit usize"))?;
-        let raster_bytes = reader.take(raster_len)?;
-        let raster = decode(raster_bytes)?;
+        let raster_bytes = take(raster_len)?;
+        let raster = decode(raster_bytes.as_ref())?;
+        drop(raster_bytes);
         total_tiles = total_tiles
             .checked_add(
                 u32::try_from(raster.allocated_tile_count())
@@ -633,9 +679,9 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
             ));
         }
         if version == MATERIAL_DOCUMENT_VERSION {
-            let length = usize::try_from(reader.u64()?)
+            let length = usize::try_from(document_u64(&mut take)?)
                 .map_err(|_| CheckpointError::invalid("material length overflow"))?;
-            let material = decode(reader.take(length)?)?;
+            let material = decode(take(length)?.as_ref())?;
             total_tiles = total_tiles
                 .checked_add(material.allocated_tile_count() as u32)
                 .ok_or_else(|| CheckpointError::invalid("material tile count overflow"))?;
@@ -654,12 +700,14 @@ pub fn decode_document(encoded: &[u8]) -> Result<Document, CheckpointError> {
             raster,
         });
     }
-    reader.finish()?;
-    let mut document = Document::from_layer_parts(width, height, tile_size, active_layer, parts)?;
-    for (id, material) in materials {
-        document.install_material_raster(id, material)?;
-    }
-    Ok(document)
+    Ok(DecodedDocumentParts {
+        width,
+        height,
+        tile_size,
+        active_layer,
+        parts,
+        materials,
+    })
 }
 
 pub fn decode(encoded: &[u8]) -> Result<RasterLayer, CheckpointError> {
@@ -842,14 +890,71 @@ pub fn load(path: &Path) -> Result<RasterLayer, CheckpointError> {
 }
 
 pub fn load_document(path: &Path) -> Result<Document, CheckpointError> {
-    let encoded = read_checkpoint(path)?;
-    if encoded.starts_with(&DOCUMENT_MAGIC) {
-        decode_document(&encoded)
-    } else if encoded.starts_with(&MAGIC) {
-        Ok(Document::from_flattened(decode(&encoded)?, "Recovered")?)
-    } else {
-        Err(CheckpointError::invalid("checkpoint magic does not match"))
+    let mut file = File::open(path)?;
+    let length = file.metadata()?.len();
+    if length > MAX_CHECKPOINT_BYTES {
+        return Err(CheckpointError::invalid("checkpoint exceeds size limit"));
     }
+    let mut bytes = [0; HEADER_SIZE];
+    file.read_exact(&mut bytes)?;
+    if bytes.starts_with(&MAGIC) {
+        // Legacy raster import uses the existing decoder.
+        let mut encoded = bytes.to_vec();
+        file.take(MAX_CHECKPOINT_BYTES + 1 - HEADER_SIZE as u64)
+            .read_to_end(&mut encoded)?;
+        let raster = decode(&encoded)?;
+        drop(encoded);
+        return Ok(Document::from_flattened(raster, "Recovered")?);
+    }
+    let mut header = Reader::new(&bytes);
+    if header.take(DOCUMENT_MAGIC.len())? != DOCUMENT_MAGIC {
+        return Err(CheckpointError::invalid("checkpoint magic does not match"));
+    }
+    let version = header.u32()?;
+    if version != DOCUMENT_VERSION && version != MATERIAL_DOCUMENT_VERSION {
+        return Err(CheckpointError::invalid(
+            "unsupported document checkpoint version",
+        ));
+    }
+    if header.u32()? != FLAGS {
+        return Err(CheckpointError::invalid(
+            "unsupported document feature flags",
+        ));
+    }
+    let mut remaining = header.u64()?;
+    let expected_checksum = header.u64()?;
+    if remaining != length.saturating_sub(HEADER_SIZE as u64) {
+        return Err(CheckpointError::invalid(
+            "payload length does not match file",
+        ));
+    }
+    let mut hash = 0xcbf2_9ce4_8422_2325;
+    // Keep only one encoded plane at once. Decoded layer tiles own their data;
+    // each temporary plane buffer is dropped before reading the next one.
+    let parts = decode_document_parts(
+        |count| {
+            if count as u64 > remaining {
+                return Err(CheckpointError::invalid("file is truncated"));
+            }
+            let mut data = vec![0; count];
+            file.read_exact(&mut data)?;
+            remaining -= count as u64;
+            hash = update_checksum(hash, &data);
+            Ok(Cow::Owned(data))
+        },
+        version,
+    )?;
+    if remaining != 0 {
+        return Err(CheckpointError::invalid("file has trailing data"));
+    }
+    let mut extra = [0];
+    if file.read(&mut extra)? != 0 {
+        return Err(CheckpointError::invalid("file has trailing data"));
+    }
+    if hash != expected_checksum {
+        return Err(CheckpointError::invalid("payload checksum does not match"));
+    }
+    parts.into_document()
 }
 
 fn read_checkpoint(path: &Path) -> Result<Vec<u8>, CheckpointError> {
@@ -916,7 +1021,10 @@ fn nonempty_env(name: &str) -> Option<OsString> {
 }
 
 fn checksum(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    update_checksum(0xcbf2_9ce4_8422_2325_u64, bytes)
+}
+
+fn update_checksum(mut hash: u64, bytes: &[u8]) -> u64 {
     for byte in bytes {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
@@ -1141,6 +1249,23 @@ mod tests {
             Some(expected)
         );
         assert_eq!(encode_document(&loaded).unwrap().0, encoded);
+        let directory = PathBuf::from(format!(
+            ".artifacts/material-stream-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("material.sketchpad");
+        fs::write(&path, &encoded).unwrap();
+        assert_eq!(
+            encode_document(&load_document(&path).unwrap()).unwrap().0,
+            encoded
+        );
+        let mut corrupt = encoded.clone();
+        corrupt[24] ^= 1;
+        fs::write(&path, corrupt).unwrap();
+        assert!(load_document(&path).is_err());
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
         assert_eq!(
             loaded.composite().pixel(8, 9),
             Some(LinearRgba::TRANSPARENT),

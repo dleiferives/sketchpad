@@ -460,6 +460,18 @@ impl GpuResidentRoundStrokeEngine {
                 active.load,
             );
         }
+
+        // A broad contact must finish its surface work before allocating undo
+        // and mirror snapshots. Otherwise the driver retains the envelope and
+        // texture-initialization work alongside all three transaction copies.
+        if active.material_surface && mask.retained_page_count() >= 8 {
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .map_err(|_| GpuResidentRoundStrokeError::TargetBusy)?;
+        }
         mask.end_stroke()?;
         if active.loaded {
             // The submitted surface pass has consumed the envelope; the exact
@@ -493,6 +505,7 @@ impl GpuResidentRoundStrokeEngine {
                 return Err(error.into());
             }
         };
+
         let prepared = match document.prepare_round_stroke_commit(
             id,
             target,
@@ -509,6 +522,7 @@ impl GpuResidentRoundStrokeEngine {
                 return Err(failure.error.into());
             }
         };
+
         match document.submit_commit(queue, target, encoder, prepared) {
             Ok(committed) => {
                 document

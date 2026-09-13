@@ -38,7 +38,8 @@ pub struct MaterialTarget {
     layout: AtlasLayout,
     pipeline: wgpu::ComputePipeline,
     bindings: wgpu::BindGroupLayout,
-    pages: Vec<SurfacePage>,
+    pages: HashMap<AtlasPageId, SurfacePage>,
+    page_span: usize,
     dummy: wgpu::TextureView,
     tiles: Vec<ActiveRoundMaskTile>,
     dirty: HashSet<TileCoord>,
@@ -110,7 +111,8 @@ impl MaterialTarget {
             layout,
             pipeline,
             bindings,
-            pages: Vec::new(),
+            pages: HashMap::new(),
+            page_span: 0,
             dummy,
             tiles: Vec::new(),
             dirty: HashSet::new(),
@@ -130,9 +132,10 @@ impl MaterialTarget {
     }
 
     pub fn release(&mut self) {
-        for page in self.pages.drain(..) {
+        for (_, page) in self.pages.drain() {
             page.color.destroy();
         }
+        self.page_span = 0;
         self.tiles.clear();
         self.dirty.clear();
         self.generation = self.generation.wrapping_add(1);
@@ -158,7 +161,7 @@ impl MaterialTarget {
     ) {
         let active = mask.active_tiles();
         let map: HashMap<_, _> = active.iter().map(|tile| (tile.key.tile, *tile)).collect();
-        if let Some(page) = active
+        let mut needed_pages: Vec<_> = active
             .iter()
             .flat_map(|tile| {
                 [
@@ -171,18 +174,24 @@ impl MaterialTarget {
             })
             .flatten()
             .map(|slot| slot.page().get())
-            .max()
-        {
-            while self.pages.len() <= page as usize {
+            .collect();
+        needed_pages.sort_unstable();
+        needed_pages.dedup();
+        for page in needed_pages {
+            let id = AtlasPageId::from_raw(page);
+            if let std::collections::hash_map::Entry::Vacant(entry) = self.pages.entry(id) {
                 let color = surface_texture(device, self.layout.page_size(), "Live material color");
-
                 let color_view = color.create_view(&Default::default());
-                self.pages.push(SurfacePage { color, color_view });
+                entry.insert(SurfacePage { color, color_view });
+                self.page_span = self.page_span.max(page as usize + 1);
+                // A formerly empty hole may already have a dummy cached binding.
+                self.generation = self.generation.wrapping_add(1);
             }
         }
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Paint surface update"),
         });
+
         let scratch_color_view = self.scratch_color.create_view(&Default::default());
         let scratch_material_view = self.scratch_material.create_view(&Default::default());
         let mut dispatched = false;
@@ -315,7 +324,7 @@ impl MaterialTarget {
                     encoder.copy_texture_to_texture(
                         source.as_image_copy(),
                         wgpu::TexelCopyTextureInfo {
-                            texture: &self.pages[slot.page().get() as usize].color,
+                            texture: &self.pages[&slot.page()].color,
                             mip_level: 0,
                             origin: wgpu::Origin3d {
                                 x: slot.origin()[0],
@@ -344,10 +353,7 @@ impl MaterialTarget {
     /// Read-only native preview access for export/renderer diagnostics.
     pub fn color_tile(&self, coord: TileCoord) -> Option<(&wgpu::Texture, [u32; 2])> {
         let tile = self.tiles.iter().find(|tile| tile.key.tile == coord)?;
-        Some((
-            &self.pages[tile.slot.page().get() as usize].color,
-            tile.slot.origin(),
-        ))
+        Some((&self.pages[&tile.slot.page()].color, tile.slot.origin()))
     }
 
     pub fn copies<'a>(
@@ -356,7 +362,7 @@ impl MaterialTarget {
     ) -> Result<Vec<MaterialCopy<'a>>, GpuDocumentTargetError> {
         let mut copies = Vec::with_capacity(self.tiles.len() * 2);
         for tile in &self.tiles {
-            let page = &self.pages[tile.slot.page().get() as usize];
+            let page = &self.pages[&tile.slot.page()];
             copies.push(MaterialCopy {
                 destination: *tile,
                 source: &page.color,
@@ -372,7 +378,7 @@ impl MaterialTarget {
                     slot,
                     local_damage: tile.local_damage,
                 },
-                source: &self.pages[slot.page().get() as usize].color,
+                source: &self.pages[&slot.page()].color,
                 source_origin: slot.origin(),
             });
         }
@@ -394,12 +400,17 @@ impl StrokePreview for MaterialTarget {
         self.tiles.clone()
     }
     fn page_view(&self, page: AtlasPageId) -> Option<&wgpu::TextureView> {
-        self.pages
-            .get(page.get() as usize)
-            .map(|page| &page.color_view)
+        ((page.get() as usize) < self.page_span).then(|| {
+            self.pages
+                .get(&page)
+                .map(|page| &page.color_view)
+                .unwrap_or(&self.dummy)
+        })
     }
     fn retained_page_count(&self) -> usize {
-        self.pages.len()
+        // Compositor bindings use the logical page span; holes use one tiny
+        // dummy view and consume no full-size texture allocation.
+        self.page_span
     }
     fn generation(&self) -> u64 {
         self.generation

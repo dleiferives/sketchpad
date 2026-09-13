@@ -744,6 +744,10 @@ impl GpuCpuMirrorSnapshot {
         self.tiles.get(&key).map(AsRef::as_ref)
     }
 
+    pub(crate) fn shared_tile_pixels(&self, key: LayerTileKey) -> Option<Arc<[LinearRgba]>> {
+        self.tiles.get(&key).map(Arc::clone)
+    }
+
     pub fn tile_bounds(&self, coord: TileCoord) -> Option<RectU32> {
         let origin_x = coord.x.checked_mul(self.tile_size)?;
         let origin_y = coord.y.checked_mul(self.tile_size)?;
@@ -1019,6 +1023,18 @@ impl GpuCpuMirror {
             for region in batch.regions {
                 if !region.initialized {
                     self.tiles.remove(&region.key);
+                    continue;
+                }
+                // A complete interior tile is already immutable, validated storage.
+                // Share it with recovery instead of copying the entire readback.
+                if region.local_bounds.min_x() == 0
+                    && region.local_bounds.min_y() == 0
+                    && region.local_bounds.width() == self.tile_size
+                    && region.local_bounds.height() == self.tile_size
+                    && region.key.tile.x < self.width / self.tile_size
+                    && region.key.tile.y < self.height / self.tile_size
+                {
+                    self.tiles.insert(region.key, region.pixels);
                     continue;
                 }
                 let pixels = self
@@ -2055,6 +2071,42 @@ mod tests {
                 .collect(),
             byte_len: batch.byte_len(),
         }
+    }
+
+    #[test]
+    fn full_tile_mirror_shares_readback_and_partial_edits_preserve_snapshot() {
+        let layout = AtlasLayout::new(64, 32, 1).unwrap();
+        let (capture, states) = capture_and_states(
+            layout,
+            &[(
+                TileCoord::new(0, 0),
+                RectU32::from_xywh(0, 0, 32, 32).unwrap(),
+                true,
+            )],
+        );
+        let plan = GpuMirrorReadbackPlan::from_capture(
+            DocumentRevision::INITIAL,
+            DocumentRevision::from_raw(1),
+            &capture,
+            &states,
+            DEFAULT_RECONCILIATION_BYTES_IN_FLIGHT,
+        )
+        .unwrap();
+        let blue = LinearRgba::from_straight(0.0, 0.0, 1.0, 1.0);
+        let patch = solid_patch(&plan.batches()[0], blue);
+        let key = patch.regions[0].key;
+        let shared = Arc::clone(&patch.regions[0].pixels);
+        let mut mirror = GpuCpuMirror::new(64, 64, 32, DocumentRevision::INITIAL).unwrap();
+        mirror.apply_validated_revision(DocumentRevision::from_raw(1), vec![patch]);
+        assert_eq!(mirror.tile_pixels(key).unwrap().as_ptr(), shared.as_ptr());
+        let snapshot = mirror.snapshot();
+        let mut patch = solid_patch(&plan.batches()[0], LinearRgba::TRANSPARENT);
+        patch.regions[0].local_bounds = RectU32::from_xywh(0, 0, 16, 16).unwrap();
+        patch.regions[0].pixels = vec![LinearRgba::TRANSPARENT; 256].into();
+        mirror.apply_validated_revision(DocumentRevision::from_raw(2), vec![patch]);
+        assert_eq!(snapshot.tile_pixels(key).unwrap()[0], blue);
+        assert_eq!(mirror.tile_pixels(key).unwrap()[0], LinearRgba::TRANSPARENT);
+        assert_eq!(mirror.tile_pixels(key).unwrap()[31], blue);
     }
 
     #[test]

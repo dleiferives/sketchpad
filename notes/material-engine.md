@@ -1,8 +1,10 @@
 # Material engine: loaded paint now, fuller simulation later
 
-**Work in progress; not ready to ship.** The full 4096px material save still
-exceeds the constrained memory gate. All remote builds and tests were stopped
-after the user reported memory alerts on both machines.
+**Implemented and validated on Atlas and Apollo.** The loaded-paint knife now
+retains opaque pigment and surface relief. Both machines pass the 4096px material
+stroke/save/load/undo/redo stress test under a 3,500 MiB hard test limit, with no
+OOM events. This is the first material model; full wet-paint simulation remains
+future work.
 
 The [palette-knife research](ui-concepts/palette-knife-research.html) records the
 physical references, application precedents, measured repeated-hole defect and
@@ -115,7 +117,7 @@ the shared slot budget. This fixes the old 256 MiB default-device limit exposed
 by a 512 MiB color-plus-material memento on a fully painted 4096px layer. Limits
 are ceilings; allocation remains proportional to touched pages and regions.
 
-## Validation in progress
+## Brush and document validation
 
 The native overlap study now has 0/5,280 transparent sampled interior pixels at
 1, 2, 4 and 8 contacts; all 5,280 reach alpha >= 0.99. The four opacity/pressure
@@ -123,9 +125,9 @@ rows also have full sampled interior coverage and retained nonuniform thickness.
 Atlas and Apollo passed native buildup, cancel, ordinary-brush flattening,
 layer duplication/deletion/reordering, exact undo/redo, save/load and identical
 continuation after reload. A live 512px contact retains earlier sampled pixels
-and matches its committed output. The large 4096px test exposed the device-buffer
-limit above; after correction, Atlas passed that stress case in debug as well.
-Release verification and final checks are recorded below when complete.
+and matches its committed output. The large 4096px test initially exposed the
+device-buffer limit above; the memory corrections and final release validation
+are recorded below.
 
 ## Apollo memory incident and correction
 
@@ -178,36 +180,110 @@ unused flattened composite. Nested raster encodings append directly into the
 one document buffer instead of holding another complete encoded layer at once.
 The existing checkpoint byte format and checksum validation are preserved.
 
-## Stopped-run status — September 13, 2026
+## Memory investigation — September 13, 2026
 
-Atlas systemd confirmed `Result=oom-kill`, `MemoryPeak=3670016000` and
-`MemoryMax=3670016000` for the explicitly limited test scope. This is a test
-cgroup limit failure, not evidence that all 64 GB of Atlas RAM was exhausted.
-The subsequent health check reported about 47 GB available on Atlas and 5 GB on
-Apollo. No Sketchpad build/test processes remained on either machine. Further
-remote execution was stopped in response to the user's second memory report.
+An early constrained Atlas run reported `Result=oom-kill`,
+`MemoryPeak=3670016000` and `MemoryMax=3670016000`. That was the isolated
+3,500 MiB test scope reaching its limit, not evidence that Atlas exhausted all
+64 GB of system RAM. Health checks reported about 47 GB available on Atlas and
+5 GB on Apollo. Remote work stopped after the user's second memory report and
+resumed only after their instruction to continue. The earlier 6 GiB Atlas pass
+was insufficient evidence for the lower-memory machine.
 
-Completed evidence:
-- 295 library tests pass after direct raster encoding and composite-free GPU
-  checkpoint construction.
-- Before the final save/undo changes, native material integration passed on both
-  machines; the guarded Apollo integration had no OOM events and a 667,040 KiB
-  maximum child RSS including compilation.
-- Atlas native opacity/load/overlap studies have zero sampled interior holes.
-  The gallery's three native images, comparison/background controls, local links
-  and 390px mobile layout passed browser checks.
-- Atlas shader reload, mixed-media/file workflows, media-mask oracle and release
-  build passed before the final save/undo changes.
-- The earlier Atlas large case passed with a 6 GiB test limit, with a 2,744,980 KiB
-  maximum child RSS and 6,089,396,224-byte cgroup peak including compilation/cache.
-- The 3,500 MiB Atlas gate still fails during saving after the later reductions.
-  The full-canvas Apollo retry was stopped by the available-memory guard, before
-  a cgroup OOM event, and was not repeated with these later changes.
+The resumed runs keep the 3,500 MiB hard cap and disable test swap. A monitor
+stops only its own test process group if system available memory falls below
+2 GiB, charged memory excluding reclaimable disk cache exceeds 3,300 MiB, or
+runtime exceeds four minutes. MemoryHigh is 3,350 MiB. This is a stress-test
+safety boundary, not an application-wide guarantee or an FPS benchmark.
 
-Still required before shipping: identify the remaining save/recovery peak,
-validate the final region-swap undo and checkpoint changes in the native GPU
-integration/oracles, rerun relevant checks after any correction, and demonstrate
-bounded large-contact/save behavior on Apollo. Do not raise the test cap or
-retry shared-machine stress work merely to obtain a passing result. The latest
-remote formatting suggestions were applied locally; final format/clippy/native
-verification of this work-in-progress snapshot remains outstanding.
+## Continued memory work
+
+Complete immutable interior tiles now share allocation between GPU readback,
+CPU mirror, exact recovery, recovered rasters and full-tile before snapshots.
+Partial regions and clipped canvas-edge tiles retain their existing copy path;
+later edits use copy-on-write. Two regression tests assert shared allocation,
+exact replay and isolation of earlier snapshots after a partial edit.
+
+The resumed trace also identified overlap at pen-up: the GPU could still retain
+surface/envelope initialization work when the host allocated undo and mirror
+buffers. Broad material contacts (at least eight retained mask pages) now drain
+the surface submission before ending/releasing the mask and preparing the
+transaction. Ordinary small contacts avoid this extra wait. This bounds overlap;
+it is not a claim of improved interactive latency or a smaller persistent file.
+
+A new material contact whose entire captured before-state is uninitialized now
+stores an implicit blank memento (tile/region metadata, no GPU pixel buffer).
+The existing exact-history hydration path materializes its zeros if undo needs
+to swap pixels later. This removes a 512 MiB allocation from the initial 4096px
+material transaction. History accounts resident pixel bytes separately from its
+logical capture size, and zero-byte entries still obey the entry-count bound.
+
+Native file loading now retains one encoded raster plane at a time rather than
+an entire encoded material document alongside all decoded planes. The byte and
+file APIs share their body parser. Nested checksums and the incremental outer
+checksum are validated before publishing a document; trailing or truncated data
+is rejected. Legacy raster imports still use their existing decoder and release
+the encoded bytes before constructing the composite. A file roundtrip and
+corrupt-checksum test exercise this path.
+
+The device requests `MemoryHints::MemoryUsage`. In the pinned wgpu Vulkan
+allocator this uses smaller allocation blocks than the default Performance
+hint, reducing retained driver-pool memory after a large temporary workload.
+This is a backend-dependent hint, not a hard budget or a performance claim.
+See the [wgpu API](https://docs.rs/wgpu/latest/wgpu/enum.MemoryHints.html) and
+[pinned allocator source](https://github.com/gfx-rs/wgpu/blob/e904d2eac09a9494fb8a453b7e0278fb06e8693c/wgpu-hal/src/lib.rs).
+
+Material preview pages now allocate only occupied page IDs. Holes in the shared
+atlas address space bind one tiny dummy texture, rather than allocating an
+unused prefix of full-size pages. Preview generations invalidate cached bindings
+when a hole becomes occupied. This matters for a small edit after a large drawing.
+
+Implicit blank undo hydration uses an unmapped, zero-initialized GPU buffer,
+avoiding another full-size mapped staging allocation. After a submitted redo
+returns the material memento to an entirely uninitialized before-state, its GPU
+handle is released and history again accounts only the implicit metadata.
+Queued GPU work retains its required resources until completion. Atlas pins,
+history entry limits and exact initialization flags are preserved.
+
+## Final validation — September 13, 2026
+
+- Atlas: 298 library tests and the complete non-ignored Cargo suite pass.
+  All-target Clippy passes with the repository's existing argument-count and
+  while-let-loop allowances. Changed-file formatting is checked remotely.
+- Atlas native GPU checks: material integration; shader reload with active-contact
+  pinning; mixed-media history/files; failed-open preservation and file workflow;
+  exact region-swap commit/undo/redo and bounded mirror readback oracle.
+- Atlas and Apollo: final release application builds pass.
+- Atlas browser gallery: three native images load at their expected sizes,
+  comparison/background controls and local links work, CSV measurements match,
+  and the 390px mobile viewport has no page overflow.
+- Atlas and Apollo: release material integration covers actual document install,
+  next-stroke equivalence after native reload, cancellation, duplicated/deleted/
+  reordered layers, ordinary-media flattening and live 512px preview consistency.
+- Both release large-contact tests pass: one 512px knife contact covers most of a
+  4096px document, commits as one history entry, saves, loads through the native
+  file codec, undoes, redoes, then accepts an eraser edit. The large fixture loads
+  a second CPU document for validation; it does not reinstall that full 4096px
+  document into the live GPU owner. Actual install/continuation is covered by the
+  smaller material integration fixture.
+
+| Latest guarded release run | Atlas | Apollo |
+| --- | ---: | ---: |
+| Hard cgroup limit | 3,500 MiB | 3,500 MiB |
+| Cgroup peak, including cache/driver charges | 3,631,288,320 bytes | 3,593,580,544 bytes |
+| Maximum child RSS | 1,615,024 KiB | 1,573,452 KiB |
+| Minimum available system memory | 51,841,384,448 bytes | 2,198,351,872 bytes |
+| Guard stopped test / OOM events | no / 0 | no / 0 |
+
+Atlas's scope includes recompilation; Apollo's test binary was already built.
+The scope forbids swap and can throttle at MemoryHigh, so these runs are memory
+and correctness checks, not comparable performance benchmarks. Apollo's headroom
+is limited: passing this fixture does not establish a bound for additional large
+layers, arbitrary documents or every full-document replacement workflow. Further
+simulation needs its own budgets and tests; keep the system-memory reserve.
+
+The final Apollo pass follows a guard stop during redo (no OOM) that identified
+retained blank undo pixels. Neither the hard cap nor the system-memory reserve
+was relaxed to obtain the passing result. Native image studies remain available
+at `http://localhost:8058/material-engine.html` on Atlas, with the physical research
+and fuller-simulation roadmap linked alongside them.

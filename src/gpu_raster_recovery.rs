@@ -58,6 +58,10 @@ impl RecoveryPixels {
 }
 
 impl GpuExactRasterRecoveryCommand {
+    pub(crate) fn is_uninitialized(&self) -> bool {
+        self.tiles.iter().all(|tile| !tile.initialized)
+    }
+
     pub(crate) fn archived(&self, store: &HistoryStore) -> Result<Self, ArchiveError> {
         let mut command = self.clone();
         for tile in &mut command.tiles {
@@ -372,6 +376,13 @@ fn capture_snapshot_regions(
         let pixels = existing.map_or_else(
             || Arc::from([]),
             |tile| {
+                if region.local_bounds.min_x() == 0
+                    && region.local_bounds.min_y() == 0
+                    && region.local_bounds.width() == snapshot.tile_size()
+                    && region.local_bounds.height() == snapshot.tile_size()
+                {
+                    return snapshot.shared_tile_pixels(region.key).unwrap();
+                }
                 let stride = snapshot.tile_size() as usize;
                 let width = region.local_bounds.width() as usize;
                 let mut pixels = Vec::with_capacity(region.local_bounds.area() as usize);
@@ -603,6 +614,44 @@ pub fn replay_exact_raster_recovery_command(
         let valid_width = valid_bounds.width();
         let valid_height = valid_bounds.height();
         let was_allocated = layer.tile_is_allocated(tile.coord);
+        if tile.initialized
+            && valid_width == command.tile_size
+            && valid_height == command.tile_size
+            && tile.regions.len() == 1
+        {
+            let region = &tile.regions[0];
+            if region.local_bounds.min_x() == 0
+                && region.local_bounds.min_y() == 0
+                && region.local_bounds.width() == command.tile_size
+                && region.local_bounds.height() == command.tile_size
+            {
+                if let RecoveryPixels::Raw(pixels) = &region.pixels {
+                    let blank;
+                    let before = if let Some(previous) = layer.tile(tile.coord) {
+                        previous.pixels()
+                    } else {
+                        blank = vec![LinearRgba::TRANSPARENT; tile_pixel_count];
+                        &blank
+                    };
+                    if let Some(bounds) = changed_pixel_bounds(
+                        before,
+                        pixels,
+                        command.tile_size,
+                        valid_width,
+                        valid_height,
+                        &mut pixels_changed,
+                    ) {
+                        damage.add(tile.coord, translate_to_canvas(bounds, valid_bounds));
+                        prepared.push(PreparedRecoveryTile {
+                            coord: tile.coord,
+                            pixels: Arc::clone(pixels),
+                            was_allocated,
+                        });
+                    }
+                    continue;
+                }
+            }
+        }
         let mut pixels = layer.tile(tile.coord).map_or_else(
             || vec![LinearRgba::TRANSPARENT; tile_pixel_count],
             |tile| tile.pixels().to_vec(),
@@ -639,7 +688,7 @@ pub fn replay_exact_raster_recovery_command(
             );
             prepared.push(PreparedRecoveryTile {
                 coord: tile.coord,
-                pixels: pixels.into_boxed_slice(),
+                pixels: pixels.into(),
                 was_allocated,
             });
         }
@@ -649,7 +698,7 @@ pub fn replay_exact_raster_recovery_command(
     let mut tiles_removed = 0_u32;
     for tile in prepared {
         layer
-            .restore_tile(tile.coord, tile.pixels)
+            .restore_shared_tile(tile.coord, tile.pixels)
             .expect("recovery replay prevalidated every tile and pixel count");
         if layer.tile_is_allocated(tile.coord) {
             tiles_written = tiles_written.saturating_add(1);
@@ -668,7 +717,7 @@ pub fn replay_exact_raster_recovery_command(
 
 struct PreparedRecoveryTile {
     coord: TileCoord,
-    pixels: Box<[LinearRgba]>,
+    pixels: Arc<[LinearRgba]>,
     was_allocated: bool,
 }
 
@@ -1355,6 +1404,35 @@ mod tests {
         );
         assert_eq!(failure.regions.len(), 2);
         assert_eq!(failure.regions[0].pixels[0], RED);
+    }
+
+    #[test]
+    fn full_tile_replay_shares_storage_and_later_edits_copy_on_write() {
+        let layer_id = LayerId::from_raw(7);
+        let coord = TileCoord::new(0, 0);
+        let patch = region(
+            layer_id,
+            coord,
+            RectU32::from_xywh(0, 0, 32, 32).unwrap(),
+            true,
+            BLUE,
+        );
+        let retained = Arc::clone(&patch.pixels);
+        let command = GpuExactRasterRecoveryCommand::from_regions(32, vec![patch]).unwrap();
+        let mut layer = RasterLayer::new(32, 32, 32).unwrap();
+        let replay = replay_exact_raster_recovery_command(layer_id, &mut layer, &command).unwrap();
+        assert_eq!(replay.pixels_changed, 1024);
+        assert_eq!(
+            layer.tile(coord).unwrap().pixels().as_ptr(),
+            retained.as_ptr()
+        );
+        let gesture = layer.begin_gesture().unwrap();
+        layer.set_pixel(gesture, 1, 1, RED).unwrap();
+        layer.commit_gesture(gesture).unwrap();
+        assert_eq!(retained[33], BLUE);
+        assert_eq!(layer.pixel(1, 1), Some(RED));
+        replay_exact_raster_recovery_command(layer_id, &mut layer, &command).unwrap();
+        assert_eq!(layer.pixel(1, 1), Some(BLUE));
     }
 
     #[test]

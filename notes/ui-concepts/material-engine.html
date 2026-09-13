@@ -5,7 +5,7 @@
 </style></head><body><main>
 <p class="eyebrow">Sketchpad · material engine · September 13, 2026</p>
 <h1>Loaded paint.<br>Retained surface relief.</h1>
-<p><strong>Implementation preview — not ready to ship.</strong> The full-canvas save still fails the constrained memory test. Remote testing is stopped while the remaining allocations are investigated. The images below show the implemented brush behavior.</p>
+<p><strong>Validated on Atlas and Apollo.</strong> Both machines pass the large 4096-pixel drawing, save/load, undo/redo and follow-up edit test under a 3,500 MiB memory limit, with no OOM events. The images below are native brush output.</p>
 <p><strong>The knife now deposits an opaque body and keeps its paint surface.</strong> Paper texture changes thickness instead of permanently excluding interior pixels. Separate contacts build on the retained surface. The shader keeps unlit pigment separate from its shaded appearance.</p>
 <p>This is the first material-engine implementation: a loaded-deposit model with automatic replenishment. Wet mixing, finite blade loads, pickup and physical plowing remain future stages. The <a href="palette-knife-research.html">research and physical references</a> describe the broader target.</p>
 <nav aria-label="Page contents"><a href="#overlap">Overlapping strokes</a><a href="#load">Paint load</a><a href="#direction">Direction and curves</a><a href="#storage">History and saving</a><a href="#next">Fuller simulation</a></nav>
@@ -38,7 +38,7 @@
 <tr><td>Layer operations</td><td>Duplicate, delete, reorder and undo preserve material without adding UI layers.</td></tr>
 <tr><td>Large transactions</td><td>A loaded stroke across a 4096-pixel document survives lift, save, undo, redo and a follow-up edit.</td></tr>
 </tbody></table></div>
-<p class="note" id="validation-status">Validation results and machine-specific limits are recorded in the repository's material-engine notes. The native integration tests include Atlas and Apollo. This page does not claim a performance improvement over the coverage-only engine.</p></section>
+<p class="note" id="validation-status">The large test validates file-codec loading; actual app reload and identical continuation are covered by the smaller native integration test. Memory headroom on Apollo remains limited, and additional large layers need separate testing. <a href="https://github.com/dleiferives/sketchpad/blob/trunk/notes/material-engine.md">Validation details and machine-specific measurements</a>. These checks do not establish a speed improvement over the coverage-only engine.</p></section>
 
 <section id="next"><h2>A foundation for fuller simulation</h2>
 <p>The new shader contract returns coverage and thickness. The engine owns surface state, lighting, resource boundaries and history. This keeps programmable brush authoring while providing a place to add ordered material interaction.</p>

@@ -855,7 +855,7 @@ impl GpuDocumentTarget {
             .iter()
             .map(|region| self.initialized_residents.get(&region.slot) == Some(&region.key))
             .collect();
-        let memento = GpuDocumentMemento::new(device, plan, initialized)
+        let memento = GpuDocumentMemento::new_material(device, plan, initialized)
             .map_err(GpuDocumentTargetError::UndoResource)?;
         let serial = self.next_commit_serial;
         let next = serial
@@ -869,7 +869,12 @@ impl GpuDocumentTarget {
                 .max()
                 .unwrap(),
         )?;
-        for region in memento.plan().regions() {
+        for region in memento
+            .plan()
+            .regions()
+            .iter()
+            .filter(|_| memento.resident_byte_len() != 0)
+        {
             if self.initialized_residents.get(&region.slot) == Some(&region.key) {
                 encoder.copy_texture_to_buffer(
                     texture_copy(

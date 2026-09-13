@@ -285,7 +285,7 @@ impl GpuDocumentHistory {
                 return Err(Box::new(GpuHistoryRecordFailure { error, memento }));
             }
         };
-        let byte_len = memento.byte_len();
+        let byte_len = memento.resident_byte_len();
         let residents = memento_residents(&memento);
         let mut pinned = Vec::with_capacity(residents.len());
         for &(key, slot) in &residents {
@@ -350,9 +350,14 @@ impl GpuDocumentHistory {
         atlas: &SparseAtlasPlanner,
         memento: &GpuDocumentMemento,
     ) -> Result<GpuHistoryRecordPreview, GpuHistoryRecordError> {
+        if memento.plan().is_empty() {
+            return Err(GpuHistoryRecordError::History(
+                GpuDocumentHistoryError::EmptyMemento,
+            ));
+        }
         let preview = self
             .core
-            .check_record(memento.byte_len())
+            .check_record(memento.resident_byte_len())
             .map_err(GpuHistoryRecordError::History)?;
         for (key, slot) in memento_residents(memento) {
             atlas
@@ -531,6 +536,14 @@ impl GpuDocumentHistory {
     }
 
     pub fn finish_pending(&mut self) -> Result<GpuHistoryId, GpuDocumentHistoryError> {
+        if let Some(pending) = &mut self.core.pending {
+            if let Some(memento) = pending.entry.value.raster_memento_mut() {
+                memento.release_blank_pixels();
+                self.core.resident_bytes =
+                    self.core.resident_bytes - pending.entry.byte_len + memento.resident_byte_len();
+                pending.entry.byte_len = memento.resident_byte_len();
+            }
+        }
         self.core.finish_pending()
     }
 
@@ -706,9 +719,6 @@ impl<T> BoundedHistory<T> {
     fn check_record(&self, byte_len: u64) -> Result<CoreRecordPreview, GpuDocumentHistoryError> {
         if self.pending.is_some() {
             return Err(GpuDocumentHistoryError::PendingOperation);
-        }
-        if byte_len == 0 {
-            return Err(GpuDocumentHistoryError::EmptyMemento);
         }
         if byte_len > self.max_bytes {
             return Err(GpuDocumentHistoryError::MementoExceedsBudget {
@@ -926,6 +936,18 @@ mod tests {
 
     fn values(entries: &[WeightedEntry<u32>]) -> Vec<u32> {
         entries.iter().map(|entry| entry.value).collect()
+    }
+
+    #[test]
+    fn implicit_entries_use_no_pixel_budget_but_still_obey_entry_limit() {
+        let mut history = BoundedHistory::new(2, 10).unwrap();
+        let first = history.record(1, 0).unwrap().id;
+        history.record(2, 0).unwrap();
+        let record = history.record(3, 0).unwrap();
+        assert_eq!(record.evicted.len(), 1);
+        assert_eq!(record.evicted[0].id, first);
+        assert_eq!(history.resident_bytes, 0);
+        assert_eq!(history.undo.len(), 2);
     }
 
     #[test]

@@ -41,6 +41,7 @@ pub struct GpuDocumentMemento {
     buffer: Option<wgpu::Buffer>,
     archived: Option<crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand>,
     resident_states: Vec<GpuMementoResidentState>,
+    allow_implicit_blank: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -57,6 +58,23 @@ impl GpuDocumentMemento {
         plan: GpuUndoCapturePlan,
         prior_initialized: Vec<bool>,
     ) -> Result<Self, GpuUndoResourceError> {
+        Self::new_internal(device, plan, prior_initialized, false)
+    }
+
+    pub(crate) fn new_material(
+        device: &wgpu::Device,
+        plan: GpuUndoCapturePlan,
+        prior_initialized: Vec<bool>,
+    ) -> Result<Self, GpuUndoResourceError> {
+        Self::new_internal(device, plan, prior_initialized, true)
+    }
+
+    fn new_internal(
+        device: &wgpu::Device,
+        plan: GpuUndoCapturePlan,
+        prior_initialized: Vec<bool>,
+        allow_implicit_blank: bool,
+    ) -> Result<Self, GpuUndoResourceError> {
         if plan.is_empty() {
             return Err(GpuUndoResourceError::EmptyCapture);
         }
@@ -72,6 +90,23 @@ impl GpuDocumentMemento {
                 actual: prior_initialized.len(),
             });
         }
+        let implicit_blank =
+            allow_implicit_blank && prior_initialized.iter().all(|initialized| !initialized);
+        let archived = implicit_blank.then(|| {
+            crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand::from_regions(
+                plan.layout().tile_size(),
+                plan.regions()
+                    .iter()
+                    .map(|region| crate::gpu_document_mirror::GpuMirrorPatchRegion {
+                        key: region.key,
+                        local_bounds: region.local_bounds,
+                        initialized: false,
+                        pixels: std::sync::Arc::from([]),
+                    })
+                    .collect(),
+            )
+            .expect("a material capture contains validated regions of one drawing layer")
+        });
         let resident_states = plan
             .regions()
             .iter()
@@ -83,18 +118,50 @@ impl GpuDocumentMemento {
                 memento_initialized,
             })
             .collect();
-        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GPU Document Exact Undo Memento"),
-            size: plan.byte_len(),
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let buffer = (!implicit_blank).then(|| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("GPU Document Exact Undo Memento"),
+                size: plan.byte_len(),
+                usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
         });
         Ok(Self {
             plan,
-            buffer: Some(buffer),
-            archived: None,
+            buffer,
+            archived,
             resident_states,
+            allow_implicit_blank,
         })
+    }
+
+    /// After submission, a swap back to an uninitialized before-state needs
+    /// only metadata again. Dropping the handle preserves queued GPU use.
+    pub(crate) fn release_blank_pixels(&mut self) {
+        if !self.allow_implicit_blank
+            || self
+                .resident_states
+                .iter()
+                .any(|state| state.memento_initialized)
+            || self.buffer.is_none()
+        {
+            return;
+        }
+        let command = crate::gpu_raster_recovery::GpuExactRasterRecoveryCommand::from_regions(
+            self.plan.layout().tile_size(),
+            self.plan
+                .regions()
+                .iter()
+                .map(|region| crate::gpu_document_mirror::GpuMirrorPatchRegion {
+                    key: region.key,
+                    local_bounds: region.local_bounds,
+                    initialized: false,
+                    pixels: std::sync::Arc::from([]),
+                })
+                .collect(),
+        )
+        .expect("a material capture contains validated regions of one drawing layer");
+        self.archive(command);
     }
 
     pub(crate) fn archive(
@@ -120,12 +187,20 @@ impl GpuDocumentMemento {
         let Some(command) = &self.archived else {
             return Ok(());
         };
+        // Newly created unmapped WebGPU buffers are zero-initialized. An
+        // implicit blank needs no full-size mapped staging allocation.
+        let implicit_blank = command.is_uninitialized();
         let buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Restored exact undo memento"),
             size: self.byte_len(),
             usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: true,
+            mapped_at_creation: !implicit_blank,
         });
+        if implicit_blank {
+            self.buffer = Some(buffer);
+            self.archived = None;
+            return Ok(());
+        }
         {
             let mut mapped = buffer
                 .slice(..)
