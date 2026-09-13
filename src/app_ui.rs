@@ -1,4 +1,4 @@
-use super::canvas_interaction::{BrushAxis, BrushDrag};
+use super::canvas_interaction::BrushAxis;
 use super::file_browser::{BrowserOutcome, FileBrowser, FilePurpose, UnsavedChoice};
 use super::keybindings::{
     KeyBindings, KeyChord, KeyCommand, ALL_KEY_COMMANDS, BINDINGS_PER_COMMAND,
@@ -21,17 +21,16 @@ use winit::{
     window::Window,
 };
 
-const TOOLBAR_POSITION: Pos2 = Pos2::new(16.0, 16.0);
+const TOOLBAR_POSITION: Pos2 = Pos2::new(8.0, 8.0);
 const FILE_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
-const BRUSH_PANEL_POSITION: Pos2 = Pos2::new(108.0, 96.0);
-const COLOR_PANEL_POSITION: Pos2 = Pos2::new(108.0, 96.0);
+const BRUSH_PANEL_POSITION: Pos2 = Pos2::new(88.0, 144.0);
+const COLOR_PANEL_POSITION: Pos2 = Pos2::new(88.0, 144.0);
 const KEYBINDING_PANEL_POSITION: Pos2 = Pos2::new(16.0, 82.0);
 const CONTROL_HEIGHT: f32 = 44.0;
 const TOOL_BUTTON_WIDTH: f32 = 44.0;
-const SLIDER_WIDTH: f32 = 212.0;
 const COLOR_BUTTON_SIZE: f32 = 44.0;
 const COLOR_PRESET_COUNT: usize = 6;
-const COLOR_PICKER_WIDTH: f32 = 244.0;
+const COLOR_PICKER_WIDTH: f32 = 279.0;
 const COLOR_PLANE_HEIGHT: f32 = 168.0;
 const HUE_SLIDER_HEIGHT: f32 = 44.0;
 const COLOR_MESH_STEPS: usize = 16;
@@ -40,14 +39,14 @@ const KEYBINDING_LABEL_WIDTH: f32 = 214.0;
 const KEYBINDING_BUTTON_WIDTH: f32 = 134.0;
 const LAYER_PANEL_WIDTH: f32 = 292.0;
 const LAYER_NAME_WIDTH: f32 = 170.0;
-const TOOLBAR_RADIUS: u8 = 14;
-const CONTROL_RADIUS: u8 = 9;
+const TOOLBAR_RADIUS: u8 = 7;
+const CONTROL_RADIUS: u8 = 5;
 
-const PANEL: Color32 = Color32::from_rgb(252, 251, 248);
-const CONTROL: Color32 = Color32::from_rgb(245, 243, 238);
-const CONTROL_HOVER: Color32 = Color32::from_rgb(234, 231, 223);
-const CONTROL_ACTIVE: Color32 = Color32::from_rgb(55, 102, 90);
-const BORDER: Color32 = Color32::from_rgb(221, 219, 212);
+const PANEL: Color32 = Color32::from_rgb(250, 250, 251);
+const CONTROL: Color32 = Color32::from_rgb(238, 240, 243);
+const CONTROL_HOVER: Color32 = Color32::from_rgb(225, 229, 234);
+const CONTROL_ACTIVE: Color32 = Color32::from_rgb(43, 84, 108);
+const BORDER: Color32 = Color32::from_rgb(210, 215, 221);
 const TEXT: Color32 = Color32::from_rgb(46, 50, 47);
 const TEXT_MUTED: Color32 = Color32::from_rgb(112, 116, 108);
 
@@ -396,6 +395,8 @@ impl Default for ColorPickerState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct UiSessionState {
+    touch_controls: bool,
+    brush_query: String,
     shader_brushes: Vec<(String, String, String)>,
     selected_shader: Option<String>,
     shader_errors: String,
@@ -404,9 +405,7 @@ struct UiSessionState {
     file_browser: Option<FileBrowser>,
     unsaved_prompt: bool,
     notification: Option<(String, bool)>,
-    controls_open: bool,
     editing_bindings: bool,
-    puck_drag: Option<BrushDrag>,
     file_panel_open: bool,
     brush_panel_open: bool,
     color_panel_open: bool,
@@ -537,7 +536,6 @@ impl UiOverlay {
             UiPanel::Color => {
                 self.session.color_panel_open = !self.session.color_panel_open;
                 self.session.brush_panel_open = false;
-                self.session.controls_open = false;
                 self.session.file_panel_open = false;
                 self.session.keybinding_panel_open = false;
             }
@@ -548,7 +546,6 @@ impl UiOverlay {
                 self.session.file_panel_open = false;
                 self.session.color_panel_open = false;
                 self.session.brush_panel_open = false;
-                self.session.controls_open = false;
             }
         }
         self.session.key_capture = None;
@@ -559,7 +556,6 @@ impl UiOverlay {
         self.session.file_panel_open = false;
         self.session.color_panel_open = false;
         self.session.brush_panel_open = false;
-        self.session.controls_open = false;
         self.session.keybinding_panel_open = false;
         self.session.layers_panel_open = false;
         self.session.key_capture = None;
@@ -1045,7 +1041,6 @@ impl UiOverlay {
     pub fn cancel_pointer_capture(&mut self) {
         self.mouse_capture = false;
         self.touch_capture = None;
-        self.session.puck_drag = None;
         if self.tablet_capture.device_id.is_some() {
             if let Some(pos) = self.tablet_position {
                 self.platform
@@ -1160,6 +1155,8 @@ fn show_toolbar(
     actions: &mut Vec<UiAction>,
     session: &mut UiSessionState,
 ) -> UiHitRegions {
+    let height = if session.touch_controls { 44.0 } else { 36.0 };
+    let narrow = root.ctx().content_rect().width() < 900.0;
     let area = egui::Area::new(Id::new("sketchpad-tool-strip"))
         .fixed_pos(TOOLBAR_POSITION)
         .order(Order::Foreground)
@@ -1167,72 +1164,127 @@ fn show_toolbar(
         .fade_in(false)
         .show(root.ctx(), |ui| {
             panel_frame().show(ui, |ui| {
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.spacing_mut().item_spacing = Vec2::splat(4.0);
                 ui.horizontal(|ui| {
-                    let full_name = if session.document_label.is_empty() {
+                    let name = if session.document_label.is_empty() {
                         "Untitled"
                     } else {
                         &session.document_label
                     };
-                    let name: String = full_name.chars().take(24).collect();
-                    let label = if full_name.chars().count() > 24 {
-                        format!("{name}…")
-                    } else {
-                        name
-                    };
-                    if text_button(ui, &label, session.file_panel_open)
-                        .on_hover_text(format!("{full_name} · File menu"))
-                        .clicked()
+                    let title = format!(
+                        "File · {}",
+                        shortened_label(name, if narrow { 8 } else { 14 })
+                    );
+                    if work_button(
+                        ui,
+                        &title,
+                        if narrow { 108.0 } else { 150.0 },
+                        height,
+                        session.file_panel_open,
+                        &format!("{name} · Open, save, import and export"),
+                    )
+                    .clicked()
                     {
                         session.file_panel_open = !session.file_panel_open;
+                        session.keybinding_panel_open = false;
                         session.brush_panel_open = false;
                         session.color_panel_open = false;
-                        session.keybinding_panel_open = false;
-                        session.key_capture = None;
                     }
-                    separator(ui);
+                    if work_button(ui, "Save", 44.0, height, false, "Save document").clicked() {
+                        actions.push(UiAction::SaveDocument);
+                    }
                     ui.add_enabled_ui(snapshot.undo_available, |ui| {
-                        if history_button(ui, false).clicked() {
+                        if work_button(ui, "↶", height, height, false, "Undo").clicked() {
                             actions.push(UiAction::Undo);
                         }
                     });
                     ui.add_enabled_ui(snapshot.redo_available, |ui| {
-                        if history_button(ui, true).clicked() {
+                        if work_button(ui, "↷", height, height, false, "Redo").clicked() {
                             actions.push(UiAction::Redo);
                         }
                     });
-                    separator(ui);
-                    if text_button(ui, "Layers", session.layers_panel_open).clicked() {
+                    let layer_name = layers
+                        .iter()
+                        .find(|l| l.id == snapshot.active_layer)
+                        .map_or("Layer", |l| l.name);
+                    let layer_label = format!(
+                        "Layers · {}",
+                        shortened_label(layer_name, if narrow { 5 } else { 14 })
+                    );
+                    if work_button(
+                        ui,
+                        &layer_label,
+                        if narrow { 108.0 } else { 164.0 },
+                        height,
+                        session.layers_panel_open,
+                        &format!("{layer_name} · Open layer stack"),
+                    )
+                    .clicked()
+                    {
                         session.layers_panel_open = !session.layers_panel_open;
                     }
-                    if icon_button(
+                    if work_button(
+                        ui,
+                        if session.touch_controls {
+                            "Compact"
+                        } else {
+                            "Touch"
+                        },
+                        64.0,
+                        height,
+                        false,
+                        "Choose compact controls or larger touch targets",
+                    )
+                    .clicked()
+                    {
+                        session.touch_controls = !session.touch_controls;
+                    }
+                    if work_button(
+                        ui,
+                        "⇄",
+                        height,
+                        height,
+                        false,
+                        "Move palette to the other side",
+                    )
+                    .clicked()
+                    {
+                        session.dock_right = !session.dock_right;
+                    }
+                    if work_button(
                         ui,
                         "?",
-                        "Help and keyboard shortcuts",
+                        height,
+                        height,
                         session.keybinding_panel_open,
+                        "Help and keyboard shortcuts",
                     )
                     .clicked()
                     {
                         session.keybinding_panel_open = !session.keybinding_panel_open;
-                        session.editing_bindings = false;
-                        session.controls_open = false;
                         session.file_panel_open = false;
                         session.brush_panel_open = false;
                         session.color_panel_open = false;
+                        session.editing_bindings = false;
                     }
-                    if icon_button(ui, "◱", "Focus canvas", false).clicked() {
+                    if work_button(
+                        ui,
+                        "Focus",
+                        48.0,
+                        height,
+                        false,
+                        "Hide controls · restore with Show tools",
+                    )
+                    .clicked()
+                    {
                         actions.push(UiAction::SetVisible(false));
                     }
                 });
             });
         });
     let brush_dock = show_brush_dock(root, snapshot, actions, session);
-    let navigation = show_navigation(root, snapshot, actions);
-    let settings_panel = if session.controls_open {
-        show_brush_controls(root, snapshot, actions, session)
-    } else {
-        Rect::NOTHING
-    };
+    let navigation = show_navigation(root, snapshot, actions, height);
+    let settings_panel = show_brush_context(root, snapshot, actions, session);
     let file_panel = if session.file_panel_open {
         show_file_panel(root, actions, &mut session.file_panel_open)
     } else {
@@ -1248,6 +1300,7 @@ fn show_toolbar(
             &session.shader_brushes,
             session.selected_shader.as_deref(),
             &session.shader_errors,
+            &mut session.brush_query,
         )
     } else {
         Rect::NOTHING
@@ -1301,10 +1354,10 @@ pub(super) fn panel_frame() -> egui::Frame {
         .fill(PANEL)
         .stroke(Stroke::new(1.0, BORDER))
         .corner_radius(TOOLBAR_RADIUS)
-        .inner_margin(12.0)
+        .inner_margin(6.0)
         .shadow(egui::Shadow {
             offset: [0, 3],
-            blur: 14,
+            blur: 6,
             spread: 0,
             color: Color32::from_black_alpha(18),
         })
@@ -1326,34 +1379,132 @@ fn show_restore_button(root: &mut egui::Ui, actions: &mut Vec<UiAction>) -> Rect
         .rect
 }
 
-fn show_navigation(root: &mut egui::Ui, snapshot: UiSnapshot, actions: &mut Vec<UiAction>) -> Rect {
+fn shortened_label(label: &str, limit: usize) -> String {
+    if label.chars().count() <= limit {
+        return label.to_owned();
+    }
+    let dirty = label.ends_with('•');
+    let mut short: String = label
+        .chars()
+        .take(limit.saturating_sub(if dirty { 2 } else { 1 }))
+        .collect();
+    short.push('…');
+    if dirty {
+        short.push('•');
+    }
+    short
+}
+
+fn work_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    width: f32,
+    height: f32,
+    selected: bool,
+    help: &str,
+) -> egui::Response {
+    custom_button(
+        ui,
+        Vec2::new(width, height),
+        selected,
+        help,
+        |ui, rect, color| {
+            let center = rect.center();
+            let stroke = Stroke::new(1.6, color);
+            match label {
+                "↶" | "↷" => {
+                    let direction = if label == "↷" { 1.0 } else { -1.0 };
+                    let tip = center + Vec2::new(7.0 * direction, -4.0);
+                    ui.painter().add(egui::Shape::line(
+                        vec![
+                            center + Vec2::new(-4.0 * direction, 7.0),
+                            center + Vec2::new(-7.0 * direction, 2.0),
+                            center + Vec2::new(-5.0 * direction, -4.0),
+                            tip,
+                        ],
+                        stroke,
+                    ));
+                    ui.painter().add(egui::Shape::line(
+                        vec![
+                            tip + Vec2::new(-4.0 * direction, -4.0),
+                            tip,
+                            tip + Vec2::new(-4.0 * direction, 4.0),
+                        ],
+                        stroke,
+                    ));
+                }
+                "⇄" => {
+                    for direction in [-1.0, 1.0] {
+                        let start = center + Vec2::new(-7.0 * direction, -4.0 * direction);
+                        let end = start + Vec2::new(14.0 * direction, 0.0);
+                        ui.painter().line_segment([start, end], stroke);
+                        ui.painter().add(egui::Shape::line(
+                            vec![
+                                end + Vec2::new(-3.0 * direction, -3.0),
+                                end,
+                                end + Vec2::new(-3.0 * direction, 3.0),
+                            ],
+                            stroke,
+                        ));
+                    }
+                }
+                _ => {
+                    let text = label.trim_end_matches(" ▾");
+                    let offset = if text != label {
+                        Vec2::new(-6.0, 0.0)
+                    } else {
+                        Vec2::ZERO
+                    };
+                    ui.painter().text(
+                        center + offset,
+                        Align2::CENTER_CENTER,
+                        text,
+                        FontId::proportional(12.0),
+                        color,
+                    );
+                    if text != label {
+                        let tip = rect.right_center() - Vec2::new(12.0, -2.0);
+                        ui.painter().add(egui::Shape::line(
+                            vec![tip + Vec2::new(-3.0, -3.0), tip, tip + Vec2::new(3.0, -3.0)],
+                            stroke,
+                        ));
+                    }
+                }
+            }
+        },
+    )
+    .on_hover_text(help)
+}
+
+fn show_navigation(
+    root: &mut egui::Ui,
+    snapshot: UiSnapshot,
+    actions: &mut Vec<UiAction>,
+    height: f32,
+) -> Rect {
     egui::Area::new(Id::new("sketchpad-navigation"))
-        .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -16.0))
+        .anchor(Align2::CENTER_BOTTOM, Vec2::new(0.0, -8.0))
         .order(Order::Foreground)
         .fade_in(false)
         .show(root.ctx(), |ui| {
             panel_frame().show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    if text_button(ui, "Draw", snapshot.canvas_mode == CanvasMode::Draw).clicked() {
-                        actions.push(UiAction::SetCanvasMode(CanvasMode::Draw));
-                    }
-                    if text_button(ui, "Pan", snapshot.canvas_mode == CanvasMode::Pan)
-                        .on_hover_text("Drag the canvas with your pen")
-                        .clicked()
-                    {
-                        actions.push(UiAction::SetCanvasMode(CanvasMode::Pan));
-                    }
-                    separator(ui);
-                    if icon_button(ui, "−", "Zoom out", false).clicked() {
+                    if work_button(ui, "−", 44.0, height, false, "Zoom out").clicked() {
                         actions.push(UiAction::Zoom(0.8));
                     }
-                    if text_button(ui, &format!("{:.0}%", snapshot.zoom * 100.0), false)
-                        .on_hover_text("Fit canvas")
-                        .clicked()
+                    if work_button(
+                        ui,
+                        &format!("{:.0}% · Fit", snapshot.zoom * 100.0),
+                        88.0,
+                        height,
+                        false,
+                        "Fit canvas",
+                    )
+                    .clicked()
                     {
                         actions.push(UiAction::FitCanvas);
                     }
-                    if icon_button(ui, "+", "Zoom in", false).clicked() {
+                    if work_button(ui, "+", 44.0, height, false, "Zoom in").clicked() {
                         actions.push(UiAction::Zoom(1.25));
                     }
                 });
@@ -1369,146 +1520,240 @@ fn show_brush_dock(
     actions: &mut Vec<UiAction>,
     session: &mut UiSessionState,
 ) -> Rect {
+    let height = if session.touch_controls { 44.0 } else { 36.0 };
+    let wide = root.ctx().content_rect().width() >= 1200.0;
     egui::Area::new(Id::new("sketchpad-brush-rail"))
+        .default_size(Vec2::new(72.0, root.ctx().content_rect().height() - 80.0))
         .anchor(
             if session.dock_right {
                 Align2::RIGHT_TOP
             } else {
                 Align2::LEFT_TOP
             },
-            Vec2::new(if session.dock_right { -16.0 } else { 16.0 }, 96.0),
+            Vec2::new(
+                if session.dock_right { -8.0 } else { 8.0 },
+                if wide {
+                    height + 28.0
+                } else {
+                    height * 2.0 + 48.0
+                },
+            ),
         )
         .order(Order::Foreground)
         .fade_in(false)
         .show(root.ctx(), |ui| {
             panel_frame().show(ui, |ui| {
-                ui.set_width(64.0);
-                ui.spacing_mut().item_spacing = Vec2::new(0.0, 5.0);
-                for tool in [UiTool::Pen, UiTool::Eraser] {
-                    if tool_card(
-                        ui,
-                        tool,
-                        snapshot.tool == tool && snapshot.canvas_mode == CanvasMode::Draw,
-                    )
-                    .clicked()
-                    {
-                        actions.push(UiAction::SelectTool(tool));
-                    }
-                }
-                separator_horizontal(ui);
-                brush_puck(ui, snapshot, actions, session);
-                ui.vertical_centered(|ui| {
-                    if color_swatch(ui, snapshot.color, 1.0).clicked() {
-                        session.color_panel_open = !session.color_panel_open;
-                        session.controls_open = false;
-                        session.brush_panel_open = false;
-                        session.file_panel_open = false;
-                        session.keybinding_panel_open = false;
-                    }
-                    if text_button(ui, "Pick", snapshot.canvas_mode == CanvasMode::PickColor)
-                        .on_hover_text("Pick color from canvas")
-                        .clicked()
-                    {
-                        actions.push(UiAction::SetCanvasMode(
-                            if snapshot.canvas_mode == CanvasMode::PickColor {
-                                CanvasMode::Draw
+                ui.spacing_mut().item_spacing = Vec2::new(0.0, 3.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("favorite-brushes")
+                    .max_height(
+                        (ui.ctx().content_rect().height()
+                            - if wide {
+                                height + 28.0
                             } else {
-                                CanvasMode::PickColor
-                            },
-                        ));
-                    }
-                    if text_button(ui, "Tune", session.controls_open)
-                        .on_hover_text("Brush settings and presets")
+                                height * 2.0 + 48.0
+                            }
+                            - 22.0)
+                            .max(100.0),
+                    )
+                    .show(ui, |ui| {
+                        for tool in UiTool::ALL {
+                            ui.add_enabled_ui(
+                                snapshot.natural_brushes_available
+                                    || matches!(tool, UiTool::Pen | UiTool::Eraser),
+                                |ui| {
+                                    let selected = tool == snapshot.tool
+                                        && (session.selected_shader.is_none()
+                                            || tool == UiTool::Eraser)
+                                        && snapshot.canvas_mode == CanvasMode::Draw;
+                                    if work_button(
+                                        ui,
+                                        tool.short_label(),
+                                        58.0,
+                                        height,
+                                        selected,
+                                        tool.description(),
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(UiAction::SelectTool(tool));
+                                    }
+                                },
+                            );
+                        }
+                        if work_button(
+                            ui,
+                            "Brushes",
+                            58.0,
+                            height,
+                            session.brush_panel_open,
+                            "All brushes, including shader packages",
+                        )
                         .clicked()
-                    {
-                        session.controls_open = !session.controls_open;
-                        session.brush_panel_open = false;
-                        session.color_panel_open = false;
-                        session.file_panel_open = false;
-                        session.keybinding_panel_open = false;
-                    }
-                    if icon_button(ui, "⇄", "Move tools to the other side", false).clicked() {
-                        session.dock_right = !session.dock_right;
-                        session.controls_open = false;
-                        session.layers_panel_open = false;
-                    }
-                });
+                        {
+                            session.brush_panel_open = !session.brush_panel_open;
+                            session.file_panel_open = false;
+                            session.keybinding_panel_open = false;
+                            session.color_panel_open = false;
+                        }
+                        ui.add_space(5.0);
+                        if work_button(
+                            ui,
+                            "Pick",
+                            58.0,
+                            height,
+                            snapshot.canvas_mode == CanvasMode::PickColor,
+                            "Pick a canvas color · Alt + contact",
+                        )
+                        .clicked()
+                        {
+                            actions.push(UiAction::SetCanvasMode(
+                                if snapshot.canvas_mode == CanvasMode::PickColor {
+                                    CanvasMode::Draw
+                                } else {
+                                    CanvasMode::PickColor
+                                },
+                            ));
+                        }
+                        if work_button(
+                            ui,
+                            "Pan",
+                            58.0,
+                            height,
+                            snapshot.canvas_mode == CanvasMode::Pan,
+                            "Move the canvas · Space + drag",
+                        )
+                        .clicked()
+                        {
+                            actions.push(UiAction::SetCanvasMode(
+                                if snapshot.canvas_mode == CanvasMode::Pan {
+                                    CanvasMode::Draw
+                                } else {
+                                    CanvasMode::Pan
+                                },
+                            ));
+                        }
+                    });
             });
         })
         .response
         .rect
 }
 
-fn brush_puck(
-    ui: &mut egui::Ui,
+fn show_brush_context(
+    root: &mut egui::Ui,
     snapshot: UiSnapshot,
     actions: &mut Vec<UiAction>,
     session: &mut UiSessionState,
-) {
-    let (rect, response) = ui.allocate_exact_size(Vec2::new(64.0, 96.0), Sense::click_and_drag());
-    let center = rect.center_top() + Vec2::new(0.0, 28.0);
-    ui.painter().circle_filled(center, 27.0, CONTROL);
-    ui.painter()
-        .circle_stroke(center, 27.0, Stroke::new(1.0, BORDER));
-    let rgb = snapshot.color.map(linear_to_srgb_u8);
-    ui.painter().circle_filled(
-        center,
-        (snapshot.brush_diameter.sqrt() * 2.0).clamp(3.0, 20.0),
-        Color32::from_rgb(rgb[0], rgb[1], rgb[2]).gamma_multiply(snapshot.brush_opacity),
-    );
-    ui.painter().text(
-        rect.center_top() + Vec2::new(0.0, 67.0),
-        Align2::CENTER_CENTER,
-        format!("{:.1} px", snapshot.brush_diameter),
-        FontId::proportional(12.0),
-        TEXT,
-    );
-    ui.painter().text(
-        rect.center_top() + Vec2::new(0.0, 85.0),
-        Align2::CENTER_CENTER,
-        format!("{:.0}%", snapshot.brush_opacity * 100.0),
-        FontId::proportional(12.0),
-        TEXT_MUTED,
-    );
-    if response.is_pointer_button_down_on() && session.puck_drag.is_none() {
-        if let Some(position) = response.interact_pointer_pos() {
-            session.puck_drag = Some(BrushDrag::new(
-                [position.x, position.y],
-                snapshot.brush_diameter,
-                snapshot.brush_opacity,
-                None,
-            ));
-        }
-    }
-    if response.dragged() {
-        if let (Some(drag), Some(position)) =
-            (&mut session.puck_drag, response.interact_pointer_pos())
-        {
-            match drag.update([position.x, position.y]) {
-                Some((BrushAxis::Size, value)) => actions.push(UiAction::SetBrushDiameter(value)),
-                Some((BrushAxis::Opacity, value)) => actions.push(UiAction::SetBrushOpacity(value)),
-                None => {}
-            }
-        }
-    }
-    if response.clicked() {
-        session.controls_open = !session.controls_open;
-        session.color_panel_open = false;
-        session.brush_panel_open = false;
-        session.file_panel_open = false;
-        session.keybinding_panel_open = false;
-    }
-    if response.drag_stopped() || !ui.input(|input| input.pointer.primary_down()) {
-        session.puck_drag = None;
-    }
-    response.widget_info(|| {
-        WidgetInfo::labeled(
-            WidgetType::Slider,
-            ui.is_enabled(),
-            "Brush puck: drag horizontally for size, vertically for opacity; tap for settings",
+) -> Rect {
+    let height = if session.touch_controls { 44.0 } else { 36.0 };
+    let wide = root.ctx().content_rect().width() >= 1200.0;
+    let right = wide || session.dock_right;
+    egui::Area::new(Id::new("sketchpad-brush-context"))
+        .anchor(
+            if right {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::LEFT_TOP
+            },
+            Vec2::new(
+                if right { -8.0 } else { 8.0 },
+                if wide { 8.0 } else { height + 28.0 },
+            ),
         )
-    });
-    response.on_hover_text("Drag left/right: size\nDrag up/down: opacity\nTap: brush settings");
+        .order(Order::Foreground)
+        .fade_in(false)
+        .show(root.ctx(), |ui| {
+            panel_frame().show(ui, |ui| {
+                ui.spacing_mut().item_spacing = Vec2::splat(6.0);
+                ui.horizontal(|ui| {
+                    let label = if snapshot.tool == UiTool::Eraser {
+                        "Eraser"
+                    } else {
+                        session
+                            .selected_shader
+                            .as_ref()
+                            .and_then(|id| session.shader_brushes.iter().find(|b| &b.0 == id))
+                            .map_or(snapshot.tool.menu_label(), |b| b.1.as_str())
+                    };
+                    let label = format!("{} ▾", label.chars().take(19).collect::<String>());
+                    if work_button(
+                        ui,
+                        &label,
+                        154.0,
+                        height,
+                        session.brush_panel_open,
+                        "Choose a brush",
+                    )
+                    .clicked()
+                    {
+                        session.brush_panel_open = !session.brush_panel_open;
+                        session.file_panel_open = false;
+                        session.keybinding_panel_open = false;
+                        session.color_panel_open = false;
+                    }
+                    let color_label = format!("Color {}", linear_rgb_hex(snapshot.color));
+                    if custom_button(
+                        ui,
+                        Vec2::new(56.0, height),
+                        session.color_panel_open,
+                        &color_label,
+                        |ui, rect, text| {
+                            let rgb = snapshot.color.map(linear_to_srgb_u8);
+                            ui.painter().circle_filled(
+                                rect.center_top() + Vec2::new(0.0, 12.0),
+                                7.0,
+                                Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                            );
+                            ui.painter().circle_stroke(
+                                rect.center_top() + Vec2::new(0.0, 12.0),
+                                7.0,
+                                Stroke::new(1.0, Color32::WHITE),
+                            );
+                            ui.painter().text(
+                                rect.center_bottom() - Vec2::new(0.0, 8.0),
+                                Align2::CENTER_CENTER,
+                                "Color",
+                                FontId::proportional(10.0),
+                                text,
+                            );
+                        },
+                    )
+                    .on_hover_text(color_label)
+                    .clicked()
+                    {
+                        session.color_panel_open = !session.color_panel_open;
+                        session.file_panel_open = false;
+                        session.keybinding_panel_open = false;
+                        session.brush_panel_open = false;
+                    }
+                    let label = format!("Size  {:.1} px", snapshot.brush_diameter);
+                    if let Some(unit) = unit_slider(
+                        ui,
+                        diameter_to_unit(snapshot.brush_diameter),
+                        snapshot.brush_diameter,
+                        &label,
+                        1.0 / 64.0,
+                        Vec2::new(116.0, height),
+                    ) {
+                        actions.push(UiAction::SetBrushDiameter(unit_to_diameter(unit)));
+                    }
+                    let label = format!("Opacity  {:.0}%", snapshot.brush_opacity * 100.0);
+                    if let Some(value) = unit_slider(
+                        ui,
+                        snapshot.brush_opacity,
+                        snapshot.brush_opacity,
+                        &label,
+                        0.05,
+                        Vec2::new(116.0, height),
+                    ) {
+                        actions.push(UiAction::SetBrushOpacity(value));
+                    }
+                });
+            });
+        })
+        .response
+        .rect
 }
 
 fn show_help_content(
@@ -1527,7 +1772,7 @@ fn show_help_content(
     });
     egui::ScrollArea::vertical().id_salt("input-help").max_height((ui.ctx().content_rect().height() - 220.0).max(180.0)).show(ui, |ui| {
         ui.label(egui::RichText::new("With a pen · no keyboard needed").strong().color(CONTROL_ACTIVE));
-        for text in ["Choose a preset in the brush library, or tap Eraser. Pick samples a color, then returns to drawing.", "Drag the round puck sideways for size, or vertically for opacity. Tune opens sliders and presets.", "Pan lets you drag the canvas. Use − / + to zoom; tap the percentage to fit.", "Undo, redo, color and layers are always a tap away. Focus hides tools; Show tools brings them back.", "On a touchscreen: two fingers pan/pinch, two-finger tap undoes, three-finger tap redoes. One finger on the canvas does not paint."] {
+        for text in ["Choose a preset in the brush library, or tap Eraser. Pick samples a color, then returns to drawing.", "Size and opacity are always visible above the canvas. Drag either slider to adjust; tap the current brush or Brushes for the library.", "Pan in the palette lets you drag the canvas. Use − / + to zoom; tap Fit to see the whole canvas.", "Undo, redo, color and layers are always a tap away. Focus hides tools; Show tools brings them back.", "On a touchscreen: two fingers pan/pinch, two-finger tap undoes, three-finger tap redoes. One finger on the canvas does not paint."] {
             ui.add_space(8.0); ui.label(text);
         }
         ui.add_space(14.0);
@@ -1546,258 +1791,6 @@ fn show_help_content(
         ui.add_space(12.0);
         if menu_button(ui, "Edit keyboard shortcuts", "Change or restore shortcuts").clicked() { session.editing_bindings = true; }
     });
-}
-
-fn show_brush_controls(
-    root: &mut egui::Ui,
-    snapshot: UiSnapshot,
-    actions: &mut Vec<UiAction>,
-    session: &mut UiSessionState,
-) -> Rect {
-    let anchor = if session.dock_right {
-        Align2::RIGHT_TOP
-    } else {
-        Align2::LEFT_TOP
-    };
-    let offset = Vec2::new(if session.dock_right { -108.0 } else { 108.0 }, 96.0);
-    egui::Area::new(Id::new("sketchpad-brush-controls"))
-        .anchor(anchor, offset)
-        .order(Order::Foreground)
-        .fade_in(false)
-        .show(root.ctx(), |ui| {
-            panel_frame().show(ui, |ui| {
-                ui.set_width(212.0);
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 4.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("brush-dock-scroll")
-                    .max_height(
-                        (root.ctx().content_rect().height()
-                            - if root.ctx().content_rect().width() < 960.0 {
-                                212.0
-                            } else {
-                                132.0
-                            })
-                        .max(160.0),
-                    )
-                    .show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Brush settings")
-                                    .size(15.0)
-                                    .strong()
-                                    .color(TEXT),
-                            );
-                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                if icon_button(ui, "×", "Close brush settings", false).clicked() {
-                                    session.controls_open = false;
-                                }
-                            });
-                        });
-                        if let Some(id) = &session.selected_shader {
-                            if let Some((_, name, _)) =
-                                session.shader_brushes.iter().find(|(key, _, _)| key == id)
-                            {
-                                if snapshot.tool != UiTool::Eraser {
-                                    ui.label(name);
-                                }
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            for tool in [UiTool::Pen, UiTool::Eraser] {
-                                if tool_card(
-                                    ui,
-                                    tool,
-                                    snapshot.tool == tool
-                                        && snapshot.canvas_mode == CanvasMode::Draw,
-                                )
-                                .clicked()
-                                {
-                                    actions.push(UiAction::SelectTool(tool));
-                                }
-                            }
-                            if custom_button(
-                                ui,
-                                Vec2::new(64.0, 66.0),
-                                session.brush_panel_open,
-                                "More brushes",
-                                |ui, rect, color| {
-                                    ui.painter().text(
-                                        rect.center() - Vec2::new(0.0, 9.0),
-                                        Align2::CENTER_CENTER,
-                                        "•••",
-                                        FontId::proportional(19.0),
-                                        color,
-                                    );
-                                    ui.painter().text(
-                                        rect.center() + Vec2::new(0.0, 19.0),
-                                        Align2::CENTER_CENTER,
-                                        "More",
-                                        FontId::proportional(12.0),
-                                        color,
-                                    );
-                                },
-                            )
-                            .clicked()
-                            {
-                                session.brush_panel_open = !session.brush_panel_open;
-                                session.color_panel_open = false;
-                                session.file_panel_open = false;
-                                session.keybinding_panel_open = false;
-                            }
-                        });
-                        ui.add_space(2.0);
-                        ui.label(
-                            egui::RichText::new(snapshot.tool.menu_label())
-                                .size(13.0)
-                                .color(TEXT_MUTED),
-                        );
-                        brush_preview(ui, snapshot);
-                        control_label(ui, "Size", &format!("{:.1} px", snapshot.brush_diameter));
-                        if let Some(value) = diameter_slider(ui, snapshot.brush_diameter) {
-                            actions.push(UiAction::SetBrushDiameter(value));
-                        }
-                        ui.horizontal(|ui| {
-                            for value in [2.0, 8.0, 24.0, 64.0] {
-                                if text_button(
-                                    ui,
-                                    &format!("{value:.0}"),
-                                    (snapshot.brush_diameter - value).abs() < 0.1,
-                                )
-                                .clicked()
-                                {
-                                    actions.push(UiAction::SetBrushDiameter(value));
-                                }
-                            }
-                        });
-                        control_label(
-                            ui,
-                            "Opacity",
-                            &format!("{:.0}%", snapshot.brush_opacity * 100.0),
-                        );
-                        if let Some(value) = opacity_slider(ui, snapshot.brush_opacity) {
-                            actions.push(UiAction::SetBrushOpacity(value));
-                        }
-                        separator_horizontal(ui);
-                        ui.horizontal(|ui| {
-                            if color_swatch(ui, snapshot.color, snapshot.brush_opacity).clicked() {
-                                session.color_panel_open = !session.color_panel_open;
-                                session.brush_panel_open = false;
-                                session.file_panel_open = false;
-                                session.keybinding_panel_open = false;
-                            }
-                            if text_button(ui, "Color", session.color_panel_open).clicked() {
-                                session.color_panel_open = !session.color_panel_open;
-                                session.brush_panel_open = false;
-                                session.file_panel_open = false;
-                                session.keybinding_panel_open = false;
-                            }
-                            if text_button(
-                                ui,
-                                "Pick",
-                                snapshot.canvas_mode == CanvasMode::PickColor,
-                            )
-                            .on_hover_text(
-                                "Pick a color from the canvas; lift to return to drawing",
-                            )
-                            .clicked()
-                            {
-                                actions.push(UiAction::SetCanvasMode(
-                                    if snapshot.canvas_mode == CanvasMode::PickColor {
-                                        CanvasMode::Draw
-                                    } else {
-                                        CanvasMode::PickColor
-                                    },
-                                ));
-                            }
-                        });
-                        ui.horizontal(|ui| {
-                            for color in snapshot.color_presets.iter().take(4) {
-                                if color_button(ui, *color, *color == snapshot.color).clicked() {
-                                    actions.push(UiAction::CommitColor(*color));
-                                }
-                            }
-                        });
-                    });
-            });
-        })
-        .response
-        .rect
-}
-
-fn control_label(ui: &mut egui::Ui, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(label).size(13.0).color(TEXT_MUTED));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(egui::RichText::new(value).size(13.0).color(TEXT));
-        });
-    });
-}
-
-fn tool_card(ui: &mut egui::Ui, tool: UiTool, selected: bool) -> egui::Response {
-    custom_button(
-        ui,
-        Vec2::new(64.0, 66.0),
-        selected,
-        tool.menu_label(),
-        |ui, rect, color| {
-            let c = rect.center() - Vec2::new(0.0, 9.0);
-            let points = if tool == UiTool::Eraser {
-                vec![
-                    c + Vec2::new(-11.0, 2.0),
-                    c + Vec2::new(1.0, -10.0),
-                    c + Vec2::new(11.0, 0.0),
-                    c + Vec2::new(0.0, 11.0),
-                    c + Vec2::new(-4.0, 11.0),
-                ]
-            } else {
-                vec![
-                    c + Vec2::new(-10.0, 11.0),
-                    c + Vec2::new(-6.0, 0.0),
-                    c + Vec2::new(6.0, -12.0),
-                    c + Vec2::new(12.0, -6.0),
-                    c + Vec2::new(0.0, 6.0),
-                ]
-            };
-            ui.painter()
-                .add(egui::Shape::closed_line(points, Stroke::new(1.7, color)));
-            ui.painter().text(
-                rect.center() + Vec2::new(0.0, 19.0),
-                Align2::CENTER_CENTER,
-                tool.short_label(),
-                FontId::proportional(12.0),
-                color,
-            );
-        },
-    )
-}
-
-fn brush_preview(ui: &mut egui::Ui, snapshot: UiSnapshot) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(212.0, 52.0), Sense::hover());
-    ui.painter().rect_filled(rect, 8, CONTROL);
-    let rgb = snapshot.color.map(linear_to_srgb_u8);
-    let color = if snapshot.tool == UiTool::Eraser {
-        TEXT_MUTED
-    } else {
-        Color32::from_rgb(rgb[0], rgb[1], rgb[2])
-    };
-    let color = color.gamma_multiply(snapshot.brush_opacity);
-    let width = snapshot.brush_diameter.clamp(1.0, 22.0);
-    for i in 0..48 {
-        let point = |t: f32| {
-            Pos2::new(
-                rect.left() + 16.0 + t * 180.0,
-                rect.center().y + (t * std::f32::consts::TAU).sin() * 9.0,
-            )
-        };
-        let t = i as f32 / 48.0;
-        ui.painter().line_segment(
-            [point(t), point((i + 1) as f32 / 48.0)],
-            Stroke::new(
-                width * (0.2 + (t * std::f32::consts::PI).sin() * 0.8),
-                color,
-            ),
-        );
-    }
 }
 
 fn show_keybinding_panel(
@@ -1920,6 +1913,10 @@ fn show_color_panel(
     dock_right: bool,
 ) -> Rect {
     let area = egui::Area::new(Id::new("sketchpad-color-panel"))
+        .default_size(Vec2::new(
+            COLOR_PICKER_WIDTH + 14.0,
+            root.ctx().content_rect().height() - COLOR_PANEL_POSITION.y - 16.0,
+        ))
         .anchor(
             if dock_right {
                 Align2::RIGHT_TOP
@@ -1941,51 +1938,66 @@ fn show_color_panel(
         .show(root.ctx(), |ui| {
             panel_frame().show(ui, |ui| {
                 ui.set_width(COLOR_PICKER_WIDTH);
-                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                ui.horizontal(|ui| {
-                    palette_label(ui, "Color");
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if icon_button(ui, "×", "Close color picker", false).clicked() {
-                            *color_panel_open = false;
-                        }
-                        ui.label(
-                            egui::RichText::new(linear_rgb_hex(picker.source_linear))
-                                .font(FontId::proportional(13.0))
-                                .color(TEXT),
+                egui::ScrollArea::vertical()
+                    .id_salt("color-editor-scroll")
+                    .max_height(
+                        (ui.ctx().content_rect().height() - COLOR_PANEL_POSITION.y - 32.0)
+                            .max(180.0),
+                    )
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = Vec2::new(3.0, 6.0);
+                        ui.horizontal(|ui| {
+                            palette_label(ui, "Color");
+                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                if icon_button(ui, "×", "Close color picker", false).clicked() {
+                                    *color_panel_open = false;
+                                }
+                                ui.label(
+                                    egui::RichText::new(linear_rgb_hex(picker.source_linear))
+                                        .font(FontId::proportional(13.0))
+                                        .color(TEXT),
+                                );
+                            });
+                        });
+                        let plane = saturation_value_picker(ui, *picker);
+                        apply_picker_interaction(
+                            plane,
+                            picker,
+                            actions,
+                            |picker, position, rect| {
+                                let saturation =
+                                    ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                                let value = (1.0 - (position.y - rect.top()) / rect.height())
+                                    .clamp(0.0, 1.0);
+                                picker.set_sv(saturation, value)
+                            },
                         );
-                    });
-                });
-                let plane = saturation_value_picker(ui, *picker);
-                apply_picker_interaction(plane, picker, actions, |picker, position, rect| {
-                    let saturation = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                    let value = (1.0 - (position.y - rect.top()) / rect.height()).clamp(0.0, 1.0);
-                    picker.set_sv(saturation, value)
-                });
-                let hue = hue_picker(ui, *picker);
-                apply_picker_interaction(hue, picker, actions, |picker, position, rect| {
-                    let hue = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
-                    picker.set_hue(hue)
-                });
-                separator_horizontal(ui);
-                palette_label(ui, "Palette");
-                ui.horizontal_wrapped(|ui| {
-                    for color in snapshot.color_presets {
-                        if color_button(ui, color, color == snapshot.color).clicked() {
-                            actions.push(UiAction::CommitColor(color));
-                        }
-                    }
-                });
-                if snapshot.recent_color_count > 0 {
-                    palette_label(ui, "Recent colors");
-                    ui.horizontal_wrapped(|ui| {
-                        let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
-                        for &color in &snapshot.recent_colors[..count] {
-                            if color_button(ui, color, color == snapshot.color).clicked() {
-                                actions.push(UiAction::CommitColor(color));
+                        let hue = hue_picker(ui, *picker);
+                        apply_picker_interaction(hue, picker, actions, |picker, position, rect| {
+                            let hue = ((position.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+                            picker.set_hue(hue)
+                        });
+                        separator_horizontal(ui);
+                        palette_label(ui, "Palette");
+                        ui.horizontal_wrapped(|ui| {
+                            for color in snapshot.color_presets {
+                                if color_button(ui, color, color == snapshot.color).clicked() {
+                                    actions.push(UiAction::CommitColor(color));
+                                }
                             }
+                        });
+                        if snapshot.recent_color_count > 0 {
+                            palette_label(ui, "Recent colors");
+                            ui.horizontal_wrapped(|ui| {
+                                let count = snapshot.recent_color_count.min(MAX_RECENT_COLORS);
+                                for &color in &snapshot.recent_colors[..count] {
+                                    if color_button(ui, color, color == snapshot.color).clicked() {
+                                        actions.push(UiAction::CommitColor(color));
+                                    }
+                                }
+                            });
                         }
                     });
-                }
             });
         });
     area.response.rect
@@ -2091,69 +2103,129 @@ fn show_brush_panel(
     shader_brushes: &[(String, String, String)],
     selected_shader: Option<&str>,
     shader_errors: &str,
+    query: &mut String,
 ) -> Rect {
-    let area = egui::Area::new(Id::new("sketchpad-brush-panel"))
-        .anchor(if dock_right { Align2::RIGHT_TOP } else { Align2::LEFT_TOP }, Vec2::new(if dock_right { -BRUSH_PANEL_POSITION.x } else { BRUSH_PANEL_POSITION.x }, BRUSH_PANEL_POSITION.y))
+    egui::Area::new(Id::new("sketchpad-brush-panel"))
+        .default_size(Vec2::new(
+            258.0,
+            root.ctx().content_rect().height() - BRUSH_PANEL_POSITION.y - 16.0,
+        ))
+        .anchor(
+            if dock_right {
+                Align2::RIGHT_TOP
+            } else {
+                Align2::LEFT_TOP
+            },
+            Vec2::new(
+                if dock_right {
+                    -BRUSH_PANEL_POSITION.x
+                } else {
+                    BRUSH_PANEL_POSITION.x
+                },
+                BRUSH_PANEL_POSITION.y,
+            ),
+        )
         .order(Order::Foreground)
         .movable(false)
         .fade_in(false)
         .show(root.ctx(), |ui| {
-            panel_frame()
-                .show(ui, |ui| {
-                    ui.set_width(220.0);
-                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height()-BRUSH_PANEL_POSITION.y-48.0).max(120.0)).id_salt("brush-library-scroll").show(ui, |ui| {
-                    ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
-                    ui.horizontal(|ui| {
-                        palette_label(ui, "Brush library");
-                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                            if icon_button(ui, "×", "Close brush presets", false).clicked() {
-                                *brush_panel_open = false;
-                            }
-                        });
+            panel_frame().show(ui, |ui| {
+                ui.set_width(244.0);
+                ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
+                ui.horizontal(|ui| {
+                    palette_label(ui, "Brush library");
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if icon_button(ui, "×", "Close brush library", false).clicked() {
+                            *brush_panel_open = false;
+                        }
                     });
-                    if !snapshot.natural_brushes_available {
-                        ui.label(egui::RichText::new("Hard round and eraser are available. Textured brushes need the GPU renderer.").size(12.0).color(TEXT_MUTED));
-                    }
-                    for tool in UiTool::ALL {
-                        let label = if tool == snapshot.tool && (selected_shader.is_none() || tool == UiTool::Eraser) {
-                            format!("{}  •", tool.menu_label())
-                        } else {
-                            tool.menu_label().to_owned()
-                        };
-                        let available = snapshot.natural_brushes_available || matches!(tool, UiTool::Pen | UiTool::Eraser);
-                        ui.add_enabled_ui(available, |ui| {
-                            if menu_button(ui, &label, tool.description()).clicked() {
-                                actions.push(UiAction::SelectTool(tool));
-                                *brush_panel_open = false;
+                });
+                ui.add_sized(
+                    [244.0, 36.0],
+                    egui::TextEdit::singleline(query)
+                        .hint_text("Find a brush…")
+                        .char_limit(64),
+                );
+                let filter = query.trim().to_lowercase();
+                let matches = |name: &str, description: &str| {
+                    filter.is_empty()
+                        || name.to_lowercase().contains(&filter)
+                        || description.to_lowercase().contains(&filter)
+                };
+                egui::ScrollArea::vertical()
+                    .max_height(
+                        (ui.ctx().content_rect().height() - BRUSH_PANEL_POSITION.y - 130.0)
+                            .max(100.0),
+                    )
+                    .id_salt("brush-library-scroll")
+                    .show(ui, |ui| {
+                        let mut count = 0;
+                        if !snapshot.natural_brushes_available {
+                            ui.label("Textured brushes need the GPU renderer.");
+                        }
+                        for tool in UiTool::ALL {
+                            if !matches(tool.menu_label(), tool.description()) {
+                                continue;
                             }
-                            ui.label(egui::RichText::new(tool.description()).size(11.0).color(TEXT_MUTED));
-                        });
-                    }
-                    egui::ScrollArea::vertical().max_height(180.0).id_salt("shader-brush-list").show(ui, |ui| {
-                        for (id,name,description) in shader_brushes {
-                            let selected = selected_shader == Some(id.as_str()) && snapshot.tool != UiTool::Eraser;
-                            let label = if selected { format!("{name}  •") } else { name.clone() };
+                            count += 1;
+                            let selected = tool == snapshot.tool
+                                && (selected_shader.is_none() || tool == UiTool::Eraser);
+                            ui.add_enabled_ui(
+                                snapshot.natural_brushes_available
+                                    || matches!(tool, UiTool::Pen | UiTool::Eraser),
+                                |ui| {
+                                    if work_button(
+                                        ui,
+                                        tool.menu_label(),
+                                        244.0,
+                                        44.0,
+                                        selected,
+                                        tool.description(),
+                                    )
+                                    .clicked()
+                                    {
+                                        actions.push(UiAction::SelectTool(tool));
+                                        *brush_panel_open = false;
+                                    }
+                                },
+                            );
+                        }
+                        for (id, name, description) in shader_brushes {
+                            if !matches(name, description) {
+                                continue;
+                            }
+                            count += 1;
+                            let selected = selected_shader == Some(id.as_str())
+                                && snapshot.tool != UiTool::Eraser;
                             ui.add_enabled_ui(snapshot.natural_brushes_available, |ui| {
-                                if menu_button(ui,&label,description).clicked() {
+                                if work_button(ui, name, 244.0, 44.0, selected, description)
+                                    .clicked()
+                                {
                                     actions.push(UiAction::SelectShaderBrush(id.clone()));
                                     *brush_panel_open = false;
                                 }
                             });
                         }
-                    });
-                    if !shader_errors.is_empty() {
-                        ui.collapsing("Brush reload needs attention", |ui| {
-                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                        if count == 0 {
+                            ui.label("No matching brushes. Try another name.");
+                        }
+                        if !shader_errors.is_empty() {
+                            ui.collapsing("Brush reload needs attention", |ui| {
                                 ui.label(shader_errors);
                                 ui.label("Keeping the last working brushes.");
                             });
-                        });
-                    }
-                    ui.hyperlink_to(egui::RichText::new("Paper grain: David Revoy · CC BY 4.0").size(10.0).color(TEXT_MUTED), "https://www.davidrevoy.com/article326/krita-brushes-charcoal-pencils");
+                        }
+                        ui.hyperlink_to(
+                            egui::RichText::new("Paper grain: David Revoy · CC BY 4.0")
+                                .size(10.0)
+                                .color(TEXT_MUTED),
+                            "https://www.davidrevoy.com/article326/krita-brushes-charcoal-pencils",
+                        );
                     });
-                });
-        });
-    area.response.rect
+            });
+        })
+        .response
+        .rect
 }
 
 fn paint_color_mesh(
@@ -2272,7 +2344,7 @@ fn show_layers_panel(
             } else {
                 Align2::RIGHT_TOP
             },
-            Vec2::new(if dock_right { 16.0 } else { -16.0 }, 96.0),
+            Vec2::new(if dock_right { 8.0 } else { -8.0 }, 140.0),
         )
         .order(Order::Foreground)
         .movable(false)
@@ -2367,7 +2439,10 @@ fn show_layers_panel(
                 separator_horizontal(ui);
                 egui::ScrollArea::vertical()
                     .id_salt("sketchpad-layer-list")
-                    .max_height(360.0)
+                    .max_height(
+                        (ui.ctx().content_rect().height() - ui.cursor().top() - 90.0)
+                            .clamp(60.0, 360.0),
+                    )
                     .auto_shrink([false, true])
                     .show(ui, |ui| {
                         for layer in layers.iter().rev() {
@@ -2470,38 +2545,6 @@ fn visibility_button(ui: &mut egui::Ui, visible: bool, description: &str) -> egu
                     Stroke::new(1.5, color),
                 );
             }
-        },
-    )
-    .on_hover_text(description)
-}
-
-fn history_button(ui: &mut egui::Ui, redo: bool) -> egui::Response {
-    let description = if redo { "Redo" } else { "Undo" };
-    custom_button(
-        ui,
-        Vec2::splat(CONTROL_HEIGHT),
-        false,
-        description,
-        |ui, rect, color| {
-            let center = rect.center();
-            let direction = if redo { 1.0 } else { -1.0 };
-            let tip = center + Vec2::new(9.0 * direction, -5.0);
-            let points = [
-                center + Vec2::new(-5.0 * direction, 9.0),
-                center + Vec2::new(-9.0 * direction, 3.0),
-                center + Vec2::new(-6.0 * direction, -5.0),
-                tip,
-            ];
-            ui.painter()
-                .add(egui::Shape::line(points.to_vec(), Stroke::new(1.8, color)));
-            ui.painter().add(egui::Shape::line(
-                vec![
-                    tip + Vec2::new(-5.0 * direction, -5.0),
-                    tip,
-                    tip + Vec2::new(-5.0 * direction, 5.0),
-                ],
-                Stroke::new(1.8, color),
-            ));
         },
     )
     .on_hover_text(description)
@@ -2728,7 +2771,7 @@ fn custom_button(
     } else if response.hovered() {
         CONTROL_HOVER
     } else {
-        CONTROL
+        Color32::TRANSPARENT
     };
     let text = if !ui.is_enabled() {
         TEXT_MUTED.gamma_multiply(0.45)
@@ -2755,43 +2798,36 @@ fn custom_button(
     response
 }
 
-fn diameter_slider(ui: &mut egui::Ui, value: f32) -> Option<f32> {
-    unit_slider(
-        ui,
-        diameter_to_unit(value),
-        value,
-        "Brush diameter",
-        1.0 / 64.0,
-    )
-    .map(unit_to_diameter)
-}
-
-fn opacity_slider(ui: &mut egui::Ui, value: f32) -> Option<f32> {
-    unit_slider(ui, value.clamp(0.0, 1.0), value, "Brush opacity", 0.05)
-}
-
 fn unit_slider(
     ui: &mut egui::Ui,
     unit: f32,
     semantic_value: f32,
     label: &str,
     keyboard_step: f32,
+    size: Vec2,
 ) -> Option<f32> {
-    let (rect, mut response) = ui.allocate_exact_size(
-        Vec2::new(SLIDER_WIDTH, CONTROL_HEIGHT),
-        Sense::click_and_drag(),
+    let (rect, mut response) = ui.allocate_exact_size(size, Sense::click_and_drag());
+    let track = Rect::from_center_size(
+        rect.center_bottom() - Vec2::new(0.0, 8.0),
+        Vec2::new(rect.width() - 16.0, 3.0),
     );
-    let track = Rect::from_center_size(rect.center(), Vec2::new(rect.width() - 16.0, 4.0));
+    ui.painter().text(
+        rect.center_top() + Vec2::new(0.0, 10.0),
+        Align2::CENTER_CENTER,
+        label,
+        FontId::proportional(11.0),
+        TEXT,
+    );
     let unit = unit.clamp(0.0, 1.0);
     let knob_x = egui::lerp(track.x_range(), unit);
     let fill = Rect::from_min_max(track.left_top(), Pos2::new(knob_x, track.bottom()));
     ui.painter().rect_filled(track, 2, CONTROL);
     ui.painter().rect_filled(fill, 2, CONTROL_ACTIVE);
     ui.painter()
-        .circle_filled(Pos2::new(knob_x, track.center().y), 9.0, PANEL);
+        .circle_filled(Pos2::new(knob_x, track.center().y), 5.0, PANEL);
     ui.painter().circle_stroke(
         Pos2::new(knob_x, track.center().y),
-        9.0,
+        5.0,
         Stroke::new(1.5, CONTROL_ACTIVE),
     );
 
@@ -2834,19 +2870,6 @@ fn unit_to_diameter(unit: f32) -> f32 {
     let min = super::MIN_BRUSH_DIAMETER.ln();
     let max = super::MAX_BRUSH_DIAMETER.ln();
     (min + unit.clamp(0.0, 1.0) * (max - min)).exp()
-}
-
-fn color_swatch(ui: &mut egui::Ui, linear_rgb: [f32; 3], _opacity: f32) -> egui::Response {
-    let (rect, response) = ui.allocate_exact_size(Vec2::splat(CONTROL_HEIGHT), Sense::click());
-    let rgb = linear_rgb.map(linear_to_srgb_u8);
-    let fill = Color32::from_rgb(rgb[0], rgb[1], rgb[2]);
-    ui.painter().circle_filled(rect.center(), 15.0, fill);
-    ui.painter()
-        .circle_stroke(rect.center(), 15.0, Stroke::new(1.0, TEXT_MUTED));
-    response.widget_info(|| {
-        WidgetInfo::labeled(WidgetType::Button, ui.is_enabled(), "Choose brush color")
-    });
-    response.on_hover_text("Choose brush color")
 }
 
 fn color_button(ui: &mut egui::Ui, linear_rgb: [f32; 3], selected: bool) -> egui::Response {
@@ -2953,11 +2976,6 @@ fn hsv_to_srgb(hue: f32, saturation: f32, value: f32) -> [f32; 3] {
     }
 }
 
-fn separator(ui: &mut egui::Ui) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(1.0, 24.0), Sense::hover());
-    ui.painter().rect_filled(rect, 0, BORDER);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2985,16 +3003,232 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "renders actual egui controls on a hardware GPU for visual review"]
+    fn ui_reference_render() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::PRIMARY,
+            flags: Default::default(),
+            memory_budget_thresholds: Default::default(),
+            backend_options: Default::default(),
+            display: None,
+        });
+        let adapter = pollster::block_on(instance.enumerate_adapters(wgpu::Backends::PRIMARY))
+            .into_iter()
+            .find(|a| a.get_info().device_type != wgpu::DeviceType::Cpu)
+            .unwrap();
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let directory = std::path::PathBuf::from(".artifacts/ui-redesign");
+        std::fs::create_dir_all(&directory).unwrap();
+        for (name, width, height, library) in [
+            ("default", 1280u32, 720u32, false),
+            ("brushes", 1280, 720, true),
+            ("portrait", 768, 1024, false),
+            ("touch", 800, 600, false),
+            ("color", 800, 600, false),
+            ("layers", 800, 600, false),
+            ("search", 800, 600, true),
+        ] {
+            let context = egui::Context::default();
+            context.set_visuals(egui::Visuals::light());
+            let mut renderer = egui_wgpu::Renderer::new(&device, format, Default::default());
+            let mut session = UiSessionState {
+                brush_panel_open: library,
+                touch_controls: name == "touch",
+                color_panel_open: name == "color",
+                layers_panel_open: name == "layers",
+                brush_query: if name == "search" {
+                    "stipple".into()
+                } else {
+                    String::new()
+                },
+                document_label: "Product study.sketchpad".into(),
+                shader_brushes: vec![(
+                    "stipple".into(),
+                    "Stipple".into(),
+                    "Procedural stipple".into(),
+                )],
+                ..Default::default()
+            };
+            let mut snapshot = test_snapshot();
+            snapshot.natural_brushes_available = true;
+            snapshot.tool = UiTool::Pencil;
+            snapshot.color = [0.035, 0.07, 0.16];
+            snapshot.color_presets = [
+                [0.0; 3],
+                [1.0; 3],
+                [0.6, 0.05, 0.02],
+                [0.02, 0.1, 0.5],
+                [0.02, 0.3, 0.1],
+                [0.7, 0.3, 0.01],
+            ];
+            snapshot.recent_color_count = 3;
+            snapshot.recent_colors[..3].copy_from_slice(&[
+                [0.035, 0.07, 0.16],
+                [0.25, 0.13, 0.05],
+                [0.3, 0.3, 0.3],
+            ]);
+            session.color_picker = ColorPickerState::new(snapshot.color);
+            let layer = UiLayerSnapshot {
+                id: snapshot.active_layer,
+                name: "Linework",
+                visible: true,
+                opacity: 1.0,
+            };
+            let mut jobs = Vec::new();
+            for _ in 0..3 {
+                let output = context.run_ui(
+                    egui::RawInput {
+                        screen_rect: Some(Rect::from_min_size(
+                            Pos2::ZERO,
+                            Vec2::new(width as f32, height as f32),
+                        )),
+                        ..Default::default()
+                    },
+                    |root| {
+                        root.painter().rect_filled(
+                            root.max_rect(),
+                            0,
+                            Color32::from_rgb(230, 232, 234),
+                        );
+                        root.painter().rect_filled(
+                            Rect::from_min_max(
+                                Pos2::new(100.0, 120.0),
+                                Pos2::new(width as f32 - 100.0, height as f32 - 80.0),
+                            ),
+                            0,
+                            Color32::WHITE,
+                        );
+                        show_toolbar(
+                            root,
+                            snapshot,
+                            &[layer],
+                            KeyBindings::default(),
+                            &mut Vec::new(),
+                            &mut session,
+                        );
+                    },
+                );
+                for (id, delta) in &output.textures_delta.set {
+                    renderer.update_texture(&device, &queue, *id, delta);
+                }
+                jobs = context.tessellate(output.shapes, 1.0);
+            }
+            let screen = egui_wgpu::ScreenDescriptor {
+                size_in_pixels: [width, height],
+                pixels_per_point: 1.0,
+            };
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&Default::default());
+            let mut encoder = device.create_command_encoder(&Default::default());
+            let commands = renderer.update_buffers(&device, &queue, &mut encoder, &jobs, &screen);
+            {
+                let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::WHITE),
+                            store: wgpu::StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                renderer.render(&mut pass.forget_lifetime(), &jobs, &screen);
+            }
+            let stride = (width * 4).div_ceil(256) * 256;
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(stride * height),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(stride),
+                        rows_per_image: Some(height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(commands.into_iter().chain([encoder.finish()]));
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer.slice(..).map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).unwrap();
+            });
+            device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            rx.recv().unwrap().unwrap();
+            let data = buffer.slice(..).get_mapped_range().unwrap();
+            let pixels: Vec<u8> = data
+                .chunks(stride as usize)
+                .flat_map(|row| row[..(width * 4) as usize].iter().copied())
+                .collect();
+            let mut png = png::Encoder::new(
+                std::fs::File::create(directory.join(format!("{name}.png"))).unwrap(),
+                width,
+                height,
+            );
+            png.set_color(png::ColorType::Rgba);
+            png.set_depth(png::BitDepth::Eight);
+            png.write_header()
+                .unwrap()
+                .write_image_data(&pixels)
+                .unwrap();
+            println!("rendered {name} {width}x{height}");
+        }
+    }
+
+    #[test]
     fn tablet_layout_stays_inside_landscape_and_portrait_windows() {
         for size in [
             Vec2::new(1280.0, 720.0),
             Vec2::new(768.0, 1024.0),
             Vec2::new(800.0, 600.0),
         ] {
-            for dock_right in [false, true] {
+            for (dock_right, touch_controls) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
                 let context = egui::Context::default();
                 let mut session = UiSessionState {
                     dock_right,
+                    touch_controls,
                     ..Default::default()
                 };
                 let screen = Rect::from_min_size(Pos2::ZERO, size);
@@ -3017,10 +3251,17 @@ mod tests {
                         },
                     );
                 }
-                for rect in [regions.toolbar, regions.brush_dock, regions.navigation] {
+                for rect in [
+                    regions.toolbar,
+                    regions.brush_dock,
+                    regions.navigation,
+                    regions.settings_panel,
+                ] {
                     assert!(screen.contains_rect(rect), "{size:?}: {rect:?}");
                 }
                 assert!(!regions.toolbar.intersects(regions.brush_dock));
+                assert!(!regions.settings_panel.intersects(regions.brush_dock));
+                assert!(!regions.settings_panel.intersects(regions.toolbar));
                 assert!(
                     !regions.navigation.intersects(regions.brush_dock),
                     "{size:?}: {:?}",
@@ -3029,6 +3270,210 @@ mod tests {
                 assert!(!regions.contains(Pos2::new(size.x * 0.5, size.y * 0.5)));
             }
         }
+    }
+
+    #[test]
+    fn panels_fit_short_windows_with_full_color_history_and_layer_stack() {
+        let snapshot = test_snapshot();
+        let layers = vec![
+            UiLayerSnapshot {
+                id: snapshot.active_layer,
+                name: "Linework",
+                visible: true,
+                opacity: 1.0
+            };
+            20
+        ];
+        for panel in 0..4 {
+            for dock_right in [false, true] {
+                let context = egui::Context::default();
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+                let mut session = UiSessionState {
+                    dock_right,
+                    brush_panel_open: panel == 0,
+                    color_panel_open: panel == 1,
+                    layers_panel_open: panel == 2,
+                    keybinding_panel_open: panel == 3,
+                    ..Default::default()
+                };
+                let mut regions = UiHitRegions::default();
+                for _ in 0..3 {
+                    let _ = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |root| {
+                            regions = show_toolbar(
+                                root,
+                                snapshot,
+                                &layers,
+                                KeyBindings::default(),
+                                &mut Vec::new(),
+                                &mut session,
+                            );
+                        },
+                    );
+                }
+                let rect = match panel {
+                    0 => regions.brush_panel,
+                    1 => regions.color_panel,
+                    2 => regions.layers_panel,
+                    _ => regions.keybinding_panel,
+                };
+                assert!(
+                    screen.contains_rect(rect),
+                    "panel {panel}, right {dock_right}: {rect:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn visible_palette_and_brush_context_work_with_pointer_only() {
+        for touch in [false, true] {
+            for action in 0..4 {
+                let context = egui::Context::default();
+                let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+                let mut snapshot = test_snapshot();
+                snapshot.natural_brushes_available = true;
+                let mut session = UiSessionState {
+                    touch_controls: touch,
+                    ..Default::default()
+                };
+                let mut actions = Vec::new();
+                let mut regions = UiHitRegions::default();
+                for _ in 0..3 {
+                    let _ = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            ..Default::default()
+                        },
+                        |root| {
+                            regions = show_toolbar(
+                                root,
+                                snapshot,
+                                &[],
+                                KeyBindings::default(),
+                                &mut actions,
+                                &mut session,
+                            );
+                        },
+                    );
+                }
+                let height = if touch { 44.0 } else { 36.0 };
+                let position = match action {
+                    0 => Pos2::new(
+                        regions.brush_dock.center().x,
+                        regions.brush_dock.top() + 9.0 + height + 3.0 + height / 2.0,
+                    ),
+                    1 => regions.settings_panel.left_top() + Vec2::new(80.0, 20.0),
+                    2 => regions.settings_panel.left_top() + Vec2::new(320.0, 20.0),
+                    _ => regions.settings_panel.left_top() + Vec2::new(420.0, 20.0),
+                };
+                for pressed in [true, false] {
+                    let _ = context.run_ui(
+                        egui::RawInput {
+                            screen_rect: Some(screen),
+                            events: vec![
+                                egui::Event::PointerMoved(position),
+                                egui::Event::PointerButton {
+                                    pos: position,
+                                    button: egui::PointerButton::Primary,
+                                    pressed,
+                                    modifiers: Default::default(),
+                                },
+                            ],
+                            ..Default::default()
+                        },
+                        |root| {
+                            show_toolbar(
+                                root,
+                                snapshot,
+                                &[],
+                                KeyBindings::default(),
+                                &mut actions,
+                                &mut session,
+                            );
+                        },
+                    );
+                }
+                match action {
+                    0 => assert_eq!(actions, vec![UiAction::SelectTool(UiTool::Pencil)]),
+                    1 => assert!(session.brush_panel_open),
+                    2 => assert!(
+                        matches!(actions.as_slice(),[UiAction::SetBrushDiameter(value)] if *value>snapshot.brush_diameter)
+                    ),
+                    _ => assert!(
+                        matches!(actions.as_slice(),[UiAction::SetBrushOpacity(value)] if *value<snapshot.brush_opacity)
+                    ),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn brush_search_selects_a_shader_package_without_nested_menus() {
+        let context = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(800.0, 600.0));
+        let mut snapshot = test_snapshot();
+        snapshot.natural_brushes_available = true;
+        let mut session = UiSessionState {
+            brush_panel_open: true,
+            brush_query: "PROCEDURAL".into(),
+            shader_brushes: vec![("stipple".into(), "Stipple".into(), "Procedural dots".into())],
+            ..Default::default()
+        };
+        let mut actions = Vec::new();
+        let mut regions = UiHitRegions::default();
+        for _ in 0..3 {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |root| {
+                    regions = show_toolbar(
+                        root,
+                        snapshot,
+                        &[],
+                        KeyBindings::default(),
+                        &mut actions,
+                        &mut session,
+                    );
+                },
+            );
+        }
+        let position = regions.brush_panel.left_top() + Vec2::new(120.0, 120.0);
+        for pressed in [true, false] {
+            let _ = context.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: Default::default(),
+                        },
+                    ],
+                    ..Default::default()
+                },
+                |root| {
+                    show_toolbar(
+                        root,
+                        snapshot,
+                        &[],
+                        KeyBindings::default(),
+                        &mut actions,
+                        &mut session,
+                    );
+                },
+            );
+        }
+        assert_eq!(actions, vec![UiAction::SelectShaderBrush("stipple".into())]);
+        assert!(!session.brush_panel_open);
     }
 
     #[test]
@@ -3069,6 +3514,13 @@ mod tests {
             );
         }
         assert_eq!(actions, vec![UiAction::SetVisible(true)]);
+    }
+
+    #[test]
+    fn shortened_document_names_keep_the_unsaved_marker() {
+        assert_eq!(shortened_label("Product study.sketchpad •", 8), "Produc…•");
+        assert_eq!(shortened_label("Product study.sketchpad", 8), "Product…");
+        assert_eq!(shortened_label("Ink •", 8), "Ink •");
     }
 
     #[test]

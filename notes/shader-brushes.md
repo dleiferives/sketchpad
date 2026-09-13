@@ -36,7 +36,7 @@ fn brush_coverage(b: BrushInput) -> f32 {
 }
 ```
 
-Find the brush under **Tune → More brushes**, or use the existing next-brush shortcut. A scan runs about once per second.
+Find the brush under **Brushes** in the side palette (or click the current brush name), or use the existing next-brush shortcut. A scan runs about once per second.
 File reads and shader compilation run on a background worker. Unchanged sources
 reuse pipelines; unchanged failed edits reuse diagnostics instead of recompiling.
 The library publishes accepted changes between contacts. The shader and recipe
