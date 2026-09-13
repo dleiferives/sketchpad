@@ -52,7 +52,7 @@ impl ClearInstance {
 
 impl RoundMaskInstance {
     fn layout() -> wgpu::VertexBufferLayout<'static> {
-        const ATTRIBUTES: [wgpu::VertexAttribute; 8] = wgpu::vertex_attr_array![
+        const ATTRIBUTES: [wgpu::VertexAttribute; 9] = wgpu::vertex_attr_array![
             0 => Float32x2,
             1 => Float32x2,
             2 => Float32x2,
@@ -60,7 +60,8 @@ impl RoundMaskInstance {
             4 => Float32x2,
             5 => Float32x2,
             6 => Float32x4,
-            7 => Float32x4
+            7 => Float32x4,
+            8 => Float32x4
         ];
         wgpu::VertexBufferLayout {
             array_stride: size_of::<Self>() as u64,
@@ -845,8 +846,8 @@ mod tests {
 
     #[test]
     fn instance_layouts_are_tightly_packed_float_pairs() {
-        assert_eq!(size_of::<RoundMaskInstance>(), 80);
-        assert_eq!(RoundMaskInstance::layout().array_stride, 80);
+        assert_eq!(size_of::<RoundMaskInstance>(), 96);
+        assert_eq!(RoundMaskInstance::layout().array_stride, 96);
         assert_eq!(size_of::<ClearInstance>(), 16);
         assert_eq!(ClearInstance::layout().array_stride, 16);
     }

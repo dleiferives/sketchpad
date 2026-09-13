@@ -49,7 +49,11 @@ packages retain their last working version until restart.
 
 `BrushInput` provides `point`, `start`, `end` in document pixels; `radii` for the
 segment's two endpoints; `pressures` (0–1); and `tilt_start`/`tilt_end` (normalized
-X/Y tilt). A stationary contact has equal endpoints. Shapes must handle it.
+X/Y tilt). Directional application footprints also receive `tip_axis_start` and
+`tip_axis_end`, resolved unit axes in document coordinates. They are zero when the
+legacy orientation control is used. `media_surface` consumes these axes without
+replacing the raw tilt used for tip aspect. A stationary contact has equal
+endpoints; its end axis still changes when the pen turns. Shapes must handle it.
 Coordinates are independent of physical atlas placement.
 
 `footprint: "constant"` reserves diameter × extent / 2 at each endpoint,
@@ -82,7 +86,7 @@ Avoid expensive loops and excessive per-pixel work, particularly at large sizes.
 ## Pixels, history and performance
 
 A package stroke uses the existing sparse mask pages, one instanced pass per
-page, an 80-byte segment instance, and the existing exact undo/mirror captures.
+page, a 96-byte segment instance, and the existing exact undo/mirror captures.
 There is no per-pixel plugin dispatch, added render pass, or shader compilation
 on the drawing thread. Package strokes also stop retaining/cloning the CPU
 replay command list. Compilation can still compete for driver/CPU resources;
@@ -162,3 +166,5 @@ Both APIs share discovery, immutable active-contact pipelines and validation on
 reload. A material pipeline is compiled for RG32Float envelope attachments;
 a coverage pipeline retains R32Float. The older CPU/legacy knife remains a v1
 replay/control implementation, not an oracle for the new material brush.
+
+See [directional brush orientation](brush-orientation.md) for input behavior and the Apollo checks.

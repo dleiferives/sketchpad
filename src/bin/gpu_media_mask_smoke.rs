@@ -55,7 +55,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         BrushTip::PaletteKnife,
         BrushTip::Charcoal,
     ] {
-        for package in [false, true] {
+        for (package, oriented) in [(false, false), (false, true), (true, false), (true, true)] {
             // API 2 retains a material surface; its oracle is the native material
             // regression, not equality with the historical coverage-only knife.
             if package && tip == BrushTip::PaletteKnife {
@@ -78,6 +78,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         RoundMaskTarget::compile_brush(&device, target.shader_layout(), &source)?;
                     target.set_brush_pipeline(Some(pipeline))?;
                     scheduler = scheduler.with_shader_fringe();
+                }
+                if oriented {
+                    scheduler = scheduler.with_brush_orientation();
                 }
                 let from = RoundContact {
                     center: [25.0, 30.0],
@@ -116,7 +119,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 assert_eq!(stats.render_passes, 1);
                 assert_eq!(
                     stats.instance_bytes_written,
-                    u64::from(stats.round_instances) * 80 + u64::from(stats.cleared_slots) * 16
+                    u64::from(stats.round_instances)
+                        * std::mem::size_of::<sketchpad::gpu_round::RoundMaskInstance>() as u64
+                        + u64::from(stats.cleared_slots) * 16
                 );
                 let readback = device.create_buffer(&wgpu::BufferDescriptor {
                     label: None,
@@ -172,10 +177,22 @@ fn main() -> Result<(), Box<dyn Error>> {
                             origin[1] + y % TILE_SIZE,
                         )?;
                         let p = [x as f32 + 0.5, y as f32 + 0.5];
-                        let expected = tip
-                            .coverage(from, from, p)
-                            .max(tip.coverage(from, to, p))
-                            .max(tip.coverage(to, stationary, p));
+                        let expected = if oriented {
+                            let physical = [
+                                (origin[0] + x % TILE_SIZE) as f32 + 0.5,
+                                (origin[1] + y % TILE_SIZE) as f32 + 0.5,
+                            ];
+                            batch
+                                .pages()
+                                .iter()
+                                .flat_map(|page| &page.work)
+                                .map(|work| work.payload.coverage_at(physical))
+                                .fold(0.0_f32, f32::max)
+                        } else {
+                            tip.coverage(from, from, p)
+                                .max(tip.coverage(from, to, p))
+                                .max(tip.coverage(to, stationary, p))
+                        };
                         worst = worst.max((actual - expected).abs());
                         if actual > 0.0 {
                             painted += 1;
@@ -188,7 +205,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     );
                 }
                 println!(
-            "{tip:?}: package={package} scale={scale}, pixels={painted}, max_gpu_cpu_error={worst}; reordered tile seams checked"
+            "{tip:?}: package={package} oriented={oriented} scale={scale}, pixels={painted}, max_gpu_cpu_error={worst}; reordered tile seams checked"
         );
                 drop(bytes);
                 readback.unmap();

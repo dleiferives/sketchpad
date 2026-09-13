@@ -287,3 +287,10 @@ retained blank undo pixels. Neither the hard cap nor the system-memory reserve
 was relaxed to obtain the passing result. Native image studies remain available
 at `http://localhost:8058/material-engine.html` on Atlas, with the physical research
 and fuller-simulation roadmap linked alongside them.
+
+## Orientation follow-up
+
+Directional tip orientation now follows pen azimuth or travel, with retained
+heading through pauses and storage batches. The [orientation note](brush-orientation.md)
+records the shared pencil/marker/charcoal/knife behavior. The user explicitly
+deferred scraping and further material interaction for a later discussion.

@@ -23,7 +23,7 @@ struct ActiveRoundStroke {
     commands: Vec<RoundPathCommand>,
     provisional_allocations: Vec<AtlasAllocation>,
     submitted_batches: u32,
-    shader_brush: bool,
+    exact_pixels: bool,
     loaded: bool,
     material_surface: bool,
     load: f32,
@@ -65,6 +65,18 @@ impl GpuResidentRoundStrokeEngine {
             active: None,
             material_submissions: Default::default(),
         })
+    }
+
+    pub fn seed_orientation(&mut self, orientation: crate::brush_orientation::TipOrientation) {
+        if let Some(active) = &mut self.active {
+            active.scheduler.seed_orientation(orientation);
+        }
+    }
+
+    pub fn tip_axis(&self) -> Option<[f32; 2]> {
+        self.active
+            .as_ref()
+            .and_then(|active| active.scheduler.tip_axis())
     }
 
     pub fn shader_layout(&self) -> &wgpu::PipelineLayout {
@@ -139,6 +151,11 @@ impl GpuResidentRoundStrokeEngine {
             self.layout,
         )?
         .with_tip(recipe.tip());
+        let scheduler = if recipe.tip() != crate::brush_tip::BrushTip::HardRound {
+            scheduler.with_brush_orientation()
+        } else {
+            scheduler
+        };
         let scheduler = if shader_brush {
             scheduler.with_shader_fringe()
         } else {
@@ -164,7 +181,7 @@ impl GpuResidentRoundStrokeEngine {
             commands: Vec::new(),
             provisional_allocations: Vec::new(),
             submitted_batches: 0,
-            shader_brush,
+            exact_pixels: shader_brush || recipe.tip() != crate::brush_tip::BrushTip::HardRound,
             loaded,
             material_surface: false,
             load,
@@ -299,7 +316,7 @@ impl GpuResidentRoundStrokeEngine {
                     .filter(|allocation| allocation.newly_allocated),
             );
         }
-        if !active.shader_brush && !active.material_surface {
+        if !active.exact_pixels && !active.material_surface {
             active.commands.extend_from_slice(commands);
         }
         active.provisional_allocations.extend(
@@ -428,7 +445,7 @@ impl GpuResidentRoundStrokeEngine {
         if active.scheduler.is_active() {
             return Err(GpuResidentRoundStrokeError::PathStillActive);
         }
-        let recovery = if active.shader_brush || active.material_surface {
+        let recovery = if active.exact_pixels || active.material_surface {
             crate::gpu_recovery_replay::GpuRasterRecoveryCommand::AwaitingPixels(
                 active.scheduler.layer(),
             )

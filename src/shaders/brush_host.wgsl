@@ -15,6 +15,7 @@ struct RoundVertexInput {
     @location(5) world_offset: vec2<f32>,
     @location(6) brush_data: vec4<f32>,
     @location(7) tilts: vec4<f32>,
+    @location(8) tip_axes: vec4<f32>,
 }
 
 struct RoundVertexOutput {
@@ -28,6 +29,7 @@ struct RoundVertexOutput {
     @location(6) @interpolate(flat) world_offset: vec2<f32>,
     @location(7) @interpolate(flat) brush_data: vec4<f32>,
     @location(8) @interpolate(flat) tilts: vec4<f32>,
+    @location(9) @interpolate(flat) tip_axes: vec4<f32>,
 }
 
 fn quad_corner(vertex_index: u32) -> vec2<f32> {
@@ -74,6 +76,7 @@ fn round_vs(
     output.world_offset = input.world_offset;
     output.brush_data = input.brush_data;
     output.tilts = input.tilts;
+    output.tip_axes = input.tip_axes;
     return output;
 }
 
@@ -178,13 +181,16 @@ struct BrushInput {
     pressures: vec2<f32>,
     tilt_start: vec2<f32>,
     tilt_end: vec2<f32>,
+    tip_axis_start: vec2<f32>,
+    tip_axis_end: vec2<f32>,
 }
 @fragment
 fn round_fs(input: RoundVertexOutput) -> @location(0) f32 {
     if any(input.physical < input.clip_min) || any(input.physical >= input.clip_max) { discard; }
     let brush = BrushInput(input.physical + input.world_offset,
         input.start_point + input.world_offset, input.end_point + input.world_offset,
-        input.radii, input.brush_data.yz, input.tilts.xy, input.tilts.zw);
+        input.radii, input.brush_data.yz, input.tilts.xy, input.tilts.zw,
+        input.tip_axes.xy, input.tip_axes.zw);
     let coverage = brush_coverage(brush);
     // NaN and negative values produce no deposit; output never exceeds one.
     return select(0.0, min(coverage, 1.0), coverage > 0.0);
@@ -211,6 +217,13 @@ fn media_surface(input: BrushInput, kind: u32) -> MediaSurface {
     let weight = clamp((side - 0.08) / 0.24, 0.0, 1.0);
     var direction = vec2<f32>(0.8, 0.6)*(1.0-weight) + tilt/max(length(tilt), 1e-6)*weight;
     if length(direction) > 1e-6 { direction = normalize(direction); } else { direction = vec2<f32>(0.8,0.6); }
+    if kind != 0u && dot(input.tip_axis_end, input.tip_axis_end) > 0.5 {
+        var axis_t = t;
+        if max(length(input.tilt_start), length(input.tilt_end)) < 0.08 {
+            axis_t = min(t * max(length(delta) / 4.0, 1.0), 1.0);
+        }
+        direction = normalize(mix(input.tip_axis_start, input.tip_axis_end, axis_t));
+    }
     var aspect = 1.0 - 0.45 * side;
     if kind == 2u { aspect = 0.42; }
     if kind == 3u { aspect = 0.32; }

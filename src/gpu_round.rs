@@ -9,6 +9,7 @@ use crate::{
 use std::{collections::HashMap, error::Error, fmt};
 
 const COVERAGE_FRINGE: f64 = 0.5;
+type LogicalRoundWork = (LayerTileKey, RoundContact, RoundContact, [u32; 2], [f32; 4]);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -21,6 +22,7 @@ pub struct RoundMaskInstance {
     world_offset: [f32; 2],
     brush_data: [f32; 4],
     tilts: [f32; 4],
+    tip_axes: [f32; 4],
 }
 
 impl RoundMaskInstance {
@@ -60,7 +62,7 @@ impl RoundMaskInstance {
             _ => crate::brush_tip::BrushTip::HardRound,
         };
         let world = |p: [f32; 2]| [p[0] + self.world_offset[0], p[1] + self.world_offset[1]];
-        tip.coverage(
+        tip.coverage_oriented(
             RoundContact {
                 dynamics: [self.brush_data[1], self.tilts[0], self.tilts[1]],
                 center: world(self.from),
@@ -74,6 +76,7 @@ impl RoundMaskInstance {
                 elapsed_micros: 0,
             },
             world(physical_point),
+            (self.tip_axes[2].hypot(self.tip_axes[3]) > 0.5).then_some(self.tip_axes),
         )
     }
 }
@@ -132,6 +135,7 @@ pub struct RoundMaskScheduler {
     active_contact: Option<RoundContact>,
     tip: crate::brush_tip::BrushTip,
     fringe: Option<f64>,
+    brush_orientation: Option<crate::brush_orientation::TipOrientation>,
 }
 
 impl RoundMaskScheduler {
@@ -150,7 +154,23 @@ impl RoundMaskScheduler {
             active_contact: None,
             tip: crate::brush_tip::BrushTip::HardRound,
             fringe: None,
+            brush_orientation: None,
         })
+    }
+
+    pub fn with_brush_orientation(mut self) -> Self {
+        self.brush_orientation = Some(Default::default());
+        self
+    }
+
+    pub fn seed_orientation(&mut self, orientation: crate::brush_orientation::TipOrientation) {
+        if self.brush_orientation.is_some() {
+            self.brush_orientation = Some(orientation);
+        }
+    }
+
+    pub fn tip_axis(&self) -> Option<[f32; 2]> {
+        self.brush_orientation.map(|pose| pose.axis())
     }
 
     pub fn with_shader_fringe(mut self) -> Self {
@@ -231,15 +251,23 @@ impl RoundMaskScheduler {
 
         let mut damage = HashMap::<LayerTileKey, RectU32>::new();
         let mut logical_work = Vec::new();
+        let mut next_pose = self.brush_orientation;
         for (from, to) in &primitives {
-            self.append_primitive_work(*from, *to, &mut damage, &mut logical_work);
+            let axes = if let Some(pose) = &mut next_pose {
+                let start = pose.update(from.center, [from.dynamics[1], from.dynamics[2]]);
+                let end = pose.update(to.center, [to.dynamics[1], to.dynamics[2]]);
+                [start[0], start[1], end[0], end[1]]
+            } else {
+                [0.0; 4]
+            };
+            self.append_primitive_work(*from, *to, axes, &mut damage, &mut logical_work);
         }
         let mut keys: Vec<_> = damage.keys().copied().collect();
         keys.sort_by_key(|key| (key.layer.get(), key.tile.y, key.tile.x));
         let allocations = atlas.allocate_batch(keys.iter().copied())?;
 
         let mut physical_work = Vec::with_capacity(logical_work.len());
-        for (key, from, to, valid_extent) in logical_work {
+        for (key, from, to, valid_extent, tip_axes) in logical_work {
             let slot = atlas
                 .slot(key)
                 .expect("every scheduled tile was allocated in this transaction");
@@ -251,6 +279,7 @@ impl RoundMaskScheduler {
             physical_work.push((
                 key,
                 RoundMaskInstance {
+                    tip_axes,
                     world_offset: [
                         tile_origin[0] as f32 - slot_origin[0] as f32,
                         tile_origin[1] as f32 - slot_origin[1] as f32,
@@ -294,6 +323,7 @@ impl RoundMaskScheduler {
             .collect();
 
         self.active_contact = next_active;
+        self.brush_orientation = next_pose;
         Ok(RoundMaskBatch {
             layout: self.layout,
             pages,
@@ -308,8 +338,9 @@ impl RoundMaskScheduler {
         &self,
         from: RoundContact,
         to: RoundContact,
+        tip_axes: [f32; 4],
         damage: &mut HashMap<LayerTileKey, RectU32>,
-        work: &mut Vec<(LayerTileKey, RoundContact, RoundContact, [u32; 2])>,
+        work: &mut Vec<LogicalRoundWork>,
     ) {
         let fringe = self.coverage_fringe();
         let min_x = ((from.center[0] as f64 - from.radius as f64)
@@ -356,7 +387,7 @@ impl RoundMaskScheduler {
                     .entry(key)
                     .and_modify(|existing| *existing = existing.union(local_damage))
                     .or_insert(local_damage);
-                work.push((key, from, to, valid_extent));
+                work.push((key, from, to, valid_extent, tip_axes));
             }
         }
     }
@@ -439,6 +470,75 @@ mod tests {
 
     fn scheduler(layout: AtlasLayout, canvas: [u32; 2]) -> RoundMaskScheduler {
         RoundMaskScheduler::new(canvas, LayerId::from_raw(3), layout).unwrap()
+    }
+
+    #[test]
+    fn long_mouse_move_reaches_full_tip_width_near_the_start() {
+        let layout = AtlasLayout::document_default();
+        let mut atlas = SparseAtlasPlanner::new(layout);
+        let mut scheduler = scheduler(layout, [512, 512])
+            .with_tip(crate::brush_tip::BrushTip::Marker)
+            .with_brush_orientation();
+        let a = contact([60.0, 60.0], 30.0, 0);
+        let b = contact([400.0, 60.0], 30.0, 1);
+        let batch = scheduler
+            .schedule(
+                &mut atlas,
+                &[
+                    RoundPathCommand::Begin(a),
+                    RoundPathCommand::Sweep { from: a, to: b },
+                ],
+            )
+            .unwrap();
+        let key = LayerTileKey::new(LayerId::from_raw(3), TileCoord::new(0, 0));
+        let origin = atlas.slot(key).unwrap().origin();
+        let coverage = batch
+            .pages()
+            .iter()
+            .flat_map(|page| &page.work)
+            .map(|work| {
+                work.payload
+                    .coverage_at([origin[0] as f32 + 100.5, origin[1] as f32 + 80.5])
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            coverage > 0.49,
+            "rotation must not stretch into a long wedge"
+        );
+    }
+
+    #[test]
+    fn knife_orientation_survives_batch_boundaries_and_stationary_rotation() {
+        let layout = AtlasLayout::document_default();
+        let a = contact([40.0, 40.0], 5.0, 0);
+        let b = contact([60.0, 40.0], 5.0, 1);
+        let c = contact([60.0, 70.0], 5.0, 2);
+        let mut d = c;
+        d.dynamics = [1.0, 0.8, 0.0];
+        d.elapsed_micros = 3;
+        let commands = [
+            RoundPathCommand::Begin(a),
+            RoundPathCommand::Sweep { from: a, to: b },
+            RoundPathCommand::Sweep { from: b, to: c },
+            RoundPathCommand::Sweep { from: c, to: d },
+        ];
+        let render = |chunk: usize| {
+            let mut atlas = SparseAtlasPlanner::new(layout);
+            let mut scheduler = scheduler(layout, [128, 128]).with_brush_orientation();
+            let mut axes = Vec::new();
+            for commands in commands.chunks(chunk) {
+                let batch = scheduler.schedule(&mut atlas, commands).unwrap();
+                for page in batch.pages() {
+                    axes.extend(page.work.iter().map(|work| work.payload.tip_axes));
+                }
+            }
+            axes
+        };
+        let axes = render(4);
+        assert_eq!(axes, render(1));
+        assert!(axes[1][3].abs() > 0.999);
+        assert!(axes[2][2].abs() > 0.999);
+        assert!(axes[3][3].abs() > 0.999);
     }
 
     #[test]

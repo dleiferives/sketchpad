@@ -669,6 +669,7 @@ struct App {
     shader_brush: Option<String>,
     shader_selection_dirty: bool,
     paint_load: f32,
+    cursor_orientation: sketchpad::brush_orientation::TipOrientation,
     shader_settings: std::collections::HashMap<String, [f32; 2]>,
     active_stroke: Option<ActiveStroke>,
     active_pointer: Option<PointerOwner>,
@@ -781,6 +782,7 @@ impl App {
             shader_brush: None,
             shader_selection_dirty: true,
             paint_load: 1.0,
+            cursor_orientation: Default::default(),
             shader_settings: Default::default(),
             active_stroke: None,
             active_pointer: None,
@@ -1551,7 +1553,15 @@ impl App {
         } else {
             tip
         };
-        let (direction, aspect) = tip.shape(self.cursor_tilt);
+        let (mut direction, aspect) = tip.shape(self.cursor_tilt);
+        if tip != sketchpad::brush_tip::BrushTip::HardRound {
+            direction = self
+                .gpu
+                .as_ref()
+                .and_then(|gpu| gpu.resident.as_ref())
+                .and_then(|resident| resident.strokes.tip_axis())
+                .unwrap_or_else(|| self.cursor_orientation.axis());
+        }
         let chisel = matches!(
             tip,
             sketchpad::brush_tip::BrushTip::Marker | sketchpad::brush_tip::BrushTip::PaletteKnife
@@ -1581,6 +1591,8 @@ impl App {
             return;
         }
         self.cursor_tilt = tilt;
+        let world = self.camera().world_from_screen(position);
+        self.cursor_orientation.update(world, tilt);
         if let Some(direction) = contact_direction_from_tilt(tilt) {
             self.cursor_direction = direction;
             return;
@@ -1869,6 +1881,7 @@ impl App {
                         .begin(&mut resident.document, &resident.target, recipe)
                 }
                 .map_err(|error| error.to_string())?;
+                resident.strokes.seed_orientation(self.cursor_orientation);
                 let batch = path.take_batch();
                 if let Err(error) = resident.strokes.submit_commands(
                     &mut resident.document,
@@ -6210,7 +6223,100 @@ mod tests {
         assert_eq!(snapshot(&mut app), before);
         app.redo();
         assert_eq!(snapshot(&mut app), broad);
-        println!("Material buildup, mixed-media flattening, cancel, duplicate/delete/reorder, exact undo/redo, native reload/continuation and live 512px contact passed");
+        let mut orientation_sheet = RasterLayer::new(768, 1280, DEFAULT_TILE_SIZE).unwrap();
+        for (row, tool) in [
+            UiTool::Pencil,
+            UiTool::Marker,
+            UiTool::Charcoal,
+            UiTool::PaletteKnife,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.install_document(Document::new(768, 640, DEFAULT_TILE_SIZE).unwrap(), None)
+                .unwrap();
+            app.select_ui_tool(tool);
+            app.set_brush_diameter(96.0);
+            app.start_stroke([200.0, 200.0], 1.0, [0.8, 0.0], PointerOwner::Mouse);
+            app.finish_stroke();
+            app.start_stroke([400.0, 200.0], 1.0, [0.0, 0.8], PointerOwner::Mouse);
+            app.finish_stroke();
+            let oriented = snapshot(&mut app);
+            assert!(
+                oriented.0[470 * 768 + 200].a > 0.05,
+                "{tool:?}: pen X tilt turns tip vertical"
+            );
+            assert_eq!(oriented.0[440 * 768 + 235].a, 0.0, "{tool:?}: narrow axis");
+            assert!(
+                oriented.0[440 * 768 + 430].a > 0.05,
+                "{tool:?}: pen Y tilt turns tip horizontal"
+            );
+            assert_eq!(oriented.0[475 * 768 + 400].a, 0.0, "{tool:?}: narrow axis");
+            app.start_stroke([600.0, 200.0], 1.0, [0.8, 0.0], PointerOwner::Mouse);
+            app.update_stroke([600.0, 200.0], 1.0, [0.0, 0.8]);
+            if tool == UiTool::PaletteKnife {
+                prepare_preview(&mut app);
+                let rotated_preview = preview_pixel(&app, 630, 440);
+                assert!(
+                    rotated_preview.a > 0.99,
+                    "stationary pen rotation updates live footprint"
+                );
+                app.finish_stroke();
+                assert_eq!(snapshot(&mut app).0[440 * 768 + 630], rotated_preview);
+            } else {
+                app.finish_stroke();
+            }
+            let rotated = snapshot(&mut app);
+            assert!(
+                rotated.0[440 * 768 + 630].a > 0.05,
+                "{tool:?}: stationary rotation"
+            );
+            app.undo();
+            assert_eq!(snapshot(&mut app), oriented);
+            app.redo();
+            assert_eq!(snapshot(&mut app), rotated);
+            app.cursor_pos = Some([100.0, 330.0]);
+            app.cursor_visible = true;
+            app.cursor_tool = ToolKind::Pen;
+            app.cursor_tilt = [0.0; 2];
+            app.start_stroke([100.0, 330.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            app.update_stroke([300.0, 330.0], 1.0, [0.0; 2]);
+            assert!(
+                app.cursor_uniform().direction[1].abs() > 0.999,
+                "{tool:?}: cursor follows horizontal travel"
+            );
+            app.update_stroke([300.0, 420.0], 1.0, [0.0; 2]);
+            let axis = app.cursor_uniform().direction;
+            assert!(axis[0].abs() > 0.999, "{tool:?}: cursor follows turn");
+            app.update_stroke([300.0, 420.0], 0.5, [0.0; 2]);
+            assert_eq!(
+                app.cursor_uniform().direction,
+                axis,
+                "{tool:?}: paused pressure changes retain heading"
+            );
+            app.finish_stroke();
+            let sheet = snapshot(&mut app);
+            let mut gesture = orientation_sheet.scoped_gesture().unwrap();
+            for y in 0..320 {
+                for x in 0..768 {
+                    gesture
+                        .set_pixel(
+                            x,
+                            row as u32 * 320 + y,
+                            sheet.0[((639 - (150 + y)) * 768 + x) as usize],
+                        )
+                        .unwrap();
+                }
+            }
+            gesture.commit().unwrap();
+        }
+        image_io::export_png_file_atomic(
+            &directory.join("orientation.png"),
+            &orientation_sheet,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
+        println!("Material buildup, pen orientation, cancel, layers, exact undo/redo, native reload/continuation and live 512px contact passed");
     }
 
     #[cfg(target_os = "linux")]

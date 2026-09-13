@@ -1,4 +1,5 @@
 pub mod brush;
+pub mod brush_orientation;
 pub mod brush_tip;
 pub mod checkpoint;
 pub mod contact;

@@ -51,7 +51,17 @@ impl BrushTip {
         (direction, aspect)
     }
 
-    pub fn coverage(self, mut from: RoundContact, to: RoundContact, point: [f32; 2]) -> f32 {
+    pub fn coverage(self, from: RoundContact, to: RoundContact, point: [f32; 2]) -> f32 {
+        self.coverage_oriented(from, to, point, None)
+    }
+
+    pub(crate) fn coverage_oriented(
+        self,
+        mut from: RoundContact,
+        to: RoundContact,
+        point: [f32; 2],
+        axes: Option<[f32; 4]>,
+    ) -> f32 {
         if self == Self::HardRound {
             return RoundSweepGeometry::new(from, to)
                 .expect("validated contact")
@@ -67,13 +77,34 @@ impl BrushTip {
         let delta = [to.center[0] - from.center[0], to.center[1] - from.center[1]];
         let relative = [point[0] - from.center[0], point[1] - from.center[1]];
         let dot = |a: [f32; 2], b: [f32; 2]| a[0] * b[0] + a[1] * b[1];
-        let t = (dot(relative, delta) / dot(delta, delta).max(1e-12)).clamp(0.0, 1.0);
+        let t = if dot(delta, delta) <= 1e-12 {
+            1.0
+        } else {
+            (dot(relative, delta) / dot(delta, delta)).clamp(0.0, 1.0)
+        };
         let mix = |a: f32, b: f32| a + (b - a) * t;
         let pressure = mix(from.dynamics[0], to.dynamics[0]);
-        let (direction, aspect) = self.shape([
+        let (mut direction, aspect) = self.shape([
             mix(from.dynamics[1], to.dynamics[1]),
             mix(from.dynamics[2], to.dynamics[2]),
         ]);
+        if let Some(axes) = axes {
+            let axis_t = if from.dynamics[1]
+                .hypot(from.dynamics[2])
+                .max(to.dynamics[1].hypot(to.dynamics[2]))
+                < 0.08
+            {
+                (t * (delta[0].hypot(delta[1]) / 4.0).max(1.0)).min(1.0)
+            } else {
+                t
+            };
+            let axis = [
+                axes[0] + (axes[2] - axes[0]) * axis_t,
+                axes[1] + (axes[3] - axes[1]) * axis_t,
+            ];
+            let length = axis[0].hypot(axis[1]);
+            direction = [axis[0] / length, axis[1] / length];
+        }
         let transform = |v: [f32; 2]| {
             [
                 dot(v, direction),

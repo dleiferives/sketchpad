@@ -15,6 +15,7 @@ struct RoundVertexInput {
     @location(5) world_offset: vec2<f32>,
     @location(6) brush_data: vec4<f32>,
     @location(7) tilts: vec4<f32>,
+    @location(8) tip_axes: vec4<f32>,
 }
 
 struct RoundVertexOutput {
@@ -28,6 +29,7 @@ struct RoundVertexOutput {
     @location(6) @interpolate(flat) world_offset: vec2<f32>,
     @location(7) @interpolate(flat) brush_data: vec4<f32>,
     @location(8) @interpolate(flat) tilts: vec4<f32>,
+    @location(9) @interpolate(flat) tip_axes: vec4<f32>,
 }
 
 fn quad_corner(vertex_index: u32) -> vec2<f32> {
@@ -74,6 +76,7 @@ fn round_vs(
     output.world_offset = input.world_offset;
     output.brush_data = input.brush_data;
     output.tilts = input.tilts;
+    output.tip_axes = input.tip_axes;
     return output;
 }
 
@@ -163,6 +166,13 @@ fn media_coverage(input: RoundVertexOutput) -> f32 {
     let weight = clamp((side - 0.08) / 0.24, 0.0, 1.0);
     var direction = vec2<f32>(0.8, 0.6)*(1.0-weight) + tilt/max(length(tilt), 1e-6)*weight;
     if length(direction) > 1e-6 { direction = normalize(direction); } else { direction = vec2<f32>(0.8,0.6); }
+    if dot(input.tip_axes.zw, input.tip_axes.zw) > 0.5 {
+        var axis_t = t;
+        if max(length(input.tilts.xy), length(input.tilts.zw)) < 0.08 {
+            axis_t = min(t * max(length(delta) / 4.0, 1.0), 1.0);
+        }
+        direction = normalize(mix(input.tip_axes.xy, input.tip_axes.zw, axis_t));
+    }
     var aspect = 1.0 - 0.45 * side;
     if kind == 2u { aspect = 0.42; }
     if kind == 3u { aspect = 0.32; }
