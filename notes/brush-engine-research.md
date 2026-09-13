@@ -1,5 +1,36 @@
 # Brush engine research and knife opacity
 
+## Palette-knife material study (September 13, 2026)
+
+The [palette-knife research](ui-concepts/palette-knife-research.html), hosted on
+[Atlas localhost:8058](http://localhost:8058/palette-knife-research.html), compares
+physical knife marks, published simulation research and Painter/ArtRage behavior.
+It recommends sparse paint quantity/height, a spatial blade reservoir, ordered
+transfer, bounded pigment depth and relief shading. This is a proposed material
+engine, not an implemented brush retune.
+
+The extended `palette_knife_opacity_study` measures 1, 2, 4 and 8 identical
+96-pixel contacts at full pressure and opacity. In its 5,280-pixel interior band,
+171 pixels remain exactly transparent at every measured pass count. Pixels at
+alpha >= 0.99 increase from 4,850 to 5,011. This isolates fixed zero coverage:
+nonzero alpha accumulates between contacts, but the fixed grain exclusions do
+not respond to previously deposited paint. The diagnostic exports a native PNG
+and CSV; it deliberately does not assert that future models must retain holes.
+
+Atlas and Apollo passed the extended native study with identical counts.
+Changed-file remote rustfmt and Atlas all-target Clippy passed with the existing
+argument-count and loop-style allowances. Production brush formulas are unchanged.
+Physical reference excerpts are attributed to Okaichi et al., Figure 3 (2007).
+The report includes implementation boundaries, material-history requirements,
+memory arithmetic and artist-facing acceptance cases. Performance and physical
+accuracy of the proposed model remain unmeasured.
+
+The Atlas HTTP page passed headless Chrome checks for all four images, seven
+references, section anchors, local links, the CSV and three transparency
+backgrounds. Desktop and 390-pixel layouts were captured; the narrow layout has
+no document-level horizontal overflow. Artifacts are under
+`.artifacts/knife-material/` (the native test writes `.artifacts/knife-opacity/`).
+
 The subsequent [orientation study](ui-concepts/brush-orientation.html), hosted at
 [localhost:8058/brush-orientation.html](http://localhost:8058/brush-orientation.html),
 separates nib pose, initial direction, continuing direction, filtering, azimuth

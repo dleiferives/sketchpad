@@ -6055,6 +6055,67 @@ mod tests {
             ExportRegion::FullCanvas,
         )
         .unwrap();
+        // Diagnostic overlap sheet: identical paths use identical document grain.
+        // Record holes without asserting that they must remain in future models.
+        for _ in 0..6 {
+            app.undo();
+        }
+        app.set_brush_diameter(96.0);
+        let path = line([70.0, 280.0], [830.0, 280.0]);
+        let mut overlap = RasterLayer::new(900, 400, DEFAULT_TILE_SIZE).unwrap();
+        let mut csv = String::from("passes,samples,zero_alpha,alpha_at_least_099\n");
+        let mut row = 0;
+        for pass in 1..=8 {
+            app.start_stroke(path[0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            for p in &path[1..] {
+                app.update_stroke(*p, 1.0, [0.0; 2]);
+            }
+            app.finish_stroke();
+            if ![1, 2, 4, 8].contains(&pass) {
+                continue;
+            }
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let doc = recovered.document();
+            let raster = doc.layer_raster(doc.active_layer_id()).unwrap();
+            let mut zero = 0;
+            let mut opaque = 0;
+            for sy in 276..284 {
+                for x in 120..780 {
+                    let alpha = raster.pixel(x, 559 - sy).unwrap().a;
+                    if alpha == 0.0 {
+                        zero += 1;
+                    }
+                    if alpha >= 0.99 {
+                        opaque += 1;
+                    }
+                }
+            }
+            csv.push_str(&format!("{pass},5280,{zero},{opaque}\n"));
+            let mut gesture = overlap.scoped_gesture().unwrap();
+            for sy in 230..330 {
+                for x in 0..900 {
+                    gesture
+                        .set_pixel(x, row * 100 + sy - 230, raster.pixel(x, 559 - sy).unwrap())
+                        .unwrap();
+                }
+            }
+            gesture.commit().unwrap();
+            row += 1;
+        }
+        println!("knife overlap diagnostic:\n{csv}");
+        std::fs::write(directory.join("overlap.csv"), csv).unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("overlap.png"),
+            &overlap,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]
