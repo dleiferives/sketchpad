@@ -18,10 +18,10 @@ impl BrushTip {
         let side = tilt[0].hypot(tilt[1]).min(1.0);
         let scale = match self {
             Self::HardRound => p.max(minimum),
-            Self::Pencil => (0.28 + 0.72 * p.sqrt()) * (0.35 + 0.65 * side),
+            Self::Pencil => (0.15 + 0.85 * p.sqrt()) * (0.6 + 0.4 * side),
             Self::Marker => 0.72 + 0.28 * p,
             Self::PaletteKnife => 0.55 + 0.45 * p,
-            Self::Charcoal => (0.55 + 0.45 * p.sqrt()) * (0.65 + 0.35 * side),
+            Self::Charcoal => (0.8 + 0.2 * p) * (0.8 + 0.2 * side),
         };
         diameter * 0.5 * scale
     }
@@ -43,10 +43,10 @@ impl BrushTip {
         };
         let aspect = match self {
             Self::HardRound => 1.0,
-            Self::Pencil => 1.0 - 0.65 * side,
+            Self::Pencil => 1.0 - 0.45 * side,
             Self::Marker => 0.42,
-            Self::PaletteKnife => 0.22,
-            Self::Charcoal => 0.65 - 0.25 * side,
+            Self::PaletteKnife => 0.32,
+            Self::Charcoal => 0.72 - 0.25 * side,
         };
         (direction, aspect)
     }
@@ -93,48 +93,53 @@ impl BrushTip {
                 .expect("validated contact")
                 .signed_distance(local)
         } * aspect;
+        if self == Self::Marker {
+            // Preserve the approved marker's exact coverage/opacity behavior.
+            return (0.5 - distance).clamp(0.0, 1.0) * (0.38 + 0.12 * pressure);
+        }
         let radius = mix(from.radius, to.radius);
-        let edge = match self {
-            Self::Pencil => 0.65,
-            Self::Charcoal => (radius * 0.12).max(0.8),
-            _ => 0.5,
-        };
-        let coverage = ((0.5 - distance) / (2.0 * edge)).clamp(0.0, 1.0);
-        let fine = grain(point, 1.0);
-        let coarse = grain(point, 3.0);
-        let texture = match self {
+        let paper =
+            crate::paper_grain::sample(point, if self == Self::Pencil { 0.35 } else { 0.45 });
+        match self {
             Self::Pencil => {
-                ((pressure * 1.15 - fine * 0.8 - coarse * 0.18) * 2.2).clamp(0.0, 1.0)
-                    * (0.3 + pressure * 0.65)
-            }
-            Self::Marker => 0.38 + 0.12 * pressure,
-            Self::PaletteKnife => {
-                let lane = grain(
-                    [
-                        point[0] * direction[0] + point[1] * direction[1],
-                        (-point[0] * direction[1] + point[1] * direction[0]) * 0.06,
-                    ],
-                    1.0,
-                );
-                ((pressure * 0.95 - lane * 0.85 - fine * 0.25) * 3.0).clamp(0.0, 1.0)
+                let core = (-distance / (radius * aspect).max(0.25)).clamp(0.0, 1.0);
+                let tooth = smooth(0.08, 0.88, paper);
+                let deposit = pressure.sqrt() * (0.5 + 0.5 * tooth) * (0.45 + 0.55 * core.sqrt());
+                (0.5 - distance).clamp(0.0, 1.0) * deposit
             }
             Self::Charcoal => {
-                ((pressure * 1.1 - coarse * 0.6 - fine * 0.35) * 2.5).clamp(0.0, 1.0) * 0.88
+                // Broken contact edge, not a radius-scaled airbrush falloff.
+                let edge =
+                    (0.5 - distance - (1.0 - paper) * (radius * aspect).min(0.85)).clamp(0.0, 1.0);
+                let body = crate::paper_grain::sample(point, 3.2);
+                let tooth = smooth(0.12, 0.86, paper * 0.78 + body * 0.22 + pressure * 0.08);
+                edge * pressure.sqrt() * (0.28 + 0.65 * pressure) * (0.65 + 0.35 * tooth)
             }
-            Self::HardRound => 1.0,
-        };
-        coverage * texture
+            Self::PaletteKnife => {
+                // A loaded blade leaves a solid body; only the edge and sparse
+                // scrapes break up. Coherent paper replaces pixel-column slots.
+                let drag = crate::paper_grain::sample(
+                    [
+                        point[0] * direction[0] + point[1] * direction[1],
+                        (-point[0] * direction[1] + point[1] * direction[0]) * 0.15,
+                    ],
+                    2.8,
+                );
+                let edge_depth =
+                    (1.0 - paper) * (1.5 + radius * 0.08).min(3.0).min(radius * aspect * 0.5);
+                let edge = (0.5 - distance - edge_depth).clamp(0.0, 1.0);
+                let body = smooth(0.0, (radius * aspect * 0.7).max(1.0), -distance);
+                let scrape = smooth(0.2, 0.65, drag + body * 0.3 + pressure * 0.15);
+                edge * (0.65 + 0.35 * pressure) * (0.7 + 0.3 * scrape) * (0.88 + 0.12 * paper)
+            }
+            _ => unreachable!(),
+        }
     }
 }
 
-fn grain(point: [f32; 2], scale: f32) -> f32 {
-    let x = (point[0] / scale).floor() as i32 as u32;
-    let y = (point[1] / scale).floor() as i32 as u32;
-    let mut h = x.wrapping_mul(0x1f123bb5) ^ y.wrapping_mul(0x5f356495) ^ 0x91e10da5;
-    h ^= h >> 16;
-    h = h.wrapping_mul(0x7feb352d);
-    h ^= h >> 15;
-    (h & 65535) as f32 / 65535.0
+fn smooth(low: f32, high: f32, value: f32) -> f32 {
+    let t = ((value - low) / (high - low)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
 }
 
 // Minimum of four affine half-plane distances over the swept chisel. Evaluating
@@ -199,6 +204,38 @@ mod tests {
             assert!(values.windows(2).any(|v| (v[0] - v[1]).abs() > 0.05));
         }
     }
+    #[test]
+    fn graphite_and_charcoal_have_connected_tone_instead_of_isolated_dots() {
+        for tip in [BrushTip::Pencil, BrushTip::Charcoal] {
+            for pressure in [0.2, 0.6, 1.0] {
+                let c = contact(tip, pressure, [0.0; 2]);
+                for y in 62..67 {
+                    for x in 62..67 {
+                        let mask = tip.coverage(c, c, [x as f32 + 0.5, y as f32 + 0.5]);
+                        assert!(
+                            mask > 0.02,
+                            "{tip:?} lost the center at pressure {pressure}"
+                        );
+                        if tip == BrushTip::Charcoal && pressure == 1.0 {
+                            assert!(mask > 0.55);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn loaded_knife_retains_a_dense_body() {
+        let c = contact(BrushTip::PaletteKnife, 1.0, [0.0; 2]);
+        for y in 62..67 {
+            for x in 62..67 {
+                assert!(
+                    BrushTip::PaletteKnife.coverage(c, c, [x as f32 + 0.5, y as f32 + 0.5]) > 0.7
+                );
+            }
+        }
+    }
+
     #[test]
     fn marker_is_uniform_translucent_and_round_is_solid() {
         let c = contact(BrushTip::Marker, 1.0, [0.0; 2]);

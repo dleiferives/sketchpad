@@ -119,11 +119,16 @@ fn distance_to_variable_capsule(
     return tangent * local.x + slope * local.y - radii.x;
 }
 
-fn grain(point: vec2<f32>, scale: f32) -> f32 {
-    let cell = vec2<i32>(floor(point / scale));
-    var h = bitcast<u32>(cell.x) * 0x1f123bb5u ^ bitcast<u32>(cell.y) * 0x5f356495u ^ 0x91e10da5u;
-    h = h ^ (h >> 16u); h = h * 0x7feb352du; h = h ^ (h >> 15u);
-    return f32(h & 65535u) / 65535.0;
+@group(0) @binding(1) var<storage, read> paper_words: array<u32>;
+fn paper_texel(cell: vec2<i32>) -> f32 {
+    let c = vec2<u32>((cell % vec2<i32>(512) + vec2<i32>(512)) % vec2<i32>(512));
+    let index = c.y*512u+c.x;
+    return f32((paper_words[index/4u] >> ((index%4u)*8u)) & 255u) / 255.0;
+}
+fn paper_sample(point: vec2<f32>, scale: f32) -> f32 {
+    let p=point/scale;
+    let base=vec2<i32>(floor(p)); let f=fract(p);
+    return mix(mix(paper_texel(base),paper_texel(base+vec2<i32>(1,0)),f.x),mix(paper_texel(base+vec2<i32>(0,1)),paper_texel(base+vec2<i32>(1,1)),f.x),f.y);
 }
 
 fn box_value(base: vec4<f32>, slope: vec4<f32>, t: f32) -> f32 {
@@ -158,37 +163,38 @@ fn media_coverage(input: RoundVertexOutput) -> f32 {
     let weight = clamp((side - 0.08) / 0.24, 0.0, 1.0);
     var direction = vec2<f32>(0.8, 0.6)*(1.0-weight) + tilt/max(length(tilt), 1e-6)*weight;
     if length(direction) > 1e-6 { direction = normalize(direction); } else { direction = vec2<f32>(0.8,0.6); }
-    var aspect = 1.0 - 0.65 * side;
+    var aspect = 1.0 - 0.45 * side;
     if kind == 2u { aspect = 0.42; }
-    if kind == 3u { aspect = 0.22; }
-    if kind == 4u { aspect = 0.65 - 0.25 * side; }
+    if kind == 3u { aspect = 0.32; }
+    if kind == 4u { aspect = 0.72 - 0.25 * side; }
     let normal = vec2<f32>(-direction.y, direction.x);
     let local = vec2<f32>(dot(relative, direction), dot(relative, normal) / aspect);
     let end = vec2<f32>(dot(delta, direction), dot(delta, normal) / aspect);
     var distance = distance_to_variable_capsule(local, vec2<f32>(0.0), end, radii);
     if kind == 2u || kind == 3u { distance = box_sweep_distance(local, end, radii * 0.92); }
     distance *= aspect;
+    if kind == 2u { return clamp(0.5-distance,0.0,1.0)*(0.38+0.12*pressure); }
     let radius = mix(radii.x, radii.y, t);
-    var edge = 0.5;
-    if kind == 1u { edge = 0.65; }
-    if kind == 4u { edge = max(radius * 0.12, 0.8); }
-    let coverage = clamp((0.5 - distance) / (2.0 * edge), 0.0, 1.0);
     let world = input.physical + input.world_offset;
-    let fine = grain(world, 1.0);
-    let coarse = grain(world, 3.0);
-    var texture = 1.0;
+    let paper = paper_sample(world, select(0.45,0.35,kind==1u));
     if kind == 1u {
-        texture = clamp((pressure * 1.15 - fine * 0.8 - coarse * 0.18) * 2.2, 0.0, 1.0) * (0.3 + pressure * 0.65);
-    }
-    if kind == 2u { texture = 0.38 + 0.12 * pressure; }
-    if kind == 3u {
-        let lane = grain(vec2<f32>(dot(world, direction), dot(world, normal)*0.06), 1.0);
-        texture = clamp((pressure * 0.95 - lane * 0.85 - fine * 0.25) * 3.0, 0.0, 1.0);
+        let core = clamp(-distance/max(radius*aspect,0.25),0.0,1.0);
+        let tooth = smoothstep(0.08,0.88,paper);
+        let deposit = sqrt(pressure)*(0.5+0.5*tooth)*(0.45+0.55*sqrt(core));
+        return clamp(0.5-distance,0.0,1.0)*deposit;
     }
     if kind == 4u {
-        texture = clamp((pressure * 1.1 - coarse * 0.6 - fine * 0.35) * 2.5, 0.0, 1.0) * 0.88;
+        let edge = clamp(0.5-distance-(1.0-paper)*min(radius*aspect,0.85),0.0,1.0);
+        let body = paper_sample(world,3.2);
+        let tooth = smoothstep(0.12,0.86,paper*0.78+body*0.22+pressure*0.08);
+        return edge*sqrt(pressure)*(0.28+0.65*pressure)*(0.65+0.35*tooth);
     }
-    return coverage * texture;
+    let drag = paper_sample(vec2<f32>(dot(world,direction),dot(world,normal)*0.15),2.8);
+    let edge_depth = (1.0-paper)*min(min(1.5+radius*0.08,3.0),radius*aspect*0.5);
+    let edge = clamp(0.5-distance-edge_depth,0.0,1.0);
+    let body = smoothstep(0.0,max(radius*aspect*0.7,1.0),-distance);
+    let scrape = smoothstep(0.2,0.65,drag+body*0.3+pressure*0.15);
+    return edge*(0.65+0.35*pressure)*(0.7+0.3*scrape)*(0.88+0.12*paper);
 }
 
 @fragment

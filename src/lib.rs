@@ -34,6 +34,7 @@ pub mod input;
 pub mod input_trace;
 pub mod natural;
 pub mod palette;
+pub mod paper_grain;
 pub mod persistence;
 pub mod pipeline;
 pub mod raster;

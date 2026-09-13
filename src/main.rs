@@ -5361,6 +5361,27 @@ mod tests {
             .flat_map(|y| (0..768).map(move |x| raster.pixel(x, y).unwrap()))
             .collect();
         assert_eq!(expected, loaded);
+        if let Some(path) = std::env::var_os("SKETCHPAD_BRUSH_BASELINE") {
+            let baseline = checkpoint::load_document(&PathBuf::from(path)).unwrap();
+            let baseline = baseline.layer_raster(baseline.active_layer_id()).unwrap();
+            for y in (280..400).chain(520..640) {
+                for x in 0..768 {
+                    let a = raster.pixel(x, y).unwrap();
+                    let b = baseline.pixel(x, y).unwrap();
+                    let error = [a.r - b.r, a.g - b.g, a.b - b.b, a.a - b.a]
+                        .into_iter()
+                        .map(f32::abs)
+                        .fold(0.0_f32, f32::max);
+                    // Shader compilation may change float rounding; this is well below
+                    // one 8-bit display level. Geometry/material recipes stay unchanged.
+                    assert!(
+                        error < 0.00005,
+                        "approved marker/round changed at {x},{y}: {error}"
+                    );
+                }
+            }
+        }
+
         app.export_png_to(&directory.join("swatches.png"), ExportRegion::FullCanvas);
         assert!(directory.join("swatches.png").exists());
         // Present the actual GPU readback on white for a legible review artifact.
@@ -5424,6 +5445,153 @@ mod tests {
                 "{tool:?}: broad stroke must undo as one contact"
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "GPU visual study: fine lines, pressure, side shading and layered patches"]
+    #[allow(deprecated)]
+    fn dry_media_drawing_studies() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(1000, 780)),
+                )
+                .unwrap(),
+        );
+        let directory = PathBuf::from(".artifacts/brush-rework");
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("studies.sketchpad");
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            Document::new(1000, 780, DEFAULT_TILE_SIZE).unwrap(),
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("studies.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+        app.set_paint_color([0.012; 3], false);
+        let stroke = |app: &mut App, points: &[[f32; 2]], pressure: f32, tilt: [f32; 2]| {
+            app.start_stroke(points[0], pressure, tilt, PointerOwner::Mouse);
+            for &p in &points[1..] {
+                app.update_stroke(p, pressure, tilt);
+            }
+            app.finish_stroke();
+        };
+        for (row, tool) in [UiTool::Pencil, UiTool::Charcoal, UiTool::PaletteKnife]
+            .into_iter()
+            .enumerate()
+        {
+            app.select_ui_tool(tool);
+            let y = 35.0 + row as f32 * 250.0;
+            // Fine curved lines, then three increasing pressures with the same nib.
+            app.set_brush_diameter(if tool == UiTool::Pencil { 8.0 } else { 16.0 });
+            for line in 0..4 {
+                let points: Vec<_> = (0..50)
+                    .map(|i| {
+                        let t = i as f32 / 49.0;
+                        [
+                            35.0 + t * 180.0,
+                            y + 20.0 + line as f32 * 40.0 + (t * 8.0).sin() * 12.0,
+                        ]
+                    })
+                    .collect();
+                stroke(&mut app, &points, 0.25 + line as f32 * 0.25, [0.0; 2]);
+            }
+            app.set_brush_diameter(if tool == UiTool::Pencil { 36.0 } else { 55.0 });
+            for line in 0..3 {
+                stroke(
+                    &mut app,
+                    &[
+                        [280.0, y + 25.0 + line as f32 * 60.0],
+                        [430.0, y + 55.0 + line as f32 * 60.0],
+                    ],
+                    0.25 + line as f32 * 0.35,
+                    [0.0; 2],
+                );
+            }
+            // Each patch is one pass, three passes, and six passes over paper.
+            app.set_brush_diameter(if tool == UiTool::Pencil { 44.0 } else { 48.0 });
+            for (patch, passes) in [1, 3, 6].into_iter().enumerate() {
+                for _ in 0..passes {
+                    for line in 0..5 {
+                        stroke(
+                            &mut app,
+                            &[
+                                [510.0 + line as f32 * 18.0, y + 15.0 + patch as f32 * 65.0],
+                                [565.0 + line as f32 * 18.0, y + 48.0 + patch as f32 * 65.0],
+                            ],
+                            0.3,
+                            [0.8, 0.0],
+                        );
+                    }
+                }
+            }
+            // Overlapping curved hatching forms a small tonal volume.
+            app.set_brush_diameter(if tool == UiTool::Pencil { 5.0 } else { 18.0 });
+            for line in 0..15 {
+                let shift = line as f32 * 8.0;
+                let points: Vec<_> = (0..40)
+                    .map(|i| {
+                        let t = i as f32 / 39.0;
+                        [
+                            770.0 + shift + (t * std::f32::consts::PI).sin() * 28.0,
+                            y + 10.0 + t * 190.0,
+                        ]
+                    })
+                    .collect();
+                stroke(&mut app, &points, 0.22 + line as f32 / 22.0, [0.0; 2]);
+            }
+            app.reconcile_gpu_mirror_for_file().unwrap();
+        }
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        let doc = recovered.document();
+        let raster = doc.layer_raster(doc.active_layer_id()).unwrap();
+        let mut review = RasterLayer::new(1000, 780, DEFAULT_TILE_SIZE).unwrap();
+        let mut gesture = review.scoped_gesture().unwrap();
+        for y in 0..780 {
+            for x in 0..1000 {
+                let p = raster.pixel(x, 779 - y).unwrap();
+                gesture
+                    .set_pixel(
+                        x,
+                        y,
+                        LinearRgba::premultiplied(
+                            p.r + 1.0 - p.a,
+                            p.g + 1.0 - p.a,
+                            p.b + 1.0 - p.a,
+                            1.0,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        gesture.commit().unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("studies.png"),
+            &review,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]

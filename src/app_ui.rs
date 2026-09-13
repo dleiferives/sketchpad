@@ -111,10 +111,10 @@ impl UiTool {
         match self {
             Self::Pen => "Crisp edges · pressure controls size",
             Self::Eraser => "Clean, pressure-sensitive removal",
-            Self::Pencil => "Fine grain · tilt for side shading",
+            Self::Pencil => "Fine graphite · tilt for side shading",
             Self::Marker => "Translucent chisel · layer to deepen",
-            Self::PaletteKnife => "Flat blade · broken, dry ridges",
-            Self::Charcoal => "Soft grain · pressure and tilt shading",
+            Self::PaletteKnife => "Loaded blade · irregular scraped edges",
+            Self::Charcoal => "Dense charcoal · grain and side shading",
         }
     }
 }
@@ -2092,6 +2092,7 @@ fn show_brush_panel(
                             ui.label(egui::RichText::new(tool.description()).size(11.0).color(TEXT_MUTED));
                         });
                     }
+                    ui.hyperlink_to(egui::RichText::new("Paper grain: David Revoy · CC BY 4.0").size(10.0).color(TEXT_MUTED), "https://www.davidrevoy.com/article326/krita-brushes-charcoal-pencils");
                 });
         });
     area.response.rect
