@@ -116,5 +116,17 @@ hardware-only tests excluded from the ordinary run. Explicit custom-package,
 built-in media, full 4096px shared-layer stroke and file workflow tests passed;
 the 20-case legacy/package GPU mask comparison and mixed-media exact archive
 checks passed. Release build, Clippy (existing argument-count/loop allowances)
-and remote rustfmt checks passed. Apollo accepted the initial source sync but
-stopped responding to SSH during validation; its final build is unverified.
+and remote rustfmt checks passed.
+
+Apollo follow-up (12 September 2026): release build and all 361 ordinary tests
+passed with two Cargo build jobs. Its Intel UHD Graphics (JSL) passed the 20-case
+GPU mask comparison, custom-package live reload, built-in media, file workflows,
+the full 4096px shared-layer stroke, and exact GPU/RAM/disk/pressure-limited undo
+checks. Logs are retained under `.artifacts/shader-brushes/apollo-validation/`
+on Apollo and fetched locally.
+
+The first Apollo suite run exposed a test-fixture race: parallel cache tests
+could acquire the abandoned session's cleanup lease before the test's own
+cleaner, invalidating its immediate-deletion assertion. That test now uses a
+private parent directory. All six cache tests passed 20 consecutive runs on
+Apollo and a separate Atlas run; Atlas also passed the formatter check.

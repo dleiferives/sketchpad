@@ -388,8 +388,15 @@ mod tests {
     }
     #[test]
     fn cleanup_preserves_active_sessions_and_reclaims_abandoned_cache() {
-        let first = store(0, 4096);
-        let parent = first.0.directory.parent().unwrap();
+        // Other tests create stores (and run cleanup) concurrently. Their
+        // cleaner can hold the abandoned lease when ours runs, so use a private
+        // parent to make this test's immediate reclamation assertion meaningful.
+        let parent = PathBuf::from(".artifacts/history-storage-tests").join(format!(
+            "cleanup-{}-{}",
+            std::process::id(),
+            NEXT_SESSION.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = HistoryStore::new(&parent, 0, 4096).unwrap();
         let live = first.store(&[3; 256]).unwrap();
         let abandoned = parent.join(format!(
             "session-abandoned-{}-{}",
@@ -399,9 +406,12 @@ mod tests {
         fs::create_dir(&abandoned).unwrap();
         fs::write(abandoned.join("1.blob"), [7; 512]).unwrap();
         fs::write(abandoned.join("lease"), []).unwrap();
-        clean_abandoned_sessions(parent);
+        clean_abandoned_sessions(&parent);
         assert!(!abandoned.exists());
         assert_eq!(live.read().unwrap(), [3; 256]);
+        drop(live);
+        drop(first);
+        fs::remove_dir(parent).unwrap();
     }
 
     #[test]
