@@ -5875,6 +5875,117 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[ignore = "hardware knife opacity and texture review, using a hidden window"]
+    #[allow(deprecated)]
+    fn palette_knife_opacity_study() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(900, 560)),
+                )
+                .unwrap(),
+        );
+        let directory = PathBuf::from(".artifacts/knife-opacity");
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("study.sketchpad");
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            Document::new(900, 560, DEFAULT_TILE_SIZE).unwrap(),
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("study.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+        app.select_ui_tool(UiTool::PaletteKnife);
+        app.set_brush_diameter(96.0);
+        app.set_paint_color([0.55, 0.075, 0.015], false);
+        for (row, (opacity, pressure)) in [(1.0, 1.0), (1.0, 0.25), (0.5, 1.0), (0.25, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
+            app.set_brush_opacity(opacity);
+            let y = 70.0 + row as f32 * 140.0;
+            app.start_stroke([70.0, y], pressure, [0.0; 2], PointerOwner::Mouse);
+            for step in 1..=80 {
+                app.update_stroke([70.0 + step as f32 * 9.5, y], pressure, [0.0; 2]);
+            }
+            app.finish_stroke();
+        }
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        let doc = recovered.document();
+        let raster = doc.layer_raster(doc.active_layer_id()).unwrap();
+        for (row, opacity) in [1.0, 1.0, 0.5, 0.25].into_iter().enumerate() {
+            let mut solid = 0;
+            let mut samples = 0;
+            let mut gaps = 0;
+            for sy in (66 + row * 140)..(74 + row * 140) {
+                for x in 120..780 {
+                    let alpha = raster.pixel(x, 559 - sy as u32).unwrap().a;
+                    samples += 1;
+                    assert!(
+                        alpha <= opacity + 0.00001,
+                        "selected opacity must remain the stroke ceiling"
+                    );
+                    if (alpha - opacity).abs() < 0.00001 {
+                        solid += 1;
+                    }
+                    if alpha < opacity * 0.25 {
+                        gaps += 1;
+                    }
+                }
+            }
+            println!(
+                "row {row}: {solid}/{samples} pixels at selected opacity, {gaps} scraped pixels"
+            );
+            assert!(
+                solid > samples * 70 / 100,
+                "loaded paint must reach the selected opacity"
+            );
+            assert!(
+                gaps > samples / 500 && gaps < samples / 4,
+                "texture must be localized"
+            );
+        }
+        let mut review = RasterLayer::new(900, 560, DEFAULT_TILE_SIZE).unwrap();
+        let mut gesture = review.scoped_gesture().unwrap();
+        for y in 0..560 {
+            for x in 0..900 {
+                gesture
+                    .set_pixel(x, y, raster.pixel(x, 559 - y).unwrap())
+                    .unwrap();
+            }
+        }
+        gesture.commit().unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("study.png"),
+            &review,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     #[ignore = "GPU visual study: fine lines, pressure, side shading and layered patches"]
     #[allow(deprecated)]
     fn dry_media_drawing_studies() {

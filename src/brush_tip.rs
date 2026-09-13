@@ -116,21 +116,24 @@ impl BrushTip {
                 edge * pressure.sqrt() * (0.28 + 0.65 * pressure) * (0.65 + 0.35 * tooth)
             }
             Self::PaletteKnife => {
-                // A loaded blade leaves a solid body; only the edge and sparse
-                // scrapes break up. Coherent paper replaces pixel-column slots.
+                // Opaque paint with localized scraped grooves; pressure changes
+                // the footprint and scraping, not the whole deposit's opacity.
                 let drag = crate::paper_grain::sample(
                     [
                         point[0] * direction[0] + point[1] * direction[1],
-                        (-point[0] * direction[1] + point[1] * direction[0]) * 0.15,
+                        (-point[0] * direction[1] + point[1] * direction[0]) * 0.45,
                     ],
-                    2.8,
+                    0.65,
                 );
+                let breakup = crate::paper_grain::sample(point, 2.2);
                 let edge_depth =
-                    (1.0 - paper) * (1.5 + radius * 0.08).min(3.0).min(radius * aspect * 0.5);
+                    (1.0 - paper) * (2.0 + radius * 0.10).min(4.0).min(radius * aspect * 0.5);
                 let edge = (0.5 - distance - edge_depth).clamp(0.0, 1.0);
                 let body = smooth(0.0, (radius * aspect * 0.7).max(1.0), -distance);
-                let scrape = smooth(0.2, 0.65, drag + body * 0.3 + pressure * 0.15);
-                edge * (0.65 + 0.35 * pressure) * (0.7 + 0.3 * scrape) * (0.88 + 0.12 * paper)
+                let threshold = 0.25 + (1.0 - pressure) * 0.04 + (1.0 - body) * 0.07;
+                let scrape = 1.0 - smooth(threshold, threshold + 0.06, drag + breakup * 0.10);
+                let detail = smooth(0.5, 2.0, radius * aspect);
+                edge * (1.0 - scrape * detail)
             }
             _ => unreachable!(),
         }
@@ -225,14 +228,35 @@ mod tests {
         }
     }
     #[test]
-    fn loaded_knife_retains_a_dense_body() {
-        let c = contact(BrushTip::PaletteKnife, 1.0, [0.0; 2]);
-        for y in 62..67 {
-            for x in 62..67 {
-                assert!(
-                    BrushTip::PaletteKnife.coverage(c, c, [x as f32 + 0.5, y as f32 + 0.5]) > 0.7
-                );
+    fn loaded_knife_has_opaque_paint_and_localized_scrapes_at_low_and_high_pressure() {
+        for pressure in [0.25, 1.0] {
+            let mut from = contact(BrushTip::PaletteKnife, pressure, [0.0; 2]);
+            from.center = [64.0, 128.0];
+            let mut to = from;
+            to.center = [768.0, 128.0];
+            let mut opaque = 0;
+            let mut scrapes = 0;
+            let mut total = 0;
+            for y in 125..131 {
+                for x in 100..720 {
+                    let coverage =
+                        BrushTip::PaletteKnife.coverage(from, to, [x as f32 + 0.5, y as f32 + 0.5]);
+                    assert!((0.0..=1.0).contains(&coverage));
+                    total += 1;
+                    if coverage == 1.0 {
+                        opaque += 1;
+                    }
+                    if coverage < 0.25 {
+                        scrapes += 1;
+                    }
+                }
             }
+            println!("pressure {pressure}: {opaque}/{total} opaque, {scrapes} scraped");
+            assert!(opaque > total * 65 / 100, "paint must reach full coverage");
+            assert!(
+                scrapes > total / 200 && scrapes < total / 4,
+                "localized grooves must remain visible"
+            );
         }
     }
 
