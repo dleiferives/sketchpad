@@ -4,7 +4,6 @@ use crate::{
         AtlasAllocation, AtlasError, AtlasLayout, AtlasPageBatch, LayerTileKey, SparseAtlasPlanner,
     },
     raster::{RectU32, TileCoord},
-    round_geometry::RoundSweepGeometry,
     stroke::{RoundContact, RoundPathCommand, StrokeError},
 };
 use std::{collections::HashMap, error::Error, fmt};
@@ -19,6 +18,9 @@ pub struct RoundMaskInstance {
     radii: [f32; 2],
     clip_min: [f32; 2],
     clip_max: [f32; 2],
+    world_offset: [f32; 2],
+    brush_data: [f32; 4],
+    tilts: [f32; 4],
 }
 
 impl RoundMaskInstance {
@@ -50,20 +52,29 @@ impl RoundMaskInstance {
         {
             return 0.0;
         }
-        RoundSweepGeometry::new(
+        let tip = match self.brush_data[0] as u32 {
+            1 => crate::brush_tip::BrushTip::Pencil,
+            2 => crate::brush_tip::BrushTip::Marker,
+            3 => crate::brush_tip::BrushTip::PaletteKnife,
+            4 => crate::brush_tip::BrushTip::Charcoal,
+            _ => crate::brush_tip::BrushTip::HardRound,
+        };
+        let world = |p: [f32; 2]| [p[0] + self.world_offset[0], p[1] + self.world_offset[1]];
+        tip.coverage(
             RoundContact {
-                center: self.from,
+                dynamics: [self.brush_data[1], self.tilts[0], self.tilts[1]],
+                center: world(self.from),
                 radius: self.radii[0],
                 elapsed_micros: 0,
             },
             RoundContact {
-                center: self.to,
+                dynamics: [self.brush_data[2], self.tilts[2], self.tilts[3]],
+                center: world(self.to),
                 radius: self.radii[1],
                 elapsed_micros: 0,
             },
+            world(physical_point),
         )
-        .expect("scheduled round contacts are valid")
-        .coverage(physical_point)
     }
 }
 
@@ -119,6 +130,7 @@ pub struct RoundMaskScheduler {
     layer: LayerId,
     layout: AtlasLayout,
     active_contact: Option<RoundContact>,
+    tip: crate::brush_tip::BrushTip,
 }
 
 impl RoundMaskScheduler {
@@ -135,7 +147,13 @@ impl RoundMaskScheduler {
             layer,
             layout,
             active_contact: None,
+            tip: crate::brush_tip::BrushTip::HardRound,
         })
+    }
+
+    pub fn with_tip(mut self, tip: crate::brush_tip::BrushTip) -> Self {
+        self.tip = tip;
+        self
     }
 
     pub const fn layer(&self) -> LayerId {
@@ -217,6 +235,22 @@ impl RoundMaskScheduler {
             physical_work.push((
                 key,
                 RoundMaskInstance {
+                    world_offset: [
+                        tile_origin[0] as f32 - slot_origin[0] as f32,
+                        tile_origin[1] as f32 - slot_origin[1] as f32,
+                    ],
+                    brush_data: [
+                        self.tip as u32 as f32,
+                        from.dynamics[0],
+                        to.dynamics[0],
+                        0.0,
+                    ],
+                    tilts: [
+                        from.dynamics[1],
+                        from.dynamics[2],
+                        to.dynamics[1],
+                        to.dynamics[2],
+                    ],
                     from: [
                         slot_origin[0] as f32 + from.center[0] - tile_origin[0] as f32,
                         slot_origin[1] as f32 + from.center[1] - tile_origin[1] as f32,
@@ -261,24 +295,29 @@ impl RoundMaskScheduler {
         damage: &mut HashMap<LayerTileKey, RectU32>,
         work: &mut Vec<(LayerTileKey, RoundContact, RoundContact, [u32; 2])>,
     ) {
+        let fringe = if self.tip == crate::brush_tip::BrushTip::HardRound {
+            COVERAGE_FRINGE
+        } else {
+            3.0
+        };
         let min_x = ((from.center[0] as f64 - from.radius as f64)
             .min(to.center[0] as f64 - to.radius as f64)
-            - COVERAGE_FRINGE)
+            - fringe)
             .floor()
             .clamp(0.0, self.canvas[0] as f64) as u32;
         let min_y = ((from.center[1] as f64 - from.radius as f64)
             .min(to.center[1] as f64 - to.radius as f64)
-            - COVERAGE_FRINGE)
+            - fringe)
             .floor()
             .clamp(0.0, self.canvas[1] as f64) as u32;
         let max_x = ((from.center[0] as f64 + from.radius as f64)
             .max(to.center[0] as f64 + to.radius as f64)
-            + COVERAGE_FRINGE)
+            + fringe)
             .ceil()
             .clamp(0.0, self.canvas[0] as f64) as u32;
         let max_y = ((from.center[1] as f64 + from.radius as f64)
             .max(to.center[1] as f64 + to.radius as f64)
-            + COVERAGE_FRINGE)
+            + fringe)
             .ceil()
             .clamp(0.0, self.canvas[1] as f64) as u32;
         if min_x >= max_x || min_y >= max_y {
@@ -315,6 +354,11 @@ fn validate_contact(contact: RoundContact) -> Result<(), RoundMaskError> {
     if contact.center.iter().any(|value| !value.is_finite())
         || !contact.radius.is_finite()
         || contact.radius <= 0.0
+        || !contact.dynamics[0].is_finite()
+        || !(0.0..=1.0).contains(&contact.dynamics[0])
+        || contact.dynamics[1..]
+            .iter()
+            .any(|v| !v.is_finite() || !(-1.0..=1.0).contains(v))
     {
         return Err(StrokeError::InvalidContact.into());
     }
@@ -374,6 +418,7 @@ mod tests {
 
     fn contact(center: [f32; 2], radius: f32, elapsed_micros: u64) -> RoundContact {
         RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center,
             radius,
             elapsed_micros,

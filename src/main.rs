@@ -339,20 +339,31 @@ enum PointerOwner {
 enum PaintEngine {
     #[default]
     HardRound,
-    Flat,
+    Marker,
     Pencil,
     PaletteKnife,
-    Bristle,
+    Charcoal,
 }
 
 impl PaintEngine {
+    const fn tip(self) -> sketchpad::brush_tip::BrushTip {
+        use sketchpad::brush_tip::BrushTip;
+        match self {
+            Self::HardRound => BrushTip::HardRound,
+            Self::Pencil => BrushTip::Pencil,
+            Self::Marker => BrushTip::Marker,
+            Self::PaletteKnife => BrushTip::PaletteKnife,
+            Self::Charcoal => BrushTip::Charcoal,
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
-            Self::HardRound => "Pen",
-            Self::Flat => "Flat",
+            Self::HardRound => "Round",
+            Self::Marker => "Marker",
             Self::Pencil => "Pencil",
             Self::PaletteKnife => "Knife",
-            Self::Bristle => "Brush",
+            Self::Charcoal => "Charcoal",
         }
     }
 }
@@ -644,6 +655,7 @@ struct App {
     configured: bool,
     document: Document,
     paint_brush: HardRoundBrush,
+    brush_settings: [[f32; 2]; 5],
     recent_colors: RecentColors,
     eraser_brush: HardRoundBrush,
     paint_engine: PaintEngine,
@@ -745,6 +757,13 @@ impl App {
             configured: false,
             document,
             paint_brush,
+            brush_settings: [
+                [12.0, 1.0],
+                [10.0, 1.0],
+                [36.0, 1.0],
+                [80.0, 1.0],
+                [48.0, 1.0],
+            ],
             recent_colors,
             eraser_brush: HardRoundBrush::eraser(64.0, 1.0, 0.18).unwrap(),
             paint_engine: PaintEngine::default(),
@@ -842,10 +861,10 @@ impl App {
         let tool = match (self.mouse_tool, self.paint_engine) {
             (ToolKind::Eraser, _) => UiTool::Eraser,
             (ToolKind::Pen, PaintEngine::HardRound) => UiTool::Pen,
-            (ToolKind::Pen, PaintEngine::Flat) => UiTool::Flat,
+            (ToolKind::Pen, PaintEngine::Marker) => UiTool::Marker,
             (ToolKind::Pen, PaintEngine::Pencil) => UiTool::Pencil,
             (ToolKind::Pen, PaintEngine::PaletteKnife) => UiTool::PaletteKnife,
-            (ToolKind::Pen, PaintEngine::Bristle) => UiTool::Bristle,
+            (ToolKind::Pen, PaintEngine::Charcoal) => UiTool::Charcoal,
         };
         let brush = self.brush_for_tool(self.mouse_tool);
         let mut recent_colors = [[0.0; 3]; MAX_RECENT_COLORS];
@@ -860,7 +879,7 @@ impl App {
             },
             brush_adjusting: self.brush_drag.and_then(|(_, drag)| drag.axis),
             zoom: self.zoom,
-            natural_brushes_available: self.gpu_resident_document().is_none(),
+            natural_brushes_available: self.gpu_resident_document().is_some(),
             tool,
             brush_diameter: brush.diameter(),
             brush_opacity: brush.opacity(),
@@ -1262,22 +1281,21 @@ impl App {
         if self.canvas_busy() {
             return;
         }
-        if self.gpu_resident_document().is_some() && !matches!(tool, UiTool::Pen | UiTool::Eraser) {
-            log::warn!(
-                "the {:?} brush is temporarily unavailable during the GPU-resident cutover",
-                tool
-            );
+        if self.gpu_resident_document().is_none() && !matches!(tool, UiTool::Pen | UiTool::Eraser) {
+            log::warn!("media brushes require the GPU-resident renderer");
             return;
         }
+        self.brush_settings[self.paint_engine.tip() as usize] =
+            [self.paint_brush.diameter(), self.paint_brush.opacity()];
         match tool {
             UiTool::Pen => {
                 self.mouse_tool = ToolKind::Pen;
                 self.paint_engine = PaintEngine::HardRound;
             }
             UiTool::Eraser => self.mouse_tool = ToolKind::Eraser,
-            UiTool::Flat => {
+            UiTool::Marker => {
                 self.mouse_tool = ToolKind::Pen;
-                self.paint_engine = PaintEngine::Flat;
+                self.paint_engine = PaintEngine::Marker;
             }
             UiTool::Pencil => {
                 self.mouse_tool = ToolKind::Pen;
@@ -1287,11 +1305,18 @@ impl App {
                 self.mouse_tool = ToolKind::Pen;
                 self.paint_engine = PaintEngine::PaletteKnife;
             }
-            UiTool::Bristle => {
+            UiTool::Charcoal => {
                 self.mouse_tool = ToolKind::Pen;
-                self.paint_engine = PaintEngine::Bristle;
+                self.paint_engine = PaintEngine::Charcoal;
             }
         }
+        let [diameter, opacity] = self.brush_settings[self.paint_engine.tip() as usize];
+        self.paint_brush = self
+            .paint_brush
+            .with_diameter(diameter)
+            .unwrap()
+            .with_opacity(opacity)
+            .unwrap();
         self.canvas_mode = CanvasMode::Draw;
         self.cursor_tool = self.mouse_tool;
         self.cursor_pressure = 0.0;
@@ -1364,33 +1389,31 @@ impl App {
             ToolKind::Pen => [brush.color()[0], brush.color()[1], brush.color()[2], 1.0],
             ToolKind::Eraser => [1.0, 0.36, 0.08, 1.0],
         };
-        let (half_extents, shape) = match (self.cursor_tool, self.paint_engine) {
-            (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound) => {
-                let radius = brush.radius_for_pressure(pressure);
-                ([radius, radius], CURSOR_SHAPE_CIRCLE)
-            }
-            (ToolKind::Pen, PaintEngine::Flat) => (
-                flat_brush_from_paint(brush).contact_half_extents(pressure),
-                CURSOR_SHAPE_BOX,
-            ),
-            (ToolKind::Pen, PaintEngine::Pencil) => (
-                pencil_brush_from_paint(brush).contact_half_extents(pressure, self.cursor_tilt),
-                CURSOR_SHAPE_ELLIPSE,
-            ),
-            (ToolKind::Pen, PaintEngine::PaletteKnife) => (
-                palette_knife_from_paint(brush).contact_half_extents(pressure),
-                CURSOR_SHAPE_BOX,
-            ),
-            (ToolKind::Pen, PaintEngine::Bristle) => (
-                bristle_brush_from_paint(brush).contact_half_extents(pressure),
-                CURSOR_SHAPE_BOX,
-            ),
+        let tip = if self.cursor_tool == ToolKind::Eraser {
+            sketchpad::brush_tip::BrushTip::HardRound
+        } else {
+            self.paint_engine.tip()
+        };
+        let radius = tip.radius(brush.diameter(), pressure, self.cursor_tilt, 0.05);
+        let (direction, aspect) = tip.shape(self.cursor_tilt);
+        let chisel = matches!(
+            tip,
+            sketchpad::brush_tip::BrushTip::Marker | sketchpad::brush_tip::BrushTip::PaletteKnife
+        );
+        let radius = if chisel { radius * 0.92 } else { radius };
+        let half_extents = [radius, radius * aspect];
+        let shape = if chisel {
+            CURSOR_SHAPE_BOX
+        } else if aspect == 1.0 {
+            CURSOR_SHAPE_CIRCLE
+        } else {
+            CURSOR_SHAPE_ELLIPSE
         };
 
         BrushCursorUniform {
             position: self.camera().world_from_screen(screen),
             half_extents,
-            direction: self.cursor_direction,
+            direction,
             shape,
             visible: 1.0,
             color,
@@ -1507,25 +1530,14 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
-        if self.gpu_resident_document().is_some() {
-            self.paint_engine = PaintEngine::HardRound;
-            log::warn!("only the hard-round brush is enabled during the GPU-resident cutover");
-            self.request_redraw();
-            return;
-        }
-        self.paint_engine = match self.paint_engine {
-            PaintEngine::HardRound => PaintEngine::Flat,
-            PaintEngine::Flat => PaintEngine::Pencil,
-            PaintEngine::Pencil => PaintEngine::PaletteKnife,
-            PaintEngine::PaletteKnife => PaintEngine::Bristle,
-            PaintEngine::Bristle => PaintEngine::HardRound,
+        let next = match self.paint_engine {
+            PaintEngine::HardRound => UiTool::Pencil,
+            PaintEngine::Pencil => UiTool::Marker,
+            PaintEngine::Marker => UiTool::PaletteKnife,
+            PaintEngine::PaletteKnife => UiTool::Charcoal,
+            PaintEngine::Charcoal => UiTool::Pen,
         };
-        self.mouse_tool = ToolKind::Pen;
-        self.cursor_tool = ToolKind::Pen;
-        self.cursor_pressure = 0.0;
-        self.cursor_contact = false;
-        self.update_window_title(None);
-        self.request_redraw();
+        self.select_ui_tool(next);
     }
 
     fn pick_color(&mut self, screen: [f32; 2]) {
@@ -1600,14 +1612,9 @@ impl App {
         };
         let brush = self.brush_for_tool(tool);
         let sample = BrushSample::with_tilt(world, pressure, tilt);
-        let resident_round = matches!(
-            (tool, self.paint_engine),
-            (ToolKind::Eraser, _) | (ToolKind::Pen, PaintEngine::HardRound)
-        ) && self.gpu.as_ref().is_some_and(|gpu| gpu.resident.is_some());
-        if self.gpu_resident_document().is_some() && !resident_round {
-            log::warn!(
-                "only hard-round paint and erase are enabled during the GPU-resident cutover"
-            );
+        let resident_round = self.gpu.as_ref().is_some_and(|gpu| gpu.resident.is_some());
+        if !resident_round && tool == ToolKind::Pen && self.paint_engine != PaintEngine::HardRound {
+            log::warn!("media brush unavailable after GPU renderer fallback; select Hard round to continue");
             return;
         }
         let gpu_palette_knife = tool == ToolKind::Pen
@@ -1622,8 +1629,14 @@ impl App {
                     HardRoundMode::Erase => StrokeMaterial::eraser(brush.opacity(), 1.0),
                 }
                 .map_err(|error| error.to_string())?;
+                let tip = if tool == ToolKind::Eraser {
+                    sketchpad::brush_tip::BrushTip::HardRound
+                } else {
+                    self.paint_engine.tip()
+                };
                 let recipe = RoundBrushRecipeV1::new(material, brush.diameter())
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|error| error.to_string())?
+                    .with_tip(tip);
                 let timed = TimedBrushSample::new(
                     world,
                     pressure.clamp(0.0, 1.0),
@@ -1667,7 +1680,7 @@ impl App {
                         .map(ActiveStroke::HardRound)
                         .map_err(|error| error.to_string())
                 }
-                (ToolKind::Pen, PaintEngine::Flat) => {
+                (ToolKind::Pen, PaintEngine::Marker) => {
                     let flat = flat_brush_from_paint(brush);
                     FlatStroke::begin(self.document.active_layer_mut(), flat, sample)
                         .map(ActiveStroke::Flat)
@@ -1708,7 +1721,7 @@ impl App {
                         .map(ActiveStroke::PaletteKnife)
                         .map_err(|error| error.to_string())
                 }
-                (ToolKind::Pen, PaintEngine::Bristle) => {
+                (ToolKind::Pen, PaintEngine::Charcoal) => {
                     let bristle = bristle_brush_from_paint(brush);
                     BristleStroke::begin(self.document.active_layer_mut(), bristle, sample)
                         .map(ActiveStroke::Bristle)
@@ -5227,6 +5240,189 @@ mod tests {
             for axis in 0..2 {
                 assert!((before[axis] - after[axis]).abs() < 0.001);
             }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires X11 and a hardware GPU; renders brush swatches in a hidden window"]
+    #[allow(deprecated)]
+    fn media_brushes_preserve_pixels_history_and_files() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(768, 640)),
+                )
+                .unwrap(),
+        );
+        let directory = PathBuf::from(".artifacts/brushes");
+        std::fs::create_dir_all(&directory).unwrap();
+        let recovery = directory.join("media-recovery.sketchpad");
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            Document::new(768, 640, DEFAULT_TILE_SIZE).unwrap(),
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("swatches.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+        let pixels = |app: &App| {
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let doc = recovered.document();
+            let layer = doc.layer_raster(doc.active_layer_id()).unwrap();
+            (0..640)
+                .flat_map(|y| (0..768).map(move |x| layer.pixel(x, y).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        for (index, tool) in [
+            UiTool::Pen,
+            UiTool::Pencil,
+            UiTool::Marker,
+            UiTool::PaletteKnife,
+            UiTool::Charcoal,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            app.select_ui_tool(tool);
+            assert_eq!(app.ui_snapshot().tool, tool);
+            app.set_brush_diameter(if tool == UiTool::Pencil { 48.0 } else { 70.0 });
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            let before = pixels(&app);
+            let depth = app.gpu_resident_document().unwrap().history().undo_depth();
+            let y = 60.0 + index as f32 * 120.0;
+            app.start_stroke([60.0, y], 0.2, [0.0; 2], PointerOwner::Mouse);
+            for step in 1..=80 {
+                let t = step as f32 / 80.0;
+                app.update_stroke(
+                    [
+                        60.0 + t * 410.0,
+                        y + (t * std::f32::consts::TAU).sin() * 18.0,
+                    ],
+                    0.2 + 0.8 * t,
+                    [0.7 * t, 0.0],
+                );
+                assert!(
+                    matches!(&app.active_stroke,Some(ActiveStroke::GpuResidentRound(stroke)) if !stroke.update_error_reported)
+                );
+            }
+            app.finish_stroke();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            let after = pixels(&app);
+            assert_ne!(before, after, "{tool:?} did not paint");
+            assert_eq!(
+                app.gpu_resident_document().unwrap().history().undo_depth(),
+                depth + 1
+            );
+            app.undo();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert_eq!(pixels(&app), before);
+            app.redo();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert_eq!(pixels(&app), after);
+            // A mouse-only crosshatch exercises fixed chisel orientation and layering.
+            for offset in [0.0, 20.0] {
+                app.start_stroke(
+                    [550.0 + offset, y - 30.0],
+                    1.0,
+                    [0.0; 2],
+                    PointerOwner::Mouse,
+                );
+                app.update_stroke([680.0 - offset, y + 30.0], 1.0, [0.0; 2]);
+                app.finish_stroke();
+            }
+        }
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let expected = pixels(&app);
+        let path = directory.join("media.sketchpad");
+        assert!(app.save_document_to(path.clone()));
+        let saved = checkpoint::load_document(&path).unwrap();
+        let raster = saved.layer_raster(saved.active_layer_id()).unwrap();
+        let loaded: Vec<_> = (0..640)
+            .flat_map(|y| (0..768).map(move |x| raster.pixel(x, y).unwrap()))
+            .collect();
+        assert_eq!(expected, loaded);
+        app.export_png_to(&directory.join("swatches.png"), ExportRegion::FullCanvas);
+        assert!(directory.join("swatches.png").exists());
+        // Present the actual GPU readback on white for a legible review artifact.
+        let mut review = sketchpad::raster::RasterLayer::new(768, 640, DEFAULT_TILE_SIZE).unwrap();
+        let mut gesture = review.scoped_gesture().unwrap();
+        for y in 0..640 {
+            for x in 0..768 {
+                let p = expected[(y * 768 + x) as usize];
+                gesture
+                    .set_pixel(
+                        x,
+                        y,
+                        LinearRgba::premultiplied(
+                            p.r + 1.0 - p.a,
+                            p.g + 1.0 - p.a,
+                            p.b + 1.0 - p.a,
+                            1.0,
+                        ),
+                    )
+                    .unwrap();
+            }
+        }
+        gesture.commit().unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("swatches-white.png"),
+            &review,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
+        app.select_ui_tool(UiTool::Pencil);
+        assert_eq!(app.paint_brush.diameter(), 48.0);
+        for tool in [
+            UiTool::Pen,
+            UiTool::Pencil,
+            UiTool::Marker,
+            UiTool::PaletteKnife,
+            UiTool::Charcoal,
+        ] {
+            app.select_ui_tool(tool);
+            app.set_brush_diameter(512.0);
+            app.start_stroke([50.0, 50.0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            for step in 0..64 {
+                app.update_stroke(
+                    [
+                        50.0 + (step % 8) as f32 * 90.0,
+                        50.0 + (step / 8) as f32 * 75.0,
+                    ],
+                    1.0,
+                    [0.0; 2],
+                );
+                assert!(
+                    matches!(&app.active_stroke,Some(ActiveStroke::GpuResidentRound(stroke)) if !stroke.update_error_reported)
+                );
+            }
+            app.finish_stroke();
+            app.undo();
+            app.reconcile_gpu_mirror_for_file().unwrap();
+            assert_eq!(
+                pixels(&app),
+                expected,
+                "{tool:?}: broad stroke must undo as one contact"
+            );
         }
     }
 

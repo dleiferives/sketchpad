@@ -780,6 +780,7 @@ fn swap_and_read(
 
 fn contact(center: [f32; 2], radius: f32, elapsed_micros: u64) -> RoundContact {
     RoundContact {
+        dynamics: [1.0, 0.0, 0.0],
         center,
         radius,
         elapsed_micros,

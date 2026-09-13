@@ -124,9 +124,16 @@ pub fn replay_round_recovery_command(
     command: &GpuRoundRecoveryCommand,
 ) -> Result<GpuRoundRecoveryReplay, GpuRoundRecoveryReplayError> {
     let geometry = command.geometry();
-    let bounds = geometry
+    let mut bounds = geometry
         .bounds()
         .expect("a complete recovery path has conservative bounds");
+    if command.recipe.tip() != crate::brush_tip::BrushTip::HardRound {
+        // Anisotropic tips need up to three pixels of conservative AA fringe.
+        for axis in 0..2 {
+            bounds.min[axis] -= 2.5;
+            bounds.max[axis] += 2.5;
+        }
+    }
     let min_x = (bounds.min[0] as f64)
         .floor()
         .clamp(0.0, layer.width() as f64) as u32;
@@ -146,10 +153,24 @@ pub fn replay_round_recovery_command(
         for y in min_y..max_y {
             for x in min_x..max_x {
                 pixels_evaluated = pixels_evaluated.saturating_add(1);
-                let mask = geometry.accumulated_mask_at(
-                    [x as f32 + 0.5, y as f32 + 0.5],
-                    StrokeAccumulation::CoverageUnion,
-                )?;
+                let point = [x as f32 + 0.5, y as f32 + 0.5];
+                let mask = if command.recipe.tip() == crate::brush_tip::BrushTip::HardRound {
+                    geometry.accumulated_mask_at(point, StrokeAccumulation::CoverageUnion)?
+                } else {
+                    command
+                        .commands
+                        .iter()
+                        .map(|part| match *part {
+                            RoundPathCommand::Begin(at) => {
+                                command.recipe.tip().coverage(at, at, point)
+                            }
+                            RoundPathCommand::Sweep { from, to } => {
+                                command.recipe.tip().coverage(from, to, point)
+                            }
+                            RoundPathCommand::End { .. } => 0.0,
+                        })
+                        .fold(0.0_f32, f32::max)
+                };
                 if mask == 0.0 {
                     continue;
                 }
@@ -321,6 +342,7 @@ mod tests {
 
     fn contact(center: [f32; 2], radius: f32, elapsed_micros: u64) -> RoundContact {
         RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center,
             radius,
             elapsed_micros,

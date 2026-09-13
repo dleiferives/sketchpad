@@ -244,6 +244,11 @@ impl RoundStrokeGeometry {
 
 fn valid_contact(contact: RoundContact) -> bool {
     contact.center.iter().all(|value| value.is_finite())
+        && contact.dynamics.iter().all(|v| v.is_finite())
+        && (0.0..=1.0).contains(&contact.dynamics[0])
+        && contact.dynamics[1..]
+            .iter()
+            .all(|v| (-1.0..=1.0).contains(v))
         && contact.radius.is_finite()
         && contact.radius > 0.0
 }
@@ -268,6 +273,7 @@ mod tests {
 
     fn contact(center: [f32; 2], radius: f32) -> RoundContact {
         RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center,
             radius,
             elapsed_micros: 0,

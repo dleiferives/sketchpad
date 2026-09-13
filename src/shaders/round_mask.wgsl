@@ -12,6 +12,9 @@ struct RoundVertexInput {
     @location(2) radii: vec2<f32>,
     @location(3) clip_min: vec2<f32>,
     @location(4) clip_max: vec2<f32>,
+    @location(5) world_offset: vec2<f32>,
+    @location(6) brush_data: vec4<f32>,
+    @location(7) tilts: vec4<f32>,
 }
 
 struct RoundVertexOutput {
@@ -22,6 +25,9 @@ struct RoundVertexOutput {
     @location(3) @interpolate(flat) radii: vec2<f32>,
     @location(4) @interpolate(flat) clip_min: vec2<f32>,
     @location(5) @interpolate(flat) clip_max: vec2<f32>,
+    @location(6) @interpolate(flat) world_offset: vec2<f32>,
+    @location(7) @interpolate(flat) brush_data: vec4<f32>,
+    @location(8) @interpolate(flat) tilts: vec4<f32>,
 }
 
 fn quad_corner(vertex_index: u32) -> vec2<f32> {
@@ -46,7 +52,7 @@ fn round_vs(
     @builtin(vertex_index) vertex_index: u32,
     input: RoundVertexInput,
 ) -> RoundVertexOutput {
-    let fringe = vec2<f32>(0.5);
+    let fringe = vec2<f32>(select(0.5, 3.0, input.brush_data.x > 0.5));
     let bounds_min = min(
         input.start_point - vec2<f32>(input.radii.x),
         input.end_point - vec2<f32>(input.radii.y),
@@ -65,6 +71,9 @@ fn round_vs(
     output.radii = input.radii;
     output.clip_min = input.clip_min;
     output.clip_max = input.clip_max;
+    output.world_offset = input.world_offset;
+    output.brush_data = input.brush_data;
+    output.tilts = input.tilts;
     return output;
 }
 
@@ -110,11 +119,84 @@ fn distance_to_variable_capsule(
     return tangent * local.x + slope * local.y - radii.x;
 }
 
+fn grain(point: vec2<f32>, scale: f32) -> f32 {
+    let cell = vec2<i32>(floor(point / scale));
+    var h = bitcast<u32>(cell.x) * 0x1f123bb5u ^ bitcast<u32>(cell.y) * 0x5f356495u ^ 0x91e10da5u;
+    h = h ^ (h >> 16u); h = h * 0x7feb352du; h = h ^ (h >> 15u);
+    return f32(h & 65535u) / 65535.0;
+}
+
+fn box_value(base: vec4<f32>, slope: vec4<f32>, t: f32) -> f32 {
+    let v = base + slope * t;
+    return max(max(v.x, v.y), max(v.z, v.w));
+}
+fn box_sweep_distance(point: vec2<f32>, end: vec2<f32>, radii: vec2<f32>) -> f32 {
+    let dr = radii.y-radii.x;
+    let base = vec4<f32>(point.x, -point.x, point.y, -point.y) - vec4<f32>(radii.x);
+    let slope = vec4<f32>(-end.x, end.x, -end.y, end.y) - vec4<f32>(dr);
+    var best = min(box_value(base, slope, 0.0), box_value(base, slope, 1.0));
+    for (var i = 0u; i < 4u; i++) { for (var j = i+1u; j < 4u; j++) {
+        let divisor = slope[i]-slope[j];
+        if abs(divisor) > 1e-6 {
+            let t = clamp((base[j]-base[i])/divisor, 0.0, 1.0);
+            best = min(best, box_value(base, slope, t));
+        }
+    }}
+    return best;
+}
+
+fn media_coverage(input: RoundVertexOutput) -> f32 {
+    let kind = u32(input.brush_data.x);
+    let delta = input.end_point - input.start_point;
+    let relative = input.physical - input.start_point;
+    var t = clamp(dot(relative, delta) / max(dot(delta, delta), 1e-12), 0.0, 1.0);
+    var radii = input.radii;
+    if dot(delta, delta) <= 1e-12 { t = 1.0; radii = vec2<f32>(input.radii.y); }
+    let pressure = mix(input.brush_data.y, input.brush_data.z, t);
+    let tilt = mix(input.tilts.xy, input.tilts.zw, t);
+    let side = min(length(tilt), 1.0);
+    let weight = clamp((side - 0.08) / 0.24, 0.0, 1.0);
+    var direction = vec2<f32>(0.8, 0.6)*(1.0-weight) + tilt/max(length(tilt), 1e-6)*weight;
+    if length(direction) > 1e-6 { direction = normalize(direction); } else { direction = vec2<f32>(0.8,0.6); }
+    var aspect = 1.0 - 0.65 * side;
+    if kind == 2u { aspect = 0.42; }
+    if kind == 3u { aspect = 0.22; }
+    if kind == 4u { aspect = 0.65 - 0.25 * side; }
+    let normal = vec2<f32>(-direction.y, direction.x);
+    let local = vec2<f32>(dot(relative, direction), dot(relative, normal) / aspect);
+    let end = vec2<f32>(dot(delta, direction), dot(delta, normal) / aspect);
+    var distance = distance_to_variable_capsule(local, vec2<f32>(0.0), end, radii);
+    if kind == 2u || kind == 3u { distance = box_sweep_distance(local, end, radii * 0.92); }
+    distance *= aspect;
+    let radius = mix(radii.x, radii.y, t);
+    var edge = 0.5;
+    if kind == 1u { edge = 0.65; }
+    if kind == 4u { edge = max(radius * 0.12, 0.8); }
+    let coverage = clamp((0.5 - distance) / (2.0 * edge), 0.0, 1.0);
+    let world = input.physical + input.world_offset;
+    let fine = grain(world, 1.0);
+    let coarse = grain(world, 3.0);
+    var texture = 1.0;
+    if kind == 1u {
+        texture = clamp((pressure * 1.15 - fine * 0.8 - coarse * 0.18) * 2.2, 0.0, 1.0) * (0.3 + pressure * 0.65);
+    }
+    if kind == 2u { texture = 0.38 + 0.12 * pressure; }
+    if kind == 3u {
+        let lane = grain(vec2<f32>(dot(world, direction), dot(world, normal)*0.06), 1.0);
+        texture = clamp((pressure * 0.95 - lane * 0.85 - fine * 0.25) * 3.0, 0.0, 1.0);
+    }
+    if kind == 4u {
+        texture = clamp((pressure * 1.1 - coarse * 0.6 - fine * 0.35) * 2.5, 0.0, 1.0) * 0.88;
+    }
+    return coverage * texture;
+}
+
 @fragment
 fn round_fs(input: RoundVertexOutput) -> @location(0) f32 {
     if any(input.physical < input.clip_min) || any(input.physical >= input.clip_max) {
         discard;
     }
+    if input.brush_data.x > 0.5 { return media_coverage(input); }
     let distance = distance_to_variable_capsule(
         input.physical,
         input.start_point,

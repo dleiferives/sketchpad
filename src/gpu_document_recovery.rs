@@ -346,6 +346,7 @@ mod tests {
 
     fn round_command(layer: LayerId) -> GpuRasterRecoveryCommand {
         let at = RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center: [8.5, 8.5],
             radius: 2.0,
             elapsed_micros: 0,

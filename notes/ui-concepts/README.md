@@ -33,7 +33,7 @@ All project commands run on Atlas via `scripts/atlas run`:
 - Remote `rustfmt --check` for changed Rust files and local `git diff --check`.
 - Live X11 mouse/keyboard smoke: Shift/O drags, cancellation, both puck axes, Space-pan, help, Tab focus and pointer restoration, mirrored color panel, drawing, erasing and undo. Window-only screenshots are hosted in this directory; transient logs and captures remain under `.artifacts/ui-refresh/`.
 
-Physical pen pressure, simultaneous pen/touch behavior and gesture feel still require a tablet. View rotation, a radial menu, barrel-button mapping, held-E erasing and an off-hand touch modifier remain future options. Natural-media tools remain unavailable in the current GPU-resident engine and are disabled in the brush library.
+Physical pen pressure, simultaneous pen/touch behavior and gesture feel still require a tablet. View rotation, a radial menu, barrel-button mapping, held-E erasing and an off-hand touch modifier remain future options. The GPU brush library now includes hard round, pencil, alcohol marker, palette knife and charcoal. See [brush implementation and validation](../brushes.md) and [actual GPU swatches](brushes.html).
 
 ## View on Atlas
 

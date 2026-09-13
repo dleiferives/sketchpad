@@ -172,6 +172,7 @@ pub struct RoundBrushRecipeV1 {
     material: StrokeMaterial,
     diameter: f32,
     minimum_pressure_fraction: f32,
+    tip: crate::brush_tip::BrushTip,
 }
 
 impl RoundBrushRecipeV1 {
@@ -196,7 +197,17 @@ impl RoundBrushRecipeV1 {
             material,
             diameter,
             minimum_pressure_fraction,
+            tip: crate::brush_tip::BrushTip::HardRound,
         })
+    }
+
+    pub fn with_tip(mut self, tip: crate::brush_tip::BrushTip) -> Self {
+        self.tip = tip;
+        self
+    }
+
+    pub const fn tip(self) -> crate::brush_tip::BrushTip {
+        self.tip
     }
 
     pub const fn version(self) -> u32 {
@@ -216,7 +227,12 @@ impl RoundBrushRecipeV1 {
     }
 
     pub fn radius_for_pressure(self, pressure: f32) -> f32 {
-        self.diameter * 0.5 * pressure.clamp(0.0, 1.0).max(self.minimum_pressure_fraction)
+        self.tip.radius(
+            self.diameter,
+            pressure,
+            [0.0; 2],
+            self.minimum_pressure_fraction,
+        )
     }
 }
 
@@ -256,6 +272,8 @@ impl TimedBrushSample {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoundContact {
+    /// Pressure and normalized tablet tilt, retained for textured recovery.
+    pub dynamics: [f32; 3],
     pub center: [f32; 2],
     pub radius: f32,
     pub elapsed_micros: u64,
@@ -354,14 +372,22 @@ impl ContinuousRoundPath {
         }
 
         let contact = RoundContact {
+            dynamics: [sample.pressure, sample.tilt[0], sample.tilt[1]],
             center: sample.position,
-            radius: self.recipe.radius_for_pressure(sample.pressure),
+            radius: self.recipe.tip().radius(
+                self.recipe.diameter(),
+                sample.pressure,
+                sample.tilt,
+                self.recipe.minimum_pressure_fraction(),
+            ),
             elapsed_micros: sample.elapsed_micros,
         };
         match self.active_contact.replace(contact) {
             None => self.push(RoundPathCommand::Begin(contact)),
             Some(previous)
-                if previous.center == contact.center && previous.radius == contact.radius =>
+                if previous.center == contact.center
+                    && previous.radius == contact.radius
+                    && previous.dynamics == contact.dynamics =>
             {
                 // No command was emitted: retain the exact endpoint (including its
                 // timestamp) that the renderer and recovery replay last received.

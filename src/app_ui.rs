@@ -70,41 +70,51 @@ pub enum UiPanel {
 pub enum UiTool {
     Pen,
     Eraser,
-    Flat,
+    Marker,
     Pencil,
     PaletteKnife,
-    Bristle,
+    Charcoal,
 }
 
 impl UiTool {
     const ALL: [Self; 6] = [
         Self::Pen,
-        Self::Eraser,
-        Self::Flat,
         Self::Pencil,
+        Self::Marker,
         Self::PaletteKnife,
-        Self::Bristle,
+        Self::Charcoal,
+        Self::Eraser,
     ];
 
     const fn short_label(self) -> &'static str {
         match self {
-            Self::Pen => "Ink",
+            Self::Pen => "Round",
             Self::Eraser => "Eraser",
-            Self::Flat => "Flat",
+            Self::Marker => "Marker",
             Self::Pencil => "Pencil",
             Self::PaletteKnife => "Knife",
-            Self::Bristle => "Bristle",
+            Self::Charcoal => "Charcoal",
         }
     }
 
     const fn menu_label(self) -> &'static str {
         match self {
-            Self::Pen => "Ink pen",
+            Self::Pen => "Hard round",
             Self::Eraser => "Eraser",
-            Self::Flat => "Flat nib",
-            Self::Pencil => "Graphite",
+            Self::Marker => "Alcohol marker",
+            Self::Pencil => "Graphite pencil",
             Self::PaletteKnife => "Palette knife",
-            Self::Bristle => "Bristle",
+            Self::Charcoal => "Charcoal",
+        }
+    }
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Pen => "Crisp edges · pressure controls size",
+            Self::Eraser => "Clean, pressure-sensitive removal",
+            Self::Pencil => "Fine grain · tilt for side shading",
+            Self::Marker => "Translucent chisel · layer to deepen",
+            Self::PaletteKnife => "Flat blade · broken, dry ridges",
+            Self::Charcoal => "Soft grain · pressure and tilt shading",
         }
     }
 }
@@ -1493,7 +1503,7 @@ fn show_help_content(
     });
     egui::ScrollArea::vertical().id_salt("input-help").max_height((ui.ctx().content_rect().height() - 220.0).max(180.0)).show(ui, |ui| {
         ui.label(egui::RichText::new("With a pen · no keyboard needed").strong().color(CONTROL_ACTIVE));
-        for text in ["Tap Ink or Eraser to draw. Pick samples a color, then returns to drawing.", "Drag the round puck sideways for size, or vertically for opacity. Tune opens sliders and presets.", "Pan lets you drag the canvas. Use − / + to zoom; tap the percentage to fit.", "Undo, redo, color and layers are always a tap away. Focus hides tools; Show tools brings them back.", "On a touchscreen: two fingers pan/pinch, two-finger tap undoes, three-finger tap redoes. One finger on the canvas does not paint."] {
+        for text in ["Choose a preset in the brush library, or tap Eraser. Pick samples a color, then returns to drawing.", "Drag the round puck sideways for size, or vertically for opacity. Tune opens sliders and presets.", "Pan lets you drag the canvas. Use − / + to zoom; tap the percentage to fit.", "Undo, redo, color and layers are always a tap away. Focus hides tools; Show tools brings them back.", "On a touchscreen: two fingers pan/pinch, two-finger tap undoes, three-finger tap redoes. One finger on the canvas does not paint."] {
             ui.add_space(8.0); ui.label(text);
         }
         ui.add_space(14.0);
@@ -2065,7 +2075,7 @@ fn show_brush_panel(
                         });
                     });
                     if !snapshot.natural_brushes_available {
-                        ui.label(egui::RichText::new("Ink and eraser are available. Other brushes are coming to this renderer.").size(12.0).color(TEXT_MUTED));
+                        ui.label(egui::RichText::new("Hard round and eraser are available. Textured brushes need the GPU renderer.").size(12.0).color(TEXT_MUTED));
                     }
                     for tool in UiTool::ALL {
                         let label = if tool == snapshot.tool {
@@ -2075,10 +2085,11 @@ fn show_brush_panel(
                         };
                         let available = snapshot.natural_brushes_available || matches!(tool, UiTool::Pen | UiTool::Eraser);
                         ui.add_enabled_ui(available, |ui| {
-                            if menu_button(ui, &label, "Select brush preset").clicked() {
+                            if menu_button(ui, &label, tool.description()).clicked() {
                                 actions.push(UiAction::SelectTool(tool));
                                 *brush_panel_open = false;
                             }
+                            ui.label(egui::RichText::new(tool.description()).size(11.0).color(TEXT_MUTED));
                         });
                     }
                 });

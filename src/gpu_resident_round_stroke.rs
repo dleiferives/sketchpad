@@ -82,7 +82,8 @@ impl GpuResidentRoundStrokeEngine {
             [document.metadata().width(), document.metadata().height()],
             layer,
             self.layout,
-        )?;
+        )?
+        .with_tip(recipe.tip());
         let id = document.begin_round_stroke(target, layer)?;
         if let Err(error) = self.mask.begin_stroke() {
             document

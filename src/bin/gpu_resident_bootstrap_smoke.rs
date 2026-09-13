@@ -257,6 +257,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut strokes = GpuResidentRoundStrokeEngine::new(&device, &resident)?;
     let paint_contact = RoundContact {
+        dynamics: [1.0, 0.0, 0.0],
         center: [143.5, 17.5],
         radius: 4.0,
         elapsed_micros: 0,
@@ -327,6 +328,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let erase_contact = RoundContact {
+        dynamics: [1.0, 0.0, 0.0],
         center: [9.5, 11.5],
         radius: 4.0,
         elapsed_micros: 2,
@@ -587,6 +589,7 @@ fn verify_history_presentation(
         GpuDocumentCompositor::new(device, wgpu::TextureFormat::Rgba32Float, &target);
     let mut strokes = GpuResidentRoundStrokeEngine::new(device, &resident)?;
     let contact = RoundContact {
+        dynamics: [1.0, 0.0, 0.0],
         center: [20.0, 20.0],
         radius: 4.0,
         elapsed_micros: 0,
@@ -650,6 +653,7 @@ fn verify_history_presentation(
         }
     }
     let next = RoundContact {
+        dynamics: [1.0, 0.0, 0.0],
         center: [150.0, 20.0],
         ..contact
     };

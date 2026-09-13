@@ -58,7 +58,22 @@ impl Canvas {
             StrokeMaterial::paint([0.1 + index as f32 / 20.0, 0.3, 0.7], 0.7, 1.0)?
         };
         let recipe = RoundBrushRecipeV1::with_minimum_pressure_fraction(material, diameter, 1.0)?;
+        let recipe = if std::env::args().skip(2).any(|arg| arg == "--media") {
+            use sketchpad::brush_tip::BrushTip;
+            recipe.with_tip(
+                [
+                    BrushTip::HardRound,
+                    BrushTip::Pencil,
+                    BrushTip::Marker,
+                    BrushTip::PaletteKnife,
+                    BrushTip::Charcoal,
+                ][index % 5],
+            )
+        } else {
+            recipe
+        };
         let at = RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center: [
                 128.0 + (index * 31 % 256) as f32,
                 128.0 + (index * 17 % 256) as f32,

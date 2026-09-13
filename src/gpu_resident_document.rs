@@ -2690,6 +2690,7 @@ mod tests {
         let layer = document.metadata().active_layer();
         let mut scheduler = RoundMaskScheduler::new([48, 40], layer, layout).unwrap();
         let contact = RoundContact {
+            dynamics: [1.0, 0.0, 0.0],
             center: [4.0, 4.0],
             radius: 2.0,
             elapsed_micros: 0,
