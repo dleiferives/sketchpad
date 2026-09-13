@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "pencil",
+  "name": "Graphite pencil",
+  "description": "Built-in shader brush",
+  "footprint": "pencil",
+  "extent": 1.0,
+  "diameter": 10,
+  "opacity": 1.0
+}

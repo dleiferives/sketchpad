@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "palette-knife",
+  "name": "Palette knife",
+  "description": "Built-in shader brush",
+  "footprint": "knife",
+  "extent": 1.0,
+  "diameter": 80,
+  "opacity": 1.0
+}

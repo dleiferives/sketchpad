@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "charcoal",
+  "name": "Charcoal",
+  "description": "Built-in shader brush",
+  "footprint": "charcoal",
+  "extent": 1.0,
+  "diameter": 48,
+  "opacity": 1.0
+}

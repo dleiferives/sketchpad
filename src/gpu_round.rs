@@ -131,6 +131,7 @@ pub struct RoundMaskScheduler {
     layout: AtlasLayout,
     active_contact: Option<RoundContact>,
     tip: crate::brush_tip::BrushTip,
+    fringe: Option<f64>,
 }
 
 impl RoundMaskScheduler {
@@ -148,7 +149,22 @@ impl RoundMaskScheduler {
             layout,
             active_contact: None,
             tip: crate::brush_tip::BrushTip::HardRound,
+            fringe: None,
         })
+    }
+
+    pub fn with_shader_fringe(mut self) -> Self {
+        self.fringe = Some(3.0);
+        self
+    }
+
+    fn coverage_fringe(&self) -> f64 {
+        self.fringe
+            .unwrap_or(if self.tip == crate::brush_tip::BrushTip::HardRound {
+                COVERAGE_FRINGE
+            } else {
+                3.0
+            })
     }
 
     pub fn with_tip(mut self, tip: crate::brush_tip::BrushTip) -> Self {
@@ -243,7 +259,7 @@ impl RoundMaskScheduler {
                         self.tip as u32 as f32,
                         from.dynamics[0],
                         to.dynamics[0],
-                        0.0,
+                        self.coverage_fringe() as f32,
                     ],
                     tilts: [
                         from.dynamics[1],
@@ -295,11 +311,7 @@ impl RoundMaskScheduler {
         damage: &mut HashMap<LayerTileKey, RectU32>,
         work: &mut Vec<(LayerTileKey, RoundContact, RoundContact, [u32; 2])>,
     ) {
-        let fringe = if self.tip == crate::brush_tip::BrushTip::HardRound {
-            COVERAGE_FRINGE
-        } else {
-            3.0
-        };
+        let fringe = self.coverage_fringe();
         let min_x = ((from.center[0] as f64 - from.radius as f64)
             .min(to.center[0] as f64 - to.radius as f64)
             - fringe)

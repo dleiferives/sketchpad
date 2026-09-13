@@ -21,6 +21,7 @@ pub enum GpuRasterRecoveryCommand {
     Round(GpuRoundRecoveryCommand),
     Exact(GpuExactRasterRecoveryCommand),
     LayerSnapshot(GpuExactLayerRecoveryCommand),
+    AwaitingPixels(LayerId),
     MetadataOnly,
 }
 
@@ -30,6 +31,7 @@ impl GpuRasterRecoveryCommand {
             Self::Round(command) => Some(command.layer()),
             Self::Exact(command) => Some(command.layer()),
             Self::LayerSnapshot(command) => Some(command.layer()),
+            Self::AwaitingPixels(layer) => Some(*layer),
             Self::MetadataOnly => None,
         }
     }
@@ -48,7 +50,9 @@ impl GpuRasterRecoveryCommand {
                 size_of::<GpuExactLayerRecoveryCommand>() as u64,
                 command.retained_byte_len(),
             ),
-            Self::MetadataOnly => (size_of::<Self>() as u64, size_of::<Self>() as u64),
+            Self::AwaitingPixels(_) | Self::MetadataOnly => {
+                (size_of::<Self>() as u64, size_of::<Self>() as u64)
+            }
         };
         variant_bytes
             .checked_sub(variant_size)
@@ -123,6 +127,9 @@ pub fn replay_gpu_raster_recovery(
                     .snapshot_tiles_discarded
                     .saturating_add(replay.previous_tiles_discarded);
             }
+            GpuRasterRecoveryCommand::AwaitingPixels(_) => {
+                return Err(GpuRasterRecoveryReplayError::AwaitingPixels)
+            }
             GpuRasterRecoveryCommand::MetadataOnly => {
                 unreachable!("metadata-only recovery commands were skipped before dispatch")
             }
@@ -184,6 +191,7 @@ pub struct GpuRasterRecoveryStats {
 
 #[derive(Debug)]
 pub enum GpuRasterRecoveryReplayError {
+    AwaitingPixels,
     Raster(RasterError),
     Round(GpuRoundRecoveryReplayError),
     Exact(GpuExactRasterRecoveryReplayError),
@@ -193,6 +201,7 @@ pub enum GpuRasterRecoveryReplayError {
 impl fmt::Display for GpuRasterRecoveryReplayError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::AwaitingPixels => write!(formatter, "shader stroke pixels are still being captured; finish the GPU mirror before recovery"),
             Self::Raster(error) => error.fmt(formatter),
             Self::Round(error) => error.fmt(formatter),
             Self::Exact(error) => error.fmt(formatter),
@@ -204,6 +213,7 @@ impl fmt::Display for GpuRasterRecoveryReplayError {
 impl Error for GpuRasterRecoveryReplayError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::AwaitingPixels => None,
             Self::Raster(error) => Some(error),
             Self::Round(error) => Some(error),
             Self::Exact(error) => Some(error),

@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "marker",
+  "name": "Alcohol marker",
+  "description": "Built-in shader brush",
+  "footprint": "marker",
+  "extent": 1.0,
+  "diameter": 36,
+  "opacity": 1.0
+}

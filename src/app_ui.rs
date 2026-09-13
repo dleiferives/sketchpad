@@ -160,6 +160,7 @@ pub enum UiAction {
     Zoom(f32),
     FitCanvas,
     SelectTool(UiTool),
+    SelectShaderBrush(String),
     SetBrushDiameter(f32),
     SetBrushOpacity(f32),
     PreviewColor([f32; 3]),
@@ -395,6 +396,9 @@ impl Default for ColorPickerState {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct UiSessionState {
+    shader_brushes: Vec<(String, String, String)>,
+    selected_shader: Option<String>,
+    shader_errors: String,
     dock_right: bool,
     document_label: String,
     file_browser: Option<FileBrowser>,
@@ -475,6 +479,23 @@ pub struct UiOverlay {
 }
 
 impl UiOverlay {
+    pub fn set_shader_brushes(
+        &mut self,
+        brushes: Vec<(String, String, String)>,
+        selected: Option<String>,
+        errors: String,
+    ) {
+        if self.session.shader_brushes != brushes
+            || self.session.selected_shader != selected
+            || self.session.shader_errors != errors
+        {
+            self.session.shader_brushes = brushes;
+            self.session.selected_shader = selected;
+            self.session.shader_errors = errors;
+            self.mark_dirty();
+        }
+    }
+
     pub fn new(window: &Window, device: &wgpu::Device, format: wgpu::TextureFormat) -> Self {
         let context = egui::Context::default();
         context.set_visuals(egui::Visuals::light());
@@ -1224,6 +1245,9 @@ fn show_toolbar(
             actions,
             &mut session.brush_panel_open,
             session.dock_right,
+            &session.shader_brushes,
+            session.selected_shader.as_deref(),
+            &session.shader_errors,
         )
     } else {
         Rect::NOTHING
@@ -1569,6 +1593,15 @@ fn show_brush_controls(
                                 }
                             });
                         });
+                        if let Some(id) = &session.selected_shader {
+                            if let Some((_, name, _)) =
+                                session.shader_brushes.iter().find(|(key, _, _)| key == id)
+                            {
+                                if snapshot.tool != UiTool::Eraser {
+                                    ui.label(name);
+                                }
+                            }
+                        }
                         ui.horizontal(|ui| {
                             for tool in [UiTool::Pen, UiTool::Eraser] {
                                 if tool_card(
@@ -2055,6 +2088,9 @@ fn show_brush_panel(
     actions: &mut Vec<UiAction>,
     brush_panel_open: &mut bool,
     dock_right: bool,
+    shader_brushes: &[(String, String, String)],
+    selected_shader: Option<&str>,
+    shader_errors: &str,
 ) -> Rect {
     let area = egui::Area::new(Id::new("sketchpad-brush-panel"))
         .anchor(if dock_right { Align2::RIGHT_TOP } else { Align2::LEFT_TOP }, Vec2::new(if dock_right { -BRUSH_PANEL_POSITION.x } else { BRUSH_PANEL_POSITION.x }, BRUSH_PANEL_POSITION.y))
@@ -2065,6 +2101,7 @@ fn show_brush_panel(
             panel_frame()
                 .show(ui, |ui| {
                     ui.set_width(220.0);
+                    egui::ScrollArea::vertical().max_height((ui.ctx().content_rect().height()-BRUSH_PANEL_POSITION.y-48.0).max(120.0)).id_salt("brush-library-scroll").show(ui, |ui| {
                     ui.spacing_mut().item_spacing = Vec2::new(6.0, 6.0);
                     ui.horizontal(|ui| {
                         palette_label(ui, "Brush library");
@@ -2078,7 +2115,7 @@ fn show_brush_panel(
                         ui.label(egui::RichText::new("Hard round and eraser are available. Textured brushes need the GPU renderer.").size(12.0).color(TEXT_MUTED));
                     }
                     for tool in UiTool::ALL {
-                        let label = if tool == snapshot.tool {
+                        let label = if tool == snapshot.tool && (selected_shader.is_none() || tool == UiTool::Eraser) {
                             format!("{}  •", tool.menu_label())
                         } else {
                             tool.menu_label().to_owned()
@@ -2092,7 +2129,28 @@ fn show_brush_panel(
                             ui.label(egui::RichText::new(tool.description()).size(11.0).color(TEXT_MUTED));
                         });
                     }
+                    egui::ScrollArea::vertical().max_height(180.0).id_salt("shader-brush-list").show(ui, |ui| {
+                        for (id,name,description) in shader_brushes {
+                            let selected = selected_shader == Some(id.as_str()) && snapshot.tool != UiTool::Eraser;
+                            let label = if selected { format!("{name}  •") } else { name.clone() };
+                            ui.add_enabled_ui(snapshot.natural_brushes_available, |ui| {
+                                if menu_button(ui,&label,description).clicked() {
+                                    actions.push(UiAction::SelectShaderBrush(id.clone()));
+                                    *brush_panel_open = false;
+                                }
+                            });
+                        }
+                    });
+                    if !shader_errors.is_empty() {
+                        ui.collapsing("Brush reload needs attention", |ui| {
+                            egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                                ui.label(shader_errors);
+                                ui.label("Keeping the last working brushes.");
+                            });
+                        });
+                    }
                     ui.hyperlink_to(egui::RichText::new("Paper grain: David Revoy · CC BY 4.0").size(10.0).color(TEXT_MUTED), "https://www.davidrevoy.com/article326/krita-brushes-charcoal-pencils");
+                    });
                 });
         });
     area.response.rect

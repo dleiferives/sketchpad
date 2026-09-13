@@ -1,5 +1,7 @@
 # Drawing media — research and implementation
 
+Shader package authoring and the current recovery path: [shader brushes](shader-brushes.md).
+
 Updated with the second-pass pencil, charcoal and knife work: [research, changes and visual review](brush-rework.md).
 
 12 September 2026
@@ -17,7 +19,7 @@ The library contains Hard round, Graphite pencil, Alcohol marker, Palette knife,
 
 The resident GPU path renders every brush into the same sparse live mask. Round and ellipse sweeps are continuous; chisel sweeps minimize four affine edge distances instead of stamping spaced rectangles. Dry-media grain now uses a licensed 512px paper pattern sampled in document coordinates, independent of atlas slot placement and brush size. A contact uses maximum coverage, so pausing or receiving more identical input packets does not darken it. Lift and make another contact to build up pigment. Marker coverage is intrinsically translucent (about 38–50% before the opacity control).
 
-Pressure, tilt and the selected procedural tip remain in the recovery recipe/commands. CPU recovery uses matching equations; saves and exact undo retain the existing GPU readback and lossless history paths. The second pass adds one 256 KiB grayscale paper asset (CC BY 4.0), packed into a read-only GPU buffer; no dependency is added. The mask instance grows from 40 to 80 bytes; texture allocation sizes stay unchanged. Brush geometry uses circular conservative bounds, with a three-pixel antialias fringe for anisotropic tips (half a pixel for hard round).
+App paint brushes now use shader packages and exact asynchronous pixel captures for recovery; plugin authors do not implement matching CPU equations. The legacy standalone renderer and replay controls retain pressure/tilt recipes and their CPU oracle. Saves and exact undo retain the existing GPU readback and lossless history paths. The second pass adds one 256 KiB grayscale paper asset (CC BY 4.0), packed into a read-only GPU buffer; no dependency is added. The mask instance grows from 40 to 80 bytes; texture allocation sizes stay unchanged. Brush geometry uses circular conservative bounds, with a three-pixel antialias fringe for anisotropic tips (half a pixel for hard round).
 
 The new presets require the existing blendable float32 resident renderer. If the app falls back to its legacy CPU renderer, the library offers hard round and eraser instead of silently substituting a different brush. Both Atlas and Apollo support the resident path.
 

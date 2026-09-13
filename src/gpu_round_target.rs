@@ -96,6 +96,8 @@ pub struct RoundMaskTarget {
     pages: Vec<MaskPage>,
     bind_group: wgpu::BindGroup,
     round_pipeline: wgpu::RenderPipeline,
+    pipeline_layout: wgpu::PipelineLayout,
+    brush_pipeline: Option<wgpu::RenderPipeline>,
     clear_pipeline: wgpu::RenderPipeline,
     round_buffer: wgpu::Buffer,
     round_buffer_capacity: u64,
@@ -200,42 +202,7 @@ impl RoundMaskTarget {
             label: Some("Continuous Round Mask Shader"),
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/round_mask.wgsl").into()),
         });
-        let round_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Continuous Round Union Mask Pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("round_vs"),
-                compilation_options: Default::default(),
-                buffers: &[Some(RoundMaskInstance::layout())],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("round_fs"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::R32Float,
-                    blend: Some(wgpu::BlendState {
-                        color: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Max,
-                        },
-                        alpha: wgpu::BlendComponent {
-                            src_factor: wgpu::BlendFactor::One,
-                            dst_factor: wgpu::BlendFactor::One,
-                            operation: wgpu::BlendOperation::Max,
-                        },
-                    }),
-                    write_mask: wgpu::ColorWrites::RED,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let round_pipeline = Self::create_brush_pipeline(device, &pipeline_layout, &shader);
         let clear_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Round Mask Slot Clear Pipeline"),
             layout: Some(&pipeline_layout),
@@ -276,6 +243,8 @@ impl RoundMaskTarget {
             pages: Vec::new(),
             bind_group,
             round_pipeline,
+            pipeline_layout,
+            brush_pipeline: None,
             clear_pipeline,
             round_buffer,
             round_buffer_capacity: INITIAL_INSTANCE_BUFFER_BYTES,
@@ -285,6 +254,83 @@ impl RoundMaskTarget {
             active_tiles: HashMap::new(),
             encoded_batch_pending: false,
             pending_damage_changes: Vec::new(),
+        })
+    }
+
+    pub fn shader_layout(&self) -> &wgpu::PipelineLayout {
+        &self.pipeline_layout
+    }
+
+    pub fn set_brush_pipeline(
+        &mut self,
+        pipeline: Option<wgpu::RenderPipeline>,
+    ) -> Result<(), RoundMaskTargetError> {
+        if self.active {
+            return Err(RoundMaskTargetError::StrokeAlreadyActive);
+        }
+        self.brush_pipeline = pipeline;
+        Ok(())
+    }
+
+    pub fn compile_brush(
+        device: &wgpu::Device,
+        layout: &wgpu::PipelineLayout,
+        source: &str,
+    ) -> Result<wgpu::RenderPipeline, String> {
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Brush package"),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{}\n{}", include_str!("shaders/brush_host.wgsl"), source).into(),
+            ),
+        });
+        let pipeline = Self::create_brush_pipeline(device, layout, &shader);
+        match pollster::block_on(scope.pop()) {
+            Some(error) => Err(error.to_string()),
+            None => Ok(pipeline),
+        }
+    }
+
+    fn create_brush_pipeline(
+        device: &wgpu::Device,
+        pipeline_layout: &wgpu::PipelineLayout,
+        shader: &wgpu::ShaderModule,
+    ) -> wgpu::RenderPipeline {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Continuous Round Union Mask Pipeline"),
+            layout: Some(pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("round_vs"),
+                compilation_options: Default::default(),
+                buffers: &[Some(RoundMaskInstance::layout())],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("round_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::R32Float,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Max,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::One,
+                            operation: wgpu::BlendOperation::Max,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::RED,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         })
     }
 
@@ -496,7 +542,7 @@ impl RoundMaskTarget {
                 pass.set_vertex_buffer(0, self.clear_buffer.slice(..));
                 pass.draw(0..6, encoding.clear_instances.clone());
             }
-            pass.set_pipeline(&self.round_pipeline);
+            pass.set_pipeline(self.brush_pipeline.as_ref().unwrap_or(&self.round_pipeline));
             pass.set_vertex_buffer(0, self.round_buffer.slice(..));
             pass.draw(0..6, encoding.round_instances.clone());
         }

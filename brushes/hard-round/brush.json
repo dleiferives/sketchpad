@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "hard-round",
+  "name": "Hard round",
+  "description": "Built-in shader brush",
+  "footprint": "round",
+  "extent": 1.0,
+  "diameter": 12,
+  "opacity": 1.0
+}

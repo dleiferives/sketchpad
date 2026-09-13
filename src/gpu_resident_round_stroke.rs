@@ -23,6 +23,7 @@ struct ActiveRoundStroke {
     commands: Vec<RoundPathCommand>,
     provisional_allocations: Vec<AtlasAllocation>,
     submitted_batches: u32,
+    shader_brush: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -55,11 +56,37 @@ impl GpuResidentRoundStrokeEngine {
         })
     }
 
+    pub fn shader_layout(&self) -> &wgpu::PipelineLayout {
+        self.mask.shader_layout()
+    }
+
+    pub fn begin_shader(
+        &mut self,
+        document: &mut GpuResidentDocument,
+        target: &GpuDocumentTarget,
+        recipe: RoundBrushRecipeV1,
+        pipeline: wgpu::RenderPipeline,
+    ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
+        self.mask.set_brush_pipeline(Some(pipeline))?;
+        self.begin_internal(document, target, recipe, true)
+    }
+
     pub fn begin(
         &mut self,
         document: &mut GpuResidentDocument,
         target: &GpuDocumentTarget,
         recipe: RoundBrushRecipeV1,
+    ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
+        self.mask.set_brush_pipeline(None)?;
+        self.begin_internal(document, target, recipe, false)
+    }
+
+    fn begin_internal(
+        &mut self,
+        document: &mut GpuResidentDocument,
+        target: &GpuDocumentTarget,
+        recipe: RoundBrushRecipeV1,
+        shader_brush: bool,
     ) -> Result<GpuResidentRoundStrokeId, GpuResidentRoundStrokeError> {
         if self.active.is_some() {
             return Err(GpuResidentRoundStrokeError::StrokeAlreadyActive);
@@ -84,6 +111,11 @@ impl GpuResidentRoundStrokeEngine {
             self.layout,
         )?
         .with_tip(recipe.tip());
+        let scheduler = if shader_brush {
+            scheduler.with_shader_fringe()
+        } else {
+            scheduler
+        };
         let id = document.begin_round_stroke(target, layer)?;
         if let Err(error) = self.mask.begin_stroke() {
             document
@@ -98,6 +130,7 @@ impl GpuResidentRoundStrokeEngine {
             commands: Vec::new(),
             provisional_allocations: Vec::new(),
             submitted_batches: 0,
+            shader_brush,
         });
         Ok(id)
     }
@@ -140,7 +173,9 @@ impl GpuResidentRoundStrokeEngine {
                 .expect("a submitted nonempty mask batch retains its acknowledgement");
             active.submitted_batches = active.submitted_batches.saturating_add(1);
         }
-        active.commands.extend_from_slice(commands);
+        if !active.shader_brush {
+            active.commands.extend_from_slice(commands);
+        }
         active.provisional_allocations.extend(
             batch
                 .allocations()
@@ -223,12 +258,19 @@ impl GpuResidentRoundStrokeEngine {
         if active.scheduler.is_active() {
             return Err(GpuResidentRoundStrokeError::PathStillActive);
         }
-        let recovery = GpuRoundRecoveryCommand::new(
-            active.scheduler.layer(),
-            active.recipe,
-            active.commands.clone(),
-        )
-        .map_err(|failure| GpuResidentRoundStrokeError::Recovery(failure.error))?;
+        let recovery = if active.shader_brush {
+            crate::gpu_recovery_replay::GpuRasterRecoveryCommand::AwaitingPixels(
+                active.scheduler.layer(),
+            )
+        } else {
+            GpuRoundRecoveryCommand::new(
+                active.scheduler.layer(),
+                active.recipe,
+                active.commands.clone(),
+            )
+            .map_err(|failure| GpuResidentRoundStrokeError::Recovery(failure.error))?
+            .into()
+        };
         let id = active.id;
         let provisional_allocations = active.provisional_allocations.clone();
         self.mask.end_stroke()?;
@@ -259,7 +301,7 @@ impl GpuResidentRoundStrokeEngine {
             device,
             &mut encoder,
             encoded,
-            recovery.into(),
+            recovery,
         ) {
             Ok(prepared) => prepared,
             Err(failure) => {

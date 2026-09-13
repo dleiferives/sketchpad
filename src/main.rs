@@ -160,6 +160,7 @@ struct ResidentGpuCanvas {
     document: GpuResidentDocument,
     target: GpuDocumentTarget,
     strokes: GpuResidentRoundStrokeEngine,
+    brushes: sketchpad::shader_brush::BrushLibrary,
     compositor: GpuDocumentCompositor,
     checkpoint: GpuCheckpointWorker,
     mirror_readback_in_flight: bool,
@@ -284,11 +285,17 @@ impl ResidentGpuCanvas {
         }
         let strokes = GpuResidentRoundStrokeEngine::new(device, &resident_document)
             .map_err(|error| error.to_string())?;
+        let brushes = sketchpad::shader_brush::BrushLibrary::new(
+            device,
+            strokes.shader_layout(),
+            sketchpad::shader_brush::default_brush_directory(),
+        )?;
         let compositor = GpuDocumentCompositor::new(device, surface_format, &target);
         Ok(Self {
             document: resident_document,
             target,
             strokes,
+            brushes,
             compositor,
             checkpoint: GpuCheckpointWorker::new(recovery_path),
             mirror_readback_in_flight: false,
@@ -659,6 +666,9 @@ struct App {
     recent_colors: RecentColors,
     eraser_brush: HardRoundBrush,
     paint_engine: PaintEngine,
+    shader_brush: Option<String>,
+    shader_selection_dirty: bool,
+    shader_settings: std::collections::HashMap<String, [f32; 2]>,
     active_stroke: Option<ActiveStroke>,
     active_pointer: Option<PointerOwner>,
     sampling_pointer: Option<PointerOwner>,
@@ -767,6 +777,9 @@ impl App {
             recent_colors,
             eraser_brush: HardRoundBrush::eraser(64.0, 1.0, 0.18).unwrap(),
             paint_engine: PaintEngine::default(),
+            shader_brush: None,
+            shader_selection_dirty: true,
+            shader_settings: Default::default(),
             active_stroke: None,
             active_pointer: None,
             sampling_pointer: None,
@@ -931,6 +944,7 @@ impl App {
             }
             UiAction::FitCanvas => self.reset_view(),
             UiAction::SelectTool(tool) => self.select_ui_tool(tool),
+            UiAction::SelectShaderBrush(id) => self.select_shader_brush(id),
             UiAction::SetBrushDiameter(diameter) => self.set_brush_diameter(diameter),
             UiAction::SetBrushOpacity(opacity) => self.set_brush_opacity(opacity),
             UiAction::PreviewColor(color) => self.set_paint_color(color, false),
@@ -1285,8 +1299,25 @@ impl App {
             log::warn!("media brushes require the GPU-resident renderer");
             return;
         }
-        self.brush_settings[self.paint_engine.tip() as usize] =
-            [self.paint_brush.diameter(), self.paint_brush.opacity()];
+        if tool == UiTool::Eraser {
+            self.mouse_tool = ToolKind::Eraser;
+            self.cursor_tool = ToolKind::Eraser;
+            self.canvas_mode = CanvasMode::Draw;
+            self.cursor_pressure = 0.0;
+            self.cursor_contact = false;
+            self.request_redraw();
+            return;
+        }
+        self.shader_selection_dirty = true;
+        if let Some(id) = self.shader_brush.take() {
+            self.shader_settings.insert(
+                id,
+                [self.paint_brush.diameter(), self.paint_brush.opacity()],
+            );
+        } else {
+            self.brush_settings[self.paint_engine.tip() as usize] =
+                [self.paint_brush.diameter(), self.paint_brush.opacity()];
+        }
         match tool {
             UiTool::Pen => {
                 self.mouse_tool = ToolKind::Pen;
@@ -1323,6 +1354,101 @@ impl App {
         self.cursor_contact = false;
         self.update_window_title(None);
         self.request_redraw();
+    }
+
+    fn selected_shader(&self) -> Option<&sketchpad::shader_brush::ShaderBrush> {
+        let id = self
+            .shader_brush
+            .as_deref()
+            .unwrap_or(sketchpad::shader_brush::BUILTIN_IDS[self.paint_engine.tip() as usize]);
+        self.gpu
+            .as_ref()?
+            .resident
+            .as_ref()?
+            .brushes
+            .brushes
+            .get(id)
+    }
+
+    fn select_shader_brush(&mut self, id: String) {
+        if self.canvas_busy() {
+            return;
+        }
+        let Some(manifest) = self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.resident.as_ref())
+            .and_then(|r| r.brushes.brushes.get(&id))
+            .map(|b| b.manifest.clone())
+        else {
+            return;
+        };
+        if let Some(previous) = &self.shader_brush {
+            self.shader_settings.insert(
+                previous.clone(),
+                [self.paint_brush.diameter(), self.paint_brush.opacity()],
+            );
+        } else {
+            self.brush_settings[self.paint_engine.tip() as usize] =
+                [self.paint_brush.diameter(), self.paint_brush.opacity()];
+        }
+        let [size, opacity] = self
+            .shader_settings
+            .get(&id)
+            .copied()
+            .unwrap_or([manifest.diameter, manifest.opacity]);
+        self.paint_brush = self
+            .paint_brush
+            .with_diameter(size)
+            .unwrap()
+            .with_opacity(opacity)
+            .unwrap();
+        self.shader_brush = Some(id);
+        self.shader_selection_dirty = true;
+        self.mouse_tool = ToolKind::Pen;
+        self.cursor_tool = ToolKind::Pen;
+        self.canvas_mode = CanvasMode::Draw;
+        self.request_redraw();
+    }
+
+    fn poll_shader_brushes(&mut self) {
+        let idle = !self.canvas_busy();
+        let Some(gpu) = &mut self.gpu else {
+            return;
+        };
+        let Some(resident) = &mut gpu.resident else {
+            return;
+        };
+        let updated = resident
+            .brushes
+            .poll(&gpu.device, resident.strokes.shader_layout(), idle);
+        if updated || self.shader_selection_dirty {
+            if let Some(ui) = &mut self.ui {
+                self.shader_selection_dirty = false;
+                ui.set_shader_brushes(
+                    resident
+                        .brushes
+                        .brushes
+                        .values()
+                        .filter(|b| {
+                            !sketchpad::shader_brush::BUILTIN_IDS.contains(&b.manifest.id.as_str())
+                        })
+                        .map(|b| {
+                            (
+                                b.manifest.id.clone(),
+                                b.manifest.name.clone(),
+                                b.manifest.description.clone(),
+                            )
+                        })
+                        .collect(),
+                    self.shader_brush.clone(),
+                    resident.brushes.errors.join("\n"),
+                );
+            }
+        }
+        if updated {
+            self.request_redraw();
+        }
     }
 
     fn set_brush_diameter(&mut self, diameter: f32) {
@@ -1394,7 +1520,23 @@ impl App {
         } else {
             self.paint_engine.tip()
         };
-        let radius = tip.radius(brush.diameter(), pressure, self.cursor_tilt, 0.05);
+        let radius = if self.cursor_tool == ToolKind::Pen {
+            self.selected_shader().map_or_else(
+                || tip.radius(brush.diameter(), pressure, self.cursor_tilt, 0.05),
+                |b| {
+                    b.manifest
+                        .radius(brush.diameter(), pressure, self.cursor_tilt)
+                },
+            )
+        } else {
+            tip.radius(brush.diameter(), pressure, self.cursor_tilt, 0.05)
+        };
+        let tip = if self.cursor_tool == ToolKind::Pen {
+            self.selected_shader()
+                .map_or(tip, |b| b.manifest.footprint.tip())
+        } else {
+            tip
+        };
         let (direction, aspect) = tip.shape(self.cursor_tilt);
         let chisel = matches!(
             tip,
@@ -1530,6 +1672,32 @@ impl App {
         if self.active_stroke.is_some() {
             return;
         }
+        if self.shader_brush.is_some() || self.paint_engine == PaintEngine::Charcoal {
+            let custom: Vec<_> = self
+                .gpu
+                .as_ref()
+                .and_then(|g| g.resident.as_ref())
+                .map(|r| {
+                    r.brushes
+                        .brushes
+                        .keys()
+                        .filter(|id| !sketchpad::shader_brush::BUILTIN_IDS.contains(&id.as_str()))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default();
+            let index = self
+                .shader_brush
+                .as_ref()
+                .and_then(|id| custom.iter().position(|key| key == id))
+                .map_or(0, |i| i + 1);
+            if let Some(id) = custom.get(index) {
+                self.select_shader_brush(id.clone());
+            } else {
+                self.select_ui_tool(UiTool::Pen);
+            }
+            return;
+        }
         let next = match self.paint_engine {
             PaintEngine::HardRound => UiTool::Pencil,
             PaintEngine::Pencil => UiTool::Marker,
@@ -1613,7 +1781,10 @@ impl App {
         let brush = self.brush_for_tool(tool);
         let sample = BrushSample::with_tilt(world, pressure, tilt);
         let resident_round = self.gpu.as_ref().is_some_and(|gpu| gpu.resident.is_some());
-        if !resident_round && tool == ToolKind::Pen && self.paint_engine != PaintEngine::HardRound {
+        if !resident_round
+            && tool == ToolKind::Pen
+            && (self.shader_brush.is_some() || self.paint_engine != PaintEngine::HardRound)
+        {
             log::warn!("media brush unavailable after GPU renderer fallback; select Hard round to continue");
             return;
         }
@@ -1637,6 +1808,14 @@ impl App {
                 let recipe = RoundBrushRecipeV1::new(material, brush.diameter())
                     .map_err(|error| error.to_string())?
                     .with_tip(tip);
+                let shader = if tool == ToolKind::Pen {
+                    self.selected_shader().cloned()
+                } else {
+                    None
+                };
+                let recipe = shader
+                    .as_ref()
+                    .map_or(recipe, |b| b.manifest.recipe(material, brush.diameter()));
                 let timed = TimedBrushSample::new(
                     world,
                     pressure.clamp(0.0, 1.0),
@@ -1653,10 +1832,19 @@ impl App {
                     .resident
                     .as_mut()
                     .expect("resident round eligibility requires a resident canvas");
-                resident
-                    .strokes
-                    .begin(&mut resident.document, &resident.target, recipe)
-                    .map_err(|error| error.to_string())?;
+                if let Some(shader) = shader {
+                    resident.strokes.begin_shader(
+                        &mut resident.document,
+                        &resident.target,
+                        recipe,
+                        shader.pipeline,
+                    )
+                } else {
+                    resident
+                        .strokes
+                        .begin(&mut resident.document, &resident.target, recipe)
+                }
+                .map_err(|error| error.to_string())?;
                 let batch = path.take_batch();
                 if let Err(error) = resident.strokes.submit_commands(
                     &mut resident.document,
@@ -2328,6 +2516,13 @@ impl App {
         }
         if let Some(gpu) = self.gpu.as_mut() {
             if let Some(resident) = gpu.resident.as_mut() {
+                let bytes = resident.document.mirror().max_snapshot_bytes();
+                if let Err(error) = resident.make_mirror_room(&gpu.device, &gpu.queue, bytes) {
+                    log::error!(
+                        "could not capture shader pixels before duplicating layer: {error}"
+                    );
+                    return;
+                }
                 let source = resident.document.metadata().active_layer();
                 match resident.document.duplicate_layer(
                     &mut resident.target,
@@ -3472,7 +3667,9 @@ impl App {
                     sample.device_id,
                     sample.tool,
                     match sample.tool {
-                        ToolKind::Pen => self.paint_engine.label(),
+                        ToolKind::Pen => self
+                            .selected_shader()
+                            .map_or(self.paint_engine.label(), |b| b.manifest.name.as_str()),
                         ToolKind::Eraser => "Eraser",
                     },
                     self.brush_for_tool(sample.tool).diameter(),
@@ -4755,6 +4952,7 @@ impl ApplicationHandler<TabletEvent> for App {
             event_loop.exit();
             return;
         }
+        self.poll_shader_brushes();
         self.report_live_metrics();
         self.poll_gpu_stroke_commit();
         self.drive_gpu_resident_mirror();
@@ -4773,9 +4971,14 @@ impl ApplicationHandler<TabletEvent> for App {
         }
 
         let mut deadline = self
-            .metrics
-            .has_activity()
-            .then(|| self.metrics.report_deadline());
+            .gpu
+            .as_ref()
+            .and_then(|g| g.resident.as_ref())
+            .map(|r| r.brushes.poll_deadline());
+        if self.metrics.has_activity() {
+            let report = self.metrics.report_deadline();
+            deadline = Some(deadline.map_or(report, |due| due.min(report)));
+        }
         if let Some(ui_deadline) = self.ui.as_ref().and_then(UiOverlay::repaint_deadline) {
             deadline = Some(
                 deadline
@@ -5241,6 +5444,229 @@ mod tests {
                 assert!((before[axis] - after[axis]).abs() < 0.001);
             }
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "hidden-window shader reload, exact history and large-contact regression"]
+    #[allow(deprecated)]
+    fn shader_packages_reload_without_changing_active_strokes_or_saved_pixels() {
+        use winit::platform::x11::EventLoopBuilderExtX11;
+        let mut builder = EventLoop::<TabletEvent>::with_user_event();
+        builder.with_x11().with_any_thread(true);
+        let event_loop = builder.build().unwrap();
+        let window = Arc::new(
+            event_loop
+                .create_window(
+                    Window::default_attributes()
+                        .with_visible(false)
+                        .with_inner_size(winit::dpi::PhysicalSize::new(768, 640)),
+                )
+                .unwrap(),
+        );
+        let directory = PathBuf::from(".artifacts/shader-brushes/integration");
+        let package = directory.join("packages/test-brush");
+        std::fs::create_dir_all(&package).unwrap();
+        let example = directory.join("packages/stipple");
+        std::fs::create_dir_all(&example).unwrap();
+        std::fs::write(
+            example.join("brush.json"),
+            include_str!("../brushes/stipple/brush.json"),
+        )
+        .unwrap();
+        std::fs::write(
+            example.join("brush.wgsl"),
+            include_str!("../brushes/stipple/brush.wgsl"),
+        )
+        .unwrap();
+        let write_package = |name: &str, amount: f32| {
+            std::fs::write(package.join("brush.json"),serde_json::json!({"api_version":1,"id":"test-brush","name":name,"diameter":512,"footprint":"constant"}).to_string()).unwrap();
+            std::fs::write(package.join("brush.wgsl"),format!("fn brush_coverage(b: BrushInput) -> f32 {{ return clamp(0.5-distance_to_variable_capsule(b.point,b.start,b.end,b.radii),0.0,1.0)*{amount}; }}")).unwrap();
+        };
+        write_package("Version one", 0.25);
+        let recovery = directory.join("recovery.sketchpad");
+        let mut app = App::new(
+            event_loop.create_proxy(),
+            Document::new(768, 640, DEFAULT_TILE_SIZE).unwrap(),
+            PersistenceState::fresh(recovery.clone()),
+            None,
+            false,
+            directory.join("output.png"),
+            PresentationOptions::default(),
+        );
+        app.gpu = Some(App::init(
+            window.clone(),
+            &app.document,
+            recovery,
+            PresentationOptions::default(),
+        ));
+        app.window = Some(window);
+        app.persistence_enabled = false;
+        app.gpu
+            .as_mut()
+            .unwrap()
+            .resident
+            .as_mut()
+            .unwrap()
+            .brushes
+            .root = directory.join("packages");
+        let wait_reload = |app: &mut App, expected_name: &str, expect_error: bool| {
+            app.gpu
+                .as_mut()
+                .unwrap()
+                .resident
+                .as_mut()
+                .unwrap()
+                .brushes
+                .request_reload();
+            let deadline = Instant::now() + Duration::from_secs(15);
+            loop {
+                app.poll_shader_brushes();
+                let library = &app.gpu.as_ref().unwrap().resident.as_ref().unwrap().brushes;
+                if library
+                    .brushes
+                    .get("test-brush")
+                    .is_some_and(|b| b.manifest.name == expected_name)
+                    && library.errors.is_empty() != expect_error
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "reload timed out: {:?}",
+                    library.errors
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let pixels = |app: &App| {
+            let recovered = app
+                .gpu_resident_document()
+                .unwrap()
+                .recovery_snapshot()
+                .recover_document()
+                .unwrap();
+            let document = recovered.document();
+            let raster = document.layer_raster(document.active_layer_id()).unwrap();
+            (0..640)
+                .flat_map(|y| (0..768).map(move |x| raster.pixel(x, y).unwrap()))
+                .collect::<Vec<_>>()
+        };
+        wait_reload(&mut app, "Version one", false);
+        assert!(app
+            .gpu
+            .as_ref()
+            .unwrap()
+            .resident
+            .as_ref()
+            .unwrap()
+            .brushes
+            .brushes
+            .contains_key("stipple"));
+        app.select_shader_brush("test-brush".into());
+        assert_eq!(app.paint_brush.diameter(), 512.0);
+        let before = pixels(&app);
+        app.start_stroke([50.0, 100.0], 0.2, [0.0; 2], PointerOwner::Mouse);
+        assert!(app.active_stroke.is_some());
+        write_package("Version two", 0.75);
+        app.gpu
+            .as_mut()
+            .unwrap()
+            .resident
+            .as_mut()
+            .unwrap()
+            .brushes
+            .request_reload();
+        for step in 0..100 {
+            app.poll_shader_brushes();
+            app.update_stroke(
+                [50.0 + step as f32 * 6.5, 100.0 + step as f32 * 4.0],
+                0.2,
+                [0.0; 2],
+            );
+            assert!(
+                matches!(&app.active_stroke,Some(ActiveStroke::GpuResidentRound(stroke)) if !stroke.update_error_reported)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.selected_shader().unwrap().manifest.name, "Version one");
+        app.finish_stroke();
+        if app
+            .gpu_resident_document()
+            .unwrap()
+            .mirror()
+            .pending_revision_count()
+            > 0
+        {
+            assert!(
+                app.gpu_resident_document()
+                    .unwrap()
+                    .recovery_snapshot()
+                    .recover_document()
+                    .is_err(),
+                "pending shader pixels must never be replaced by CPU round-brush replay"
+            );
+        }
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let painted = pixels(&app);
+        assert_ne!(painted, before);
+        assert!(
+            (painted[300 * 768 + 375].a - 0.25).abs() < 1e-6,
+            "mid-contact reload altered coverage"
+        );
+        assert_eq!(
+            app.gpu_resident_document().unwrap().history().undo_depth(),
+            1
+        );
+        wait_reload(&mut app, "Version two", false);
+        std::fs::write(package.join("brush.wgsl"), "broken WGSL").unwrap();
+        wait_reload(&mut app, "Version two", true);
+        app.undo();
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        assert_eq!(pixels(&app), before);
+        app.redo();
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        assert_eq!(pixels(&app), painted);
+        // Invalid edits retain the last accepted shader. Its next contact uses V2.
+        app.start_stroke([375.0, 300.0], 0.2, [0.0; 2], PointerOwner::Mouse);
+        app.finish_stroke();
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        assert!((pixels(&app)[300 * 768 + 375].a - 0.8125).abs() < 1e-6);
+        app.undo();
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        assert_eq!(pixels(&app), painted);
+        let save = directory.join("shader-pixels.sketchpad");
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        checkpoint::save_document_atomic(&save, recovered.document()).unwrap();
+        std::fs::remove_dir_all(directory.join("packages")).unwrap();
+        let loaded = checkpoint::load_document(&save).unwrap();
+        let layer = loaded.layer_raster(loaded.active_layer_id()).unwrap();
+        let loaded_pixels: Vec<_> = (0..640)
+            .flat_map(|y| (0..768).map(move |x| layer.pixel(x, y).unwrap()))
+            .collect();
+        assert_eq!(
+            loaded_pixels, painted,
+            "loading pixels must not require the brush package"
+        );
+        app.start_stroke([375.0, 300.0], 0.2, [0.0; 2], PointerOwner::Mouse);
+        app.finish_stroke();
+        app.duplicate_active_layer();
+        assert_eq!(
+            app.gpu_resident_document()
+                .unwrap()
+                .metadata()
+                .layers()
+                .len(),
+            2
+        );
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        assert!((pixels(&app)[300 * 768 + 375].a - 0.8125).abs() < 1e-6);
+        println!("shader package discovery, active-contact pinning, invalid reload, 512px contact, exact undo/redo and plugin-free save/load passed");
     }
 
     #[cfg(target_os = "linux")]

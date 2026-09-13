@@ -55,123 +55,140 @@ fn main() -> Result<(), Box<dyn Error>> {
         BrushTip::PaletteKnife,
         BrushTip::Charcoal,
     ] {
-        for scale in [1.0, 0.01] {
-            let mut atlas = SparseAtlasPlanner::new(layout);
-            atlas.allocate_batch(
-                (0..4)
-                    .rev()
-                    .map(|i| LayerTileKey::new(layer, TileCoord::new(i % 2, i / 2))),
-            )?;
-            let mut scheduler =
-                RoundMaskScheduler::new([PAGE_SIZE; 2], layer, layout)?.with_tip(tip);
-            let mut target = RoundMaskTarget::new(&device, layout)?;
-            let from = RoundContact {
-                center: [25.0, 30.0],
-                radius: 28.0 * scale,
-                dynamics: [0.25, 0.0, 0.0],
-                elapsed_micros: 0,
-            };
-            let to = RoundContact {
-                center: [225.0, 215.0],
-                radius: 45.0 * scale,
-                dynamics: [0.9, 0.7, 0.0],
-                elapsed_micros: 1,
-            };
-            let stationary = RoundContact {
-                center: to.center,
-                radius: to.radius * 0.5,
-                dynamics: [0.35, 0.0, 0.8],
-                elapsed_micros: 2,
-            };
-            let commands = [
-                RoundPathCommand::Begin(from),
-                RoundPathCommand::Sweep { from, to },
-                RoundPathCommand::Sweep {
-                    from: to,
-                    to: stationary,
-                },
-                RoundPathCommand::End {
-                    at: stationary,
-                    elapsed_micros: 3,
-                },
-            ];
-            let batch = scheduler.schedule(&mut atlas, &commands)?;
-            target.begin_stroke()?;
-            let mut encoder = device.create_command_encoder(&Default::default());
-            target.encode_batch(&device, &queue, &mut encoder, &batch)?;
-            let readback = device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: u64::from(PAGE_SIZE * PAGE_SIZE * 4),
-                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: target.page_texture(batch.pages()[0].page).unwrap(),
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &readback,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(PAGE_SIZE * 4),
-                        rows_per_image: Some(PAGE_SIZE),
+        for package in [false, true] {
+            for scale in [1.0, 0.01] {
+                let mut atlas = SparseAtlasPlanner::new(layout);
+                atlas.allocate_batch(
+                    (0..4)
+                        .rev()
+                        .map(|i| LayerTileKey::new(layer, TileCoord::new(i % 2, i / 2))),
+                )?;
+                let mut scheduler =
+                    RoundMaskScheduler::new([PAGE_SIZE; 2], layer, layout)?.with_tip(tip);
+                let mut target = RoundMaskTarget::new(&device, layout)?;
+                if package {
+                    let id = sketchpad::shader_brush::BUILTIN_IDS[tip as usize];
+                    let source = std::fs::read_to_string(format!("brushes/{id}/brush.wgsl"))?;
+                    let pipeline =
+                        RoundMaskTarget::compile_brush(&device, target.shader_layout(), &source)?;
+                    target.set_brush_pipeline(Some(pipeline))?;
+                    scheduler = scheduler.with_shader_fringe();
+                }
+                let from = RoundContact {
+                    center: [25.0, 30.0],
+                    radius: 28.0 * scale,
+                    dynamics: [0.25, 0.0, 0.0],
+                    elapsed_micros: 0,
+                };
+                let to = RoundContact {
+                    center: [225.0, 215.0],
+                    radius: 45.0 * scale,
+                    dynamics: [0.9, 0.7, 0.0],
+                    elapsed_micros: 1,
+                };
+                let stationary = RoundContact {
+                    center: to.center,
+                    radius: to.radius * 0.5,
+                    dynamics: [0.35, 0.0, 0.8],
+                    elapsed_micros: 2,
+                };
+                let commands = [
+                    RoundPathCommand::Begin(from),
+                    RoundPathCommand::Sweep { from, to },
+                    RoundPathCommand::Sweep {
+                        from: to,
+                        to: stationary,
                     },
-                },
-                wgpu::Extent3d {
-                    width: PAGE_SIZE,
-                    height: PAGE_SIZE,
-                    depth_or_array_layers: 1,
-                },
-            );
-            queue.submit(iter::once(encoder.finish()));
-            target.encoded_batch_submitted()?;
-            let slice = readback.slice(..);
-            let (tx, rx) = mpsc::channel();
-            slice.map_async(wgpu::MapMode::Read, move |r| {
-                let _ = tx.send(r);
-            });
-            device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            })?;
-            rx.recv()??;
-            let bytes = slice.get_mapped_range()?;
-            let mut worst = 0.0_f32;
-            let mut painted = 0;
-            for y in 0..PAGE_SIZE {
-                for x in 0..PAGE_SIZE {
-                    let key =
-                        LayerTileKey::new(layer, TileCoord::new(x / TILE_SIZE, y / TILE_SIZE));
-                    let origin = atlas.slot(key).unwrap().origin();
-                    let actual = read_mask(
-                        &bytes,
-                        PAGE_SIZE * 4,
-                        origin[0] + x % TILE_SIZE,
-                        origin[1] + y % TILE_SIZE,
-                    )?;
-                    let p = [x as f32 + 0.5, y as f32 + 0.5];
-                    let expected = tip
-                        .coverage(from, from, p)
-                        .max(tip.coverage(from, to, p))
-                        .max(tip.coverage(to, stationary, p));
-                    worst = worst.max((actual - expected).abs());
-                    if actual > 0.0 {
-                        painted += 1;
+                    RoundPathCommand::End {
+                        at: stationary,
+                        elapsed_micros: 3,
+                    },
+                ];
+                let batch = scheduler.schedule(&mut atlas, &commands)?;
+                target.begin_stroke()?;
+                let mut encoder = device.create_command_encoder(&Default::default());
+                let stats = target.encode_batch(&device, &queue, &mut encoder, &batch)?;
+                assert_eq!(stats.render_passes, 1);
+                assert_eq!(
+                    stats.instance_bytes_written,
+                    u64::from(stats.round_instances) * 80 + u64::from(stats.cleared_slots) * 16
+                );
+                let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                    label: None,
+                    size: u64::from(PAGE_SIZE * PAGE_SIZE * 4),
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                });
+                encoder.copy_texture_to_buffer(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: target.page_texture(batch.pages()[0].page).unwrap(),
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: &readback,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(PAGE_SIZE * 4),
+                            rows_per_image: Some(PAGE_SIZE),
+                        },
+                    },
+                    wgpu::Extent3d {
+                        width: PAGE_SIZE,
+                        height: PAGE_SIZE,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                queue.submit(iter::once(encoder.finish()));
+                target.encoded_batch_submitted()?;
+                let slice = readback.slice(..);
+                let (tx, rx) = mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |r| {
+                    let _ = tx.send(r);
+                });
+                device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })?;
+                rx.recv()??;
+                let bytes = slice.get_mapped_range()?;
+                let mut worst = 0.0_f32;
+                let mut painted = 0;
+                for y in 0..PAGE_SIZE {
+                    for x in 0..PAGE_SIZE {
+                        let key =
+                            LayerTileKey::new(layer, TileCoord::new(x / TILE_SIZE, y / TILE_SIZE));
+                        let origin = atlas.slot(key).unwrap().origin();
+                        let actual = read_mask(
+                            &bytes,
+                            PAGE_SIZE * 4,
+                            origin[0] + x % TILE_SIZE,
+                            origin[1] + y % TILE_SIZE,
+                        )?;
+                        let p = [x as f32 + 0.5, y as f32 + 0.5];
+                        let expected = tip
+                            .coverage(from, from, p)
+                            .max(tip.coverage(from, to, p))
+                            .max(tip.coverage(to, stationary, p));
+                        worst = worst.max((actual - expected).abs());
+                        if actual > 0.0 {
+                            painted += 1;
+                        }
                     }
                 }
-            }
-            if worst > 0.002 || painted == 0 {
-                return Err(format!("{tip:?}: GPU/CPU mismatch {worst}, painted {painted}").into());
-            }
-            println!(
-            "{tip:?}: scale={scale}, pixels={painted}, max_gpu_cpu_error={worst}; reordered tile seams checked"
+                if worst > 0.002 || painted == 0 {
+                    return Err(
+                        format!("{tip:?}: GPU/CPU mismatch {worst}, painted {painted}").into(),
+                    );
+                }
+                println!(
+            "{tip:?}: package={package} scale={scale}, pixels={painted}, max_gpu_cpu_error={worst}; reordered tile seams checked"
         );
-            drop(bytes);
-            readback.unmap();
-            target.end_stroke()?;
+                drop(bytes);
+                readback.unmap();
+                target.end_stroke()?;
+            }
         }
     }
     if let Some(error) = pollster::block_on(error_scope.pop()) {

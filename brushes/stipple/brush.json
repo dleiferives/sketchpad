@@ -1,0 +1,10 @@
+{
+  "api_version": 1,
+  "id": "stipple",
+  "name": "Stipple",
+  "description": "Procedural stipple \u00b7 pressure controls density",
+  "footprint": "constant",
+  "extent": 1.0,
+  "diameter": 48,
+  "opacity": 1.0
+}
