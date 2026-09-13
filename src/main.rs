@@ -5982,6 +5982,79 @@ mod tests {
             ExportRegion::FullCanvas,
         )
         .unwrap();
+        // A second sheet exercises different directions and corners with the
+        // actual package renderer. Undo the opacity ladder as four contacts.
+        for _ in 0..4 {
+            app.undo();
+        }
+        app.set_brush_diameter(72.0);
+        app.set_brush_opacity(1.0);
+        let line = |a: [f32; 2], b: [f32; 2]| -> Vec<[f32; 2]> {
+            (0..=80)
+                .map(|i| {
+                    let t = i as f32 / 80.0;
+                    [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+                })
+                .collect()
+        };
+        let mut corner = line([645.0, 65.0], [745.0, 65.0]);
+        corner.extend(line([745.0, 65.0], [745.0, 205.0]));
+        let curve: Vec<_> = (0..=160)
+            .map(|i| {
+                let t = i as f32 / 160.0;
+                [
+                    45.0 + 210.0 * t,
+                    405.0 + 65.0 * (t * std::f32::consts::TAU).sin(),
+                ]
+            })
+            .collect();
+        let loop_path: Vec<_> = (0..=160)
+            .map(|i| {
+                let t = i as f32 / 160.0 * std::f32::consts::TAU;
+                [450.0 + 90.0 * t.cos(), 405.0 + 75.0 * t.sin()]
+            })
+            .collect();
+        let mut reverse = line([645.0, 405.0], [855.0, 405.0]);
+        reverse.extend(line([855.0, 405.0], [645.0, 405.0]));
+        for path in [
+            line([45.0, 135.0], [255.0, 135.0]),
+            line([450.0, 65.0], [450.0, 205.0]),
+            corner,
+            curve,
+            loop_path,
+            reverse,
+        ] {
+            app.start_stroke(path[0], 1.0, [0.0; 2], PointerOwner::Mouse);
+            for p in &path[1..] {
+                app.update_stroke(*p, 1.0, [0.0; 2]);
+            }
+            app.finish_stroke();
+        }
+        app.reconcile_gpu_mirror_for_file().unwrap();
+        let recovered = app
+            .gpu_resident_document()
+            .unwrap()
+            .recovery_snapshot()
+            .recover_document()
+            .unwrap();
+        let doc = recovered.document();
+        let raster = doc.layer_raster(doc.active_layer_id()).unwrap();
+        let mut review = RasterLayer::new(900, 560, DEFAULT_TILE_SIZE).unwrap();
+        let mut gesture = review.scoped_gesture().unwrap();
+        for y in 0..560 {
+            for x in 0..900 {
+                gesture
+                    .set_pixel(x, y, raster.pixel(x, 559 - y).unwrap())
+                    .unwrap();
+            }
+        }
+        gesture.commit().unwrap();
+        image_io::export_png_file_atomic(
+            &directory.join("direction.png"),
+            &review,
+            ExportRegion::FullCanvas,
+        )
+        .unwrap();
     }
 
     #[cfg(target_os = "linux")]

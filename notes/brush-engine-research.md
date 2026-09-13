@@ -1,5 +1,24 @@
 # Brush engine research and knife opacity
 
+The subsequent [orientation study](ui-concepts/brush-orientation.html), hosted at
+[localhost:8058/brush-orientation.html](http://localhost:8058/brush-orientation.html),
+separates nib pose, initial direction, continuing direction, filtering, azimuth
+and barrel rotation. It contains a geometric interactive comparison, primary
+references and a native knife sheet with curves, a corner and a reversal.
+
+The knife's scrape field now follows segment travel using five symmetric local
+paper samples, independently of blade tilt. This preserves paper phase through
+turns and treats reversed travel as the same scrape axis. The threshold was
+rebalanced to retain opaque interiors. An exactly stationary dab has unextended
+tooth; generalized heading retention and orientation controls remain proposals.
+
+The direction revision passed ordinary tests, GPU/CPU mask agreement, native
+opacity/direction and media/history/save checks, and release builds on Atlas and
+Apollo. The new CPU coverage test checks directional texture, reversal and
+subdivision along four axes. Atlas Clippy and changed-file formatting also passed.
+The full-pressure opacity band now has 4,775/5,280 pixels at selected opacity and
+271 scraped pixels; the earlier measurements below remain historical.
+
 Read the [full research site](ui-concepts/brush-research.html), hosted on Atlas at
 [localhost:8058/brush-research.html](http://localhost:8058/brush-research.html).
 It includes an interactive opacity/flow model, actual native knife before/after

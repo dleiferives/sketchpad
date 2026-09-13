@@ -118,19 +118,16 @@ impl BrushTip {
             Self::PaletteKnife => {
                 // Opaque paint with localized scraped grooves; pressure changes
                 // the footprint and scraping, not the whole deposit's opacity.
-                let drag = crate::paper_grain::sample(
-                    [
-                        point[0] * direction[0] + point[1] * direction[1],
-                        (-point[0] * direction[1] + point[1] * direction[0]) * 0.45,
-                    ],
-                    0.65,
-                );
+                // Sweep the fixed paper tooth along the drag, independently of
+                // the blade's tilt. Local offsets avoid rotating the entire paper
+                // around the canvas origin whenever the path turns.
+                let drag = knife_drag_grain(point, delta);
                 let breakup = crate::paper_grain::sample(point, 2.2);
                 let edge_depth =
                     (1.0 - paper) * (2.0 + radius * 0.10).min(4.0).min(radius * aspect * 0.5);
                 let edge = (0.5 - distance - edge_depth).clamp(0.0, 1.0);
                 let body = smooth(0.0, (radius * aspect * 0.7).max(1.0), -distance);
-                let threshold = 0.25 + (1.0 - pressure) * 0.04 + (1.0 - body) * 0.07;
+                let threshold = 0.14 + (1.0 - pressure) * 0.04 + (1.0 - body) * 0.07;
                 let scrape = 1.0 - smooth(threshold, threshold + 0.06, drag + breakup * 0.10);
                 let detail = smooth(0.5, 2.0, radius * aspect);
                 edge * (1.0 - scrape * detail)
@@ -138,6 +135,28 @@ impl BrushTip {
             _ => unreachable!(),
         }
     }
+}
+
+fn knife_drag_grain(point: [f32; 2], delta: [f32; 2]) -> f32 {
+    let length = delta[0].hypot(delta[1]);
+    // A dab has no movement direction: leave its tooth unextended. Symmetric
+    // offsets make forward/backward scrapes identical, without a 180-degree flip.
+    let step = if length > 1e-6 {
+        [delta[0] / length, delta[1] / length]
+    } else {
+        [0.0; 2]
+    };
+    let mut grain = 1.0_f32;
+    for offset in -2..=2 {
+        grain = grain.min(crate::paper_grain::sample(
+            [
+                point[0] + step[0] * offset as f32,
+                point[1] + step[1] * offset as f32,
+            ],
+            0.65,
+        ));
+    }
+    grain
 }
 
 fn smooth(low: f32, high: f32, value: f32) -> f32 {
@@ -267,6 +286,51 @@ mod tests {
         assert_eq!(BrushTip::Marker.coverage(c, c, [66.5, 64.5]), 0.5);
         assert_eq!(BrushTip::HardRound.coverage(c, c, [64.5, 64.5]), 1.0);
     }
+    #[test]
+    fn knife_scrapes_follow_travel_and_survive_reversal_and_subdivision() {
+        let tip = BrushTip::PaletteKnife;
+        for axis in [[1.0_f32, 0.0], [0.0, 1.0], [0.6, 0.8], [0.6, -0.8]] {
+            let normal = [-axis[1], axis[0]];
+            let mut from = contact(tip, 1.0, [0.0; 2]);
+            from.radius = 400.0;
+            from.center = [128.0 - axis[0] * 300.0, 128.0 - axis[1] * 300.0];
+            let to = RoundContact {
+                center: [128.0 + axis[0] * 300.0, 128.0 + axis[1] * 300.0],
+                ..from
+            };
+            let mid = RoundContact {
+                center: [128.0; 2],
+                ..from
+            };
+            let mut along = 0.0;
+            let mut across = 0.0;
+            for y in 80..176 {
+                for x in 80..176 {
+                    let p = [x as f32 + 0.5, y as f32 + 0.5];
+                    let value = tip.coverage(from, to, p);
+                    let forward = tip.coverage(from, to, [p[0] + axis[0], p[1] + axis[1]]);
+                    let sideways = tip.coverage(from, to, [p[0] + normal[0], p[1] + normal[1]]);
+                    along += (value - forward).abs();
+                    across += (value - sideways).abs();
+                    assert!(
+                        (value - tip.coverage(to, from, p)).abs() < 0.0001,
+                        "reversing travel must not flip the scrape pattern"
+                    );
+                    let split = tip.coverage(from, mid, p).max(tip.coverage(mid, to, p));
+                    assert!(
+                        (value - split).abs() < 0.0001,
+                        "subdivision must not restart the texture"
+                    );
+                }
+            }
+            println!("axis {axis:?}: along={along}, across={across}");
+            assert!(
+                across > along * 1.4,
+                "scrapes must be elongated along travel"
+            );
+        }
+    }
+
     #[test]
     fn stationary_pressure_and_tilt_change_deposits_new_contact() {
         for tip in [
